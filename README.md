@@ -12,7 +12,25 @@ Reads `.cact` model files directly in place with AVX2 and portable scalar backen
 
 ## Quick Start
 
-### Tool Calling
+### Minimal Example
+
+```csharp
+using Needle;
+
+const string tools = """
+[{"name":"set_timer","description":"Set a countdown timer.",
+  "parameters":{"type":"object","properties":{"minutes":{"type":"integer"}},"required":["minutes"]}}]
+""";
+
+using var model = Model.Open("needle3.cact");
+using var session = new NeedleSession(model, tools, new NeedleOptions { Threads = 4 });
+
+var result = session.Complete("set a timer for 12 minutes");
+foreach (var call in result.FunctionCalls)
+    Console.WriteLine($"{call.Name} {call.ArgumentsJson}");   // set_timer {"minutes":12}
+```
+
+### Tool Calling (multi-turn)
 
 ```csharp
 using var model = Model.Open("needle3.cact");
