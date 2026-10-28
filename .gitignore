@@ -4,3 +4,6 @@ obj/
 *.nettrace
 perf.data*
 out/
+
+__pycache__/
+*.pyc
