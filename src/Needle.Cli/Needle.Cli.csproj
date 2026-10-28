@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Needle.Cli</RootNamespace>
+    <AssemblyName>needle</AssemblyName>
+    <PublishAot>true</PublishAot>
+    <OptimizationPreference>Speed</OptimizationPreference>
+    <IlcInstructionSet>native</IlcInstructionSet>
+    <StripSymbols>false</StripSymbols>
+    <UseSystemResourceKeys>true</UseSystemResourceKeys>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Needle\Needle.csproj" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,15 @@
+<Project>
+  <PropertyGroup>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <Optimize>true</Optimize>
+    <DebugType>portable</DebugType>
+    <TieredPGO>false</TieredPGO>
+    <TieredCompilation>false</TieredCompilation>
+  </PropertyGroup>
+</Project>

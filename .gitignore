@@ -1,0 +1,6 @@
+ref/
+bin/
+obj/
+*.nettrace
+perf.data*
+out/

@@ -1,0 +1,9 @@
+{
+  "name": "com.needle.inference",
+  "displayName": "Needle Inference",
+  "version": "0.1.0",
+  "unity": "2022.3",
+  "description": "On-device Needle 3 tool calling and Whistle speech-to-text, allocation-free after load. Kernels are plain pointer functions that Burst jobs can call.",
+  "keywords": ["inference", "burst", "ecs", "speech", "tool-calling"],
+  "dependencies": {}
+}
