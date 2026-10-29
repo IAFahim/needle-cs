@@ -14,6 +14,7 @@ OUT = ROOT / "ref/golden"
 HEADER = "<48If"
 RECORD = "<BBHIIIIQQII"
 FP16, FP32, CQ, RAW = 1, 2, 3, 4
+DECODE_BUDGET = 40
 GROUP = 128
 M32 = 0xFFFFFFFF
 PRIME = 0x01000193
@@ -359,11 +360,12 @@ def main():
     logits.astype(np.float32).tofile(dump / "logits.bin")
     ids.astype(np.int32).tofile(dump / "ids.bin")
     print("first token:", int(logits.argmax()), repr(sp.Decode([int(logits.argmax())])))
+    budget = int(sys.argv[1]) if len(sys.argv) > 1 else DECODE_BUDGET
     results = []
     for case in cases:
         seq = list(case["sp_ids"])
         generated = []
-        for _ in range(int(sys.argv[1]) if len(sys.argv) > 1 else 48):
+        for _ in range(budget):
             nxt = int(model.forward(np.array(seq))[0].argmax())
             if nxt == 1:
                 break
@@ -373,7 +375,7 @@ def main():
         case["text"] = sp.Decode(generated)
         print(case["query"], "->", case["text"])
         results.append(case)
-    (OUT / "golden.json").write_text(json.dumps({"cases": results, "probes": probe_cases}, ensure_ascii=False))
+    (OUT / "golden.json").write_text(json.dumps({"budget": budget, "cases": results, "probes": probe_cases}, ensure_ascii=False))
 
 
 if __name__ == "__main__":
