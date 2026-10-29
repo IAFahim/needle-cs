@@ -1,6 +1,6 @@
 # Needle.Inference: game hot-path plan
 
-Status: plan only. Nothing here is implemented yet. Every work item (`Wnn`) has a GitHub issue, so people and local AI agents can pick items up independently. The tracking issue lists them all.
+Status: plan only. Nothing here is implemented yet. Every work item (`Wnn`) has a GitHub issue, so people and local AI agents can pick items up independently. The tracking issue is [#31](https://github.com/IAFahim/needle-cs/issues/31) (learnings plus checklist); work items are [#1](https://github.com/IAFahim/needle-cs/issues/1)–[#30](https://github.com/IAFahim/needle-cs/issues/30).
 
 Last measured: 2026-10-29, on the reference box in [2.2](#22-baseline). The numbers come from instrumented copies of the engine and are reproducible with the harness in W02.
 
@@ -287,36 +287,36 @@ Effort: S is under a day, M is 1–3 days, L is about a week. "Gain" is measured
 
 | ID | Item | Milestone | Depends on | Effort | Gain or why | Issue |
 |---|---|---|---|---|---|---|
-| W01 | Fix golden fixture drift, document test setup | M0 Ground truth | | S | suite green out of the box | #TBD |
-| W02 | Benchmark harness: end-to-end, per-stage profile, kernels, native comparison, allocation gate | M0 | W01 | M | every later PR is measurable | #TBD |
-| W03 | CI on x64 and arm64: tests, scalar, netstandard2.1, NativeAOT smoke | M0 | W01 | M | regressions caught | #TBD |
-| W04 | License and provenance | M0 | | S | legal clarity for game shipping | #TBD |
-| W05 | Cross-platform model loading (Windows, macOS, Android APK, large pages) | M1 Game-safe hosting | | M | **Windows works** | #TBD |
-| W06 | Game-friendly threading: no foreign pinning, bounded spin, priorities, P/E cores, pause/resume | M1 | | M | no stolen frame time | #TBD |
-| W07 | Zero-allocation session core (UTF-8 in, records out) | M1 | W02 | L | 0 B per call | #TBD |
-| W08 | Unmanaged channel and `NeedleHost` worker (MPMC rings, tickets, cancellation) | M1 | W06, W07 | L | Burst-callable hot path | #TBD |
-| W09 | Session startup and memory: share tokenizer and trie per model, right-size arenas, persist primed prefix, warm-up | M1 | W07 | M | from 64 MB and 0.3–0.6 s per session to ≤ 16 MB and ≤ 50 ms | #TBD |
-| W10 | Typed tools: `[NeedleTools]` source generator (schema, grammar blob, records, dispatcher) | M2 Typed C# | W07 | L | C# methods instead of JSON | #TBD |
-| W11 | Typed decoding: grammar event sink fills argument records, streaming dispatch | M2 | W10 | M | no JSON text or parsing | #TBD |
-| W12 | Hadamard MLP: register-blocked Kronecker, parallel at T=1, fused, no zeroed `stackalloc` | M3 Decode latency | W02 | M | −630 µs/token | #TBD |
-| W13 | Layer program: about 20 barriers per token, parallel hyper stages, vectorized Sinkhorn, fused elementwise | M3 | W12 | L | −250 µs/token | #TBD |
-| W14 | Attention core: GQA-shared K/V (6 queries per KV head), int8 P·V | M3 | W02 | M | −150 µs/token | #TBD |
-| W15 | Masked decoding cost: sparse head rows, masked log-sum-exp, vectorized argmax, memoized grammar masks | M3 | W07 | M | −30 to −130 µs per call step | #TBD |
-| W16 | Jump-forward over grammar-forced spans | M3 | W15, W28 | M | −24% passes | #TBD |
-| W17 | Lossless prompt-lookup speculative decoding (engine chunk checkpoint/commit) | M3 | W20 | L | −36% passes (−46% with W16) | #TBD |
-| W18 | Cheap Reset/Rewind for stateless requests | M3 | W02 | S | per-request reset in µs | #TBD |
-| W19 | T=1 GEMV at bandwidth: multi-row, precomputed scales, prefetch, tuned splitting | M4 Kernels | W02 | M | −480 µs/token | #TBD |
-| W20 | Small-T and prefill GEMM: T=2..8 at most 1.3x of T=1; T=16..64 register blocking | M4 | W19 | M | enables W17 and W26; prefill ≤ 6 ms | #TBD |
-| W21 | Zero-cost tier dispatch and new x86 tiers (Avx512BW for Zen 4, AvxVnniInt8) | M4 | W19 | L | about 2x kernels on Zen 4 | #TBD |
-| W22 | ARM tiers (dotprod, i8mm) validated on arm64 CI | M4 | W03 | M | mobile and Apple | #TBD |
-| W23 | Unity package: Entities `ISystem` + Burst glue, samples, model delivery | M5 Unity | W08, W11 | M | about 100 lines of Unity code | #TBD |
-| W24 | Telemetry: blittable stats block, Unity Profiler bridge | M5 | W08 | S | visibility in game | #TBD |
-| W25 | AOT platforms: NativeAOT C ABI (`needle_*` compatible) versus Burst kernels | M5 | W07 | L | consoles, iOS, IL2CPP | #TBD |
-| W26 | Multi-sequence batched decode for many NPCs | M6 Throughput & voice | W13, W20 | L | several NPCs for about the cost of one | #TBD |
-| W27 | Whistle for games: zero-alloc push-to-talk, streaming, voice to typed call | M6 | W08, W11 | L | voice commands | #TBD |
-| W28 | Game command evaluation suite: accuracy gate for decoding policies | M7 Quality & parity | W02 | M | guards W16, reasoning caps, tool design | #TBD |
-| W29 | Parity suite against upstream native: prefix, date, confidence, `KvWindow` | M7 | W02 | M | no silent divergence | #TBD |
-| W30 | Upstream format tracking: version checks, golden refresh procedure | M7 | W01 | S | safe model updates | #TBD |
+| W01 | Fix golden fixture drift, document test setup | M0 Ground truth | | S | suite green out of the box | [#1](https://github.com/IAFahim/needle-cs/issues/1) |
+| W02 | Benchmark harness: end-to-end, per-stage profile, kernels, native comparison, allocation gate | M0 | W01 | M | every later PR is measurable | [#2](https://github.com/IAFahim/needle-cs/issues/2) |
+| W03 | CI on x64 and arm64: tests, scalar, netstandard2.1, NativeAOT smoke | M0 | W01 | M | regressions caught | [#3](https://github.com/IAFahim/needle-cs/issues/3) |
+| W04 | License and provenance | M0 | | S | legal clarity for game shipping | [#4](https://github.com/IAFahim/needle-cs/issues/4) |
+| W05 | Cross-platform model loading (Windows, macOS, Android APK, large pages) | M1 Game-safe hosting | | M | **Windows works** | [#5](https://github.com/IAFahim/needle-cs/issues/5) |
+| W06 | Game-friendly threading: no foreign pinning, bounded spin, priorities, P/E cores, pause/resume | M1 | | M | no stolen frame time | [#6](https://github.com/IAFahim/needle-cs/issues/6) |
+| W07 | Zero-allocation session core (UTF-8 in, records out) | M1 | W02 | L | 0 B per call | [#7](https://github.com/IAFahim/needle-cs/issues/7) |
+| W08 | Unmanaged channel and `NeedleHost` worker (MPMC rings, tickets, cancellation) | M1 | W06, W07 | L | Burst-callable hot path | [#8](https://github.com/IAFahim/needle-cs/issues/8) |
+| W09 | Session startup and memory: share tokenizer and trie per model, right-size arenas, persist primed prefix, warm-up | M1 | W07 | M | from 64 MB and 0.3–0.6 s per session to ≤ 16 MB and ≤ 50 ms | [#9](https://github.com/IAFahim/needle-cs/issues/9) |
+| W10 | Typed tools: `[NeedleTools]` source generator (schema, grammar blob, records, dispatcher) | M2 Typed C# | W07 | L | C# methods instead of JSON | [#10](https://github.com/IAFahim/needle-cs/issues/10) |
+| W11 | Typed decoding: grammar event sink fills argument records, streaming dispatch | M2 | W10 | M | no JSON text or parsing | [#11](https://github.com/IAFahim/needle-cs/issues/11) |
+| W12 | Hadamard MLP: register-blocked Kronecker, parallel at T=1, fused, no zeroed `stackalloc` | M3 Decode latency | W02 | M | −630 µs/token | [#12](https://github.com/IAFahim/needle-cs/issues/12) |
+| W13 | Layer program: about 20 barriers per token, parallel hyper stages, vectorized Sinkhorn, fused elementwise | M3 | W12 | L | −250 µs/token | [#13](https://github.com/IAFahim/needle-cs/issues/13) |
+| W14 | Attention core: GQA-shared K/V (6 queries per KV head), int8 P·V | M3 | W02 | M | −150 µs/token | [#14](https://github.com/IAFahim/needle-cs/issues/14) |
+| W15 | Masked decoding cost: sparse head rows, masked log-sum-exp, vectorized argmax, memoized grammar masks | M3 | W07 | M | −30 to −130 µs per call step | [#15](https://github.com/IAFahim/needle-cs/issues/15) |
+| W16 | Jump-forward over grammar-forced spans | M3 | W15, W28 | M | −24% passes | [#16](https://github.com/IAFahim/needle-cs/issues/16) |
+| W17 | Lossless prompt-lookup speculative decoding (engine chunk checkpoint/commit) | M3 | W20 | L | −36% passes (−46% with W16) | [#17](https://github.com/IAFahim/needle-cs/issues/17) |
+| W18 | Cheap Reset/Rewind for stateless requests | M3 | W02 | S | per-request reset in µs | [#18](https://github.com/IAFahim/needle-cs/issues/18) |
+| W19 | T=1 GEMV at bandwidth: multi-row, precomputed scales, prefetch, tuned splitting | M4 Kernels | W02 | M | −480 µs/token | [#19](https://github.com/IAFahim/needle-cs/issues/19) |
+| W20 | Small-T and prefill GEMM: T=2..8 at most 1.3x of T=1; T=16..64 register blocking | M4 | W19 | M | enables W17 and W26; prefill ≤ 6 ms | [#20](https://github.com/IAFahim/needle-cs/issues/20) |
+| W21 | Zero-cost tier dispatch and new x86 tiers (Avx512BW for Zen 4, AvxVnniInt8) | M4 | W19 | L | about 2x kernels on Zen 4 | [#21](https://github.com/IAFahim/needle-cs/issues/21) |
+| W22 | ARM tiers (dotprod, i8mm) validated on arm64 CI | M4 | W03 | M | mobile and Apple | [#22](https://github.com/IAFahim/needle-cs/issues/22) |
+| W23 | Unity package: Entities `ISystem` + Burst glue, samples, model delivery | M5 Unity | W08, W11 | M | about 100 lines of Unity code | [#23](https://github.com/IAFahim/needle-cs/issues/23) |
+| W24 | Telemetry: blittable stats block, Unity Profiler bridge | M5 | W08 | S | visibility in game | [#24](https://github.com/IAFahim/needle-cs/issues/24) |
+| W25 | AOT platforms: NativeAOT C ABI (`needle_*` compatible) versus Burst kernels | M5 | W07 | L | consoles, iOS, IL2CPP | [#25](https://github.com/IAFahim/needle-cs/issues/25) |
+| W26 | Multi-sequence batched decode for many NPCs | M6 Throughput & voice | W13, W20 | L | several NPCs for about the cost of one | [#26](https://github.com/IAFahim/needle-cs/issues/26) |
+| W27 | Whistle for games: zero-alloc push-to-talk, streaming, voice to typed call | M6 | W08, W11 | L | voice commands | [#27](https://github.com/IAFahim/needle-cs/issues/27) |
+| W28 | Game command evaluation suite: accuracy gate for decoding policies | M7 Quality & parity | W02 | M | guards W16, reasoning caps, tool design | [#28](https://github.com/IAFahim/needle-cs/issues/28) |
+| W29 | Parity suite against upstream native: prefix, date, confidence, `KvWindow` | M7 | W02 | M | no silent divergence | [#29](https://github.com/IAFahim/needle-cs/issues/29) |
+| W30 | Upstream format tracking: version checks, golden refresh procedure | M7 | W01 | S | safe model updates | [#30](https://github.com/IAFahim/needle-cs/issues/30) |
 
 Suggested order:
 1. W01–W06 (blockers and measurement).
