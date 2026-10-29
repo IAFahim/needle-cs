@@ -11,6 +11,7 @@ namespace Needle;
 public sealed class NeedleOptions
 {
     public int Threads { get; init; } = 1;
+    public ThreadPolicy? Threading { get; init; }
     public int Context { get; init; } = 2048;
     public int MaxReasoningTokens { get; init; } = 96;
     public int MaxCallTokens { get; init; } = 384;
@@ -18,6 +19,8 @@ public sealed class NeedleOptions
     public bool AutoDate { get; init; } = true;
     public float RefuseBelow { get; init; } = 0.1f;
     public int RetrievalTopK { get; init; } = 5;
+
+    internal ThreadPolicy ResolvedThreading => Threading ?? ThreadPolicy.Default.WithThreads(Threads);
 }
 
 public sealed record FunctionCall(string Name, string ArgumentsJson);
@@ -124,7 +127,7 @@ public sealed unsafe class NeedleSession : IDisposable
         this.model = model;
         this.options = options ?? new NeedleOptions();
         allTools = new ToolSet(toolsJson);
-        engine = new Engine(model, this.options.Context, 64, this.options.Threads) { Pooling = true };
+        engine = new Engine(model, this.options.Context, 64, this.options.ResolvedThreading, null) { Pooling = true };
         tokenizer = new Tokenizer(model, 1 << 16);
         trie = new TokenTrie(tokenizer, model.VocabSize);
         system = BuildSystem(this.options);
@@ -369,7 +372,7 @@ public sealed unsafe class NeedleSession : IDisposable
 
     public float[] Embed(string text)
     {
-        embedder ??= new Engine(model, 512, 64, options.Threads) { Pooling = true };
+        embedder ??= new Engine(model, 512, 64, options.ResolvedThreading, engine.SharedPool) { Pooling = true };
         var ids = new List<int> { tokenizer.BeginId };
         ids.AddRange(Tokens(text, true));
         embedder.Reset();
@@ -409,6 +412,10 @@ public sealed unsafe class NeedleSession : IDisposable
         grammar = new Grammar(active.Tools);
         Prime(active);
     }
+
+    public void Pause() => engine.Pause();
+
+    public void Resume() => engine.Resume();
 
     public void Dispose()
     {

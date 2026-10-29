@@ -64,15 +64,20 @@ public sealed unsafe class Engine : IDisposable
     public ReadOnlySpan<float> Logits => new(logits, model.Embedding.Rows);
 
     public Engine(Model model, int contextLength = 1024, int chunkSize = 64, int threads = 1)
-        : this(model, contextLength, chunkSize, threads, null)
+        : this(model, contextLength, chunkSize, ThreadPolicy.Default.WithThreads(threads), null)
     {
     }
 
-    internal Engine(Model model, int contextLength, int chunkSize, int threads, Pool? shared)
+    public Engine(Model model, ThreadPolicy policy, int contextLength = 1024, int chunkSize = 64)
+        : this(model, contextLength, chunkSize, policy, null)
+    {
+    }
+
+    internal Engine(Model model, int contextLength, int chunkSize, ThreadPolicy policy, Pool? shared)
     {
         this.model = model;
         ownsPool = shared == null;
-        pool = shared ?? new Pool(threads);
+        pool = shared ?? new Pool(policy);
         g = model.Geometry;
         chunk = chunkSize;
         capacity = Math.Min(contextLength, g.MaxSeq);
@@ -579,6 +584,12 @@ public sealed unsafe class Engine : IDisposable
         head.Add(model.Embedding, logits, model.Embedding.Rows);
         MatMulBatch.Run(pool, &head);
     }
+
+    internal Pool SharedPool => pool;
+
+    public void Pause() => pool.Pause();
+
+    public void Resume() => pool.Resume();
 
     public void Dispose()
     {
