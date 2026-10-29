@@ -14,7 +14,7 @@ internal unsafe struct CrossMemory
 
 public delegate void LayerObserver(int layer, ReadOnlySpan<float> stream);
 
-public sealed unsafe class Engine : IDisposable
+public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, IStageClock
 {
     const int Lanes = 4;
     const int ConvTaps = 3;
@@ -22,6 +22,7 @@ public sealed unsafe class Engine : IDisposable
     const int EngramTaps = 4;
 
     readonly Model model;
+    readonly TClock clock;
     readonly Pool pool;
     readonly bool ownsPool;
     internal float* Alignment;
@@ -63,14 +64,10 @@ public sealed unsafe class Engine : IDisposable
 
     public ReadOnlySpan<float> Logits => new(logits, model.Embedding.Rows);
 
-    public Engine(Model model, int contextLength = 1024, int chunkSize = 64, int threads = 1)
-        : this(model, contextLength, chunkSize, threads, null)
-    {
-    }
-
-    internal Engine(Model model, int contextLength, int chunkSize, int threads, Pool? shared)
+    internal EngineCore(Model model, int contextLength, int chunkSize, int threads, Pool? shared, TClock clock)
     {
         this.model = model;
+        this.clock = clock;
         ownsPool = shared == null;
         pool = shared ?? new Pool(threads);
         g = model.Geometry;
@@ -275,6 +272,7 @@ public sealed unsafe class Engine : IDisposable
 
     void Forward(int* tokens, int count, int position, bool wantLogits)
     {
+        clock.Begin();
         for (var t = 0; t < count; t++)
         {
             Quant.GatherRow(model.Embedding, tokens[t], scratch);
@@ -283,6 +281,7 @@ public sealed unsafe class Engine : IDisposable
             for (var lane = 0; lane < Lanes; lane++) Buffer.MemoryCopy(scratch, row + lane * dim, dim * 4, dim * 4);
         }
         EngramHash.Rows(g, tokens, count, position, previousTokens, engramRows);
+        clock.Lap(Stage.Embed);
         Observer?.Invoke(-1, new ReadOnlySpan<float>(stream, count * streamWidth));
         if (pooling) PoolTokens(0, count, true);
         for (var layer = 0; layer < g.Layers; layer++)
@@ -307,9 +306,11 @@ public sealed unsafe class Engine : IDisposable
             Quant.FakeA8(normalized, streamWidth);
         }
         Quant.Prepare(normalizedStream, count, streamWidth, 4, streamAct);
+        clock.Lap(Stage.HyperPrepare);
         Quant.MatMul(hyper.PhiPre.Slice(l * Lanes, Lanes), streamAct, count, preOut, Lanes);
         Quant.MatMul(hyper.PhiPost.Slice(l * Lanes, Lanes), streamAct, count, postOut, Lanes);
         Quant.MatMul(hyper.PhiRes.Slice(l * Lanes * Lanes, Lanes * Lanes), streamAct, count, resOut, Lanes * Lanes);
+        clock.Lap(Stage.HyperPhi);
 
         var mixLogits = stackalloc float[Lanes * Lanes];
         var hpre = stackalloc float[Lanes];
@@ -327,12 +328,15 @@ public sealed unsafe class Engine : IDisposable
             Sinkhorn.Normalize(mixLogits, residualMix + t * Lanes * Lanes);
             Buffer.MemoryCopy(u, residual + (long)t * dim, dim * 4, dim * 4);
         }
+        clock.Lap(Stage.HyperMix);
 
         var site = g.SiteOf(l);
         if (site >= 0) ApplyEngram(site, count, position);
+        clock.Lap(Stage.Engram);
         RunAttention(l, w, count, position);
         if (cross.Frames > 0) RunCross(l, count, position);
         RunMlp(l, count);
+        clock.Lap(Stage.Mlp);
 
         for (var t = 0; t < count; t++)
         {
@@ -346,6 +350,7 @@ public sealed unsafe class Engine : IDisposable
             for (var i = 0; i < Lanes; i++)
                 Ops.Combine4(s, dim, mix[i * 4], mix[i * 4 + 1], mix[i * 4 + 2], mix[i * 4 + 3], y, postGate[t * Lanes + i], n + i * dim);
         }
+        clock.Lap(Stage.Combine);
         var swap = stream;
         stream = nextStream;
         nextStream = swap;
@@ -372,6 +377,7 @@ public sealed unsafe class Engine : IDisposable
         var batch = new MatMulBatch(dimAct, count);
         batch.Add(s.Key, engramKey, dim);
         batch.Add(s.Value, engramValueBuffer + EngramHistory * dim, dim);
+        clock.PoolRun();
         MatMulBatch.Run(pool, &batch);
         for (var t = 0; t < count; t++)
         {
@@ -406,6 +412,7 @@ public sealed unsafe class Engine : IDisposable
             Quant.FakeA8(r, dim);
         }
         Quant.Prepare(quantizedInput, count, dim, 2, dimAct);
+        clock.Lap(Stage.AttentionPrep);
 
         var history = qkvHistory + (long)l * historyPerLayer;
         var qHistory = history;
@@ -419,7 +426,9 @@ public sealed unsafe class Engine : IDisposable
         projections.Add(w.K, kRaw + (ConvTaps - 1) * kWidth, kWidth);
         projections.Add(w.V, vRaw + (ConvTaps - 1) * vWidth, vWidth);
         projections.Add(w.Gate, gateOut, g.OutputWidth);
+        clock.PoolRun();
         MatMulBatch.Run(pool, &projections);
+        clock.Lap(Stage.AttentionQkvg);
         TapConvolve(qRaw, w.QTaps, qConv, count, qWidth);
         TapConvolve(kRaw, w.KTaps, kConv, count, kWidth);
         TapConvolve(vRaw, w.VTaps, vConv, count, vWidth);
@@ -458,7 +467,10 @@ public sealed unsafe class Engine : IDisposable
             Heads = g.Heads, KvHeads = g.KvHeads, QkDim = g.QkDim, VDim = g.VDim, Position = position,
             Window = g.IsGlobal(l) ? 0 : g.SlidingWindow, Capacity = capacity,
         };
+        clock.Lap(Stage.AttentionPostProjection);
+        clock.PoolRun();
         AttentionBatch.Run(pool, &attention, count);
+        clock.Lap(Stage.AttentionCore);
 
         for (var t = 0; t < count; t++)
         {
@@ -467,14 +479,18 @@ public sealed unsafe class Engine : IDisposable
             Quant.FakeA8(o, g.OutputWidth);
         }
         Quant.Prepare(attnOut, count, g.OutputWidth, 2, dimAct);
+        clock.Lap(Stage.AttentionGate);
         var output = new MatMulBatch(dimAct, count);
         output.Add(w.Out, attnProj, dim);
+        clock.PoolRun();
         MatMulBatch.Run(pool, &output);
+        clock.Lap(Stage.AttentionOut);
         for (var t = 0; t < count; t++)
         {
             Ops.ZeroCenteredRms(attnProj + (long)t * dim, w.PostNorm, dim, normalized);
             Ops.AddScaled(residual + (long)t * dim, normalized, w.AttnGate, dim);
         }
+        clock.Lap(Stage.AttentionPostNorm);
     }
 
     void RunCross(int l, int count, int position)
@@ -492,6 +508,7 @@ public sealed unsafe class Engine : IDisposable
         var projections = new MatMulBatch(dimAct, count);
         projections.Add(c->Q, qConv, heads * g.QkDim);
         projections.Add(c->Gate, gateOut, g.OutputWidth);
+        clock.PoolRun();
         MatMulBatch.Run(pool, &projections);
         for (var t = 0; t < count; t++)
             for (var h = 0; h < heads; h++)
@@ -514,6 +531,7 @@ public sealed unsafe class Engine : IDisposable
             if (captureBuffer == null) captureBuffer = (float*)Mem.Alloc((nuint)(chunk * heads * frames) * 4);
             attention.Probabilities = captureBuffer;
         }
+        clock.PoolRun();
         AttentionBatch.Run(pool, &attention, count);
         if (capturing)
         {
@@ -531,12 +549,14 @@ public sealed unsafe class Engine : IDisposable
         Quant.Prepare(attnOut, count, g.OutputWidth, 2, dimAct);
         var output = new MatMulBatch(dimAct, count);
         output.Add(c->Out, attnProj, dim);
+        clock.PoolRun();
         MatMulBatch.Run(pool, &output);
         for (var t = 0; t < count; t++)
         {
             Ops.ZeroCenteredRms(attnProj + (long)t * dim, c->PostNorm, dim, scratch);
             Ops.AddScaled(residual + (long)t * dim, scratch, c->Mix, dim);
         }
+        clock.Lap(Stage.Cross);
     }
 
     void RunMlp(int layer, int count)
@@ -547,6 +567,7 @@ public sealed unsafe class Engine : IDisposable
             PreNorm = model.Blocks[layer].PreHada, PermA = model.Hyper.PermA, PermB = model.Hyper.PermB,
             Residual = residual, Dim = dim, Rows = g.HadaRows, Cols = g.HadaCols, Scale = 1f,
         };
+        clock.PoolRun();
         MlpBatch.Run(pool, &batch, count);
     }
 
@@ -577,12 +598,27 @@ public sealed unsafe class Engine : IDisposable
         Quant.Prepare(normalized, 1, dim, 4, headAct);
         var head = new MatMulBatch(headAct, 1);
         head.Add(model.Embedding, logits, model.Embedding.Rows);
+        clock.PoolRun();
         MatMulBatch.Run(pool, &head);
+        clock.Lap(Stage.Logits);
     }
 
     public void Dispose()
     {
         if (ownsPool) pool.Dispose();
         arena.Free();
+    }
+}
+
+public sealed unsafe class Engine : EngineCore<NoClock>
+{
+    public Engine(Model model, int contextLength = 1024, int chunkSize = 64, int threads = 1)
+        : base(model, contextLength, chunkSize, threads, null, default)
+    {
+    }
+
+    internal Engine(Model model, int contextLength, int chunkSize, int threads, Pool? shared)
+        : base(model, contextLength, chunkSize, threads, shared, default)
+    {
     }
 }
