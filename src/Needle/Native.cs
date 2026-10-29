@@ -1,13 +1,39 @@
 using System;
+using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Threading;
 
 namespace Needle;
 
 internal static unsafe class Mem
 {
+#if NEEDLE_ALLOC_COUNTERS
+    public static bool CountersEnabled => true;
+#else
+    public static bool CountersEnabled => false;
+#endif
+
+    static long allocations;
+    static long allocatedBytes;
+
+    public static long Allocations => Volatile.Read(ref allocations);
+
+    public static long AllocatedBytes => Volatile.Read(ref allocatedBytes);
+
+    [Conditional("NEEDLE_ALLOC_COUNTERS")]
+    static void Count(nuint bytes)
+    {
+        Interlocked.Increment(ref allocations);
+        Interlocked.Add(ref allocatedBytes, (long)bytes);
+    }
+
 #if NETSTANDARD2_1
-    public static void* Alloc(nuint bytes) => (void*)Marshal.AllocHGlobal((nint)Math.Max(1, (long)bytes));
+    public static void* Alloc(nuint bytes)
+    {
+        Count(bytes);
+        return (void*)Marshal.AllocHGlobal((nint)Math.Max(1, (long)bytes));
+    }
 
     public static void* AllocZeroed(nuint bytes)
     {
@@ -17,6 +43,14 @@ internal static unsafe class Mem
     }
 
     public static void Free(void* p) => Marshal.FreeHGlobal((nint)p);
+
+    public static void* Realloc(void* p, nuint usedBytes, nuint newBytes)
+    {
+        var grown = Alloc(newBytes);
+        Buffer.MemoryCopy(p, grown, newBytes, Math.Min(usedBytes, newBytes));
+        Free(p);
+        return grown;
+    }
 
     public static void Clear(void* p, nuint bytes)
     {
@@ -34,59 +68,58 @@ internal static unsafe class Mem
 
     public static void AlignedFree(void* p) => Free(((byte**)p)[-1]);
 #else
-    public static void* Alloc(nuint bytes) => NativeMemory.Alloc(bytes);
+    public static void* Alloc(nuint bytes)
+    {
+        Count(bytes);
+        return NativeMemory.Alloc(bytes);
+    }
 
-    public static void* AllocZeroed(nuint bytes) => NativeMemory.AllocZeroed(bytes);
+    public static void* AllocZeroed(nuint bytes)
+    {
+        Count(bytes);
+        return NativeMemory.AllocZeroed(bytes);
+    }
 
     public static void Free(void* p) => NativeMemory.Free(p);
 
+    public static void* Realloc(void* p, nuint usedBytes, nuint newBytes) => NativeMemory.Realloc(p, newBytes);
+
     public static void Clear(void* p, nuint bytes) => NativeMemory.Clear(p, bytes);
 
-    public static void* AlignedAlloc(nuint bytes, nuint alignment) => NativeMemory.AlignedAlloc(bytes, alignment);
+    public static void* AlignedAlloc(nuint bytes, nuint alignment)
+    {
+        Count(bytes);
+        return NativeMemory.AlignedAlloc(bytes, alignment);
+    }
 
     public static void AlignedFree(void* p) => NativeMemory.AlignedFree(p);
 #endif
 }
 
-internal static unsafe partial class Libc
+internal static unsafe partial class Paging
 {
 #if NETSTANDARD2_1
-    public static byte* MapReadOnly(string path, out nuint length)
-    {
-        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16, FileOptions.SequentialScan);
-        length = (nuint)stream.Length;
-        var memory = (byte*)Mem.Alloc(length);
-        for (nuint done = 0; done < length;)
-        {
-            var read = stream.Read(new Span<byte>(memory + done, (int)Math.Min(1 << 24, (long)(length - done))));
-            if (read <= 0) throw new IOException($"short read on {path}");
-            done += (nuint)read;
-        }
-        return memory;
-    }
-
-    public static void Unmap(byte* address, nuint length) => Mem.Free(address);
+    public static bool WillNeed(byte* address, nuint length) => false;
 #else
-    const int ProtRead = 1;
-    const int MapPrivate = 2;
-    const int MapPopulate = 0x8000;
+    const int AdviceWillNeed = 3;
 
-    [LibraryImport("libc", EntryPoint = "mmap")]
-    private static partial nint Mmap(nint address, nuint length, int protection, int flags, int fd, nint offset);
+    [LibraryImport("libc", EntryPoint = "madvise")]
+    private static partial int Madvise(nint address, nuint length, int advice);
 
-    [LibraryImport("libc", EntryPoint = "munmap")]
-    private static partial int Munmap(nint address, nuint length);
+    static bool HasMadvise => OperatingSystem.IsLinux() || OperatingSystem.IsMacOS() || OperatingSystem.IsAndroid() || OperatingSystem.IsIOS() || OperatingSystem.IsFreeBSD();
 
-    public static byte* MapReadOnly(string path, out nuint length)
+    public static bool WillNeed(byte* address, nuint length)
     {
-        using var handle = File.OpenHandle(path);
-        length = (nuint)RandomAccess.GetLength(handle);
-        var address = Mmap(0, length, ProtRead, MapPrivate | MapPopulate, (int)handle.DangerousGetHandle(), 0);
-        if (address == -1) throw new IOException($"mmap failed for {path}");
-        return (byte*)address;
+        if (!HasMadvise) return false;
+        try
+        {
+            return Madvise((nint)address, length, AdviceWillNeed) == 0;
+        }
+        catch (Exception e) when (e is DllNotFoundException || e is EntryPointNotFoundException)
+        {
+            return false;
+        }
     }
-
-    public static void Unmap(byte* address, nuint length) => Munmap((nint)address, length);
 #endif
 }
 

@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Threading;
 
 namespace Needle;
 
@@ -286,17 +287,15 @@ public sealed unsafe class Model : IDisposable
     internal readonly byte* TokenizerBlob;
     internal readonly nuint TokenizerLength;
 
-    readonly byte* map;
-    readonly nuint mapLength;
+    readonly ModelMemory memory;
     Arena arena;
+    int disposed;
 
-    readonly bool mapped;
-
-    Model(byte* data, nuint length, bool mapped)
+    Model(ModelMemory memory)
     {
-        map = data;
-        mapLength = length;
-        this.mapped = mapped;
+        this.memory = memory;
+        var map = memory.Address;
+        var length = memory.Length;
         var header = (uint*)map;
         if (length < 196 || header[0] != 0x05E12A84) throw new InvalidDataException("not a Needle 3 .cact archive");
         var count = (int)header[1];
@@ -349,19 +348,31 @@ public sealed unsafe class Model : IDisposable
         arena = reader.Arena;
     }
 
-    public static Model Open(string path)
-    {
-        var data = Libc.MapReadOnly(path, out var length);
-        return new Model(data, length, true);
-    }
+    public static Model Open(string path) => Open(path, true);
 
-    public static Model FromMemory(byte* data, nuint length) => new(data, length, false);
+    public static Model Open(string path, bool prefault) => From(ModelMemory.Map(path), prefault);
 
-    public static Model FromBytes(byte[] bytes)
+    public static Model FromMemory(byte* data, nuint length) => From(ModelMemory.Borrow(data, length), false);
+
+    public static Model FromBytes(byte[] bytes) => From(ModelMemory.Copy(bytes), false);
+
+    public static Model FromStream(Stream stream) => From(ModelMemory.Read(stream), false);
+
+    public void Prefault() => memory.Prefault();
+
+    static Model From(ModelMemory memory, bool prefault)
     {
-        var copy = (byte*)Mem.Alloc((nuint)bytes.Length);
-        Marshal.Copy(bytes, 0, (nint)copy, bytes.Length);
-        return new Model(copy, (nuint)bytes.Length, true);
+        try
+        {
+            var model = new Model(memory);
+            if (prefault) model.Prefault();
+            return model;
+        }
+        catch
+        {
+            memory.Dispose();
+            throw;
+        }
     }
 
     public int VocabSize => Geometry.Vocab;
@@ -374,7 +385,8 @@ public sealed unsafe class Model : IDisposable
 
     public void Dispose()
     {
-        if (mapped) Libc.Unmap(map, mapLength);
+        if (Interlocked.Exchange(ref disposed, 1) != 0) return;
+        memory.Dispose();
         arena.Free();
     }
 }

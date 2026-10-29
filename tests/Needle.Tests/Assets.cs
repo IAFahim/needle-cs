@@ -20,9 +20,14 @@ internal static class Assets
 
     public static void Require()
     {
-        foreach (var path in new[] { Model, Path.Combine(Golden, "golden.json"), Path.Combine(Golden, "case0/logits.bin") })
-            if (!File.Exists(path)) throw new InvalidOperationException($"missing {path}; run tools/fetch.sh and tools/golden.py");
+        foreach (var path in new[] { Model, Path.Combine(Golden, "golden.json"), Path.Combine(Golden, "case0/logits.bin"), Path.Combine(Golden, "case0/confidence.txt"), Path.Combine(Golden, "case0/pooled.bin") })
+            if (!File.Exists(path)) throw new InvalidOperationException($"missing {path}; generate it with: tools/fetch.sh && pip install numpy sentencepiece && python3 tools/golden.py && python3 tools/golden_confidence.py (golden.py takes about 15 CPU minutes)");
     }
+
+    public static int GoldenBudget(JsonElement golden) =>
+        golden.TryGetProperty("budget", out var budget)
+            ? budget.GetInt32()
+            : throw new InvalidOperationException("golden.json has no decode budget; regenerate it with: python3 tools/golden.py");
 
     public static JsonElement GoldenJson()
     {
