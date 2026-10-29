@@ -95,6 +95,28 @@ internal static unsafe class BenchKernels
             Array.Sort(times);
             Report(name, 1, (long)w.Rows * w.RowBytes, times);
         }
+
+        Console.WriteLine();
+        Console.WriteLine($"{"q_proj 576x768 2b, tokens",-26} {"tokens",7} {"MB",7} {"best us",9} {"med us",9} {"us/token",10}");
+        var projection = model.Blocks[5].Q;
+        foreach (var tokens in new[] { 1, 2, 3, 4, 5, 8, 16, 18, 32 })
+        {
+            var many = new Activations(ref arena, tokens, model.Geometry.Dim);
+            var rows = arena.Take<float>((nuint)(tokens * model.Geometry.Dim));
+            for (var i = 0; i < tokens * model.Geometry.Dim; i++) rows[i] = MathF.Sin(i * 0.37f) * 1.5f;
+            Quant.Prepare(rows, tokens, model.Geometry.Dim, 2, many);
+            var y = arena.Take<float>((nuint)(tokens * projection.Rows));
+            for (var i = 0; i < 100; i++) Quant.MatMul(projection, many, tokens, y, projection.Rows);
+            var times = new double[sweeps * 5];
+            for (var s = 0; s < times.Length; s++)
+            {
+                var start = Stopwatch.GetTimestamp();
+                for (var i = 0; i < 10; i++) Quant.MatMul(projection, many, tokens, y, projection.Rows);
+                times[s] = (Stopwatch.GetTimestamp() - start) * 1e6 / Stopwatch.Frequency / 10;
+            }
+            Array.Sort(times);
+            Console.WriteLine($"{"",-26} {tokens,7} {(double)projection.Rows * projection.RowBytes / 1e6,7:F2} {times[0],9:F1} {times[times.Length / 2],9:F1} {times[0] / tokens,10:F2}");
+        }
         return 0;
     }
 

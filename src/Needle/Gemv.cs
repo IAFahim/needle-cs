@@ -47,6 +47,43 @@ internal readonly struct TwoBitPlanes : IPlaneLayout
     }
 }
 
+internal readonly struct PermuteTwoBitPlanes : IPlaneLayout
+{
+    public static int GroupBytes => TwoBitPlanes.GroupBytes;
+
+    public static PlaneTables Tables(Vector256<byte> codebook) => TwoBitPlanes.Tables(codebook);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static unsafe Vector256<int> Dot(byte* packed, in PlaneTables tables, Vector256<sbyte> x0, Vector256<sbyte> x1, Vector256<sbyte> x2, Vector256<sbyte> x3)
+    {
+        var v = Avx.LoadVector256(packed).AsUInt16();
+        var lower = v.AsByte();
+        var upper = Avx2.ShiftRightLogical(v, 4).AsByte();
+        var sum = Quant.Accumulate(Vector256<int>.Zero, Avx512Vbmi.VL.PermuteVar32x8(tables.First, lower), x0);
+        sum = Quant.Accumulate(sum, Avx512Vbmi.VL.PermuteVar32x8(tables.Second, lower), x1);
+        sum = Quant.Accumulate(sum, Avx512Vbmi.VL.PermuteVar32x8(tables.First, upper), x2);
+        return Quant.Accumulate(sum, Avx512Vbmi.VL.PermuteVar32x8(tables.Second, upper), x3);
+    }
+}
+
+internal readonly struct PermuteFourBitPlanes : IPlaneLayout
+{
+    public static int GroupBytes => FourBitPlanes.GroupBytes;
+
+    public static PlaneTables Tables(Vector256<byte> codebook) => FourBitPlanes.Tables(codebook);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static unsafe Vector256<int> Dot(byte* packed, in PlaneTables tables, Vector256<sbyte> x0, Vector256<sbyte> x1, Vector256<sbyte> x2, Vector256<sbyte> x3)
+    {
+        var lo = Avx.LoadVector256(packed).AsUInt16();
+        var hi = Avx.LoadVector256(packed + 32).AsUInt16();
+        var sum = Quant.Accumulate(Vector256<int>.Zero, Avx512Vbmi.VL.PermuteVar32x8(tables.First, lo.AsByte()), x0);
+        sum = Quant.Accumulate(sum, Avx512Vbmi.VL.PermuteVar32x8(tables.First, Avx2.ShiftRightLogical(lo, 4).AsByte()), x1);
+        sum = Quant.Accumulate(sum, Avx512Vbmi.VL.PermuteVar32x8(tables.First, hi.AsByte()), x2);
+        return Quant.Accumulate(sum, Avx512Vbmi.VL.PermuteVar32x8(tables.First, Avx2.ShiftRightLogical(hi, 4).AsByte()), x3);
+    }
+}
+
 internal readonly struct FourBitPlanes : IPlaneLayout
 {
     public static int GroupBytes => 64;
@@ -71,11 +108,17 @@ internal static unsafe class Gemv
     const int PrefetchBlocks = 4;
     const int CacheLine = 64;
     const int HalvesPerVector = 8;
+    static readonly bool UsePermute = Simd.UseAvx && AvxVnni.IsSupported && Avx512Vbmi.VL.IsSupported && Environment.GetEnvironmentVariable("NEEDLE_NOAVX512") == null;
     const float HalfExponentRebias = 5.192296858534828e33f;
 
     public static void Rows(in Cq w, in Activations a, int token, float* y, int rowStart, int rowEnd)
     {
-        if (w.Bits == 2) Rows<TwoBitPlanes>(w, a, token, y, rowStart, rowEnd);
+        if (UsePermute)
+        {
+            if (w.Bits == 2) Rows<PermuteTwoBitPlanes>(w, a, token, y, rowStart, rowEnd);
+            else Rows<PermuteFourBitPlanes>(w, a, token, y, rowStart, rowEnd);
+        }
+        else if (w.Bits == 2) Rows<TwoBitPlanes>(w, a, token, y, rowStart, rowEnd);
         else Rows<FourBitPlanes>(w, a, token, y, rowStart, rowEnd);
     }
 
