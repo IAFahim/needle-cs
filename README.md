@@ -69,12 +69,25 @@ The full parity suite (golden logits, greedy decode, tokenizer) passes on AVX2, 
 
 ## Build & Test
 
+Requirements: the [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0) (the 8.0 SDK fails with `NETSDK1045`), Python 3 with `numpy` and `sentencepiece`, and `curl`.
+
 ```sh
-# Fetch models & fixtures, then run tests
+# 1. Fetch the model, tokenizer, upstream wheel, Whistle and audio clips into ref/
 tools/fetch.sh
+
+# 2. Generate the golden fixtures (numpy reference forward pass)
+pip install numpy sentencepiece
+python3 tools/golden.py               # about 15 CPU minutes
+python3 tools/golden_confidence.py    # needs the output of golden.py; takes seconds
+
+# 3. Run the 54 tests (about 2 minutes each)
 dotnet test tests/Needle.Tests -c Release
 NEEDLE_SCALAR=1 dotnet test tests/Needle.Tests -c Release
+```
 
+The greedy decode budget is `DECODE_BUDGET` in `tools/golden.py` (`python3 tools/golden.py 64` overrides it). The script records the budget it used in `ref/golden/golden.json` and `ParityTests.GenerationMatchesReferenceGreedyDecode` decodes exactly that many tokens, so the fixture and the test cannot drift.
+
+```sh
 # Build NativeAOT CLI
 dotnet publish src/Needle.Cli -c Release
 
