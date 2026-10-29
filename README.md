@@ -200,3 +200,41 @@ python3 tools/bench_ab.py --rounds 6 \
 ```
 
 `bench_ab.py` alternates A,B / B,A rounds, then reports the best of the per-round bests and the median of the per-round medians for both variants, with the percentage change. Expect about 15% noise on a shared machine; trust the best-of figures and repeat when A and B differ by less than the spread between rounds. `tools/native_bench.py --json` produces the same schema, so a native run can be passed as `--b` against a C# `--a` (its `threads` is `null`, which matches every thread count). The upstream C API reports tokens per second and no token counts or TTFT, so the native JSON carries `prefill_tps`, `decode_tps`, `decode_us_per_token` and a wall-clock `total_ms` around `needle_complete`; `bench-e2e` emits the same `prefill_tps` and `decode_tps` fields for a like-for-like comparison. The library spins its own worker threads and degrades badly on a loaded machine, so run it on an idle one.
+
+## Evaluating your tool set
+
+`needle eval` replays hand-written player commands through a real `NeedleSession` (reset between prompts) and scores the calls against expected values. Use it to choose a refusal threshold, to check that a tool set is usable, and to gate runtime policies (`MaxReasoningTokens`, `AutoDate`, `RetrievalTopK`, and later jump-forward) before turning them on.
+
+```sh
+# The shipped suite: 208 prompts over 5 game tool sets (tests/eval/*.jsonl, tools in tests/eval/tools/*.json)
+out/aot/needle eval ref/hf/needle3.cact tests/eval --policy AutoDate=false RetrievalTopK=64
+
+# Your own tool set: one JSON line per prompt, tools in <dir>/tools/<id>.json
+out/aot/needle eval ref/hf/needle3.cact mygame/eval --json > eval.json
+
+# Side by side: --baseline settings versus --policy settings, with the per-prompt regressions and improvements
+out/aot/needle eval ref/hf/needle3.cact tests/eval --baseline AutoDate=false --policy AutoDate=false MaxReasoningTokens=32 --max-drop 0.02
+```
+
+Dataset line: `{"tools":"rts","query":"move to 120, 45","expected":[{"name":"move_to","args":{"x":120,"y":45}}],"tags":["ci"]}`. An empty `expected` means the prompt is out of domain and must produce no call. Calls are compared in order, and unexpected extra arguments fail the call. Argument matchers: a bare value is an exact match, `{"near":100,"tol":2}` a number within a tolerance, `{"contains":"orc"}` a case-insensitive substring, `{"oneOf":["line","wedge"]}` an enum choice, `{"any":true}` any present value. Options: `--tag ci` selects the 20-prompt subset that `EvalTests` runs, `--limit N` takes a round-robin sample over tool sets, `--json` writes every case, `--verbose` lists all misses, `--min-accuracy f` and `--max-drop f` set the exit status. New runtime policies register as one `PolicySetting` line in `src/Needle.Cli/EvalPolicies.cs`.
+
+How to read the report:
+
+- **exact** is the fraction of in-domain prompts whose complete call list was right and was not refused. **tool** and **args** score the model output before refusal, so they show routing and extraction quality on their own. **no-call** is the fraction of out-of-domain prompts that produced no executed call.
+- **calibration** groups every reply that carries a call by its confidence. A usable threshold sits where accuracy in the bin clearly beats the bins below it. The model is monotone but not sharp: in the reference run, calls under 0.1 are right 7% of the time and calls above 0.5 are right 86% to 100% of the time.
+- **RefuseBelow curve** re-scores the same replies at each threshold. *Coverage* is the share of in-domain prompts that still execute, *precision* the share of executed calls that are exactly right, *false-call* the share of out-of-domain prompts that still execute a call, and *wrong executed* the count of executed calls that are wrong. Pick the row whose wrong-executed count your game can tolerate.
+
+Reference run (needle3, 4 threads, `AutoDate=false RetrievalTopK=64`, greedy, 208 prompts): exact 65.9%, tool 77.2%, args 72.7%, no-call 78.1%, median 200 ms per prompt. By set: chains 73.5%, dialogue 60.6%, rpg 47.2%, rts 63.9%, settings 83.8%. The default threshold 0.1 gives the best overall accuracy (67.8%) but still executes 40 wrong calls; 0.3 executes 22 (precision 82%, coverage 68%) and 0.5 executes 7 (precision 92%, coverage 47%). For commands where a wrong action is worse than a repeated prompt, start at `RefuseBelow = 0.3` and raise it for destructive commands.
+
+### Tool design tips
+
+These come from the misses in the suite above; re-measure on your own tools.
+
+- **Keep the set small enough to skip retrieval.** With more tools than `RetrievalTopK` (5 by default) the session embeds the query and re-primes a 5-tool prefix per prompt. On the 8-tool sets this lost 6.8 points of exact accuracy (65.9% to 59.1%) and tripled median latency (about 160 ms to 520 ms). Set `RetrievalTopK` to at least your tool count, or split tools by game state and keep fewer than 6 per session.
+- **Name tools with the verb the player says.** `set_formation` for "switch to wedge" worked; `cast_spell(heal)` lost to `use_item(antidote)` for "heal Lyra", and `recruit_member` lost to `use_item` for "recruit Garrick". Prefer one tool per spoken verb, and avoid two tools that both read as "do something to a party member" (`give_item`, `use_item`, `equip_item`).
+- **Use enums for closed vocabularies and booleans or integers for toggles.** The settings set (enums, booleans, slots) scored 83.8% exact, the rpg set with free-text item and member names 47.2%. Free-text arguments are where the model copies the wrong word (`give_item(to="arrow")`).
+- **Do not require arguments the player will not say.** "light a torch" has no target, and the model invents one. Default the argument in game code or give the tool a separate no-target variant.
+- **Expect long chains to drift.** Two-call sentences are mostly right; "move to 1 1, then 2 2, then 3 3" came back as (1,2),(2,3). Split three-command sentences in the UI or execute and re-prompt.
+- **A chatty tool attracts misroutes.** With a `say(text)` tool in the set, unrelated prompts ("tell me a joke") and commands the model could not route were sent to it. Keep `say` out of command sets, or gate it with a higher threshold.
+- **Do not cap or skip reasoning.** `MaxReasoningTokens=32` cost 8.5 points and `0` cost 31 points of exact accuracy.
+- **Pin `AutoDate=false` for tests.** The date and time change the prompt, and 14 prompts flipped between right and wrong (8 lost, 6 gained, no net change) when it was on. Leave it on only if your tools need the date.
