@@ -44,6 +44,7 @@ internal static unsafe class Quant
 {
     const float HadamardScale = 0.08838834764831845f;
     const int TokenTile = 4;
+    internal const int RowBlock = 4;
 
     public static float AbsMax(float* x, int n)
     {
@@ -490,7 +491,8 @@ internal unsafe struct MatMulBatch
     {
         var rows = 0;
         for (var j = 0; j < batch->Count; j++) rows += batch->Jobs.At(j)->W.Rows;
-        batch->RowsPerTask = Math.Max(8, (rows + pool.Threads * 3 - 1) / (pool.Threads * 3));
+        var perTask = Math.Max(MinimumRowsPerTask, (rows + pool.Threads * TasksPerThread - 1) / (pool.Threads * TasksPerThread));
+        batch->RowsPerTask = (perTask + Quant.RowBlock - 1) / Quant.RowBlock * Quant.RowBlock;
         var tasks = 0;
         for (var j = 0; j < batch->Count; j++) tasks += TaskCount(batch, j);
         pool.Run(&Execute, batch, tasks);
@@ -511,4 +513,7 @@ internal unsafe struct MatMulBatch
             return;
         }
     }
+
+    const int TasksPerThread = 3;
+    const int MinimumRowsPerTask = 8;
 }

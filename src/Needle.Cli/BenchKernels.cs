@@ -80,10 +80,13 @@ internal static unsafe class BenchKernels
         foreach (var (name, w, act) in shapes)
         {
             var y = arena.Take<float>((nuint)w.Rows);
-            var inner = Math.Max(8, 400_000 / w.Rows);
-            for (var i = 0; i < 50; i++) Quant.MatMul(w, act, 1, y, w.Rows);
-            var times = new double[sweeps];
-            for (var s = 0; s < sweeps; s++)
+            for (var i = 0; i < 200; i++) Quant.MatMul(w, act, 1, y, w.Rows);
+            var probe = Stopwatch.GetTimestamp();
+            for (var i = 0; i < 20; i++) Quant.MatMul(w, act, 1, y, w.Rows);
+            var passMicroseconds = (Stopwatch.GetTimestamp() - probe) * 1e6 / Stopwatch.Frequency / 20;
+            var inner = Math.Max(1, (int)(150 / passMicroseconds));
+            var times = new double[sweeps * 10];
+            for (var s = 0; s < times.Length; s++)
             {
                 var start = Stopwatch.GetTimestamp();
                 for (var i = 0; i < inner; i++) Quant.MatMul(w, act, 1, y, w.Rows);

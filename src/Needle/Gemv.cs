@@ -1,4 +1,5 @@
 #if NEEDLE_SIMD
+using System;
 using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -66,8 +67,11 @@ internal readonly struct FourBitPlanes : IPlaneLayout
 
 internal static unsafe class Gemv
 {
-    const int RowBlock = 4;
+    const int RowBlock = Quant.RowBlock;
+    const int PrefetchBlocks = 4;
+    const int CacheLine = 64;
     const int HalvesPerVector = 8;
+    const float HalfExponentRebias = 5.192296858534828e33f;
 
     public static void Rows(in Cq w, in Activations a, int token, float* y, int rowStart, int rowEnd)
     {
@@ -83,7 +87,7 @@ internal static unsafe class Gemv
         var weightedScales = stackalloc float[stride];
         var scaled = stackalloc float[RowBlock * stride];
         var activationScales = a.Scales + token * stride;
-        var byteScale = Vector256.Create(w.Book->ByteScale);
+        var byteScale = Vector256.Create(w.Book->ByteScale * HalfExponentRebias);
         for (var v = 0; v < stride; v += HalvesPerVector)
             Avx.Store(weightedScales + v, Avx.Multiply(Avx.LoadVector256(activationScales + v), byteScale));
         var offsets = a.Offsets + token * stride;
@@ -99,91 +103,92 @@ internal static unsafe class Gemv
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    static Vector256<float> Factors(ushort* norms, int stride, float* weightedScales, float* offsets, float* scaled)
+    static Vector256<float> Corrections(ushort* norms, int stride, float* weightedScales, float* offsets, float* scaled)
     {
-        var bias = Vector256<float>.Zero;
+        var correction = Vector256<float>.Zero;
         for (var v = 0; v < stride; v += HalvesPerVector)
         {
-            var factors = Avx.Multiply(HalfToSingle(Avx2.ConvertToVector256Int32(norms + v)), Avx.LoadVector256(weightedScales + v));
+            var factors = Avx.Multiply(UnbiasedHalfToSingle(Avx2.ConvertToVector256Int32(norms + v)), Avx.LoadVector256(weightedScales + v));
             Avx.Store(scaled + v, factors);
-            bias = Fma.MultiplyAdd(factors, Avx.LoadVector256(offsets + v), bias);
+            correction = Fma.MultiplyAddNegated(factors, Avx.LoadVector256(offsets + v), correction);
         }
-        return bias;
+        return correction;
     }
 
-    static Vector256<float> FactorsAtEdge(ushort* norms, int groups, int stride, float* weightedScales, float* offsets, float* scaled)
+    static Vector256<float> CorrectionsAtEdge(ushort* norms, int groups, int stride, float* weightedScales, float* offsets, float* scaled)
     {
-        for (var i = 0; i < stride; i++) scaled[i] = i < groups ? Scalar.HalfToSingle(norms[i]) : 0f;
-        var bias = Vector256<float>.Zero;
+        for (var i = 0; i < stride; i++) scaled[i] = i < groups ? BitConverter.Int32BitsToSingle(norms[i] << 13) : 0f;
+        var correction = Vector256<float>.Zero;
         for (var v = 0; v < stride; v += HalvesPerVector)
         {
             var factors = Avx.Multiply(Avx.LoadVector256(scaled + v), Avx.LoadVector256(weightedScales + v));
             Avx.Store(scaled + v, factors);
-            bias = Fma.MultiplyAdd(factors, Avx.LoadVector256(offsets + v), bias);
+            correction = Fma.MultiplyAddNegated(factors, Avx.LoadVector256(offsets + v), correction);
         }
-        return bias;
+        return correction;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    static Vector256<float> HalfToSingle(Vector256<int> half)
-    {
-        var magnitude = Avx2.And(half, Vector256.Create(0x7FFF));
-        var sign = Avx2.ShiftLeftLogical(Avx2.And(half, Vector256.Create(0x8000)), 16);
-        var bits = Avx2.Add(Avx2.ShiftLeftLogical(magnitude, 13), Vector256.Create(0x38000000));
-        var nonZero = Avx2.CompareGreaterThan(magnitude, Vector256<int>.Zero);
-        return Avx2.Or(Avx2.And(bits, nonZero), sign).AsSingle();
-    }
+    static Vector256<float> UnbiasedHalfToSingle(Vector256<int> half) => Avx2.ShiftLeftLogical(half, 13).AsSingle();
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    static Vector256<float> Group<TPlanes>(byte* packed, in PlaneTables tables, Vector256<sbyte> x0, Vector256<sbyte> x1, Vector256<sbyte> x2, Vector256<sbyte> x3, float scale, Vector256<float> accumulator) where TPlanes : struct, IPlaneLayout =>
-        Fma.MultiplyAdd(Avx.ConvertToVector256Single(TPlanes.Dot(packed, tables, x0, x1, x2, x3)), Vector256.Create(scale), accumulator);
+    static Vector256<float> Group<TPlanes>(byte* packed, in PlaneTables tables, Vector256<sbyte> x0, Vector256<sbyte> x1, Vector256<sbyte> x2, Vector256<sbyte> x3, float* scale, Vector256<float> accumulator) where TPlanes : struct, IPlaneLayout =>
+        Fma.MultiplyAdd(Avx.ConvertToVector256Single(TPlanes.Dot(packed, tables, x0, x1, x2, x3)), Avx.BroadcastScalarToVector256(scale), accumulator);
 
     static void Block<TPlanes>(byte* packed, int rowBytes, ushort* norms, int groups, int stride, in PlaneTables tables, float* weightedScales, float* offsets, sbyte* values, float* scaled, float* y) where TPlanes : struct, IPlaneLayout
     {
-        var bias0 = Factors(norms, stride, weightedScales, offsets, scaled);
-        var bias1 = Factors(norms + groups, stride, weightedScales, offsets, scaled + stride);
-        var bias2 = Factors(norms + 2 * groups, stride, weightedScales, offsets, scaled + 2 * stride);
-        var bias3 = Factors(norms + 3 * groups, stride, weightedScales, offsets, scaled + 3 * stride);
+        var start0 = Corrections(norms, stride, weightedScales, offsets, scaled);
+        var start1 = Corrections(norms + groups, stride, weightedScales, offsets, scaled + stride);
+        var start2 = Corrections(norms + 2 * groups, stride, weightedScales, offsets, scaled + 2 * stride);
+        var start3 = Corrections(norms + 3 * groups, stride, weightedScales, offsets, scaled + 3 * stride);
         var row1 = packed + rowBytes;
         var row2 = packed + 2 * rowBytes;
         var row3 = packed + 3 * rowBytes;
-        var accumulator0 = Vector256<float>.Zero;
-        var accumulator1 = Vector256<float>.Zero;
-        var accumulator2 = Vector256<float>.Zero;
-        var accumulator3 = Vector256<float>.Zero;
+        var accumulator0 = start0;
+        var accumulator1 = start1;
+        var accumulator2 = start2;
+        var accumulator3 = start3;
         var groupBytes = TPlanes.GroupBytes;
+        var prefetchDistance = (long)PrefetchBlocks * RowBlock * rowBytes;
         for (var g = 0; g < groups; g++)
         {
+            if ((g * groupBytes & CacheLine - 1) == 0)
+            {
+                var ahead = g * groupBytes + prefetchDistance;
+                Sse.Prefetch0(packed + ahead);
+                Sse.Prefetch0(row1 + ahead);
+                Sse.Prefetch0(row2 + ahead);
+                Sse.Prefetch0(row3 + ahead);
+            }
             var x = values + g * Cq.GroupSize;
             var x0 = Avx.LoadVector256(x);
             var x1 = Avx.LoadVector256(x + 32);
             var x2 = Avx.LoadVector256(x + 64);
             var x3 = Avx.LoadVector256(x + 96);
             var offset = g * groupBytes;
-            accumulator0 = Group<TPlanes>(packed + offset, tables, x0, x1, x2, x3, scaled[g], accumulator0);
-            accumulator1 = Group<TPlanes>(row1 + offset, tables, x0, x1, x2, x3, scaled[stride + g], accumulator1);
-            accumulator2 = Group<TPlanes>(row2 + offset, tables, x0, x1, x2, x3, scaled[2 * stride + g], accumulator2);
-            accumulator3 = Group<TPlanes>(row3 + offset, tables, x0, x1, x2, x3, scaled[3 * stride + g], accumulator3);
+            accumulator0 = Group<TPlanes>(packed + offset, tables, x0, x1, x2, x3, scaled + g, accumulator0);
+            accumulator1 = Group<TPlanes>(row1 + offset, tables, x0, x1, x2, x3, scaled + stride + g, accumulator1);
+            accumulator2 = Group<TPlanes>(row2 + offset, tables, x0, x1, x2, x3, scaled + 2 * stride + g, accumulator2);
+            accumulator3 = Group<TPlanes>(row3 + offset, tables, x0, x1, x2, x3, scaled + 3 * stride + g, accumulator3);
         }
-        var pairs01 = Avx.HorizontalAdd(Avx.Subtract(accumulator0, bias0), Avx.Subtract(accumulator1, bias1));
-        var pairs23 = Avx.HorizontalAdd(Avx.Subtract(accumulator2, bias2), Avx.Subtract(accumulator3, bias3));
+        var pairs01 = Avx.HorizontalAdd(accumulator0, accumulator1);
+        var pairs23 = Avx.HorizontalAdd(accumulator2, accumulator3);
         var quads = Avx.HorizontalAdd(pairs01, pairs23);
         Sse.Store(y, Sse.Add(quads.GetLower(), quads.GetUpper()));
     }
 
     static float Single<TPlanes>(byte* packed, ushort* norms, int groups, int stride, bool convertible, in PlaneTables tables, float* weightedScales, float* offsets, sbyte* values, float* scaled) where TPlanes : struct, IPlaneLayout
     {
-        var bias = convertible
-            ? Factors(norms, stride, weightedScales, offsets, scaled)
-            : FactorsAtEdge(norms, groups, stride, weightedScales, offsets, scaled);
-        var accumulator = Vector256<float>.Zero;
+        var accumulator = convertible
+            ? Corrections(norms, stride, weightedScales, offsets, scaled)
+            : CorrectionsAtEdge(norms, groups, stride, weightedScales, offsets, scaled);
         var groupBytes = TPlanes.GroupBytes;
         for (var g = 0; g < groups; g++)
         {
             var x = values + g * Cq.GroupSize;
-            accumulator = Group<TPlanes>(packed + g * groupBytes, tables, Avx.LoadVector256(x), Avx.LoadVector256(x + 32), Avx.LoadVector256(x + 64), Avx.LoadVector256(x + 96), scaled[g], accumulator);
+            accumulator = Group<TPlanes>(packed + g * groupBytes, tables, Avx.LoadVector256(x), Avx.LoadVector256(x + 32), Avx.LoadVector256(x + 64), Avx.LoadVector256(x + 96), scaled + g, accumulator);
         }
-        return Vector256.Sum(Avx.Subtract(accumulator, bias));
+        return Vector256.Sum(accumulator);
     }
 }
 #endif
