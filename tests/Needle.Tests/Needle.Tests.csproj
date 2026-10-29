@@ -10,6 +10,10 @@
     <PackageReference Include="xunit.runner.visualstudio" Version="3.0.2" />
   </ItemGroup>
   <ItemGroup>
+    <Compile Include="..\..\src\Needle.Cli\Bench*.cs" LinkBase="Bench" />
+    <EmbeddedResource Include="..\..\tools\game_tools.json" LogicalName="game_tools.json" />
+  </ItemGroup>
+  <ItemGroup>
     <ProjectReference Include="..\..\src\Needle\Needle.csproj" />
   </ItemGroup>
 </Project>

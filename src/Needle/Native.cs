@@ -1,13 +1,39 @@
 using System;
+using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Threading;
 
 namespace Needle;
 
 internal static unsafe class Mem
 {
+#if NEEDLE_ALLOC_COUNTERS
+    public static bool CountersEnabled => true;
+#else
+    public static bool CountersEnabled => false;
+#endif
+
+    static long allocations;
+    static long allocatedBytes;
+
+    public static long Allocations => Volatile.Read(ref allocations);
+
+    public static long AllocatedBytes => Volatile.Read(ref allocatedBytes);
+
+    [Conditional("NEEDLE_ALLOC_COUNTERS")]
+    static void Count(nuint bytes)
+    {
+        Interlocked.Increment(ref allocations);
+        Interlocked.Add(ref allocatedBytes, (long)bytes);
+    }
+
 #if NETSTANDARD2_1
-    public static void* Alloc(nuint bytes) => (void*)Marshal.AllocHGlobal((nint)Math.Max(1, (long)bytes));
+    public static void* Alloc(nuint bytes)
+    {
+        Count(bytes);
+        return (void*)Marshal.AllocHGlobal((nint)Math.Max(1, (long)bytes));
+    }
 
     public static void* AllocZeroed(nuint bytes)
     {
@@ -42,9 +68,17 @@ internal static unsafe class Mem
 
     public static void AlignedFree(void* p) => Free(((byte**)p)[-1]);
 #else
-    public static void* Alloc(nuint bytes) => NativeMemory.Alloc(bytes);
+    public static void* Alloc(nuint bytes)
+    {
+        Count(bytes);
+        return NativeMemory.Alloc(bytes);
+    }
 
-    public static void* AllocZeroed(nuint bytes) => NativeMemory.AllocZeroed(bytes);
+    public static void* AllocZeroed(nuint bytes)
+    {
+        Count(bytes);
+        return NativeMemory.AllocZeroed(bytes);
+    }
 
     public static void Free(void* p) => NativeMemory.Free(p);
 
@@ -52,7 +86,11 @@ internal static unsafe class Mem
 
     public static void Clear(void* p, nuint bytes) => NativeMemory.Clear(p, bytes);
 
-    public static void* AlignedAlloc(nuint bytes, nuint alignment) => NativeMemory.AlignedAlloc(bytes, alignment);
+    public static void* AlignedAlloc(nuint bytes, nuint alignment)
+    {
+        Count(bytes);
+        return NativeMemory.AlignedAlloc(bytes, alignment);
+    }
 
     public static void AlignedFree(void* p) => NativeMemory.AlignedFree(p);
 #endif

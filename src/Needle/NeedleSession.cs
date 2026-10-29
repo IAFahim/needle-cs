@@ -95,11 +95,30 @@ public static class Extraction
     }
 }
 
-public sealed unsafe class NeedleSession : IDisposable
+public sealed unsafe partial class NeedleSession : IDisposable
 {
-    const int ImStart = 4, ImEnd = 5, ThinkStart = 6, ThinkEnd = 7, ToolCallStart = 10, ToolCallEnd = 11;
+    const int ImStart = 4, ImEnd = 5, ThinkStart = 6, ThinkEnd = 7, ToolCallStart = 10, ToolCallEnd = 11, EndOfText = 1;
+    const int MaxPieceBytes = 64;
+    const int InputOverheadBytes = 128;
+    const int TokenizerInputBytes = 1 << 16;
+    const int EmbedderContext = 512;
+    const int MinKeyScratchBytes = 64;
+
     static readonly Regex DateKey = new(@"\bdate\s*:", RegexOptions.IgnoreCase);
     static readonly Regex IsoStamp = new(@"\d{4}-\d{2}-\d{2}");
+
+    static ReadOnlySpan<byte> ToolResultHead => "<|im_start|>tool\n<tool_result>"u8;
+    static ReadOnlySpan<byte> ToolResultTail => "</tool_result><|im_end|>\n<|im_start|>assistant\n"u8;
+    static ReadOnlySpan<byte> FirstQueryHead => "\n"u8;
+    static ReadOnlySpan<byte> LaterQueryHead => "<|im_start|>user\n"u8;
+    static ReadOnlySpan<byte> QueryTail => "<|im_end|>\n<|im_start|>assistant\n"u8;
+
+    struct TurnProgress
+    {
+        public long Started, PrefillTicks, FirstTokenTicks;
+        public int PromptTokens, DecodeTokens, ReasoningLength, ResponseLength;
+        public ReplyFlags Flags;
+    }
 
     readonly Model model;
     readonly NeedleOptions options;
@@ -108,19 +127,39 @@ public sealed unsafe class NeedleSession : IDisposable
     readonly Tokenizer tokenizer;
     readonly TokenTrie trie;
     readonly string system;
-    readonly uint[] reasoningMask;
-    readonly uint[] decisionMask;
-    readonly uint[] responseMask;
+    readonly int maskWords;
+    readonly uint* reasoningMask;
+    readonly uint* decisionMask;
+    readonly uint* responseMask;
     readonly uint* mask;
     readonly float* scratchLogits;
     readonly float* pooled;
+    readonly float* confidenceScratch;
+    readonly int embeddingWidth;
+    readonly int contextCapacity;
+    readonly int embedderCapacity;
+    readonly int maxInputBytes;
+    readonly byte[] inputBuffer;
+    readonly int[] promptIds;
+    readonly int[] thinkEndForced;
+    readonly int[] callClosing;
+    readonly int[] responseClosing;
+    readonly byte[] callText;
+    readonly byte[] keyScratch;
+    readonly CallSpan[] callSpans;
     readonly bool retrieval;
-    readonly List<float[]> toolEmbeddings = new();
+    readonly float[] toolEmbeddings;
+    readonly float[] toolScores;
+    readonly int[] chosenTools;
+    readonly int[] activeTools;
+    int activeToolCount = -1;
+    int callTextLength;
+    int restoredCallCount;
+    int cancelRequested;
     Engine? embedder;
     ToolSet active;
     Grammar grammar;
     bool turnOne = true;
-    string primedRender = "";
 
     public NeedleSession(Model model, string toolsJson, NeedleOptions? options = null)
     {
@@ -128,22 +167,38 @@ public sealed unsafe class NeedleSession : IDisposable
         this.options = options ?? new NeedleOptions();
         allTools = new ToolSet(toolsJson);
         engine = new Engine(model, this.options.Context, 64, this.options.ResolvedThreading, null) { Pooling = true };
-        tokenizer = new Tokenizer(model, 1 << 16);
+        tokenizer = new Tokenizer(model, TokenizerInputBytes);
         trie = new TokenTrie(tokenizer, model.VocabSize);
         system = BuildSystem(this.options);
-        mask = (uint*)Mem.AllocZeroed((nuint)trie.Words * 4);
+        contextCapacity = Math.Min(this.options.Context, model.Geometry.MaxSeq);
+        embedderCapacity = Math.Min(EmbedderContext, model.Geometry.MaxSeq);
+        maxInputBytes = Math.Max(1, Math.Min(TokenizerInputBytes - InputOverheadBytes, this.options.Context * 16));
+        maskWords = trie.Words;
+        mask = (uint*)Mem.AllocZeroed((nuint)maskWords * 4);
         scratchLogits = (float*)Mem.Alloc((nuint)model.VocabSize * 4);
-        pooled = (float*)Mem.AllocZeroed((nuint)(4 * model.Geometry.Dim * 4));
-        reasoningMask = new uint[trie.Words];
-        for (var id = 0; id < Math.Min(model.VocabSize, tokenizer.PieceCount); id++)
-            if (tokenizer.IsConstrainable(id)) reasoningMask[id / 32] |= 1u << (id % 32);
-        reasoningMask[ThinkEnd / 32] |= 1u << (ThinkEnd % 32);
-        decisionMask = (uint[])reasoningMask.Clone();
-        responseMask = (uint[])reasoningMask.Clone();
-        foreach (var id in new[] { ToolCallStart, ImEnd, 1 }) decisionMask[id / 32] |= 1u << (id % 32);
-        foreach (var id in new[] { ImEnd, 1 }) responseMask[id / 32] |= 1u << (id % 32);
+        var head = model.Confidence;
+        embeddingWidth = head != null ? head->Queries * model.Geometry.Dim : 0;
+        pooled = (float*)Mem.AllocZeroed((nuint)Math.Max(1, embeddingWidth) * 4);
+        confidenceScratch = head != null ? (float*)Mem.AllocZeroed((nuint)((model.Geometry.Layers + 1) * head->Probes * (model.Geometry.Dim + 1)) * 4) : null;
+        reasoningMask = BuildReasoningMask();
+        decisionMask = CopyMask(reasoningMask, ToolCallStart, ImEnd, EndOfText);
+        responseMask = CopyMask(reasoningMask, ImEnd, EndOfText);
         responseMask[ThinkEnd / 32] &= ~(1u << (ThinkEnd % 32));
+        var newline = Tokens("\n", false);
+        thinkEndForced = Concatenate(new[] { ThinkEnd }, newline);
+        callClosing = Concatenate(new[] { ToolCallEnd, ImEnd }, newline);
+        responseClosing = Concatenate(new[] { ImEnd }, newline);
+        inputBuffer = new byte[maxInputBytes + InputOverheadBytes];
+        promptIds = new int[3 * (maxInputBytes + InputOverheadBytes) + 16];
+        callText = new byte[Math.Max(1, this.options.MaxCallTokens) * MaxPieceBytes];
+        callSpans = new CallSpan[Math.Max(1, this.options.MaxCallTokens)];
+        keyScratch = new byte[Math.Max(MinKeyScratchBytes, allTools.Aliases.LongestPropertyAlias + 2)];
         retrieval = allTools.Tools.Count > this.options.RetrievalTopK && model.Confidence != null;
+        var topK = Math.Max(0, this.options.RetrievalTopK);
+        toolEmbeddings = retrieval ? new float[allTools.Tools.Count * embeddingWidth] : Array.Empty<float>();
+        toolScores = retrieval ? new float[allTools.Tools.Count] : Array.Empty<float>();
+        chosenTools = new int[topK];
+        activeTools = new int[topK];
         active = allTools;
         grammar = new Grammar(active.Tools);
         if (retrieval) IndexTools();
@@ -151,6 +206,10 @@ public sealed unsafe class NeedleSession : IDisposable
     }
 
     public int ContextUsed => engine.Length;
+
+    public int MaxInputBytes => maxInputBytes;
+
+    public void RequestCancel() => System.Threading.Volatile.Write(ref cancelRequested, 1);
 
     static string BuildSystem(NeedleOptions o)
     {
@@ -161,10 +220,35 @@ public sealed unsafe class NeedleSession : IDisposable
         return text.TrimStart().StartsWith('{') ? text : fact + "; " + text;
     }
 
+    uint* BuildReasoningMask()
+    {
+        var built = (uint*)Mem.AllocZeroed((nuint)maskWords * 4);
+        for (var id = 0; id < Math.Min(model.VocabSize, tokenizer.PieceCount); id++)
+            if (tokenizer.IsConstrainable(id)) built[id / 32] |= 1u << (id % 32);
+        built[ThinkEnd / 32] |= 1u << (ThinkEnd % 32);
+        return built;
+    }
+
+    uint* CopyMask(uint* source, params int[] extraTokens)
+    {
+        var copy = (uint*)Mem.Alloc((nuint)maskWords * 4);
+        new ReadOnlySpan<uint>(source, maskWords).CopyTo(new Span<uint>(copy, maskWords));
+        foreach (var id in extraTokens) copy[id / 32] |= 1u << (id % 32);
+        return copy;
+    }
+
+    static int[] Concatenate(int[] head, int[] tail)
+    {
+        var joined = new int[head.Length + tail.Length];
+        head.CopyTo(joined, 0);
+        tail.CopyTo(joined, head.Length);
+        return joined;
+    }
+
     int[] Tokens(string text, bool leadingSpace)
     {
         var bytes = Encoding.UTF8.GetBytes(text);
-        var ids = new int[bytes.Length + 8];
+        var ids = new int[bytes.Length * 3 + 8];
         var count = tokenizer.Encode(bytes, ids, leadingSpace);
         return ids[..count];
     }
@@ -178,7 +262,6 @@ public sealed unsafe class NeedleSession : IDisposable
         engine.Feed(ids.ToArray(), computeLogits: false);
         engine.Mark();
         turnOne = true;
-        primedRender = tools.Render();
     }
 
     public void Reset()
@@ -187,230 +270,320 @@ public sealed unsafe class NeedleSession : IDisposable
         turnOne = true;
     }
 
-    public CallResult Complete(string query) => Turn(query, null);
+    public Reply Complete(ReadOnlySpan<byte> utf8Query, Span<byte> utf8Calls) =>
+        Run(utf8Query, false, utf8Calls, default, default);
 
-    public CallResult CompleteWithToolResult(string resultJson) => Turn(null, resultJson);
+    public Reply Complete(ReadOnlySpan<byte> utf8Query, Span<byte> utf8Calls, Span<byte> utf8Reasoning, Span<byte> utf8Response) =>
+        Run(utf8Query, false, utf8Calls, utf8Reasoning, utf8Response);
 
-    CallResult Turn(string? query, string? toolResult)
+    public Reply CompleteWithToolResult(ReadOnlySpan<byte> utf8Json, Span<byte> utf8Calls) =>
+        Run(utf8Json, true, utf8Calls, default, default);
+
+    public Reply CompleteWithToolResult(ReadOnlySpan<byte> utf8Json, Span<byte> utf8Calls, Span<byte> utf8Reasoning, Span<byte> utf8Response) =>
+        Run(utf8Json, true, utf8Calls, utf8Reasoning, utf8Response);
+
+    Reply Run(ReadOnlySpan<byte> input, bool toolResult, Span<byte> calls, Span<byte> reasoning, Span<byte> response)
     {
-        var started = Stopwatch.GetTimestamp();
-        try
+        var progress = new TurnProgress { Started = Stopwatch.GetTimestamp() };
+        System.Threading.Volatile.Write(ref cancelRequested, 0);
+        if (!toolResult && input.Length == 0) return Failed(FailureReason.EmptyInput, progress);
+        if (input.Length > maxInputBytes) return Failed(FailureReason.InputTooLong, progress);
+        if (retrieval && !toolResult)
         {
-            if (retrieval && query != null) SelectTools(query);
-            var prompt = new List<int>();
-            if (toolResult != null)
-                prompt.AddRange(Tokens("<|im_start|>tool\n<tool_result>" + toolResult + "</tool_result><|im_end|>\n<|im_start|>assistant\n", false));
-            else if (turnOne)
-                prompt.AddRange(Tokens("\n" + query + "<|im_end|>\n<|im_start|>assistant\n", false));
-            else
-                prompt.AddRange(Tokens("<|im_start|>user\n" + query + "<|im_end|>\n<|im_start|>assistant\n", false));
-            prompt.Add(ThinkStart);
-            turnOne = false;
-            engine.Feed(prompt.ToArray());
-            var prefilled = Stopwatch.GetTimestamp();
-            return Generate(started, prefilled, prompt.Count);
+            var selection = SelectTools(input);
+            if (selection != FailureReason.None) return Failed(selection, progress);
         }
-        catch (Exception e) when (e is InvalidOperationException or FormatException or ArgumentException)
-        {
-            return new CallResult { Success = false, Error = e.Message };
-        }
+        progress.PromptTokens = EncodePrompt(input, toolResult);
+        if (engine.Length + progress.PromptTokens > contextCapacity) return Failed(FailureReason.ContextExhausted, progress);
+        turnOne = false;
+        engine.Feed(new ReadOnlySpan<int>(promptIds, 0, progress.PromptTokens));
+        progress.PrefillTicks = Stopwatch.GetTimestamp() - progress.Started;
+        return Generate(ref progress, calls, reasoning, response);
     }
 
-    CallResult Generate(long started, long prefilled, int promptTokens)
+    int EncodePrompt(ReadOnlySpan<byte> input, bool toolResult)
     {
-        var reasoning = new List<byte>();
-        var piece = new byte[64];
-        var first = true;
-        var decoded = 0;
-        var ttft = 0.0;
+        var head = toolResult ? ToolResultHead : turnOne ? FirstQueryHead : LaterQueryHead;
+        var tail = toolResult ? ToolResultTail : QueryTail;
+        var text = new Span<byte>(inputBuffer);
+        head.CopyTo(text);
+        input.CopyTo(text[head.Length..]);
+        tail.CopyTo(text[(head.Length + input.Length)..]);
+        var count = tokenizer.Encode(text[..(head.Length + input.Length + tail.Length)], promptIds, false);
+        promptIds[count] = ThinkStart;
+        return count + 1;
+    }
+
+    Reply Generate(ref TurnProgress progress, Span<byte> calls, Span<byte> reasoning, Span<byte> response)
+    {
+        var firstPiece = true;
         for (var i = 0; i < options.MaxReasoningTokens; i++)
         {
-            var next = ArgMaxMasked(reasoningMask, out _);
-            if (i == 0) ttft = Elapsed(started, Stopwatch.GetTimestamp());
+            if (CancelRequested) return Abandon(ReplyStatus.Cancelled, FailureReason.None, progress);
+            var next = ArgMax(reasoningMask);
+            if (next < 0) return Abandon(ReplyStatus.Failed, FailureReason.GrammarDeadEnd, progress);
+            if (i == 0) progress.FirstTokenTicks = Stopwatch.GetTimestamp() - progress.Started;
             if (next == ThinkEnd) break;
-            reasoning.AddRange(piece.AsSpan(0, tokenizer.Append(next, piece, first)).ToArray());
-            first = false;
-            Feed(next);
-            decoded++;
+            AppendPiece(next, firstPiece, reasoning, ref progress.ReasoningLength, ref progress.Flags, ReplyFlags.ReasoningTruncated);
+            firstPiece = false;
+            if (!TryFeed(next)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
+            progress.DecodeTokens++;
         }
-        var forced = new List<int> { ThinkEnd };
-        forced.AddRange(Tokens("\n", false));
-        engine.Feed(forced.ToArray());
-        var decision = ArgMaxMasked(decisionMask, out _);
-        if (decision != ToolCallStart) return Respond(decision, reasoning, started, prefilled, promptTokens, decoded, ttft);
-        Feed(ToolCallStart);
+        if (!TryFeed(thinkEndForced)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
+        var decision = ArgMax(decisionMask);
+        if (decision < 0) return Abandon(ReplyStatus.Failed, FailureReason.GrammarDeadEnd, progress);
+        if (decision != ToolCallStart) return Respond(decision, ref progress, response);
+        if (!TryFeed(ToolCallStart)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
+        return GenerateCalls(ref progress, calls);
+    }
 
+    Reply GenerateCalls(ref TurnProgress progress, Span<byte> calls)
+    {
         var state = Grammar.Start(grammar.Program);
-        var text = new List<byte>();
         var logProbability = 0.0;
         var steps = 0;
         var buffer = stackalloc byte[256];
+        callTextLength = 0;
         while (!Grammar.Complete(state))
         {
-            if (steps >= options.MaxCallTokens) return new CallResult { Success = false, Error = "call exceeded the token budget", Reasoning = Encoding.UTF8.GetString(reasoning.ToArray()) };
+            if (CancelRequested) return Abandon(ReplyStatus.Cancelled, FailureReason.None, progress);
+            if (steps >= options.MaxCallTokens) return Abandon(ReplyStatus.Failed, FailureReason.CallTokenBudgetExceeded, progress);
             trie.Allow(grammar.Program, state, mask);
-            var pick = ArgMaxMasked(mask, out var probability);
-            if (steps == 0 && ttft == 0) ttft = Elapsed(started, Stopwatch.GetTimestamp());
+            var pick = ArgMaxWithProbability(mask, out var probability);
+            if (pick < 0) return Abandon(ReplyStatus.Failed, FailureReason.GrammarDeadEnd, progress);
+            if (steps == 0 && progress.FirstTokenTicks == 0) progress.FirstTokenTicks = Stopwatch.GetTimestamp() - progress.Started;
             var length = tokenizer.ConstraintBytes(pick, buffer);
+            if (callTextLength + length > callText.Length) return Abandon(ReplyStatus.Failed, FailureReason.CallTextTooLong, progress);
             var cursor = &state;
             for (var b = 0; b < length; b++)
-                if (!Grammar.Advance(grammar.Program, cursor, buffer[b])) return new CallResult { Success = false, Error = "grammar rejected an allowed token" };
-            for (var b = 0; b < length; b++) text.Add(buffer[b]);
+            {
+                if (!Grammar.Advance(grammar.Program, cursor, buffer[b])) return Abandon(ReplyStatus.Failed, FailureReason.GrammarRejectedToken, progress);
+                callText[callTextLength++] = buffer[b];
+            }
             logProbability += Math.Log(Math.Max(probability, 1e-9));
             steps++;
-            decoded++;
-            Feed(pick, computeLogits: !Grammar.Complete(state));
+            progress.DecodeTokens++;
+            if (!TryFeed(pick, computeLogits: !Grammar.Complete(state))) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
         }
-        var closing = new List<int> { ToolCallEnd, ImEnd };
-        closing.AddRange(Tokens("\n", false));
-        engine.Feed(closing.ToArray(), computeLogits: false);
+        if (!TryFeed(callClosing, computeLogits: false)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
 
-        var head = 1.0 / (1.0 + Math.Exp(-engine.ConfidenceLogit(pooled)));
+        var head = HeadProbability();
         var decode = Math.Exp(logProbability / Math.Max(1, steps));
         var confidence = (float)Math.Min(head, decode);
-        var calls = ParseCalls(Encoding.UTF8.GetString(text.ToArray()));
-        var done = Stopwatch.GetTimestamp();
+        if (!CallRestorer.TryRestore(allTools.Aliases, new ReadOnlySpan<byte>(callText, 0, callTextLength), calls, keyScratch, callSpans, out var required, out restoredCallCount))
+            return Failed(FailureReason.MalformedCalls, progress);
         var refused = confidence < options.RefuseBelow;
-        return new CallResult
-        {
-            FunctionCalls = refused ? Array.Empty<FunctionCall>() : calls,
-            SuppressedCalls = refused ? calls : Array.Empty<FunctionCall>(),
-            Reasoning = Encoding.UTF8.GetString(reasoning.ToArray()).Trim(),
-            Confidence = confidence,
-            HeadConfidence = (float)head,
-            DecodeConfidence = (float)decode,
-            PrefillTokens = promptTokens,
-            DecodeTokens = decoded,
-            TimeToFirstTokenMs = ttft,
-            PrefillTps = promptTokens / Math.Max(1e-9, (prefilled - started) / (double)Stopwatch.Frequency),
-            DecodeTps = decoded / Math.Max(1e-9, (done - prefilled) / (double)Stopwatch.Frequency),
-            TotalMs = Elapsed(started, done),
-        };
+        var status = required > calls.Length ? ReplyStatus.Failed : refused ? ReplyStatus.Refused : ReplyStatus.Called;
+        var failure = required > calls.Length ? FailureReason.CallsBufferTooSmall : FailureReason.None;
+        return new Reply(status, failure, progress.Flags, confidence, (float)head, (float)decode, restoredCallCount, required,
+            progress.ReasoningLength, 0, progress.PromptTokens, progress.DecodeTokens, progress.PrefillTicks, progress.FirstTokenTicks, Stopwatch.GetTimestamp() - progress.Started);
     }
 
-    void Feed(int token, bool computeLogits = true)
+    Reply Respond(int first, ref TurnProgress progress, Span<byte> response)
+    {
+        var next = first;
+        for (var i = 0; i < options.MaxCallTokens && next != ImEnd && next != EndOfText; i++)
+        {
+            if (CancelRequested) return Abandon(ReplyStatus.Cancelled, FailureReason.None, progress);
+            AppendPiece(next, i == 0, response, ref progress.ResponseLength, ref progress.Flags, ReplyFlags.ResponseTruncated);
+            if (!TryFeed(next)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
+            progress.DecodeTokens++;
+            next = ArgMax(responseMask);
+            if (next < 0) return Abandon(ReplyStatus.Failed, FailureReason.GrammarDeadEnd, progress);
+        }
+        if (!TryFeed(responseClosing, computeLogits: false)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
+        var confidence = (float)HeadProbability();
+        return new Reply(ReplyStatus.Responded, FailureReason.None, progress.Flags, confidence, confidence, float.NaN, 0, 0,
+            progress.ReasoningLength, progress.ResponseLength, progress.PromptTokens, progress.DecodeTokens, progress.PrefillTicks, progress.FirstTokenTicks, Stopwatch.GetTimestamp() - progress.Started);
+    }
+
+    bool CancelRequested => System.Threading.Volatile.Read(ref cancelRequested) != 0;
+
+    double HeadProbability() =>
+        confidenceScratch == null ? 1.0 : 1.0 / (1.0 + Math.Exp(-engine.ConfidenceLogit(pooled, confidenceScratch)));
+
+    Reply Failed(FailureReason reason, in TurnProgress progress) =>
+        new(ReplyStatus.Failed, reason, progress.Flags, float.NaN, float.NaN, float.NaN, 0, 0,
+            progress.ReasoningLength, progress.ResponseLength, progress.PromptTokens, progress.DecodeTokens, progress.PrefillTicks, progress.FirstTokenTicks, Stopwatch.GetTimestamp() - progress.Started);
+
+    Reply Abandon(ReplyStatus status, FailureReason reason, in TurnProgress progress)
+    {
+        Reset();
+        var reply = Failed(reason, progress);
+        return status == ReplyStatus.Cancelled ? reply with { Status = ReplyStatus.Cancelled } : reply;
+    }
+
+    bool TryFeed(ReadOnlySpan<int> tokens, bool computeLogits = true)
+    {
+        if (engine.Length + tokens.Length > contextCapacity) return false;
+        engine.Feed(tokens, computeLogits);
+        return true;
+    }
+
+    bool TryFeed(int token, bool computeLogits = true)
     {
         var one = stackalloc int[1];
         one[0] = token;
-        engine.Feed(new ReadOnlySpan<int>(one, 1), computeLogits);
+        return TryFeed(new ReadOnlySpan<int>(one, 1), computeLogits);
     }
 
-    CallResult Respond(int first, List<byte> reasoning, long started, long prefilled, int promptTokens, int decoded, double ttft)
+    void AppendPiece(int token, bool first, Span<byte> destination, ref int length, ref ReplyFlags flags, ReplyFlags truncated)
     {
-        var text = new List<byte>();
-        var piece = new byte[64];
-        var next = first;
-        for (var i = 0; i < options.MaxCallTokens && next != ImEnd && next != 1; i++)
+        if (destination.IsEmpty) return;
+        Span<byte> piece = stackalloc byte[MaxPieceBytes];
+        var count = tokenizer.Append(token, piece, first);
+        var room = destination.Length - length;
+        if (count > room) flags |= truncated;
+        var written = Math.Min(count, room);
+        piece[..written].CopyTo(destination[length..]);
+        length += written;
+    }
+
+    int ArgMax(uint* allowed)
+    {
+        fixed (float* logits = engine.Logits)
         {
-            text.AddRange(piece.AsSpan(0, tokenizer.Append(next, piece, i == 0)).ToArray());
-            Feed(next);
-            decoded++;
-            next = ArgMaxMasked(responseMask, out _);
+            var best = -1;
+            var peak = float.NegativeInfinity;
+            for (var word = 0; word < maskWords; word++)
+            {
+                var bits = allowed[word];
+                while (bits != 0)
+                {
+                    var id = word * 32 + Bits.TrailingZeros(bits);
+                    bits &= bits - 1;
+                    var value = logits[id];
+                    if (value > peak) { peak = value; best = id; }
+                }
+            }
+            return best;
         }
-        var closing = new List<int> { ImEnd };
-        closing.AddRange(Tokens("\n", false));
-        engine.Feed(closing.ToArray(), computeLogits: false);
-        var done = Stopwatch.GetTimestamp();
-        return new CallResult
-        {
-            Reasoning = Encoding.UTF8.GetString(reasoning.ToArray()).Trim(),
-            Response = Encoding.UTF8.GetString(text.ToArray()).Trim(),
-            Confidence = (float)(1.0 / (1.0 + Math.Exp(-engine.ConfidenceLogit(pooled)))),
-            PrefillTokens = promptTokens,
-            DecodeTokens = decoded,
-            TimeToFirstTokenMs = ttft,
-            PrefillTps = promptTokens / Math.Max(1e-9, (prefilled - started) / (double)Stopwatch.Frequency),
-            DecodeTps = decoded / Math.Max(1e-9, (done - prefilled) / (double)Stopwatch.Frequency),
-            TotalMs = Elapsed(started, done),
-        };
     }
 
-    static double Elapsed(long from, long to) => (to - from) * 1000.0 / Stopwatch.Frequency;
-
-    int ArgMaxMasked(ReadOnlySpan<uint> allowed, out float probability)
+    int ArgMaxWithProbability(uint* allowed, out float probability)
     {
-        fixed (uint* m = allowed) return ArgMaxMasked(m, out probability);
-    }
-
-    int ArgMaxMasked(uint* allowed, out float probability)
-    {
-        var logits = engine.Logits;
-        var vocab = model.VocabSize;
-        var best = -1;
-        var peak = float.NegativeInfinity;
-        for (var id = 0; id < vocab; id++)
+        fixed (float* logits = engine.Logits)
         {
-            var open = (allowed[id / 32] >> (id % 32) & 1) != 0;
-            scratchLogits[id] = open ? logits[id] : -1e30f;
-            if (open && logits[id] > peak) { peak = logits[id]; best = id; }
+            var best = -1;
+            var bestSlot = 0;
+            var count = 0;
+            var peak = float.NegativeInfinity;
+            for (var word = 0; word < maskWords; word++)
+            {
+                var bits = allowed[word];
+                while (bits != 0)
+                {
+                    var id = word * 32 + Bits.TrailingZeros(bits);
+                    bits &= bits - 1;
+                    var value = logits[id];
+                    scratchLogits[count] = value;
+                    if (value > peak) { peak = value; best = id; bestSlot = count; }
+                    count++;
+                }
+            }
+            if (best < 0)
+            {
+                probability = 0f;
+                return -1;
+            }
+            Ops.Softmax(scratchLogits, count);
+            probability = scratchLogits[bestSlot];
+            return best;
         }
-        if (best < 0) throw new InvalidOperationException("the grammar left no allowed token");
-        Ops.Softmax(scratchLogits, vocab);
-        probability = scratchLogits[best];
-        return best;
     }
-
-    IReadOnlyList<FunctionCall> ParseCalls(string json)
-    {
-        var parsed = JsonValue.Parse(json);
-        var calls = new List<FunctionCall>();
-        foreach (var call in parsed.Items)
-        {
-            var alias = call.GetString("name")!;
-            var arguments = call.Get("arguments") ?? JsonValue.Object(Array.Empty<KeyValuePair<string, JsonValue>>());
-            calls.Add(new FunctionCall(active.OriginalName(alias), Restore(arguments, alias).ToString()));
-        }
-        return calls;
-    }
-
-    JsonValue Restore(JsonValue value, string tool) => value.Kind switch
-    {
-        JsonKind.Object => JsonValue.Object(value.Members.ConvertAll(m => new KeyValuePair<string, JsonValue>(active.OriginalProperty(tool, m.Key), Restore(m.Value, tool)))),
-        JsonKind.Array => JsonValue.Array(value.Items.ConvertAll(i => Restore(i, tool))),
-        _ => value,
-    };
 
     public float[] Embed(string text)
     {
-        embedder ??= new Engine(model, 512, 64, options.ResolvedThreading, engine.SharedPool) { Pooling = true };
-        var ids = new List<int> { tokenizer.BeginId };
-        ids.AddRange(Tokens(text, true));
-        embedder.Reset();
-        embedder.Feed(ids.ToArray(), computeLogits: false);
-        var width = model.Confidence->Queries * model.Geometry.Dim;
-        var vector = (float*)Mem.AllocZeroed((nuint)width * 4);
-        embedder.ConfidenceLogit(vector);
-        var norm = MathF.Sqrt(Ops.SumOfSquares(vector, width)) + 1e-12f;
-        var result = new float[width];
-        for (var i = 0; i < width; i++) result[i] = vector[i] / norm;
-        Mem.Free(vector);
+        EnsureEmbedder();
+        var ids = new int[Encoding.UTF8.GetByteCount(text) * 3 + 9];
+        ids[0] = tokenizer.BeginId;
+        var count = 1 + tokenizer.Encode(Encoding.UTF8.GetBytes(text), ids.AsSpan(1), true);
+        if (EmbedTokens(new ReadOnlySpan<int>(ids, 0, count)) != FailureReason.None) throw new InvalidOperationException("context capacity exceeded");
+        var result = new float[embeddingWidth];
+        new ReadOnlySpan<float>(pooled, embeddingWidth).CopyTo(result);
         return result;
+    }
+
+    void EnsureEmbedder()
+    {
+        if (model.Confidence == null) throw new InvalidOperationException("the model has no confidence head");
+        embedder ??= new Engine(model, EmbedderContext, 64, options.ResolvedThreading, engine.SharedPool) { Pooling = true };
+    }
+
+    FailureReason EmbedTokens(ReadOnlySpan<int> ids)
+    {
+        if (ids.Length > embedderCapacity) return FailureReason.ContextExhausted;
+        embedder!.Reset();
+        embedder.Feed(ids, computeLogits: false);
+        embedder.ConfidenceLogit(pooled, confidenceScratch);
+        var norm = MathF.Sqrt(Ops.SumOfSquares(pooled, embeddingWidth)) + 1e-12f;
+        for (var i = 0; i < embeddingWidth; i++) pooled[i] /= norm;
+        return FailureReason.None;
+    }
+
+    FailureReason EmbedQuery(ReadOnlySpan<byte> query)
+    {
+        promptIds[0] = tokenizer.BeginId;
+        var count = 1 + tokenizer.Encode(query, new Span<int>(promptIds, 1, promptIds.Length - 1), true);
+        return EmbedTokens(new ReadOnlySpan<int>(promptIds, 0, count));
     }
 
     void IndexTools()
     {
-        foreach (var tool in allTools.Tools) toolEmbeddings.Add(Embed(tool.ToString()));
+        EnsureEmbedder();
+        for (var t = 0; t < allTools.Tools.Count; t++)
+            Embed(allTools.Tools[t].ToString()).CopyTo(toolEmbeddings, t * embeddingWidth);
     }
 
-    void SelectTools(string query)
+    FailureReason SelectTools(ReadOnlySpan<byte> query)
     {
-        var q = Embed(query);
-        var scored = new List<(float Score, int Index)>();
-        for (var i = 0; i < toolEmbeddings.Count; i++)
+        var embedded = EmbedQuery(query);
+        if (embedded != FailureReason.None) return embedded;
+        var toolCount = allTools.Tools.Count;
+        for (var t = 0; t < toolCount; t++)
         {
             var dot = 0f;
-            for (var j = 0; j < q.Length; j++) dot += q[j] * toolEmbeddings[i][j];
-            scored.Add((dot, i));
+            var row = t * embeddingWidth;
+            for (var j = 0; j < embeddingWidth; j++) dot += pooled[j] * toolEmbeddings[row + j];
+            toolScores[t] = dot;
         }
-        scored.Sort((a, b) => b.Score.CompareTo(a.Score));
-        var chosen = scored.GetRange(0, options.RetrievalTopK).ConvertAll(s => s.Index);
-        chosen.Sort();
-        var subset = allTools.Subset(chosen);
-        if (subset.Render() == primedRender) return;
-        active = subset;
-        grammar.Dispose();
-        grammar = new Grammar(active.Tools);
-        Prime(active);
+        for (var k = 0; k < chosenTools.Length; k++)
+        {
+            var best = -1;
+            for (var t = 0; t < toolCount; t++)
+                if (!IsChosen(t, k) && (best < 0 || toolScores[t] > toolScores[best])) best = t;
+            chosenTools[k] = best;
+        }
+        Array.Sort(chosenTools);
+        if (activeToolCount == chosenTools.Length && chosenTools.AsSpan().SequenceEqual(activeTools)) return FailureReason.None;
+        return RestrictTools();
+    }
+
+    bool IsChosen(int tool, int chosenCount)
+    {
+        for (var k = 0; k < chosenCount; k++) if (chosenTools[k] == tool) return true;
+        return false;
+    }
+
+    FailureReason RestrictTools()
+    {
+        try
+        {
+            activeToolCount = -1;
+            var subset = allTools.Subset(chosenTools);
+            var rebuilt = new Grammar(subset.Tools);
+            grammar.Dispose();
+            grammar = rebuilt;
+            active = subset;
+            Prime(active);
+            chosenTools.CopyTo(activeTools, 0);
+            activeToolCount = chosenTools.Length;
+            return FailureReason.None;
+        }
+        catch (Exception e) when (e is InvalidOperationException or FormatException or ArgumentException)
+        {
+            return FailureReason.ToolContextFailed;
+        }
     }
 
     public void Pause() => engine.Pause();
@@ -425,7 +598,11 @@ public sealed unsafe class NeedleSession : IDisposable
         trie.Dispose();
         grammar.Dispose();
         Mem.Free(mask);
+        Mem.Free(reasoningMask);
+        Mem.Free(decisionMask);
+        Mem.Free(responseMask);
         Mem.Free(scratchLogits);
         Mem.Free(pooled);
+        if (confidenceScratch != null) Mem.Free(confidenceScratch);
     }
 }
