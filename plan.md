@@ -54,7 +54,7 @@ Last measured: 2026-10-29, on the reference box in [2.2](#22-baseline). The numb
 - The projects target `net10.0`, so you need the .NET 10 SDK. The 8.0 SDK fails with `NETSDK1045`.
 - `tools/fetch.sh` downloads the model, tokenizer, upstream wheel, Whistle and the audio clips.
 - `python3 tools/golden.py` needs `numpy` and `sentencepiece` and takes about 15 minutes of CPU time; it recomputes the full forward pass for every token.
-- **Fixture drift:** `golden.py` decodes 48 tokens by default, but `ParityTests.GenerationMatchesReferenceGreedyDecode` decodes 40, so the test fails out of the box. Use `python3 tools/golden.py 40`.
+- **Fixture drift (fixed in W01):** the decode budget is now defined once as `DECODE_BUDGET = 40` in `tools/golden.py`, written into `golden.json` as `budget`, and read by `ParityTests`. Fixtures generated before W01 lack the `budget` key and must be regenerated (or patched by adding `"budget":40`).
 - `ConfidenceHeadMatchesReference` also needs `python3 tools/golden_confidence.py`. The README mentions neither step.
 - After that, 54 of 54 tests pass in Release on AVX2 and with `NEEDLE_SCALAR=1` (2 min 16 s).
 - C# greedy decoding matches the numpy reference exactly at 1 and 8 threads.

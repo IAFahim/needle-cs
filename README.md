@@ -102,3 +102,7 @@ dotnet build src/Needle -f netstandard2.1 -c Release
 - **Game builds that ship the weights** must comply with the Apache License 2.0 for those files: include its license text and keep the attribution notices. Credits are in [NOTICE](NOTICE).
 - **The upstream wheel and `libneedle3.so`** that `tools/fetch.sh` downloads are for local benchmarking only. Never commit or ship them.
 - **Clean-room:** no code from [`cactus-compute/cactus`](https://github.com/cactus-compute/cactus), which has a custom non-Apache license, may be used here. Details are in [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Loading models on mobile and consoles
+
+Files inside an Android APK (StreamingAssets) cannot be memory-mapped. Either read them into a `byte[]` and call `Model.FromBytes`, stream them with `Model.FromStream`, or copy the file once to `persistentDataPath` and call `Model.Open` on that path. iOS can map the file from the bundle path directly.
