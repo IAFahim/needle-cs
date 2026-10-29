@@ -765,6 +765,9 @@ internal static unsafe class Neon
     public static void Kron(float* z, int activeRows, float* left, float* right, int rows, int cols, int resultRows, float* result)
     {
         var tile = stackalloc float[4 * cols];
+        nint stride1 = cols;
+        nint stride2 = 2 * cols;
+        nint stride3 = 3 * cols;
         for (var k = 0; k < resultRows; k += 4)
         {
             for (var c = 0; c < cols; c += 16)
@@ -820,18 +823,18 @@ internal static unsafe class Neon
                 AdvSimd.Store(tile + c + 4, a01);
                 AdvSimd.Store(tile + c + 8, a02);
                 AdvSimd.Store(tile + c + 12, a03);
-                AdvSimd.Store(tile + cols + c, a10);
-                AdvSimd.Store(tile + cols + c + 4, a11);
-                AdvSimd.Store(tile + cols + c + 8, a12);
-                AdvSimd.Store(tile + cols + c + 12, a13);
-                AdvSimd.Store(tile + 2 * cols + c, a20);
-                AdvSimd.Store(tile + 2 * cols + c + 4, a21);
-                AdvSimd.Store(tile + 2 * cols + c + 8, a22);
-                AdvSimd.Store(tile + 2 * cols + c + 12, a23);
-                AdvSimd.Store(tile + 3 * cols + c, a30);
-                AdvSimd.Store(tile + 3 * cols + c + 4, a31);
-                AdvSimd.Store(tile + 3 * cols + c + 8, a32);
-                AdvSimd.Store(tile + 3 * cols + c + 12, a33);
+                AdvSimd.Store(tile + stride1 + c, a10);
+                AdvSimd.Store(tile + stride1 + c + 4, a11);
+                AdvSimd.Store(tile + stride1 + c + 8, a12);
+                AdvSimd.Store(tile + stride1 + c + 12, a13);
+                AdvSimd.Store(tile + stride2 + c, a20);
+                AdvSimd.Store(tile + stride2 + c + 4, a21);
+                AdvSimd.Store(tile + stride2 + c + 8, a22);
+                AdvSimd.Store(tile + stride2 + c + 12, a23);
+                AdvSimd.Store(tile + stride3 + c, a30);
+                AdvSimd.Store(tile + stride3 + c + 4, a31);
+                AdvSimd.Store(tile + stride3 + c + 8, a32);
+                AdvSimd.Store(tile + stride3 + c + 12, a33);
             }
             for (var c = 0; c < cols; c += 16)
             {
@@ -852,51 +855,53 @@ internal static unsafe class Neon
                 var a32 = Vector128<float>.Zero;
                 var a33 = Vector128<float>.Zero;
                 var row = right + c;
+                var scalars = tile;
                 for (var j = 0; j < cols; j++)
                 {
                     var r0 = AdvSimd.LoadVector128(row);
                     var r1 = AdvSimd.LoadVector128(row + 4);
                     var r2 = AdvSimd.LoadVector128(row + 8);
                     var r3 = AdvSimd.LoadVector128(row + 12);
-                    var s0 = AdvSimd.LoadAndReplicateToVector128(tile + j);
+                    var s0 = AdvSimd.LoadAndReplicateToVector128(scalars);
                     a00 = AdvSimd.FusedMultiplyAdd(a00, s0, r0);
                     a01 = AdvSimd.FusedMultiplyAdd(a01, s0, r1);
                     a02 = AdvSimd.FusedMultiplyAdd(a02, s0, r2);
                     a03 = AdvSimd.FusedMultiplyAdd(a03, s0, r3);
-                    var s1 = AdvSimd.LoadAndReplicateToVector128(tile + cols + j);
+                    var s1 = AdvSimd.LoadAndReplicateToVector128(scalars + stride1);
                     a10 = AdvSimd.FusedMultiplyAdd(a10, s1, r0);
                     a11 = AdvSimd.FusedMultiplyAdd(a11, s1, r1);
                     a12 = AdvSimd.FusedMultiplyAdd(a12, s1, r2);
                     a13 = AdvSimd.FusedMultiplyAdd(a13, s1, r3);
-                    var s2 = AdvSimd.LoadAndReplicateToVector128(tile + 2 * cols + j);
+                    var s2 = AdvSimd.LoadAndReplicateToVector128(scalars + stride2);
                     a20 = AdvSimd.FusedMultiplyAdd(a20, s2, r0);
                     a21 = AdvSimd.FusedMultiplyAdd(a21, s2, r1);
                     a22 = AdvSimd.FusedMultiplyAdd(a22, s2, r2);
                     a23 = AdvSimd.FusedMultiplyAdd(a23, s2, r3);
-                    var s3 = AdvSimd.LoadAndReplicateToVector128(tile + 3 * cols + j);
+                    var s3 = AdvSimd.LoadAndReplicateToVector128(scalars + stride3);
                     a30 = AdvSimd.FusedMultiplyAdd(a30, s3, r0);
                     a31 = AdvSimd.FusedMultiplyAdd(a31, s3, r1);
                     a32 = AdvSimd.FusedMultiplyAdd(a32, s3, r2);
                     a33 = AdvSimd.FusedMultiplyAdd(a33, s3, r3);
                     row += cols;
+                    scalars++;
                 }
                 var output = result + k * cols + c;
                 AdvSimd.Store(output, a00);
                 AdvSimd.Store(output + 4, a01);
                 AdvSimd.Store(output + 8, a02);
                 AdvSimd.Store(output + 12, a03);
-                AdvSimd.Store(output + cols, a10);
-                AdvSimd.Store(output + cols + 4, a11);
-                AdvSimd.Store(output + cols + 8, a12);
-                AdvSimd.Store(output + cols + 12, a13);
-                AdvSimd.Store(output + 2 * cols, a20);
-                AdvSimd.Store(output + 2 * cols + 4, a21);
-                AdvSimd.Store(output + 2 * cols + 8, a22);
-                AdvSimd.Store(output + 2 * cols + 12, a23);
-                AdvSimd.Store(output + 3 * cols, a30);
-                AdvSimd.Store(output + 3 * cols + 4, a31);
-                AdvSimd.Store(output + 3 * cols + 8, a32);
-                AdvSimd.Store(output + 3 * cols + 12, a33);
+                AdvSimd.Store(output + stride1, a10);
+                AdvSimd.Store(output + stride1 + 4, a11);
+                AdvSimd.Store(output + stride1 + 8, a12);
+                AdvSimd.Store(output + stride1 + 12, a13);
+                AdvSimd.Store(output + stride2, a20);
+                AdvSimd.Store(output + stride2 + 4, a21);
+                AdvSimd.Store(output + stride2 + 8, a22);
+                AdvSimd.Store(output + stride2 + 12, a23);
+                AdvSimd.Store(output + stride3, a30);
+                AdvSimd.Store(output + stride3 + 4, a31);
+                AdvSimd.Store(output + stride3 + 8, a32);
+                AdvSimd.Store(output + stride3 + 12, a33);
             }
         }
     }

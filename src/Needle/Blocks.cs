@@ -131,13 +131,13 @@ internal unsafe struct MlpBatch
 [System.Runtime.CompilerServices.SkipLocalsInit]
 internal static unsafe class HadamardMlp
 {
-    public const int Conditions = 8;
+    const int Conditions = 8;
     const int TileRows = 4;
     const int TileColumns = 16;
 
     public static int ScratchFloats(int dim, int width) => Conditions + dim + 2 * width;
 
-    public static bool Blocked(int rows, int cols) => Simd.Enabled && rows % TileRows == 0 && cols % TileColumns == 0;
+    static bool Blocked(int rows, int cols) => Simd.Enabled && rows % TileRows == 0 && cols % TileColumns == 0;
 
     public static void Apply(MlpBatch* b, float* residual, float* scratch)
     {
@@ -282,6 +282,9 @@ internal static unsafe class HadamardMlp
     public static void KronAvx512(float* z, int activeRows, float* left, float* right, int rows, int cols, int resultRows, float* result)
     {
         var tile = stackalloc float[TileRows * cols];
+        nint stride1 = cols;
+        nint stride2 = 2 * cols;
+        nint stride3 = 3 * cols;
         for (var k = 0; k < resultRows; k += TileRows)
         {
             for (var c = 0; c < cols; c += 32)
@@ -317,12 +320,12 @@ internal static unsafe class HadamardMlp
                 }
                 Avx512F.Store(tile + c, a00);
                 Avx512F.Store(tile + c + 16, a01);
-                Avx512F.Store(tile + cols + c, a10);
-                Avx512F.Store(tile + cols + c + 16, a11);
-                Avx512F.Store(tile + 2 * cols + c, a20);
-                Avx512F.Store(tile + 2 * cols + c + 16, a21);
-                Avx512F.Store(tile + 3 * cols + c, a30);
-                Avx512F.Store(tile + 3 * cols + c + 16, a31);
+                Avx512F.Store(tile + stride1 + c, a10);
+                Avx512F.Store(tile + stride1 + c + 16, a11);
+                Avx512F.Store(tile + stride2 + c, a20);
+                Avx512F.Store(tile + stride2 + c + 16, a21);
+                Avx512F.Store(tile + stride3 + c, a30);
+                Avx512F.Store(tile + stride3 + c + 16, a31);
             }
             for (var c = 0; c < cols; c += 32)
             {
@@ -335,33 +338,35 @@ internal static unsafe class HadamardMlp
                 var a30 = Vector512<float>.Zero;
                 var a31 = Vector512<float>.Zero;
                 var row = right + c;
+                var scalars = tile;
                 for (var j = 0; j < cols; j++)
                 {
                     var r0 = Avx512F.LoadVector512(row);
                     var r1 = Avx512F.LoadVector512(row + 16);
-                    var s0 = Vector512.Create(tile[j]);
+                    var s0 = Vector512.Create(*scalars);
                     a00 = Avx512F.FusedMultiplyAdd(s0, r0, a00);
                     a01 = Avx512F.FusedMultiplyAdd(s0, r1, a01);
-                    var s1 = Vector512.Create(tile[cols + j]);
+                    var s1 = Vector512.Create(scalars[stride1]);
                     a10 = Avx512F.FusedMultiplyAdd(s1, r0, a10);
                     a11 = Avx512F.FusedMultiplyAdd(s1, r1, a11);
-                    var s2 = Vector512.Create(tile[2 * cols + j]);
+                    var s2 = Vector512.Create(scalars[stride2]);
                     a20 = Avx512F.FusedMultiplyAdd(s2, r0, a20);
                     a21 = Avx512F.FusedMultiplyAdd(s2, r1, a21);
-                    var s3 = Vector512.Create(tile[3 * cols + j]);
+                    var s3 = Vector512.Create(scalars[stride3]);
                     a30 = Avx512F.FusedMultiplyAdd(s3, r0, a30);
                     a31 = Avx512F.FusedMultiplyAdd(s3, r1, a31);
                     row += cols;
+                    scalars++;
                 }
                 var output = result + k * cols + c;
                 Avx512F.Store(output, a00);
                 Avx512F.Store(output + 16, a01);
-                Avx512F.Store(output + cols, a10);
-                Avx512F.Store(output + cols + 16, a11);
-                Avx512F.Store(output + 2 * cols, a20);
-                Avx512F.Store(output + 2 * cols + 16, a21);
-                Avx512F.Store(output + 3 * cols, a30);
-                Avx512F.Store(output + 3 * cols + 16, a31);
+                Avx512F.Store(output + stride1, a10);
+                Avx512F.Store(output + stride1 + 16, a11);
+                Avx512F.Store(output + stride2, a20);
+                Avx512F.Store(output + stride2 + 16, a21);
+                Avx512F.Store(output + stride3, a30);
+                Avx512F.Store(output + stride3 + 16, a31);
             }
         }
     }
@@ -381,6 +386,9 @@ internal static unsafe class HadamardMlp
     public static void KronAvx2(float* z, int activeRows, float* left, float* right, int rows, int cols, int resultRows, float* result)
     {
         var tile = stackalloc float[TileRows * cols];
+        nint stride1 = cols;
+        nint stride2 = 2 * cols;
+        nint stride3 = 3 * cols;
         for (var k = 0; k < resultRows; k += TileRows)
         {
             for (var c = 0; c < cols; c += TileColumns)
@@ -416,12 +424,12 @@ internal static unsafe class HadamardMlp
                 }
                 Avx.Store(tile + c, a00);
                 Avx.Store(tile + c + 8, a01);
-                Avx.Store(tile + cols + c, a10);
-                Avx.Store(tile + cols + c + 8, a11);
-                Avx.Store(tile + 2 * cols + c, a20);
-                Avx.Store(tile + 2 * cols + c + 8, a21);
-                Avx.Store(tile + 3 * cols + c, a30);
-                Avx.Store(tile + 3 * cols + c + 8, a31);
+                Avx.Store(tile + stride1 + c, a10);
+                Avx.Store(tile + stride1 + c + 8, a11);
+                Avx.Store(tile + stride2 + c, a20);
+                Avx.Store(tile + stride2 + c + 8, a21);
+                Avx.Store(tile + stride3 + c, a30);
+                Avx.Store(tile + stride3 + c + 8, a31);
             }
             for (var c = 0; c < cols; c += TileColumns)
             {
@@ -434,33 +442,35 @@ internal static unsafe class HadamardMlp
                 var a30 = Vector256<float>.Zero;
                 var a31 = Vector256<float>.Zero;
                 var row = right + c;
+                var scalars = tile;
                 for (var j = 0; j < cols; j++)
                 {
                     var r0 = Avx.LoadVector256(row);
                     var r1 = Avx.LoadVector256(row + 8);
-                    var s0 = Avx.BroadcastScalarToVector256(tile + j);
+                    var s0 = Avx.BroadcastScalarToVector256(scalars);
                     a00 = Fma.MultiplyAdd(s0, r0, a00);
                     a01 = Fma.MultiplyAdd(s0, r1, a01);
-                    var s1 = Avx.BroadcastScalarToVector256(tile + cols + j);
+                    var s1 = Avx.BroadcastScalarToVector256(scalars + stride1);
                     a10 = Fma.MultiplyAdd(s1, r0, a10);
                     a11 = Fma.MultiplyAdd(s1, r1, a11);
-                    var s2 = Avx.BroadcastScalarToVector256(tile + 2 * cols + j);
+                    var s2 = Avx.BroadcastScalarToVector256(scalars + stride2);
                     a20 = Fma.MultiplyAdd(s2, r0, a20);
                     a21 = Fma.MultiplyAdd(s2, r1, a21);
-                    var s3 = Avx.BroadcastScalarToVector256(tile + 3 * cols + j);
+                    var s3 = Avx.BroadcastScalarToVector256(scalars + stride3);
                     a30 = Fma.MultiplyAdd(s3, r0, a30);
                     a31 = Fma.MultiplyAdd(s3, r1, a31);
                     row += cols;
+                    scalars++;
                 }
                 var output = result + k * cols + c;
                 Avx.Store(output, a00);
                 Avx.Store(output + 8, a01);
-                Avx.Store(output + cols, a10);
-                Avx.Store(output + cols + 8, a11);
-                Avx.Store(output + 2 * cols, a20);
-                Avx.Store(output + 2 * cols + 8, a21);
-                Avx.Store(output + 3 * cols, a30);
-                Avx.Store(output + 3 * cols + 8, a31);
+                Avx.Store(output + stride1, a10);
+                Avx.Store(output + stride1 + 8, a11);
+                Avx.Store(output + stride2, a20);
+                Avx.Store(output + stride2 + 8, a21);
+                Avx.Store(output + stride3, a30);
+                Avx.Store(output + stride3 + 8, a31);
             }
         }
     }
