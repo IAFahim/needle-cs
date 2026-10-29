@@ -286,29 +286,6 @@ internal static unsafe class Quant
             : Avx2.Add(sum, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(weights, activations), Vector256.Create((short)1)));
 #endif
 
-#if NEEDLE_SIMD
-    static Vector128<float> HalfToSingle(Vector128<uint> half)
-    {
-        var magnitude = Sse2.And(half, Vector128.Create(0x7FFFu));
-        var sign = Sse2.ShiftLeftLogical(Sse2.And(half, Vector128.Create(0x8000u)), 16);
-        var bits = Sse2.Add(Sse2.ShiftLeftLogical(magnitude, 13), Vector128.Create(0x38000000u));
-        var nonZero = Sse2.CompareGreaterThan(magnitude.AsInt32(), Vector128<int>.Zero).AsUInt32();
-        return Sse2.Or(Sse2.And(bits, nonZero), sign).AsSingle();
-    }
-#endif
-
-#if NEEDLE_SIMD
-    static void LoadFactors(ushort* norms, int groups, float scale, float* factors)
-    {
-        var multiplier = Vector128.Create(scale);
-        var g = 0;
-        for (; g + 4 <= groups; g += 4)
-            Sse.Store(factors + g, Sse.Multiply(HalfToSingle(Sse41.ConvertToVector128Int32((ushort*)(norms + g)).AsUInt32()), multiplier));
-        for (; g < groups; g++)
-            factors[g] = HalfToSingle(Vector128.Create((uint)*(ushort*)(norms + g), 0u, 0u, 0u)).ToScalar() * scale;
-    }
-#endif
-
     public static void MatMul(in Cq w, in Activations a, int tokens, float* y, int ldy) =>
         MatMulRows(w, a, tokens, y, ldy, 0, w.Rows);
 
@@ -320,136 +297,10 @@ internal static unsafe class Quant
         if (!Simd.Enabled) { Scalar.MatMulRows(w, a, tokens, y, ldy, rowStart, rowEnd); return; }
 #if NEEDLE_SIMD
         var tiledTokens = tokens & ~(TokenTile - 1);
+        for (var t = 0; t < tiledTokens; t += TokenTile) Gemv.Tile(w, a, t, y + (long)t * ldy, ldy, rowStart, rowEnd);
         for (var t = tiledTokens; t < tokens; t++) Gemv.Rows(w, a, t, y + (long)t * ldy, rowStart, rowEnd);
-        if (tiledTokens == 0) return;
-        var factors = stackalloc float[a.Stride];
-        var scaled = stackalloc float[a.Stride * TokenTile];
-        var groups = w.Groups;
-        var rowBytes = w.RowBytes;
-        var table = Avx.LoadVector256(w.Book->Bytes);
-        var byteScale = w.Book->ByteScale;
-        var two = w.Bits == 2;
-        if ((rowEnd - rowStart) * TokenTile <= tokens)
-        {
-            for (var t = 0; t < tiledTokens; t += TokenTile)
-                for (var n = rowStart; n < rowEnd; n++)
-                {
-                    LoadFactors(w.Norms + (long)n * groups, groups, byteScale, factors);
-                    var packed = w.Indices + (long)n * rowBytes;
-                    if (two) DotTile2(packed, table, factors, scaled, a, t, y + (long)t * ldy + n, ldy);
-                    else DotTile4(packed, table, factors, scaled, a, t, y + (long)t * ldy + n, ldy);
-                }
-            return;
-        }
-        for (var n = rowStart; n < rowEnd; n++)
-        {
-            LoadFactors(w.Norms + (long)n * groups, groups, byteScale, factors);
-            var packed = w.Indices + (long)n * rowBytes;
-            for (var t = 0; t < tiledTokens; t += TokenTile)
-                if (two) DotTile2(packed, table, factors, scaled, a, t, y + (long)t * ldy + n, ldy);
-                else DotTile4(packed, table, factors, scaled, a, t, y + (long)t * ldy + n, ldy);
-        }
 #endif
     }
-
-#if NEEDLE_SIMD
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    static Vector256<float> ScaleFactors(float* factors, float* scaled, float* scales, float* offsets, int stride)
-    {
-        var bias = Vector256<float>.Zero;
-        for (var v = 0; v < stride; v += 8)
-        {
-            var f = Avx.Multiply(Avx.LoadVector256(factors + v), Avx.LoadVector256(scales + v));
-            Avx.Store(scaled + v, f);
-            bias = Fma.MultiplyAdd(f, Avx.LoadVector256(offsets + v), bias);
-        }
-        return bias;
-    }
-#endif
-
-#if NEEDLE_SIMD
-    static void DotTile2(byte* packed, Vector256<byte> table, float* factors, float* scaled, in Activations a, int token, float* y, int ldy)
-    {
-        var groups = a.Groups;
-        var stride = a.Stride;
-        var cols = a.Cols;
-        var bias0 = ScaleFactors(factors, scaled, a.Scales + token * stride, a.Offsets + token * stride, stride);
-        var bias1 = ScaleFactors(factors, scaled + stride, a.Scales + (token + 1) * stride, a.Offsets + (token + 1) * stride, stride);
-        var bias2 = ScaleFactors(factors, scaled + 2 * stride, a.Scales + (token + 2) * stride, a.Offsets + (token + 2) * stride, stride);
-        var bias3 = ScaleFactors(factors, scaled + 3 * stride, a.Scales + (token + 3) * stride, a.Offsets + (token + 3) * stride, stride);
-        var v0 = a.Values + (long)token * cols;
-        var mask = Vector256.Create((byte)0x03);
-        var a0 = Vector256<float>.Zero;
-        var a1 = Vector256<float>.Zero;
-        var a2 = Vector256<float>.Zero;
-        var a3 = Vector256<float>.Zero;
-        for (var g = 0; g < groups; g++)
-        {
-            var offset = g * Cq.GroupSize;
-            var v = Avx.LoadVector256(packed + g * 32).AsUInt16();
-            var p0 = Avx2.Shuffle(table, Avx2.And(v.AsByte(), mask));
-            var p1 = Avx2.Shuffle(table, Avx2.And(Avx2.ShiftRightLogical(v, 2).AsByte(), mask));
-            var p2 = Avx2.Shuffle(table, Avx2.And(Avx2.ShiftRightLogical(v, 4).AsByte(), mask));
-            var p3 = Avx2.Shuffle(table, Avx2.And(Avx2.ShiftRightLogical(v, 6).AsByte(), mask));
-            a0 = Fma.MultiplyAdd(Avx.ConvertToVector256Single(Planes4Dot(p0, p1, p2, p3, v0 + offset)), Vector256.Create(scaled[g]), a0);
-            a1 = Fma.MultiplyAdd(Avx.ConvertToVector256Single(Planes4Dot(p0, p1, p2, p3, v0 + cols + offset)), Vector256.Create(scaled[stride + g]), a1);
-            a2 = Fma.MultiplyAdd(Avx.ConvertToVector256Single(Planes4Dot(p0, p1, p2, p3, v0 + 2 * cols + offset)), Vector256.Create(scaled[2 * stride + g]), a2);
-            a3 = Fma.MultiplyAdd(Avx.ConvertToVector256Single(Planes4Dot(p0, p1, p2, p3, v0 + 3 * cols + offset)), Vector256.Create(scaled[3 * stride + g]), a3);
-        }
-        y[0] = Vector256.Sum(Avx.Subtract(a0, bias0));
-        y[ldy] = Vector256.Sum(Avx.Subtract(a1, bias1));
-        y[2 * ldy] = Vector256.Sum(Avx.Subtract(a2, bias2));
-        y[3 * ldy] = Vector256.Sum(Avx.Subtract(a3, bias3));
-    }
-#endif
-
-#if NEEDLE_SIMD
-    static void DotTile4(byte* packed, Vector256<byte> table, float* factors, float* scaled, in Activations a, int token, float* y, int ldy)
-    {
-        var groups = a.Groups;
-        var stride = a.Stride;
-        var cols = a.Cols;
-        var bias0 = ScaleFactors(factors, scaled, a.Scales + token * stride, a.Offsets + token * stride, stride);
-        var bias1 = ScaleFactors(factors, scaled + stride, a.Scales + (token + 1) * stride, a.Offsets + (token + 1) * stride, stride);
-        var bias2 = ScaleFactors(factors, scaled + 2 * stride, a.Scales + (token + 2) * stride, a.Offsets + (token + 2) * stride, stride);
-        var bias3 = ScaleFactors(factors, scaled + 3 * stride, a.Scales + (token + 3) * stride, a.Offsets + (token + 3) * stride, stride);
-        var v0 = a.Values + (long)token * cols;
-        var mask = Vector256.Create((byte)0x0F);
-        var a0 = Vector256<float>.Zero;
-        var a1 = Vector256<float>.Zero;
-        var a2 = Vector256<float>.Zero;
-        var a3 = Vector256<float>.Zero;
-        for (var g = 0; g < groups; g++)
-        {
-            var offset = g * Cq.GroupSize;
-            var lo = Avx.LoadVector256(packed + g * 64).AsUInt16();
-            var hi = Avx.LoadVector256(packed + g * 64 + 32).AsUInt16();
-            var p0 = Avx2.Shuffle(table, Avx2.And(lo.AsByte(), mask));
-            var p1 = Avx2.Shuffle(table, Avx2.And(Avx2.ShiftRightLogical(lo, 4).AsByte(), mask));
-            var p2 = Avx2.Shuffle(table, Avx2.And(hi.AsByte(), mask));
-            var p3 = Avx2.Shuffle(table, Avx2.And(Avx2.ShiftRightLogical(hi, 4).AsByte(), mask));
-            a0 = Fma.MultiplyAdd(Avx.ConvertToVector256Single(Planes4Dot(p0, p1, p2, p3, v0 + offset)), Vector256.Create(scaled[g]), a0);
-            a1 = Fma.MultiplyAdd(Avx.ConvertToVector256Single(Planes4Dot(p0, p1, p2, p3, v0 + cols + offset)), Vector256.Create(scaled[stride + g]), a1);
-            a2 = Fma.MultiplyAdd(Avx.ConvertToVector256Single(Planes4Dot(p0, p1, p2, p3, v0 + 2 * cols + offset)), Vector256.Create(scaled[2 * stride + g]), a2);
-            a3 = Fma.MultiplyAdd(Avx.ConvertToVector256Single(Planes4Dot(p0, p1, p2, p3, v0 + 3 * cols + offset)), Vector256.Create(scaled[3 * stride + g]), a3);
-        }
-        y[0] = Vector256.Sum(Avx.Subtract(a0, bias0));
-        y[ldy] = Vector256.Sum(Avx.Subtract(a1, bias1));
-        y[2 * ldy] = Vector256.Sum(Avx.Subtract(a2, bias2));
-        y[3 * ldy] = Vector256.Sum(Avx.Subtract(a3, bias3));
-    }
-#endif
-
-#if NEEDLE_SIMD
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    static Vector256<int> Planes4Dot(Vector256<byte> p0, Vector256<byte> p1, Vector256<byte> p2, Vector256<byte> p3, sbyte* values)
-    {
-        var sum = Accumulate(Vector256<int>.Zero, p0, Avx.LoadVector256(values));
-        sum = Accumulate(sum, p1, Avx.LoadVector256(values + 32));
-        sum = Accumulate(sum, p2, Avx.LoadVector256(values + 64));
-        return Accumulate(sum, p3, Avx.LoadVector256(values + 96));
-    }
-#endif
 }
 
 internal unsafe struct MatMulJob
