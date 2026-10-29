@@ -187,11 +187,19 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
 
     internal float ConfidenceLogit(float* pooledOut)
     {
+        var scratch = (float*)Mem.AllocZeroed((nuint)((g.Layers + 1) * model.Confidence->Probes * (dim + 1)) * 4);
+        var logit = ConfidenceLogit(pooledOut, scratch);
+        Mem.Free(scratch);
+        return logit;
+    }
+
+    internal float ConfidenceLogit(float* pooledOut, float* scratchRows)
+    {
         var head = model.Confidence;
         var probes = head->Probes;
         var rows = (g.Layers + 1) * probes;
-        var vectors = (float*)Mem.AllocZeroed((nuint)(rows * dim * 4));
-        var weights = (float*)Mem.Alloc((nuint)rows * 4);
+        var vectors = scratchRows;
+        var weights = scratchRows + (long)rows * dim;
         var inverseRoot = 1f / MathF.Sqrt(dim);
         for (var i = 0; i < rows; i++)
         {
@@ -211,8 +219,6 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
             for (var i = 0; i < rows; i++) Ops.AddScaled(pooled, vectors + (long)i * dim, weights[i], dim);
         }
         logit += Ops.Dot(pooledOut, head->Projection, head->Queries * dim);
-        Mem.Free(vectors);
-        Mem.Free(weights);
         return logit;
     }
 
