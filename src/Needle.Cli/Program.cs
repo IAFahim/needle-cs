@@ -10,6 +10,7 @@ return args switch
 {
     ["verify", var model, var golden] => Verify(model, golden),
     ["bench", var model] => Bench(model),
+    ["bench-kernels", var model, .. var options] => Needle.Cli.BenchKernels.Run(model, options),
     ["generate", var model, var text, .. var count] => Generate(model, text, count.Length > 0 ? int.Parse(count[0]) : 80),
     ["transcribe", var model, var wav, .. var options] => Transcribe(model, wav, options),
     ["stream", var model, var wav] => StreamClip(model, wav),

@@ -279,7 +279,7 @@ internal static unsafe class Quant
 
 #if NEEDLE_SIMD
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    static Vector256<int> Accumulate(Vector256<int> sum, Vector256<byte> weights, Vector256<sbyte> activations) =>
+    internal static Vector256<int> Accumulate(Vector256<int> sum, Vector256<byte> weights, Vector256<sbyte> activations) =>
         AvxVnni.IsSupported
             ? AvxVnni.MultiplyWideningAndAdd(sum, weights, activations)
             : Avx2.Add(sum, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(weights, activations), Vector256.Create((short)1)));
@@ -318,6 +318,9 @@ internal static unsafe class Quant
 #endif
         if (!Simd.Enabled) { Scalar.MatMulRows(w, a, tokens, y, ldy, rowStart, rowEnd); return; }
 #if NEEDLE_SIMD
+        var tiledTokens = tokens & ~(TokenTile - 1);
+        for (var t = tiledTokens; t < tokens; t++) Gemv.Rows(w, a, t, y + (long)t * ldy, rowStart, rowEnd);
+        if (tiledTokens == 0) return;
         var factors = stackalloc float[a.Stride];
         var scaled = stackalloc float[a.Stride * TokenTile];
         var groups = w.Groups;
@@ -327,7 +330,7 @@ internal static unsafe class Quant
         var two = w.Bits == 2;
         if ((rowEnd - rowStart) * TokenTile <= tokens)
         {
-            for (var t = 0; t + TokenTile <= tokens; t += TokenTile)
+            for (var t = 0; t < tiledTokens; t += TokenTile)
                 for (var n = rowStart; n < rowEnd; n++)
                 {
                     LoadFactors(w.Norms + (long)n * groups, groups, byteScale, factors);
@@ -335,25 +338,15 @@ internal static unsafe class Quant
                     if (two) DotTile2(packed, table, factors, scaled, a, t, y + (long)t * ldy + n, ldy);
                     else DotTile4(packed, table, factors, scaled, a, t, y + (long)t * ldy + n, ldy);
                 }
-            for (var t = tokens & ~(TokenTile - 1); t < tokens; t++)
-                for (var n = rowStart; n < rowEnd; n++)
-                {
-                    LoadFactors(w.Norms + (long)n * groups, groups, byteScale, factors);
-                    var packed = w.Indices + (long)n * rowBytes;
-                    y[(long)t * ldy + n] = two ? DotRow2(packed, table, factors, scaled, a, t) : DotRow4(packed, table, factors, scaled, a, t);
-                }
             return;
         }
         for (var n = rowStart; n < rowEnd; n++)
         {
             LoadFactors(w.Norms + (long)n * groups, groups, byteScale, factors);
             var packed = w.Indices + (long)n * rowBytes;
-            var t = 0;
-            for (; t + TokenTile <= tokens; t += TokenTile)
+            for (var t = 0; t < tiledTokens; t += TokenTile)
                 if (two) DotTile2(packed, table, factors, scaled, a, t, y + (long)t * ldy + n, ldy);
                 else DotTile4(packed, table, factors, scaled, a, t, y + (long)t * ldy + n, ldy);
-            for (; t < tokens; t++)
-                y[(long)t * ldy + n] = two ? DotRow2(packed, table, factors, scaled, a, t) : DotRow4(packed, table, factors, scaled, a, t);
         }
 #endif
     }
@@ -370,59 +363,6 @@ internal static unsafe class Quant
             bias = Fma.MultiplyAdd(f, Avx.LoadVector256(offsets + v), bias);
         }
         return bias;
-    }
-#endif
-
-#if NEEDLE_SIMD
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    static Vector256<int> Dot2(byte* packed, Vector256<byte> table, Vector256<byte> mask, sbyte* values)
-    {
-        var v = Avx.LoadVector256(packed).AsUInt16();
-        var sum = Accumulate(Vector256<int>.Zero, Avx2.Shuffle(table, Avx2.And(v.AsByte(), mask)), Avx.LoadVector256(values));
-        sum = Accumulate(sum, Avx2.Shuffle(table, Avx2.And(Avx2.ShiftRightLogical(v, 2).AsByte(), mask)), Avx.LoadVector256(values + 32));
-        sum = Accumulate(sum, Avx2.Shuffle(table, Avx2.And(Avx2.ShiftRightLogical(v, 4).AsByte(), mask)), Avx.LoadVector256(values + 64));
-        return Accumulate(sum, Avx2.Shuffle(table, Avx2.And(Avx2.ShiftRightLogical(v, 6).AsByte(), mask)), Avx.LoadVector256(values + 96));
-    }
-#endif
-
-#if NEEDLE_SIMD
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    static Vector256<int> Dot4(byte* packed, Vector256<byte> table, Vector256<byte> mask, sbyte* values)
-    {
-        var lo = Avx.LoadVector256(packed).AsUInt16();
-        var hi = Avx.LoadVector256(packed + 32).AsUInt16();
-        var sum = Accumulate(Vector256<int>.Zero, Avx2.Shuffle(table, Avx2.And(lo.AsByte(), mask)), Avx.LoadVector256(values));
-        sum = Accumulate(sum, Avx2.Shuffle(table, Avx2.And(Avx2.ShiftRightLogical(lo, 4).AsByte(), mask)), Avx.LoadVector256(values + 32));
-        sum = Accumulate(sum, Avx2.Shuffle(table, Avx2.And(hi.AsByte(), mask)), Avx.LoadVector256(values + 64));
-        return Accumulate(sum, Avx2.Shuffle(table, Avx2.And(Avx2.ShiftRightLogical(hi, 4).AsByte(), mask)), Avx.LoadVector256(values + 96));
-    }
-#endif
-
-#if NEEDLE_SIMD
-    static float DotRow2(byte* packed, Vector256<byte> table, float* factors, float* scaled, in Activations a, int token)
-    {
-        var groups = a.Groups;
-        var bias = ScaleFactors(factors, scaled, a.Scales + token * a.Stride, a.Offsets + token * a.Stride, a.Stride);
-        var values = a.Values + (long)token * a.Cols;
-        var mask = Vector256.Create((byte)0x03);
-        var accumulator = Vector256<float>.Zero;
-        for (var g = 0; g < groups; g++)
-            accumulator = Fma.MultiplyAdd(Avx.ConvertToVector256Single(Dot2(packed + g * 32, table, mask, values + g * Cq.GroupSize)), Vector256.Create(scaled[g]), accumulator);
-        return Vector256.Sum(Avx.Subtract(accumulator, bias));
-    }
-#endif
-
-#if NEEDLE_SIMD
-    static float DotRow4(byte* packed, Vector256<byte> table, float* factors, float* scaled, in Activations a, int token)
-    {
-        var groups = a.Groups;
-        var bias = ScaleFactors(factors, scaled, a.Scales + token * a.Stride, a.Offsets + token * a.Stride, a.Stride);
-        var values = a.Values + (long)token * a.Cols;
-        var mask = Vector256.Create((byte)0x0F);
-        var accumulator = Vector256<float>.Zero;
-        for (var g = 0; g < groups; g++)
-            accumulator = Fma.MultiplyAdd(Avx.ConvertToVector256Single(Dot4(packed + g * 64, table, mask, values + g * Cq.GroupSize)), Vector256.Create(scaled[g]), accumulator);
-        return Vector256.Sum(Avx.Subtract(accumulator, bias));
     }
 #endif
 
