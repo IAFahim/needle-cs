@@ -81,3 +81,11 @@ dotnet publish src/Needle.Cli -c Release
 # Build Unity netstandard2.1 DLL
 dotnet build src/Needle -f netstandard2.1 -c Release
 ```
+
+## Licensing and model files
+
+- **This repository's code license is pending.** The owner has not yet chosen one, so there is no `LICENSE` file. See [CONTRIBUTING.md](CONTRIBUTING.md).
+- **Model weights are not in this repository.** `needle3.cact` and `whistle.cact` come from the [Needle 3](https://huggingface.co/Cactus-Compute/needle3) and [Whistle](https://huggingface.co/Cactus-Compute/whistle) Hugging Face repositories, whose model cards declare `license: apache-2.0`. `tools/fetch.sh` downloads them into `ref/`, which is git-ignored.
+- **Game builds that ship the weights** must comply with the Apache License 2.0 for those files: include its license text and keep the attribution notices. Credits are in [NOTICE](NOTICE).
+- **The upstream wheel and `libneedle3.so`** that `tools/fetch.sh` downloads are for local benchmarking only. Never commit or ship them.
+- **Clean-room:** no code from [`cactus-compute/cactus`](https://github.com/cactus-compute/cactus), which has a custom non-Apache license, may be used here. Details are in [CONTRIBUTING.md](CONTRIBUTING.md).
