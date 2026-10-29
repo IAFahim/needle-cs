@@ -96,6 +96,7 @@ internal static unsafe class Scalar
     {
         var magnitude = half & 0x7FFF;
         if (magnitude == 0) return 0f;
+        if (magnitude < 0x0400) return (half & 0x8000) != 0 ? -magnitude * 5.9604645e-8f : magnitude * 5.9604645e-8f;
         var bits = ((uint)magnitude << 13) + 0x38000000u | (uint)(half & 0x8000) << 16;
         return *(float*)&bits;
     }

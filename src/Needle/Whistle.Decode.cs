@@ -118,28 +118,9 @@ public sealed unsafe partial class Whistle
         BuildCrossMemory();
         pass.EncodeMs = (Stopwatch.GetTimestamp() - started) * 1000.0 / Stopwatch.Frequency;
 
-        decoder.Reset();
-        decoder.Alignment = null;
-        if (align)
-        {
-            Mem.Clear(alignment, (nuint)g.MaxSeq * (nuint)maxFrames * 4);
-            decoder.Alignment = alignment;
-            decoder.AlignmentFromLayer = g.Layers / 2;
-        }
+        Prime(language, align, pass);
         var one = stackalloc int[1];
-        one[0] = Bos;
-        decoder.Feed(new ReadOnlySpan<int>(one, 1));
         var logits = decoder.Logits;
-        int tag;
-        if (language != null) tag = textVocab + Array.IndexOf(languages, language);
-        else
-        {
-            tag = textVocab;
-            for (var i = 1; i < languages.Length; i++) if (logits[textVocab + i] > logits[tag]) tag = textVocab + i;
-        }
-        pass.Language = languages[tag - textVocab];
-        one[0] = tag;
-        decoder.Feed(new ReadOnlySpan<int>(one, 1));
 
         var firstToken = Stopwatch.GetTimestamp();
         var decodeStart = firstToken;
@@ -176,6 +157,34 @@ public sealed unsafe partial class Whistle
         pass.Tps = steps / seconds;
         BuildText(pass, align);
         return pass;
+    }
+
+    void Prime(string? language, bool align, Pass pass)
+    {
+        decoder.Reset();
+        decoder.Alignment = null;
+        if (align)
+        {
+            Mem.Clear(alignment, (nuint)g.MaxSeq * (nuint)maxFrames * 4);
+            decoder.Alignment = alignment;
+            decoder.AlignmentFromLayer = g.Layers / 2;
+        }
+        var one = stackalloc int[1];
+        one[0] = Bos;
+        decoder.Feed(new ReadOnlySpan<int>(one, 1));
+        var logits = decoder.Logits;
+        Observer?.Invoke("logits_bos", logits);
+        int tag;
+        if (language != null) tag = textVocab + Array.IndexOf(languages, language);
+        else
+        {
+            tag = textVocab;
+            for (var i = 1; i < languages.Length; i++) if (logits[textVocab + i] > logits[tag]) tag = textVocab + i;
+        }
+        pass.Language = languages[tag - textVocab];
+        one[0] = tag;
+        decoder.Feed(new ReadOnlySpan<int>(one, 1));
+        Observer?.Invoke("logits_tag", decoder.Logits);
     }
 
     string WordSoFar(List<int> generated)
