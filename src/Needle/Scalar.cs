@@ -10,7 +10,15 @@ internal static class Simd
 #if NEEDLE_SIMD
     static bool forceScalar;
 
-    public static bool Enabled => !forceScalar && Avx2.IsSupported && Fma.IsSupported && Sse41.IsSupported;
+    public static bool Avx => Avx2.IsSupported && Fma.IsSupported && Sse41.IsSupported;
+
+    public static bool Neon => System.Runtime.Intrinsics.Arm.AdvSimd.IsSupported;
+
+    public static bool Enabled => !forceScalar && (Avx || Neon);
+
+    public static bool UseAvx => !forceScalar && Avx;
+
+    public static bool UseNeon => !forceScalar && Neon;
 
 #pragma warning disable CA2255
     [System.Runtime.CompilerServices.ModuleInitializer]

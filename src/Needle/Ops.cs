@@ -44,6 +44,9 @@ internal static unsafe class Ops
 
     public static void Silu(float* x, int n)
     {
+        #if NEEDLE_SIMD
+        if (Simd.UseNeon) { Neon.Silu(x, n); return; }
+#endif
         if (!Simd.Enabled) { Scalar.Silu(x, n); return; }
 #if NEEDLE_SIMD
         for (var i = 0; i < n; i += 8)
@@ -56,6 +59,9 @@ internal static unsafe class Ops
 
     public static void MultiplyBySigmoid(float* x, float* gate, int n)
     {
+        #if NEEDLE_SIMD
+        if (Simd.UseNeon) { Neon.MultiplyBySigmoid(x, gate, n); return; }
+#endif
         if (!Simd.Enabled) { Scalar.MultiplyBySigmoid(x, gate, n); return; }
 #if NEEDLE_SIMD
         for (var i = 0; i < n; i += 8)
@@ -65,6 +71,9 @@ internal static unsafe class Ops
 
     public static float SumOfSquares(float* x, int n)
     {
+        #if NEEDLE_SIMD
+        if (Simd.UseNeon) { return Neon.SumOfSquares(x, n); }
+#endif
         if (!Simd.Enabled) return Scalar.SumOfSquares(x, n);
 #if NEEDLE_SIMD
         var s0 = Vector256<float>.Zero;
@@ -82,6 +91,9 @@ internal static unsafe class Ops
 
     public static float Dot(float* a, float* b, int n)
     {
+        #if NEEDLE_SIMD
+        if (Simd.UseNeon) { return Neon.Dot(a, b, n); }
+#endif
         if (!Simd.Enabled) return Scalar.Dot(a, b, n);
 #if NEEDLE_SIMD
         var s0 = Vector256<float>.Zero;
@@ -99,6 +111,9 @@ internal static unsafe class Ops
 
     public static void RmsUnit(float* x, int n, float* destination)
     {
+#if NEEDLE_SIMD
+        if (Simd.UseNeon) { Neon.RmsUnit(x, n, destination); return; }
+#endif
         if (!Simd.Enabled) { var scalarInverse = InverseRms(x, n); for (var i = 0; i < n; i++) destination[i] = x[i] * scalarInverse; return; }
 #if NEEDLE_SIMD
         var inverse = Vector256.Create(InverseRms(x, n));
@@ -108,6 +123,9 @@ internal static unsafe class Ops
 
     public static void ZeroCenteredRms(float* x, float* scale, int n, float* destination)
     {
+#if NEEDLE_SIMD
+        if (Simd.UseNeon) { Neon.ZeroCenteredRms(x, scale, n, destination); return; }
+#endif
         if (!Simd.Enabled) { var scalarInverse = InverseRms(x, n); for (var i = 0; i < n; i++) destination[i] = (1f + scale[i]) * x[i] * scalarInverse; return; }
 #if NEEDLE_SIMD
         var inverse = Vector256.Create(InverseRms(x, n));
@@ -119,6 +137,9 @@ internal static unsafe class Ops
 
     public static void Softmax(float* s, int n)
     {
+        #if NEEDLE_SIMD
+        if (Simd.UseNeon) { Neon.Softmax(s, n); return; }
+#endif
         if (!Simd.Enabled) { Scalar.Softmax(s, n); return; }
 #if NEEDLE_SIMD
         var peak = float.NegativeInfinity;
@@ -147,6 +168,9 @@ internal static unsafe class Ops
 
     public static void Rope(float* x, int heads, int headDim, float* cos, float* sin)
     {
+        #if NEEDLE_SIMD
+        if (Simd.UseNeon) { Neon.Rope(x, heads, headDim, cos, sin); return; }
+#endif
         if (!Simd.Enabled) { Scalar.Rope(x, heads, headDim, cos, sin); return; }
 #if NEEDLE_SIMD
         var half = headDim / 2;
@@ -169,6 +193,9 @@ internal static unsafe class Ops
 
     public static void Mix4(float* s, int dim, float w0, float w1, float w2, float w3, float* destination)
     {
+        #if NEEDLE_SIMD
+        if (Simd.UseNeon) { Neon.Mix4(s, dim, w0, w1, w2, w3, destination); return; }
+#endif
         if (!Simd.Enabled) { Scalar.Mix4(s, dim, w0, w1, w2, w3, destination); return; }
 #if NEEDLE_SIMD
         var v0 = Vector256.Create(w0);
@@ -188,6 +215,9 @@ internal static unsafe class Ops
 
     public static void Combine4(float* s, int dim, float w0, float w1, float w2, float w3, float* y, float post, float* destination)
     {
+        #if NEEDLE_SIMD
+        if (Simd.UseNeon) { Neon.Combine4(s, dim, w0, w1, w2, w3, y, post, destination); return; }
+#endif
         if (!Simd.Enabled) { Scalar.Combine4(s, dim, w0, w1, w2, w3, y, post, destination); return; }
 #if NEEDLE_SIMD
         var v0 = Vector256.Create(w0);
@@ -209,6 +239,9 @@ internal static unsafe class Ops
 
     public static void Subtract(float* a, float* b, int n, float* destination)
     {
+        #if NEEDLE_SIMD
+        if (Simd.UseNeon) { Neon.Subtract(a, b, n, destination); return; }
+#endif
         if (!Simd.Enabled) { Scalar.Subtract(a, b, n, destination); return; }
 #if NEEDLE_SIMD
         for (var i = 0; i < n; i += 8) Avx.Store(destination + i, Avx.Subtract(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
@@ -217,6 +250,9 @@ internal static unsafe class Ops
 
     public static void MultiplyAccumulate(float* destination, float* a, float* b, int n)
     {
+        #if NEEDLE_SIMD
+        if (Simd.UseNeon) { Neon.MultiplyAccumulate(destination, a, b, n); return; }
+#endif
         if (!Simd.Enabled) { Scalar.MultiplyAccumulate(destination, a, b, n); return; }
 #if NEEDLE_SIMD
         for (var i = 0; i < n; i += 8)
@@ -226,6 +262,9 @@ internal static unsafe class Ops
 
     public static void ScaleAdd(float* destination, float scale, float* x, float xScale, int n)
     {
+        #if NEEDLE_SIMD
+        if (Simd.UseNeon) { Neon.ScaleAdd(destination, scale, x, xScale, n); return; }
+#endif
         if (!Simd.Enabled) { Scalar.ScaleAdd(destination, scale, x, xScale, n); return; }
 #if NEEDLE_SIMD
         var s = Vector256.Create(scale);
@@ -236,6 +275,9 @@ internal static unsafe class Ops
 
     public static void AddScaled(float* destination, float* x, float scale, int n)
     {
+        #if NEEDLE_SIMD
+        if (Simd.UseNeon) { Neon.AddScaled(destination, x, scale, n); return; }
+#endif
         if (!Simd.Enabled) { Scalar.AddScaled(destination, x, scale, n); return; }
 #if NEEDLE_SIMD
         var s = Vector256.Create(scale);
@@ -250,6 +292,9 @@ internal static unsafe class Ops
 
     public static void Glu(float* value, float* gate, float* destination, int n)
     {
+        #if NEEDLE_SIMD
+        if (Simd.UseNeon) { Neon.Glu(value, gate, destination, n); return; }
+#endif
         if (!Simd.Enabled) { Scalar.Glu(value, gate, destination, n); return; }
 #if NEEDLE_SIMD
         for (var i = 0; i < n; i += 8)
@@ -259,6 +304,9 @@ internal static unsafe class Ops
 
     public static void Taps3(float* taps, int width, float* current, float* destination)
     {
+        #if NEEDLE_SIMD
+        if (Simd.UseNeon) { Neon.Taps3(taps, width, current, destination); return; }
+#endif
         if (!Simd.Enabled) { Scalar.Taps3(taps, width, current, destination); return; }
 #if NEEDLE_SIMD
         for (var c = 0; c < width; c += 8)

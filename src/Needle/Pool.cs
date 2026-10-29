@@ -23,6 +23,7 @@ internal sealed unsafe class Pool : IDisposable
 
     readonly Control* control;
     readonly Thread[] workers;
+    readonly int[] cores;
     readonly SemaphoreSlim wake = new(0);
 
     public int Threads => workers.Length + 1;
@@ -31,10 +32,13 @@ internal sealed unsafe class Pool : IDisposable
     {
         control = (Control*)Mem.AlignedAlloc((nuint)sizeof(Control), CacheLine);
         Mem.Clear(control, (nuint)sizeof(Control));
+        cores = Libc.FastCores(threads);
+        if (cores.Length > 0) Libc.PinToCpu(cores[0]);
         workers = new Thread[Math.Max(0, threads - 1)];
         for (var i = 0; i < workers.Length; i++)
         {
-            workers[i] = new Thread(Work) { IsBackground = true, Name = $"needle-{i}" };
+            var slot = i + 1;
+            workers[i] = new Thread(() => Work(slot)) { IsBackground = true, Name = $"needle-{i}" };
             workers[i].Start();
         }
     }
@@ -79,8 +83,9 @@ internal sealed unsafe class Pool : IDisposable
         }
     }
 
-    void Work()
+    void Work(int slot)
     {
+        if (cores.Length > 0) Libc.PinToCpu(cores[slot % cores.Length]);
         var idle = 0;
         while (Volatile.Read(ref control->Stopping) == 0)
         {

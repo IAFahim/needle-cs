@@ -96,12 +96,12 @@ public sealed class ParityTests : IDisposable
         var ids = MemoryMarshal.Cast<byte, int>(File.ReadAllBytes(Path.Combine(Assets.Golden, "case0/ids.bin"))).ToArray();
         var expected = double.Parse(File.ReadAllText(Path.Combine(Assets.Golden, "case0/confidence.txt")), System.Globalization.CultureInfo.InvariantCulture);
         var reference = MemoryMarshal.Cast<byte, float>(File.ReadAllBytes(Path.Combine(Assets.Golden, "case0/pooled.bin"))).ToArray();
+        float* pooled = stackalloc float[3072];
         foreach (var chunk in new[] { 64, 9 })
         {
             using var engine = new Engine(model, 512, chunk, 4);
             engine.Pooling = true;
             engine.Feed(ids);
-            var pooled = stackalloc float[3072];
             var logit = engine.ConfidenceLogit(pooled);
             var cosine = Cosine(new ReadOnlySpan<float>(pooled, 3072).ToArray(), reference);
             Assert.True(cosine > 0.9995, $"chunk {chunk}: cosine {cosine} logit {logit} expected {expected}");

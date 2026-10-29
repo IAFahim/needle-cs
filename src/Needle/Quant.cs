@@ -47,6 +47,9 @@ internal static unsafe class Quant
 
     public static float AbsMax(float* x, int n)
     {
+        #if NEEDLE_SIMD
+        if (Simd.UseNeon) { return Neon.AbsMax(x, n); }
+#endif
         if (!Simd.Enabled) return Scalar.AbsMax(x, n);
 #if NEEDLE_SIMD
         var peak = Vector256<float>.Zero;
@@ -67,6 +70,9 @@ internal static unsafe class Quant
 
     public static void RoundTrip(float* x, int n, float inverse, float scale)
     {
+        #if NEEDLE_SIMD
+        if (Simd.UseNeon) { Neon.RoundTrip(x, n, inverse, scale); return; }
+#endif
         if (!Simd.Enabled) { Scalar.RoundTrip(x, n, inverse, scale); return; }
 #if NEEDLE_SIMD
         var inv = Vector256.Create(inverse);
@@ -83,6 +89,9 @@ internal static unsafe class Quant
 
     public static float QuantizeInt8(float* x, int n, sbyte* destination)
     {
+        #if NEEDLE_SIMD
+        if (Simd.UseNeon) { return Neon.QuantizeInt8(x, n, destination); }
+#endif
         if (!Simd.Enabled) return Scalar.QuantizeInt8(x, n, destination);
 #if NEEDLE_SIMD
         var peak = AbsMax(x, n);
@@ -102,6 +111,9 @@ internal static unsafe class Quant
 
     public static void Hadamard(float* source, float* p)
     {
+        #if NEEDLE_SIMD
+        if (Simd.UseNeon) { Neon.Hadamard(source, p); return; }
+#endif
         if (!Simd.Enabled) { Scalar.Hadamard(source, p); return; }
 #if NEEDLE_SIMD
         for (var i = 0; i < 64; i += 8)
@@ -137,6 +149,9 @@ internal static unsafe class Quant
 
     public static void Prepare(float* x, int tokens, int cols, int bits, in Activations a)
     {
+        #if NEEDLE_SIMD
+        if (Simd.UseNeon) { Neon.Prepare(x, tokens, cols, bits, a); return; }
+#endif
         var rotated = stackalloc float[Cq.GroupSize];
         var quantized = stackalloc sbyte[Cq.GroupSize];
 #if NEEDLE_SIMD
@@ -205,6 +220,9 @@ internal static unsafe class Quant
 
     public static void DecodeRow(in Cq w, int row, float* destination)
     {
+        #if NEEDLE_SIMD
+        if (Simd.UseNeon) { Neon.DecodeRow(w, row, destination); return; }
+#endif
         if (!Simd.Enabled) { Scalar.DecodeRow(w, row, destination); return; }
 #if NEEDLE_SIMD
         var indices = w.Indices + (long)row * w.RowBytes;
@@ -295,6 +313,9 @@ internal static unsafe class Quant
 
     public static void MatMulRows(in Cq w, in Activations a, int tokens, float* y, int ldy, int rowStart, int rowEnd)
     {
+        #if NEEDLE_SIMD
+        if (Simd.UseNeon) { Neon.MatMulRows(w, a, tokens, y, ldy, rowStart, rowEnd); return; }
+#endif
         if (!Simd.Enabled) { Scalar.MatMulRows(w, a, tokens, y, ldy, rowStart, rowEnd); return; }
 #if NEEDLE_SIMD
         var factors = stackalloc float[a.Stride];
@@ -304,22 +325,36 @@ internal static unsafe class Quant
         var table = Avx.LoadVector256(w.Book->Bytes);
         var byteScale = w.Book->ByteScale;
         var two = w.Bits == 2;
-        var t = 0;
-        for (; t + TokenTile <= tokens; t += TokenTile)
-            for (var n = rowStart; n < rowEnd; n++)
-            {
-                LoadFactors(w.Norms + (long)n * groups, groups, byteScale, factors);
-                var packed = w.Indices + (long)n * rowBytes;
+        if ((rowEnd - rowStart) * TokenTile <= tokens)
+        {
+            for (var t = 0; t + TokenTile <= tokens; t += TokenTile)
+                for (var n = rowStart; n < rowEnd; n++)
+                {
+                    LoadFactors(w.Norms + (long)n * groups, groups, byteScale, factors);
+                    var packed = w.Indices + (long)n * rowBytes;
+                    if (two) DotTile2(packed, table, factors, scaled, a, t, y + (long)t * ldy + n, ldy);
+                    else DotTile4(packed, table, factors, scaled, a, t, y + (long)t * ldy + n, ldy);
+                }
+            for (var t = tokens & ~(TokenTile - 1); t < tokens; t++)
+                for (var n = rowStart; n < rowEnd; n++)
+                {
+                    LoadFactors(w.Norms + (long)n * groups, groups, byteScale, factors);
+                    var packed = w.Indices + (long)n * rowBytes;
+                    y[(long)t * ldy + n] = two ? DotRow2(packed, table, factors, scaled, a, t) : DotRow4(packed, table, factors, scaled, a, t);
+                }
+            return;
+        }
+        for (var n = rowStart; n < rowEnd; n++)
+        {
+            LoadFactors(w.Norms + (long)n * groups, groups, byteScale, factors);
+            var packed = w.Indices + (long)n * rowBytes;
+            var t = 0;
+            for (; t + TokenTile <= tokens; t += TokenTile)
                 if (two) DotTile2(packed, table, factors, scaled, a, t, y + (long)t * ldy + n, ldy);
                 else DotTile4(packed, table, factors, scaled, a, t, y + (long)t * ldy + n, ldy);
-            }
-        for (; t < tokens; t++)
-            for (var n = rowStart; n < rowEnd; n++)
-            {
-                LoadFactors(w.Norms + (long)n * groups, groups, byteScale, factors);
-                var packed = w.Indices + (long)n * rowBytes;
+            for (; t < tokens; t++)
                 y[(long)t * ldy + n] = two ? DotRow2(packed, table, factors, scaled, a, t) : DotRow4(packed, table, factors, scaled, a, t);
-            }
+        }
 #endif
     }
 

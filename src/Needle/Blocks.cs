@@ -24,6 +24,9 @@ internal static unsafe class Attention
         sbyte* query, float queryScale, sbyte* keys, float* keyScales, sbyte* values, float* valueScales,
         int keyStride, int valueStride, int scaleStride, int first, int last, float* scores, float* output, float* probabilities = null)
     {
+        #if NEEDLE_SIMD
+        if (Simd.UseNeon) { Neon.AttentionHead(query, queryScale, keys, keyScales, values, valueScales, keyStride, valueStride, scaleStride, first, last, scores, output, probabilities); return; }
+#endif
         if (!Simd.Enabled) { Scalar.AttentionHead(query, queryScale, keys, keyScales, values, valueScales, keyStride, valueStride, scaleStride, first, last, scores, output, probabilities); return; }
 #if NEEDLE_SIMD
         var count = last - first + 1;
@@ -153,6 +156,9 @@ internal static unsafe class HadamardMlp
 
     static void Modulate(in MlpWeights w, float* condition, float* a, int width)
     {
+        #if NEEDLE_SIMD
+        if (Simd.UseNeon) { Neon.ModulateActivate(w.D2, condition, a, w.B2, width); return; }
+#endif
         if (!Simd.Enabled) { Scalar.ModulateActivate(w.D2, condition, a, w.B2, width); return; }
 #if NEEDLE_SIMD
         for (var i = 0; i < width; i += 8)
@@ -165,6 +171,9 @@ internal static unsafe class HadamardMlp
 
     static void Condition(float* condV, float* condU, float* input, int dim, int width, float* condition)
     {
+        #if NEEDLE_SIMD
+        if (Simd.UseNeon) { Neon.Condition(condV, condU, input, dim, width, condition); return; }
+#endif
         if (!Simd.Enabled) { Scalar.Condition(condV, condU, input, dim, width, condition); return; }
 #if NEEDLE_SIMD
         var logits = Vector256<float>.Zero;
@@ -183,6 +192,9 @@ internal static unsafe class HadamardMlp
 
     static void Kron(float* z, float* left, float* right, int rows, int cols, float* result)
     {
+        #if NEEDLE_SIMD
+        if (Simd.UseNeon) { Neon.Kron(z, left, right, rows, cols, result); return; }
+#endif
         if (!Simd.Enabled) { Scalar.Kron(z, left, right, rows, cols, result); return; }
 #if NEEDLE_SIMD
         var scratch = stackalloc float[rows * cols];
