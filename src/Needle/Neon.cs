@@ -688,54 +688,217 @@ internal static unsafe class Neon
         }
     }
 
-    public static void ModulateActivate(float* d2, float* condition, float* a, float* b2, int width)
+    public static void ConditionWeights(float* condV, float* input, int dim, float* weights)
+    {
+        var even0 = Vector128<float>.Zero;
+        var even1 = Vector128<float>.Zero;
+        var odd0 = Vector128<float>.Zero;
+        var odd1 = Vector128<float>.Zero;
+        for (var i = 0; i < dim; i += 2)
+        {
+            var first = Vector128.Create(input[i]);
+            var second = Vector128.Create(input[i + 1]);
+            even0 = AdvSimd.FusedMultiplyAdd(even0, first, AdvSimd.LoadVector128(condV + i * 8));
+            even1 = AdvSimd.FusedMultiplyAdd(even1, first, AdvSimd.LoadVector128(condV + i * 8 + 4));
+            odd0 = AdvSimd.FusedMultiplyAdd(odd0, second, AdvSimd.LoadVector128(condV + i * 8 + 8));
+            odd1 = AdvSimd.FusedMultiplyAdd(odd1, second, AdvSimd.LoadVector128(condV + i * 8 + 12));
+        }
+        AdvSimd.Store(weights, AdvSimd.Add(even0, odd0));
+        AdvSimd.Store(weights + 4, AdvSimd.Add(even1, odd1));
+        Softmax(weights, 8);
+    }
+
+    public static void ScaleInput(float* input, float* d1, int dim, int padded, float* destination)
+    {
+        for (var i = 0; i < dim; i += 4) AdvSimd.Store(destination + i, AdvSimd.Multiply(AdvSimd.LoadVector128(input + i), AdvSimd.LoadVector128(d1 + i)));
+        for (var i = dim; i < padded; i += 4) AdvSimd.Store(destination + i, Vector128<float>.Zero);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    static Vector128<float> Gather(float* source, int* permutation) =>
+        Vector128.Create(source[permutation[0]], source[permutation[1]], source[permutation[2]], source[permutation[3]]);
+
+    public static void PermuteModulateActivate(int* permutation, float* source, float* d2, float* weights, float* condU, float* b2, int width, float* destination)
+    {
+        var w0 = Vector128.Create(weights[0]);
+        var w1 = Vector128.Create(weights[1]);
+        var w2 = Vector128.Create(weights[2]);
+        var w3 = Vector128.Create(weights[3]);
+        var w4 = Vector128.Create(weights[4]);
+        var w5 = Vector128.Create(weights[5]);
+        var w6 = Vector128.Create(weights[6]);
+        var w7 = Vector128.Create(weights[7]);
+        var one = Vector128.Create(1f);
+        for (var i = 0; i < width; i += 4)
+        {
+            var condition = AdvSimd.FusedMultiplyAdd(one, w0, AdvSimd.LoadVector128(condU + i));
+            condition = AdvSimd.FusedMultiplyAdd(condition, w1, AdvSimd.LoadVector128(condU + width + i));
+            condition = AdvSimd.FusedMultiplyAdd(condition, w2, AdvSimd.LoadVector128(condU + 2 * width + i));
+            condition = AdvSimd.FusedMultiplyAdd(condition, w3, AdvSimd.LoadVector128(condU + 3 * width + i));
+            condition = AdvSimd.FusedMultiplyAdd(condition, w4, AdvSimd.LoadVector128(condU + 4 * width + i));
+            condition = AdvSimd.FusedMultiplyAdd(condition, w5, AdvSimd.LoadVector128(condU + 5 * width + i));
+            condition = AdvSimd.FusedMultiplyAdd(condition, w6, AdvSimd.LoadVector128(condU + 6 * width + i));
+            condition = AdvSimd.FusedMultiplyAdd(condition, w7, AdvSimd.LoadVector128(condU + 7 * width + i));
+            var v = AdvSimd.FusedMultiplyAdd(
+                AdvSimd.LoadVector128(b2 + i),
+                AdvSimd.Multiply(AdvSimd.LoadVector128(d2 + i), condition),
+                Gather(source, permutation + i));
+            AdvSimd.Store(destination + i, AdvSimd.Multiply(v, Sigmoid(v)));
+        }
+    }
+
+    public static void PermuteScale(int* permutation, float* source, float* scale, int width, float* destination)
     {
         for (var i = 0; i < width; i += 4)
-            AdvSimd.Store(a + i, AdvSimd.FusedMultiplyAdd(
-                AdvSimd.LoadVector128(b2 + i),
-                AdvSimd.Multiply(AdvSimd.LoadVector128(d2 + i), AdvSimd.LoadVector128(condition + i)),
-                AdvSimd.LoadVector128(a + i)));
+            AdvSimd.Store(destination + i, AdvSimd.Multiply(Gather(source, permutation + i), AdvSimd.LoadVector128(scale + i)));
     }
 
-    public static void Condition(float* condV, float* condU, float* input, int dim, int width, float* condition)
+    public static void AccumulateOutput(float* residual, float* product, float* d4, float scale, int count)
     {
-        var logits0 = Vector128<float>.Zero;
-        var logits1 = Vector128<float>.Zero;
-        for (var i = 0; i < dim; i++)
-        {
-            var broadcast = Vector128.Create(input[i]);
-            logits0 = AdvSimd.FusedMultiplyAdd(logits0, broadcast, AdvSimd.LoadVector128(condV + i * 8));
-            logits1 = AdvSimd.FusedMultiplyAdd(logits1, broadcast, AdvSimd.LoadVector128(condV + i * 8 + 4));
-        }
-        var weights = stackalloc float[8];
-        AdvSimd.Store(weights, logits0);
-        AdvSimd.Store(weights + 4, logits1);
-        Softmax(weights, 8);
-        for (var n = 0; n < width; n += 4)
-        {
-            var acc = Vector128.Create(1f);
-            for (var j = 0; j < 8; j++) acc = AdvSimd.FusedMultiplyAdd(acc, Vector128.Create(weights[j]), AdvSimd.LoadVector128(condU + j * width + n));
-            AdvSimd.Store(condition + n, acc);
-        }
+        var s = Vector128.Create(scale);
+        for (var i = 0; i < count; i += 4)
+            AdvSimd.Store(residual + i, AdvSimd.FusedMultiplyAdd(
+                AdvSimd.LoadVector128(residual + i), s, AdvSimd.Multiply(AdvSimd.LoadVector128(product + i), AdvSimd.LoadVector128(d4 + i))));
     }
 
-    public static void Kron(float* z, float* left, float* right, int rows, int cols, float* result)
+    [SkipLocalsInit]
+    public static void Kron(float* z, int activeRows, float* left, float* right, int rows, int cols, int resultRows, float* result)
     {
-        var scratch = stackalloc float[rows * cols];
-        for (var k = 0; k < rows; k++)
-            for (var c = 0; c < cols; c += 4)
+        var tile = stackalloc float[4 * cols];
+        for (var k = 0; k < resultRows; k += 4)
+        {
+            for (var c = 0; c < cols; c += 16)
             {
-                var acc = Vector128<float>.Zero;
-                for (var i = 0; i < rows; i++) acc = AdvSimd.FusedMultiplyAdd(acc, Vector128.Create(left[i * rows + k]), AdvSimd.LoadVector128(z + i * cols + c));
-                AdvSimd.Store(scratch + k * cols + c, acc);
+                var a00 = Vector128<float>.Zero;
+                var a01 = Vector128<float>.Zero;
+                var a02 = Vector128<float>.Zero;
+                var a03 = Vector128<float>.Zero;
+                var a10 = Vector128<float>.Zero;
+                var a11 = Vector128<float>.Zero;
+                var a12 = Vector128<float>.Zero;
+                var a13 = Vector128<float>.Zero;
+                var a20 = Vector128<float>.Zero;
+                var a21 = Vector128<float>.Zero;
+                var a22 = Vector128<float>.Zero;
+                var a23 = Vector128<float>.Zero;
+                var a30 = Vector128<float>.Zero;
+                var a31 = Vector128<float>.Zero;
+                var a32 = Vector128<float>.Zero;
+                var a33 = Vector128<float>.Zero;
+                var column = z + c;
+                var factor = left + k;
+                for (var i = 0; i < activeRows; i++)
+                {
+                    var z0 = AdvSimd.LoadVector128(column);
+                    var z1 = AdvSimd.LoadVector128(column + 4);
+                    var z2 = AdvSimd.LoadVector128(column + 8);
+                    var z3 = AdvSimd.LoadVector128(column + 12);
+                    var l0 = AdvSimd.LoadAndReplicateToVector128(factor);
+                    a00 = AdvSimd.FusedMultiplyAdd(a00, l0, z0);
+                    a01 = AdvSimd.FusedMultiplyAdd(a01, l0, z1);
+                    a02 = AdvSimd.FusedMultiplyAdd(a02, l0, z2);
+                    a03 = AdvSimd.FusedMultiplyAdd(a03, l0, z3);
+                    var l1 = AdvSimd.LoadAndReplicateToVector128(factor + 1);
+                    a10 = AdvSimd.FusedMultiplyAdd(a10, l1, z0);
+                    a11 = AdvSimd.FusedMultiplyAdd(a11, l1, z1);
+                    a12 = AdvSimd.FusedMultiplyAdd(a12, l1, z2);
+                    a13 = AdvSimd.FusedMultiplyAdd(a13, l1, z3);
+                    var l2 = AdvSimd.LoadAndReplicateToVector128(factor + 2);
+                    a20 = AdvSimd.FusedMultiplyAdd(a20, l2, z0);
+                    a21 = AdvSimd.FusedMultiplyAdd(a21, l2, z1);
+                    a22 = AdvSimd.FusedMultiplyAdd(a22, l2, z2);
+                    a23 = AdvSimd.FusedMultiplyAdd(a23, l2, z3);
+                    var l3 = AdvSimd.LoadAndReplicateToVector128(factor + 3);
+                    a30 = AdvSimd.FusedMultiplyAdd(a30, l3, z0);
+                    a31 = AdvSimd.FusedMultiplyAdd(a31, l3, z1);
+                    a32 = AdvSimd.FusedMultiplyAdd(a32, l3, z2);
+                    a33 = AdvSimd.FusedMultiplyAdd(a33, l3, z3);
+                    column += cols;
+                    factor += rows;
+                }
+                AdvSimd.Store(tile + c, a00);
+                AdvSimd.Store(tile + c + 4, a01);
+                AdvSimd.Store(tile + c + 8, a02);
+                AdvSimd.Store(tile + c + 12, a03);
+                AdvSimd.Store(tile + cols + c, a10);
+                AdvSimd.Store(tile + cols + c + 4, a11);
+                AdvSimd.Store(tile + cols + c + 8, a12);
+                AdvSimd.Store(tile + cols + c + 12, a13);
+                AdvSimd.Store(tile + 2 * cols + c, a20);
+                AdvSimd.Store(tile + 2 * cols + c + 4, a21);
+                AdvSimd.Store(tile + 2 * cols + c + 8, a22);
+                AdvSimd.Store(tile + 2 * cols + c + 12, a23);
+                AdvSimd.Store(tile + 3 * cols + c, a30);
+                AdvSimd.Store(tile + 3 * cols + c + 4, a31);
+                AdvSimd.Store(tile + 3 * cols + c + 8, a32);
+                AdvSimd.Store(tile + 3 * cols + c + 12, a33);
             }
-        for (var k = 0; k < rows; k++)
-            for (var c = 0; c < cols; c += 4)
+            for (var c = 0; c < cols; c += 16)
             {
-                var acc = Vector128<float>.Zero;
-                for (var j = 0; j < cols; j++) acc = AdvSimd.FusedMultiplyAdd(acc, Vector128.Create(scratch[k * cols + j]), AdvSimd.LoadVector128(right + j * cols + c));
-                AdvSimd.Store(result + k * cols + c, acc);
+                var a00 = Vector128<float>.Zero;
+                var a01 = Vector128<float>.Zero;
+                var a02 = Vector128<float>.Zero;
+                var a03 = Vector128<float>.Zero;
+                var a10 = Vector128<float>.Zero;
+                var a11 = Vector128<float>.Zero;
+                var a12 = Vector128<float>.Zero;
+                var a13 = Vector128<float>.Zero;
+                var a20 = Vector128<float>.Zero;
+                var a21 = Vector128<float>.Zero;
+                var a22 = Vector128<float>.Zero;
+                var a23 = Vector128<float>.Zero;
+                var a30 = Vector128<float>.Zero;
+                var a31 = Vector128<float>.Zero;
+                var a32 = Vector128<float>.Zero;
+                var a33 = Vector128<float>.Zero;
+                var row = right + c;
+                for (var j = 0; j < cols; j++)
+                {
+                    var r0 = AdvSimd.LoadVector128(row);
+                    var r1 = AdvSimd.LoadVector128(row + 4);
+                    var r2 = AdvSimd.LoadVector128(row + 8);
+                    var r3 = AdvSimd.LoadVector128(row + 12);
+                    var s0 = AdvSimd.LoadAndReplicateToVector128(tile + j);
+                    a00 = AdvSimd.FusedMultiplyAdd(a00, s0, r0);
+                    a01 = AdvSimd.FusedMultiplyAdd(a01, s0, r1);
+                    a02 = AdvSimd.FusedMultiplyAdd(a02, s0, r2);
+                    a03 = AdvSimd.FusedMultiplyAdd(a03, s0, r3);
+                    var s1 = AdvSimd.LoadAndReplicateToVector128(tile + cols + j);
+                    a10 = AdvSimd.FusedMultiplyAdd(a10, s1, r0);
+                    a11 = AdvSimd.FusedMultiplyAdd(a11, s1, r1);
+                    a12 = AdvSimd.FusedMultiplyAdd(a12, s1, r2);
+                    a13 = AdvSimd.FusedMultiplyAdd(a13, s1, r3);
+                    var s2 = AdvSimd.LoadAndReplicateToVector128(tile + 2 * cols + j);
+                    a20 = AdvSimd.FusedMultiplyAdd(a20, s2, r0);
+                    a21 = AdvSimd.FusedMultiplyAdd(a21, s2, r1);
+                    a22 = AdvSimd.FusedMultiplyAdd(a22, s2, r2);
+                    a23 = AdvSimd.FusedMultiplyAdd(a23, s2, r3);
+                    var s3 = AdvSimd.LoadAndReplicateToVector128(tile + 3 * cols + j);
+                    a30 = AdvSimd.FusedMultiplyAdd(a30, s3, r0);
+                    a31 = AdvSimd.FusedMultiplyAdd(a31, s3, r1);
+                    a32 = AdvSimd.FusedMultiplyAdd(a32, s3, r2);
+                    a33 = AdvSimd.FusedMultiplyAdd(a33, s3, r3);
+                    row += cols;
+                }
+                var output = result + k * cols + c;
+                AdvSimd.Store(output, a00);
+                AdvSimd.Store(output + 4, a01);
+                AdvSimd.Store(output + 8, a02);
+                AdvSimd.Store(output + 12, a03);
+                AdvSimd.Store(output + cols, a10);
+                AdvSimd.Store(output + cols + 4, a11);
+                AdvSimd.Store(output + cols + 8, a12);
+                AdvSimd.Store(output + cols + 12, a13);
+                AdvSimd.Store(output + 2 * cols, a20);
+                AdvSimd.Store(output + 2 * cols + 4, a21);
+                AdvSimd.Store(output + 2 * cols + 8, a22);
+                AdvSimd.Store(output + 2 * cols + 12, a23);
+                AdvSimd.Store(output + 3 * cols, a30);
+                AdvSimd.Store(output + 3 * cols + 4, a31);
+                AdvSimd.Store(output + 3 * cols + 8, a32);
+                AdvSimd.Store(output + 3 * cols + 12, a33);
             }
+        }
     }
 
     public static int DotInt8x48(sbyte* a, sbyte* b)
