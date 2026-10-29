@@ -1,5 +1,7 @@
 # needle-cs
 
+[![CI](https://github.com/IAFahim/needle-cs/actions/workflows/ci.yml/badge.svg)](https://github.com/IAFahim/needle-cs/actions/workflows/ci.yml)
+
 Zero-allocation, unsafe C# inference engine for [Needle 3](https://huggingface.co/Cactus-Compute/needle3) (tool calling, extraction, retrieval, embeddings) and [Whistle](https://huggingface.co/Cactus-Compute/whistle) (speech-to-text).
 
 Reads `.cact` model files directly in place with AVX2, ARM64 NEON (SDOT with a widening fallback for CPUs without FEAT_DotProd), and portable scalar backends, selected at runtime per core. Supports NativeAOT, standard .NET (`net10.0`), `netstandard2.1`, and Unity/Burst.
