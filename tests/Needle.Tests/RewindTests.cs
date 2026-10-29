@@ -116,6 +116,17 @@ public sealed unsafe class RewindTests : IDisposable
             string.Join(";", reply.FunctionCalls.Select(c => c.Name + c.ArgumentsJson)));
 
     [Fact]
+    public void RewindAllocatesNothing()
+    {
+        using var engine = Primed();
+        engine.Feed(ids.AsSpan(PrefixLength, 8));
+        engine.Rewind();
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        for (var i = 0; i < 1000; i++) engine.Rewind();
+        Assert.Equal(before, GC.GetAllocatedBytesForCurrentThread());
+    }
+
+    [Fact]
     public void MeasureRewindCost()
     {
         using var engine = Primed();
@@ -139,6 +150,6 @@ public sealed unsafe class RewindTests : IDisposable
             }
             turnBest = Math.Min(turnBest, clock.Elapsed.TotalMilliseconds * 1000 / 40);
         }
-        output.WriteLine($"stateBytes={engine.StateBytes} rewind={rewindBest:F2} us rewind+feed1={turnBest:F1} us");
+        output.WriteLine($"stateBytes={engine.StateBytes} rewind={rewindBest * 1000:F1} ns rewind+feed1={turnBest:F1} us");
     }
 }
