@@ -1,0 +1,744 @@
+diff --git a/src/Needle/Gemv.cs b/src/Needle/Gemv.cs
+new file mode 100644
+index 0000000..b9cf92b
+--- /dev/null
++++ b/src/Needle/Gemv.cs
+@@ -0,0 +1,326 @@
++#if NEEDLE_SIMD
++using System;
++using System.Runtime.CompilerServices;
++using System.Runtime.Intrinsics;
++using System.Runtime.Intrinsics.X86;
++
++namespace Needle;
++
++internal readonly struct PlaneTables
++{
++    public readonly Vector256<byte> First, Second, Mask;
++
++    public PlaneTables(Vector256<byte> first, Vector256<byte> second, Vector256<byte> mask)
++    {
++        First = first;
++        Second = second;
++        Mask = mask;
++    }
++}
++
++internal interface IPlaneLayout
++{
++    static abstract int GroupBytes { get; }
++    static abstract PlaneTables Tables(Vector256<byte> codebook);
++    static abstract unsafe void Expand(byte* packed, in PlaneTables tables, out Vector256<byte> p0, out Vector256<byte> p1, out Vector256<byte> p2, out Vector256<byte> p3);
++}
++
++internal readonly struct TwoBitPlanes : IPlaneLayout
++{
++    public static int GroupBytes => 32;
++
++    public static PlaneTables Tables(Vector256<byte> codebook) => new(
++        Avx2.Shuffle(codebook, Vector256.Create((byte)0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3)),
++        Avx2.Shuffle(codebook, Vector256.Create((byte)0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3)),
++        Vector256.Create((byte)0x0F));
++
++    [MethodImpl(MethodImplOptions.AggressiveInlining)]
++    public static unsafe void Expand(byte* packed, in PlaneTables tables, out Vector256<byte> p0, out Vector256<byte> p1, out Vector256<byte> p2, out Vector256<byte> p3)
++    {
++        var v = Avx.LoadVector256(packed).AsUInt16();
++        var lower = Avx2.And(v.AsByte(), tables.Mask);
++        var upper = Avx2.And(Avx2.ShiftRightLogical(v, 4).AsByte(), tables.Mask);
++        p0 = Avx2.Shuffle(tables.First, lower);
++        p1 = Avx2.Shuffle(tables.Second, lower);
++        p2 = Avx2.Shuffle(tables.First, upper);
++        p3 = Avx2.Shuffle(tables.Second, upper);
++    }
++}
++
++internal readonly struct PermuteTwoBitPlanes : IPlaneLayout
++{
++    public static int GroupBytes => TwoBitPlanes.GroupBytes;
++
++    public static PlaneTables Tables(Vector256<byte> codebook) => TwoBitPlanes.Tables(codebook);
++
++    [MethodImpl(MethodImplOptions.AggressiveInlining)]
++    public static unsafe void Expand(byte* packed, in PlaneTables tables, out Vector256<byte> p0, out Vector256<byte> p1, out Vector256<byte> p2, out Vector256<byte> p3)
++    {
++        var v = Avx.LoadVector256(packed).AsUInt16();
++        var lower = v.AsByte();
++        var upper = Avx2.ShiftRightLogical(v, 4).AsByte();
++        p0 = Avx512Vbmi.VL.PermuteVar32x8(tables.First, lower);
++        p1 = Avx512Vbmi.VL.PermuteVar32x8(tables.Second, lower);
++        p2 = Avx512Vbmi.VL.PermuteVar32x8(tables.First, upper);
++        p3 = Avx512Vbmi.VL.PermuteVar32x8(tables.Second, upper);
++    }
++}
++
++internal readonly struct FourBitPlanes : IPlaneLayout
++{
++    public static int GroupBytes => 64;
++
++    public static PlaneTables Tables(Vector256<byte> codebook) => new(codebook, codebook, Vector256.Create((byte)0x0F));
++
++    [MethodImpl(MethodImplOptions.AggressiveInlining)]
++    public static unsafe void Expand(byte* packed, in PlaneTables tables, out Vector256<byte> p0, out Vector256<byte> p1, out Vector256<byte> p2, out Vector256<byte> p3)
++    {
++        var lo = Avx.LoadVector256(packed).AsUInt16();
++        var hi = Avx.LoadVector256(packed + 32).AsUInt16();
++        p0 = Avx2.Shuffle(tables.First, Avx2.And(lo.AsByte(), tables.Mask));
++        p1 = Avx2.Shuffle(tables.First, Avx2.And(Avx2.ShiftRightLogical(lo, 4).AsByte(), tables.Mask));
++        p2 = Avx2.Shuffle(tables.First, Avx2.And(hi.AsByte(), tables.Mask));
++        p3 = Avx2.Shuffle(tables.First, Avx2.And(Avx2.ShiftRightLogical(hi, 4).AsByte(), tables.Mask));
++    }
++}
++
++internal readonly struct PermuteFourBitPlanes : IPlaneLayout
++{
++    public static int GroupBytes => FourBitPlanes.GroupBytes;
++
++    public static PlaneTables Tables(Vector256<byte> codebook) => FourBitPlanes.Tables(codebook);
++
++    [MethodImpl(MethodImplOptions.AggressiveInlining)]
++    public static unsafe void Expand(byte* packed, in PlaneTables tables, out Vector256<byte> p0, out Vector256<byte> p1, out Vector256<byte> p2, out Vector256<byte> p3)
++    {
++        var lo = Avx.LoadVector256(packed).AsUInt16();
++        var hi = Avx.LoadVector256(packed + 32).AsUInt16();
++        p0 = Avx512Vbmi.VL.PermuteVar32x8(tables.First, lo.AsByte());
++        p1 = Avx512Vbmi.VL.PermuteVar32x8(tables.First, Avx2.ShiftRightLogical(lo, 4).AsByte());
++        p2 = Avx512Vbmi.VL.PermuteVar32x8(tables.First, hi.AsByte());
++        p3 = Avx512Vbmi.VL.PermuteVar32x8(tables.First, Avx2.ShiftRightLogical(hi, 4).AsByte());
++    }
++}
++
++internal static unsafe class Gemv
++{
++    const int RowBlock = Quant.RowBlock;
++    const int TileTokens = 4;
++    const int PrefetchBlocks = 4;
++    const int CacheLine = 64;
++    const int HalvesPerVector = 8;
++    static readonly bool UsePermute = Simd.UseAvx && AvxVnni.IsSupported && Avx512Vbmi.VL.IsSupported && Environment.GetEnvironmentVariable("NEEDLE_NOAVX512") == null;
++    const float HalfExponentRebias = 5.192296858534828e33f;
++
++    public static void Rows(in Cq w, in Activations a, int token, float* y, int rowStart, int rowEnd)
++    {
++        if (UsePermute)
++        {
++            if (w.Bits == 2) Rows<PermuteTwoBitPlanes>(w, a, token, y, rowStart, rowEnd);
++            else Rows<PermuteFourBitPlanes>(w, a, token, y, rowStart, rowEnd);
++        }
++        else if (w.Bits == 2) Rows<TwoBitPlanes>(w, a, token, y, rowStart, rowEnd);
++        else Rows<FourBitPlanes>(w, a, token, y, rowStart, rowEnd);
++    }
++
++    static void Rows<TPlanes>(in Cq w, in Activations a, int token, float* y, int rowStart, int rowEnd) where TPlanes : struct, IPlaneLayout
++    {
++        var groups = w.Groups;
++        var stride = a.Stride;
++        var tables = TPlanes.Tables(Avx.LoadVector256(w.Book->Bytes));
++        var weightedScales = stackalloc float[stride];
++        var scaled = stackalloc float[RowBlock * stride];
++        var activationScales = a.Scales + token * stride;
++        var byteScale = Vector256.Create(w.Book->ByteScale * HalfExponentRebias);
++        for (var v = 0; v < stride; v += HalvesPerVector)
++            Avx.Store(weightedScales + v, Avx.Multiply(Avx.LoadVector256(activationScales + v), byteScale));
++        var offsets = a.Offsets + token * stride;
++        var values = a.Values + (long)token * a.Cols;
++        var rowBytes = w.RowBytes;
++        var paddedGroups = (groups + HalvesPerVector - 1) & ~(HalvesPerVector - 1);
++        var convertibleRows = (long)w.Rows * groups < paddedGroups ? 0 : (int)(((long)w.Rows * groups - paddedGroups) / groups) + 1;
++        var n = rowStart;
++        for (; n + RowBlock <= rowEnd && n + RowBlock <= convertibleRows; n += RowBlock)
++            Block<TPlanes>(w.Indices + (long)n * rowBytes, rowBytes, w.Norms + (long)n * groups, groups, stride, tables, weightedScales, offsets, values, scaled, y + n);
++        for (; n < rowEnd; n++)
++            y[n] = Single<TPlanes>(w.Indices + (long)n * rowBytes, w.Norms + (long)n * groups, groups, stride, n < convertibleRows, tables, weightedScales, offsets, values, scaled);
++    }
++
++    [MethodImpl(MethodImplOptions.AggressiveInlining)]
++    static Vector256<float> Corrections(ushort* norms, int stride, float* weightedScales, float* offsets, float* scaled)
++    {
++        var correction = Vector256<float>.Zero;
++        for (var v = 0; v < stride; v += HalvesPerVector)
++        {
++            var factors = Avx.Multiply(UnbiasedHalfToSingle(Avx2.ConvertToVector256Int32(norms + v)), Avx.LoadVector256(weightedScales + v));
++            Avx.Store(scaled + v, factors);
++            correction = Fma.MultiplyAddNegated(factors, Avx.LoadVector256(offsets + v), correction);
++        }
++        return correction;
++    }
++
++    static Vector256<float> CorrectionsAtEdge(ushort* norms, int groups, int stride, float* weightedScales, float* offsets, float* scaled)
++    {
++        for (var i = 0; i < stride; i++) scaled[i] = i < groups ? BitConverter.Int32BitsToSingle(norms[i] << 13) : 0f;
++        var correction = Vector256<float>.Zero;
++        for (var v = 0; v < stride; v += HalvesPerVector)
++        {
++            var factors = Avx.Multiply(Avx.LoadVector256(scaled + v), Avx.LoadVector256(weightedScales + v));
++            Avx.Store(scaled + v, factors);
++            correction = Fma.MultiplyAddNegated(factors, Avx.LoadVector256(offsets + v), correction);
++        }
++        return correction;
++    }
++
++    [MethodImpl(MethodImplOptions.AggressiveInlining)]
++    static Vector256<float> UnbiasedHalfToSingle(Vector256<int> half) => Avx2.ShiftLeftLogical(half, 13).AsSingle();
++
++    [MethodImpl(MethodImplOptions.AggressiveInlining)]
++    static Vector256<int> Dot(Vector256<byte> p0, Vector256<byte> p1, Vector256<byte> p2, Vector256<byte> p3, Vector256<sbyte> x0, Vector256<sbyte> x1, Vector256<sbyte> x2, Vector256<sbyte> x3)
++    {
++        var sum = Quant.Accumulate(Vector256<int>.Zero, p0, x0);
++        sum = Quant.Accumulate(sum, p1, x1);
++        sum = Quant.Accumulate(sum, p2, x2);
++        return Quant.Accumulate(sum, p3, x3);
++    }
++
++    [MethodImpl(MethodImplOptions.AggressiveInlining)]
++    static Vector256<int> Dot(Vector256<byte> p0, Vector256<byte> p1, Vector256<byte> p2, Vector256<byte> p3, sbyte* x) =>
++        Dot(p0, p1, p2, p3, Avx.LoadVector256(x), Avx.LoadVector256(x + 32), Avx.LoadVector256(x + 64), Avx.LoadVector256(x + 96));
++
++    [MethodImpl(MethodImplOptions.AggressiveInlining)]
++    static Vector256<float> Group<TPlanes>(byte* packed, in PlaneTables tables, Vector256<sbyte> x0, Vector256<sbyte> x1, Vector256<sbyte> x2, Vector256<sbyte> x3, float* scale, Vector256<float> accumulator) where TPlanes : struct, IPlaneLayout
++    {
++        TPlanes.Expand(packed, tables, out var p0, out var p1, out var p2, out var p3);
++        return Fma.MultiplyAdd(Avx.ConvertToVector256Single(Dot(p0, p1, p2, p3, x0, x1, x2, x3)), Avx.BroadcastScalarToVector256(scale), accumulator);
++    }
++
++    static void Block<TPlanes>(byte* packed, int rowBytes, ushort* norms, int groups, int stride, in PlaneTables tables, float* weightedScales, float* offsets, sbyte* values, float* scaled, float* y) where TPlanes : struct, IPlaneLayout
++    {
++        var start0 = Corrections(norms, stride, weightedScales, offsets, scaled);
++        var start1 = Corrections(norms + groups, stride, weightedScales, offsets, scaled + stride);
++        var start2 = Corrections(norms + 2 * groups, stride, weightedScales, offsets, scaled + 2 * stride);
++        var start3 = Corrections(norms + 3 * groups, stride, weightedScales, offsets, scaled + 3 * stride);
++        var row1 = packed + rowBytes;
++        var row2 = packed + 2 * rowBytes;
++        var row3 = packed + 3 * rowBytes;
++        var accumulator0 = start0;
++        var accumulator1 = start1;
++        var accumulator2 = start2;
++        var accumulator3 = start3;
++        var groupBytes = TPlanes.GroupBytes;
++        var prefetchDistance = (long)PrefetchBlocks * RowBlock * rowBytes;
++        for (var g = 0; g < groups; g++)
++        {
++            if ((g * groupBytes & CacheLine - 1) == 0)
++            {
++                var ahead = g * groupBytes + prefetchDistance;
++                Sse.Prefetch0(packed + ahead);
++                Sse.Prefetch0(row1 + ahead);
++                Sse.Prefetch0(row2 + ahead);
++                Sse.Prefetch0(row3 + ahead);
++            }
++            var x = values + g * Cq.GroupSize;
++            var x0 = Avx.LoadVector256(x);
++            var x1 = Avx.LoadVector256(x + 32);
++            var x2 = Avx.LoadVector256(x + 64);
++            var x3 = Avx.LoadVector256(x + 96);
++            var offset = g * groupBytes;
++            accumulator0 = Group<TPlanes>(packed + offset, tables, x0, x1, x2, x3, scaled + g, accumulator0);
++            accumulator1 = Group<TPlanes>(row1 + offset, tables, x0, x1, x2, x3, scaled + stride + g, accumulator1);
++            accumulator2 = Group<TPlanes>(row2 + offset, tables, x0, x1, x2, x3, scaled + 2 * stride + g, accumulator2);
++            accumulator3 = Group<TPlanes>(row3 + offset, tables, x0, x1, x2, x3, scaled + 3 * stride + g, accumulator3);
++        }
++        var pairs01 = Avx.HorizontalAdd(accumulator0, accumulator1);
++        var pairs23 = Avx.HorizontalAdd(accumulator2, accumulator3);
++        var quads = Avx.HorizontalAdd(pairs01, pairs23);
++        Sse.Store(y, Sse.Add(quads.GetLower(), quads.GetUpper()));
++    }
++
++    static float Single<TPlanes>(byte* packed, ushort* norms, int groups, int stride, bool convertible, in PlaneTables tables, float* weightedScales, float* offsets, sbyte* values, float* scaled) where TPlanes : struct, IPlaneLayout
++    {
++        var accumulator = convertible
++            ? Corrections(norms, stride, weightedScales, offsets, scaled)
++            : CorrectionsAtEdge(norms, groups, stride, weightedScales, offsets, scaled);
++        var groupBytes = TPlanes.GroupBytes;
++        for (var g = 0; g < groups; g++)
++        {
++            var x = values + g * Cq.GroupSize;
++            accumulator = Group<TPlanes>(packed + g * groupBytes, tables, Avx.LoadVector256(x), Avx.LoadVector256(x + 32), Avx.LoadVector256(x + 64), Avx.LoadVector256(x + 96), scaled + g, accumulator);
++        }
++        return Vector256.Sum(accumulator);
++    }
++
++    public static void Tile(in Cq w, in Activations a, int token, float* y, int ldy, int rowStart, int rowEnd)
++    {
++        if (UsePermute)
++        {
++            if (w.Bits == 2) Tile<PermuteTwoBitPlanes>(w, a, token, y, ldy, rowStart, rowEnd);
++            else Tile<PermuteFourBitPlanes>(w, a, token, y, ldy, rowStart, rowEnd);
++        }
++        else if (w.Bits == 2) Tile<TwoBitPlanes>(w, a, token, y, ldy, rowStart, rowEnd);
++        else Tile<FourBitPlanes>(w, a, token, y, ldy, rowStart, rowEnd);
++    }
++
++    static void Tile<TPlanes>(in Cq w, in Activations a, int token, float* y, int ldy, int rowStart, int rowEnd) where TPlanes : struct, IPlaneLayout
++    {
++        var groups = w.Groups;
++        var stride = a.Stride;
++        var cols = a.Cols;
++        var tables = TPlanes.Tables(Avx.LoadVector256(w.Book->Bytes));
++        var weightedScales = stackalloc float[TileTokens * stride];
++        var scaled = stackalloc float[TileTokens * stride];
++        var rowFactors = stackalloc float[stride];
++        var byteScale = Vector256.Create(w.Book->ByteScale * HalfExponentRebias);
++        for (var t = 0; t < TileTokens; t++)
++            for (var v = 0; v < stride; v += HalvesPerVector)
++                Avx.Store(weightedScales + t * stride + v, Avx.Multiply(Avx.LoadVector256(a.Scales + (token + t) * stride + v), byteScale));
++        var offsets = a.Offsets + token * stride;
++        var values = a.Values + (long)token * cols;
++        var paddedGroups = (groups + HalvesPerVector - 1) & ~(HalvesPerVector - 1);
++        var convertibleRows = (long)w.Rows * groups < paddedGroups ? 0 : (int)(((long)w.Rows * groups - paddedGroups) / groups) + 1;
++        var groupBytes = TPlanes.GroupBytes;
++        for (var n = rowStart; n < rowEnd; n++)
++        {
++            var norms = w.Norms + (long)n * groups;
++            if (n < convertibleRows)
++                for (var v = 0; v < stride; v += HalvesPerVector) Avx.Store(rowFactors + v, UnbiasedHalfToSingle(Avx2.ConvertToVector256Int32(norms + v)));
++            else
++                for (var i = 0; i < stride; i++) rowFactors[i] = i < groups ? BitConverter.Int32BitsToSingle(norms[i] << 13) : 0f;
++            var accumulator0 = TileCorrections(rowFactors, weightedScales, offsets, scaled, stride);
++            var accumulator1 = TileCorrections(rowFactors, weightedScales + stride, offsets + stride, scaled + stride, stride);
++            var accumulator2 = TileCorrections(rowFactors, weightedScales + 2 * stride, offsets + 2 * stride, scaled + 2 * stride, stride);
++            var accumulator3 = TileCorrections(rowFactors, weightedScales + 3 * stride, offsets + 3 * stride, scaled + 3 * stride, stride);
++            var packed = w.Indices + (long)n * w.RowBytes;
++            for (var g = 0; g < groups; g++)
++            {
++                TPlanes.Expand(packed + g * groupBytes, tables, out var p0, out var p1, out var p2, out var p3);
++                var x = values + g * Cq.GroupSize;
++                accumulator0 = Fma.MultiplyAdd(Avx.ConvertToVector256Single(Dot(p0, p1, p2, p3, x)), Avx.BroadcastScalarToVector256(scaled + g), accumulator0);
++                accumulator1 = Fma.MultiplyAdd(Avx.ConvertToVector256Single(Dot(p0, p1, p2, p3, x + cols)), Avx.BroadcastScalarToVector256(scaled + stride + g), accumulator1);
++                accumulator2 = Fma.MultiplyAdd(Avx.ConvertToVector256Single(Dot(p0, p1, p2, p3, x + 2 * cols)), Avx.BroadcastScalarToVector256(scaled + 2 * stride + g), accumulator2);
++                accumulator3 = Fma.MultiplyAdd(Avx.ConvertToVector256Single(Dot(p0, p1, p2, p3, x + 3 * cols)), Avx.BroadcastScalarToVector256(scaled + 3 * stride + g), accumulator3);
++            }
++            var quads = Avx.HorizontalAdd(Avx.HorizontalAdd(accumulator0, accumulator1), Avx.HorizontalAdd(accumulator2, accumulator3));
++            var sums = Sse.Add(quads.GetLower(), quads.GetUpper());
++            y[n] = sums.ToScalar();
++            y[ldy + n] = Sse41.Extract(sums, 1);
++            y[2 * ldy + n] = Sse41.Extract(sums, 2);
++            y[3 * ldy + n] = Sse41.Extract(sums, 3);
++        }
++    }
++
++    [MethodImpl(MethodImplOptions.AggressiveInlining)]
++    static Vector256<float> TileCorrections(float* rowFactors, float* weightedScales, float* offsets, float* scaled, int stride)
++    {
++        var correction = Vector256<float>.Zero;
++        for (var v = 0; v < stride; v += HalvesPerVector)
++        {
++            var factors = Avx.Multiply(Avx.LoadVector256(rowFactors + v), Avx.LoadVector256(weightedScales + v));
++            Avx.Store(scaled + v, factors);
++            correction = Fma.MultiplyAddNegated(factors, Avx.LoadVector256(offsets + v), correction);
++        }
++        return correction;
++    }
++}
++#endif
+diff --git a/src/Needle/Quant.cs b/src/Needle/Quant.cs
+index fbc3e6c..cec9e75 100644
+--- a/src/Needle/Quant.cs
++++ b/src/Needle/Quant.cs
+@@ -44,6 +44,7 @@ internal static unsafe class Quant
+ {
+     const float HadamardScale = 0.08838834764831845f;
+     const int TokenTile = 4;
++    internal const int RowBlock = 4;
+ 
+     public static float AbsMax(float* x, int n)
+     {
+@@ -279,35 +280,12 @@ internal static unsafe class Quant
+ 
+ #if NEEDLE_SIMD
+     [MethodImpl(MethodImplOptions.AggressiveInlining)]
+-    static Vector256<int> Accumulate(Vector256<int> sum, Vector256<byte> weights, Vector256<sbyte> activations) =>
++    internal static Vector256<int> Accumulate(Vector256<int> sum, Vector256<byte> weights, Vector256<sbyte> activations) =>
+         AvxVnni.IsSupported
+             ? AvxVnni.MultiplyWideningAndAdd(sum, weights, activations)
+             : Avx2.Add(sum, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(weights, activations), Vector256.Create((short)1)));
+ #endif
+ 
+-#if NEEDLE_SIMD
+-    static Vector128<float> HalfToSingle(Vector128<uint> half)
+-    {
+-        var magnitude = Sse2.And(half, Vector128.Create(0x7FFFu));
+-        var sign = Sse2.ShiftLeftLogical(Sse2.And(half, Vector128.Create(0x8000u)), 16);
+-        var bits = Sse2.Add(Sse2.ShiftLeftLogical(magnitude, 13), Vector128.Create(0x38000000u));
+-        var nonZero = Sse2.CompareGreaterThan(magnitude.AsInt32(), Vector128<int>.Zero).AsUInt32();
+-        return Sse2.Or(Sse2.And(bits, nonZero), sign).AsSingle();
+-    }
+-#endif
+-
+-#if NEEDLE_SIMD
+-    static void LoadFactors(ushort* norms, int groups, float scale, float* factors)
+-    {
+-        var multiplier = Vector128.Create(scale);
+-        var g = 0;
+-        for (; g + 4 <= groups; g += 4)
+-            Sse.Store(factors + g, Sse.Multiply(HalfToSingle(Sse41.ConvertToVector128Int32((ushort*)(norms + g)).AsUInt32()), multiplier));
+-        for (; g < groups; g++)
+-            factors[g] = HalfToSingle(Vector128.Create((uint)*(ushort*)(norms + g), 0u, 0u, 0u)).ToScalar() * scale;
+-    }
+-#endif
+-
+     public static void MatMul(in Cq w, in Activations a, int tokens, float* y, int ldy) =>
+         MatMulRows(w, a, tokens, y, ldy, 0, w.Rows);
+ 
+@@ -318,197 +296,11 @@ internal static unsafe class Quant
+ #endif
+         if (!Simd.Enabled) { Scalar.MatMulRows(w, a, tokens, y, ldy, rowStart, rowEnd); return; }
+ #if NEEDLE_SIMD
+-        var factors = stackalloc float[a.Stride];
+-        var scaled = stackalloc float[a.Stride * TokenTile];
+-        var groups = w.Groups;
+-        var rowBytes = w.RowBytes;
+-        var table = Avx.LoadVector256(w.Book->Bytes);
+-        var byteScale = w.Book->ByteScale;
+-        var two = w.Bits == 2;
+-        if ((rowEnd - rowStart) * TokenTile <= tokens)
+-        {
+-            for (var t = 0; t + TokenTile <= tokens; t += TokenTile)
+-                for (var n = rowStart; n < rowEnd; n++)
+-                {
+-                    LoadFactors(w.Norms + (long)n * groups, groups, byteScale, factors);
+-                    var packed = w.Indices + (long)n * rowBytes;
+-                    if (two) DotTile2(packed, table, factors, scaled, a, t, y + (long)t * ldy + n, ldy);
+-                    else DotTile4(packed, table, factors, scaled, a, t, y + (long)t * ldy + n, ldy);
+-                }
+-            for (var t = tokens & ~(TokenTile - 1); t < tokens; t++)
+-                for (var n = rowStart; n < rowEnd; n++)
+-                {
+-                    LoadFactors(w.Norms + (long)n * groups, groups, byteScale, factors);
+-                    var packed = w.Indices + (long)n * rowBytes;
+-                    y[(long)t * ldy + n] = two ? DotRow2(packed, table, factors, scaled, a, t) : DotRow4(packed, table, factors, scaled, a, t);
+-                }
+-            return;
+-        }
+-        for (var n = rowStart; n < rowEnd; n++)
+-        {
+-            LoadFactors(w.Norms + (long)n * groups, groups, byteScale, factors);
+-            var packed = w.Indices + (long)n * rowBytes;
+-            var t = 0;
+-            for (; t + TokenTile <= tokens; t += TokenTile)
+-                if (two) DotTile2(packed, table, factors, scaled, a, t, y + (long)t * ldy + n, ldy);
+-                else DotTile4(packed, table, factors, scaled, a, t, y + (long)t * ldy + n, ldy);
+-            for (; t < tokens; t++)
+-                y[(long)t * ldy + n] = two ? DotRow2(packed, table, factors, scaled, a, t) : DotRow4(packed, table, factors, scaled, a, t);
+-        }
+-#endif
+-    }
+-
+-#if NEEDLE_SIMD
+-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+-    static Vector256<float> ScaleFactors(float* factors, float* scaled, float* scales, float* offsets, int stride)
+-    {
+-        var bias = Vector256<float>.Zero;
+-        for (var v = 0; v < stride; v += 8)
+-        {
+-            var f = Avx.Multiply(Avx.LoadVector256(factors + v), Avx.LoadVector256(scales + v));
+-            Avx.Store(scaled + v, f);
+-            bias = Fma.MultiplyAdd(f, Avx.LoadVector256(offsets + v), bias);
+-        }
+-        return bias;
+-    }
+-#endif
+-
+-#if NEEDLE_SIMD
+-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+-    static Vector256<int> Dot2(byte* packed, Vector256<byte> table, Vector256<byte> mask, sbyte* values)
+-    {
+-        var v = Avx.LoadVector256(packed).AsUInt16();
+-        var sum = Accumulate(Vector256<int>.Zero, Avx2.Shuffle(table, Avx2.And(v.AsByte(), mask)), Avx.LoadVector256(values));
+-        sum = Accumulate(sum, Avx2.Shuffle(table, Avx2.And(Avx2.ShiftRightLogical(v, 2).AsByte(), mask)), Avx.LoadVector256(values + 32));
+-        sum = Accumulate(sum, Avx2.Shuffle(table, Avx2.And(Avx2.ShiftRightLogical(v, 4).AsByte(), mask)), Avx.LoadVector256(values + 64));
+-        return Accumulate(sum, Avx2.Shuffle(table, Avx2.And(Avx2.ShiftRightLogical(v, 6).AsByte(), mask)), Avx.LoadVector256(values + 96));
+-    }
+-#endif
+-
+-#if NEEDLE_SIMD
+-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+-    static Vector256<int> Dot4(byte* packed, Vector256<byte> table, Vector256<byte> mask, sbyte* values)
+-    {
+-        var lo = Avx.LoadVector256(packed).AsUInt16();
+-        var hi = Avx.LoadVector256(packed + 32).AsUInt16();
+-        var sum = Accumulate(Vector256<int>.Zero, Avx2.Shuffle(table, Avx2.And(lo.AsByte(), mask)), Avx.LoadVector256(values));
+-        sum = Accumulate(sum, Avx2.Shuffle(table, Avx2.And(Avx2.ShiftRightLogical(lo, 4).AsByte(), mask)), Avx.LoadVector256(values + 32));
+-        sum = Accumulate(sum, Avx2.Shuffle(table, Avx2.And(hi.AsByte(), mask)), Avx.LoadVector256(values + 64));
+-        return Accumulate(sum, Avx2.Shuffle(table, Avx2.And(Avx2.ShiftRightLogical(hi, 4).AsByte(), mask)), Avx.LoadVector256(values + 96));
+-    }
+-#endif
+-
+-#if NEEDLE_SIMD
+-    static float DotRow2(byte* packed, Vector256<byte> table, float* factors, float* scaled, in Activations a, int token)
+-    {
+-        var groups = a.Groups;
+-        var bias = ScaleFactors(factors, scaled, a.Scales + token * a.Stride, a.Offsets + token * a.Stride, a.Stride);
+-        var values = a.Values + (long)token * a.Cols;
+-        var mask = Vector256.Create((byte)0x03);
+-        var accumulator = Vector256<float>.Zero;
+-        for (var g = 0; g < groups; g++)
+-            accumulator = Fma.MultiplyAdd(Avx.ConvertToVector256Single(Dot2(packed + g * 32, table, mask, values + g * Cq.GroupSize)), Vector256.Create(scaled[g]), accumulator);
+-        return Vector256.Sum(Avx.Subtract(accumulator, bias));
+-    }
++        var tiledTokens = tokens & ~(TokenTile - 1);
++        for (var t = 0; t < tiledTokens; t += TokenTile) Gemv.Tile(w, a, t, y + (long)t * ldy, ldy, rowStart, rowEnd);
++        for (var t = tiledTokens; t < tokens; t++) Gemv.Rows(w, a, t, y + (long)t * ldy, rowStart, rowEnd);
+ #endif
+-
+-#if NEEDLE_SIMD
+-    static float DotRow4(byte* packed, Vector256<byte> table, float* factors, float* scaled, in Activations a, int token)
+-    {
+-        var groups = a.Groups;
+-        var bias = ScaleFactors(factors, scaled, a.Scales + token * a.Stride, a.Offsets + token * a.Stride, a.Stride);
+-        var values = a.Values + (long)token * a.Cols;
+-        var mask = Vector256.Create((byte)0x0F);
+-        var accumulator = Vector256<float>.Zero;
+-        for (var g = 0; g < groups; g++)
+-            accumulator = Fma.MultiplyAdd(Avx.ConvertToVector256Single(Dot4(packed + g * 64, table, mask, values + g * Cq.GroupSize)), Vector256.Create(scaled[g]), accumulator);
+-        return Vector256.Sum(Avx.Subtract(accumulator, bias));
+     }
+-#endif
+-
+-#if NEEDLE_SIMD
+-    static void DotTile2(byte* packed, Vector256<byte> table, float* factors, float* scaled, in Activations a, int token, float* y, int ldy)
+-    {
+-        var groups = a.Groups;
+-        var stride = a.Stride;
+-        var cols = a.Cols;
+-        var bias0 = ScaleFactors(factors, scaled, a.Scales + token * stride, a.Offsets + token * stride, stride);
+-        var bias1 = ScaleFactors(factors, scaled + stride, a.Scales + (token + 1) * stride, a.Offsets + (token + 1) * stride, stride);
+-        var bias2 = ScaleFactors(factors, scaled + 2 * stride, a.Scales + (token + 2) * stride, a.Offsets + (token + 2) * stride, stride);
+-        var bias3 = ScaleFactors(factors, scaled + 3 * stride, a.Scales + (token + 3) * stride, a.Offsets + (token + 3) * stride, stride);
+-        var v0 = a.Values + (long)token * cols;
+-        var mask = Vector256.Create((byte)0x03);
+-        var a0 = Vector256<float>.Zero;
+-        var a1 = Vector256<float>.Zero;
+-        var a2 = Vector256<float>.Zero;
+-        var a3 = Vector256<float>.Zero;
+-        for (var g = 0; g < groups; g++)
+-        {
+-            var offset = g * Cq.GroupSize;
+-            var v = Avx.LoadVector256(packed + g * 32).AsUInt16();
+-            var p0 = Avx2.Shuffle(table, Avx2.And(v.AsByte(), mask));
+-            var p1 = Avx2.Shuffle(table, Avx2.And(Avx2.ShiftRightLogical(v, 2).AsByte(), mask));
+-            var p2 = Avx2.Shuffle(table, Avx2.And(Avx2.ShiftRightLogical(v, 4).AsByte(), mask));
+-            var p3 = Avx2.Shuffle(table, Avx2.And(Avx2.ShiftRightLogical(v, 6).AsByte(), mask));
+-            a0 = Fma.MultiplyAdd(Avx.ConvertToVector256Single(Planes4Dot(p0, p1, p2, p3, v0 + offset)), Vector256.Create(scaled[g]), a0);
+-            a1 = Fma.MultiplyAdd(Avx.ConvertToVector256Single(Planes4Dot(p0, p1, p2, p3, v0 + cols + offset)), Vector256.Create(scaled[stride + g]), a1);
+-            a2 = Fma.MultiplyAdd(Avx.ConvertToVector256Single(Planes4Dot(p0, p1, p2, p3, v0 + 2 * cols + offset)), Vector256.Create(scaled[2 * stride + g]), a2);
+-            a3 = Fma.MultiplyAdd(Avx.ConvertToVector256Single(Planes4Dot(p0, p1, p2, p3, v0 + 3 * cols + offset)), Vector256.Create(scaled[3 * stride + g]), a3);
+-        }
+-        y[0] = Vector256.Sum(Avx.Subtract(a0, bias0));
+-        y[ldy] = Vector256.Sum(Avx.Subtract(a1, bias1));
+-        y[2 * ldy] = Vector256.Sum(Avx.Subtract(a2, bias2));
+-        y[3 * ldy] = Vector256.Sum(Avx.Subtract(a3, bias3));
+-    }
+-#endif
+-
+-#if NEEDLE_SIMD
+-    static void DotTile4(byte* packed, Vector256<byte> table, float* factors, float* scaled, in Activations a, int token, float* y, int ldy)
+-    {
+-        var groups = a.Groups;
+-        var stride = a.Stride;
+-        var cols = a.Cols;
+-        var bias0 = ScaleFactors(factors, scaled, a.Scales + token * stride, a.Offsets + token * stride, stride);
+-        var bias1 = ScaleFactors(factors, scaled + stride, a.Scales + (token + 1) * stride, a.Offsets + (token + 1) * stride, stride);
+-        var bias2 = ScaleFactors(factors, scaled + 2 * stride, a.Scales + (token + 2) * stride, a.Offsets + (token + 2) * stride, stride);
+-        var bias3 = ScaleFactors(factors, scaled + 3 * stride, a.Scales + (token + 3) * stride, a.Offsets + (token + 3) * stride, stride);
+-        var v0 = a.Values + (long)token * cols;
+-        var mask = Vector256.Create((byte)0x0F);
+-        var a0 = Vector256<float>.Zero;
+-        var a1 = Vector256<float>.Zero;
+-        var a2 = Vector256<float>.Zero;
+-        var a3 = Vector256<float>.Zero;
+-        for (var g = 0; g < groups; g++)
+-        {
+-            var offset = g * Cq.GroupSize;
+-            var lo = Avx.LoadVector256(packed + g * 64).AsUInt16();
+-            var hi = Avx.LoadVector256(packed + g * 64 + 32).AsUInt16();
+-            var p0 = Avx2.Shuffle(table, Avx2.And(lo.AsByte(), mask));
+-            var p1 = Avx2.Shuffle(table, Avx2.And(Avx2.ShiftRightLogical(lo, 4).AsByte(), mask));
+-            var p2 = Avx2.Shuffle(table, Avx2.And(hi.AsByte(), mask));
+-            var p3 = Avx2.Shuffle(table, Avx2.And(Avx2.ShiftRightLogical(hi, 4).AsByte(), mask));
+-            a0 = Fma.MultiplyAdd(Avx.ConvertToVector256Single(Planes4Dot(p0, p1, p2, p3, v0 + offset)), Vector256.Create(scaled[g]), a0);
+-            a1 = Fma.MultiplyAdd(Avx.ConvertToVector256Single(Planes4Dot(p0, p1, p2, p3, v0 + cols + offset)), Vector256.Create(scaled[stride + g]), a1);
+-            a2 = Fma.MultiplyAdd(Avx.ConvertToVector256Single(Planes4Dot(p0, p1, p2, p3, v0 + 2 * cols + offset)), Vector256.Create(scaled[2 * stride + g]), a2);
+-            a3 = Fma.MultiplyAdd(Avx.ConvertToVector256Single(Planes4Dot(p0, p1, p2, p3, v0 + 3 * cols + offset)), Vector256.Create(scaled[3 * stride + g]), a3);
+-        }
+-        y[0] = Vector256.Sum(Avx.Subtract(a0, bias0));
+-        y[ldy] = Vector256.Sum(Avx.Subtract(a1, bias1));
+-        y[2 * ldy] = Vector256.Sum(Avx.Subtract(a2, bias2));
+-        y[3 * ldy] = Vector256.Sum(Avx.Subtract(a3, bias3));
+-    }
+-#endif
+-
+-#if NEEDLE_SIMD
+-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+-    static Vector256<int> Planes4Dot(Vector256<byte> p0, Vector256<byte> p1, Vector256<byte> p2, Vector256<byte> p3, sbyte* values)
+-    {
+-        var sum = Accumulate(Vector256<int>.Zero, p0, Avx.LoadVector256(values));
+-        sum = Accumulate(sum, p1, Avx.LoadVector256(values + 32));
+-        sum = Accumulate(sum, p2, Avx.LoadVector256(values + 64));
+-        return Accumulate(sum, p3, Avx.LoadVector256(values + 96));
+-    }
+-#endif
+ }
+ 
+ internal unsafe struct MatMulJob
+@@ -550,7 +342,8 @@ internal unsafe struct MatMulBatch
+     {
+         var rows = 0;
+         for (var j = 0; j < batch->Count; j++) rows += batch->Jobs.At(j)->W.Rows;
+-        batch->RowsPerTask = Math.Max(8, (rows + pool.Threads * 3 - 1) / (pool.Threads * 3));
++        var perTask = Math.Max(MinimumRowsPerTask, (rows + pool.Threads * TasksPerThread - 1) / (pool.Threads * TasksPerThread));
++        batch->RowsPerTask = (perTask + Quant.RowBlock - 1) / Quant.RowBlock * Quant.RowBlock;
+         var tasks = 0;
+         for (var j = 0; j < batch->Count; j++) tasks += TaskCount(batch, j);
+         pool.Run(&Execute, batch, tasks);
+@@ -571,4 +364,7 @@ internal unsafe struct MatMulBatch
+             return;
+         }
+     }
++
++    const int TasksPerThread = 3;
++    const int MinimumRowsPerTask = 8;
+ }
+diff --git a/tests/Needle.Tests/MatMulTests.cs b/tests/Needle.Tests/MatMulTests.cs
+new file mode 100644
+index 0000000..a9edb0d
+--- /dev/null
++++ b/tests/Needle.Tests/MatMulTests.cs
+@@ -0,0 +1,138 @@
++using System;
++using System.Collections.Generic;
++using System.Runtime.InteropServices;
++using Xunit;
++
++namespace Needle.Tests;
++
++public sealed unsafe class MatMulTests : IDisposable
++{
++    const float Sentinel = 12345f;
++    readonly List<nint> allocations = new();
++
++    public static IEnumerable<object[]> Shapes()
++    {
++        foreach (var bits in new[] { 2, 4 })
++            foreach (var (rows, cols) in new[] { (1, 128), (3, 128), (4, 256), (5, 768), (7, 384), (13, 768), (64, 1024), (97, 768), (576, 768), (24, 3072), (320, 3072) })
++                yield return new object[] { bits, rows, cols };
++    }
++
++    [Theory]
++    [MemberData(nameof(Shapes))]
++    public void MatchesScalarReferenceForOneToNineTokens(int bits, int rows, int cols)
++    {
++        var random = new Random(rows * 31 + cols + bits);
++        var w = Weights(random, rows, cols, bits);
++        for (var tokens = 1; tokens <= 9; tokens++)
++        {
++            var a = Prepared(random, tokens, cols, bits);
++            var expected = (float*)Allocate((nuint)(tokens * rows) * 4);
++            var actual = (float*)Allocate((nuint)(tokens * rows) * 4);
++            Fill(expected, tokens * rows, Sentinel);
++            Fill(actual, tokens * rows, Sentinel);
++            Scalar.MatMulRows(w, a, tokens, expected, rows, 0, rows);
++            Quant.MatMulRows(w, a, tokens, actual, rows, 0, rows);
++            AssertClose(expected, actual, tokens * rows);
++        }
++    }
++
++    [Theory]
++    [InlineData(2, 37, 768, 5, 29)]
++    [InlineData(2, 37, 768, 1, 2)]
++    [InlineData(4, 37, 768, 3, 36)]
++    [InlineData(4, 21, 256, 8, 21)]
++    [InlineData(2, 50, 384, 0, 7)]
++    public void LeavesRowsOutsideTheRangeUntouched(int bits, int rows, int cols, int rowStart, int rowEnd)
++    {
++        var random = new Random(rows + rowStart);
++        var w = Weights(random, rows, cols, bits);
++        foreach (var tokens in new[] { 1, 2, 5, 8 })
++        {
++            var a = Prepared(random, tokens, cols, bits);
++            var ldy = rows + 3;
++            var expected = (float*)Allocate((nuint)(tokens * ldy) * 4);
++            var actual = (float*)Allocate((nuint)(tokens * ldy) * 4);
++            Fill(expected, tokens * ldy, Sentinel);
++            Fill(actual, tokens * ldy, Sentinel);
++            Scalar.MatMulRows(w, a, tokens, expected, ldy, rowStart, rowEnd);
++            Quant.MatMulRows(w, a, tokens, actual, ldy, rowStart, rowEnd);
++            AssertClose(expected, actual, tokens * ldy);
++        }
++    }
++
++    [Theory]
++    [InlineData(2)]
++    [InlineData(4)]
++    public void SlicedWeightsAtTheEndOfTheirBufferAreExact(int bits)
++    {
++        var random = new Random(bits);
++        var parent = Weights(random, 40, 768, bits);
++        var a = Prepared(random, 1, 768, bits);
++        foreach (var (first, count) in new[] { (0, 4), (36, 4), (35, 5), (38, 2), (39, 1) })
++        {
++            var slice = parent.Slice(first, count);
++            var expected = (float*)Allocate((nuint)count * 4);
++            var actual = (float*)Allocate((nuint)count * 4);
++            Scalar.MatMulRows(slice, a, 1, expected, count, 0, count);
++            Quant.MatMulRows(slice, a, 1, actual, count, 0, count);
++            AssertClose(expected, actual, count);
++        }
++    }
++
++    void AssertClose(float* expected, float* actual, int count)
++    {
++        var magnitude = 1f;
++        for (var i = 0; i < count; i++) if (expected[i] != Sentinel) magnitude = MathF.Max(magnitude, MathF.Abs(expected[i]));
++        for (var i = 0; i < count; i++)
++        {
++            if (expected[i] == Sentinel) Assert.Equal(Sentinel, actual[i]);
++            else Assert.InRange(actual[i] - expected[i], -1e-3f * magnitude, 1e-3f * magnitude);
++        }
++    }
++
++    static void Fill(float* x, int count, float value)
++    {
++        for (var i = 0; i < count; i++) x[i] = value;
++    }
++
++    void* Allocate(nuint bytes)
++    {
++        var p = (nint)NativeMemory.AlignedAlloc(bytes + 64, 64);
++        allocations.Add(p);
++        new Span<byte>((void*)p, (int)bytes + 64).Clear();
++        return (void*)p;
++    }
++
++    Cq Weights(Random random, int rows, int cols, int bits)
++    {
++        var levels = stackalloc float[16];
++        var count = bits == 2 ? 4 : 16;
++        for (var i = 0; i < count; i++) levels[i] = (i - (count - 1) / 2f) * 0.4f + (float)(random.NextDouble() - 0.5) * 0.1f;
++        var book = (Codebook*)Allocate((nuint)sizeof(Codebook));
++        Codebook.Fill(book, levels, count);
++        var rowBytes = cols * bits / 8;
++        var indices = (byte*)Allocate((nuint)(rows * rowBytes));
++        for (var i = 0; i < rows * rowBytes; i++) indices[i] = (byte)random.Next(256);
++        var groups = cols / Cq.GroupSize;
++        var norms = (ushort*)Allocate((nuint)(rows * groups) * 2);
++        for (var i = 0; i < rows * groups; i++)
++            norms[i] = BitConverter.HalfToUInt16Bits((Half)(i % 11 == 5 ? 0f : 0.2f + (float)random.NextDouble() * 1.8f));
++        return new Cq(indices, norms, book, rows, cols, bits);
++    }
++
++    Activations Prepared(Random random, int tokens, int cols, int bits)
++    {
++        var arena = new Arena((nuint)(tokens * cols * 10 + 4096));
++        allocations.Add((nint)arena.Base);
++        var a = new Activations(ref arena, tokens, cols);
++        var x = (float*)Allocate((nuint)(tokens * cols) * 4);
++        for (var i = 0; i < tokens * cols; i++) x[i] = (float)(random.NextDouble() - 0.5) * (1 + i % 7);
++        Quant.Prepare(x, tokens, cols, bits, a);
++        return a;
++    }
++
++    public void Dispose()
++    {
++        foreach (var p in allocations) NativeMemory.AlignedFree((void*)p);
++    }
++}
