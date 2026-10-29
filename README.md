@@ -8,14 +8,14 @@ Reads `.cact` model files directly in place with AVX2, ARM64 NEON (SDOT with a w
 
 ## Status
 
-Early but usable for a showcase: everything below works on Linux x64 today and is covered by 71 passing tests (Linux x64, AVX2 and scalar).
+Early but usable for a showcase: everything below works on Linux x64 today and is covered by 85 passing tests (Linux x64, AVX2 and scalar).
 
 | Area | State |
 |---|---|
 | Tool calling, extraction, embeddings, voice to tool call | Working, golden-parity tested against a numpy reference |
 | Loading models | Portable file mapping (`Model.Open`), `FromBytes`, `FromMemory`, `FromStream`. Verified on Linux; Windows and macOS code exists but has not been run |
 | Threading | `ThreadPolicy` presets, the library never pins your calling thread, workers park when idle, `Pause`/`Resume` |
-| Speed | About the same as the upstream native engine (92-111 ms vs 95-129 ms per call on a 4-core VM). A 4x decode speedup is planned, see below |
+| Speed | Faster than the upstream native engine on the reference VM (73-84 ms vs 95-129 ms per call, 4 threads). A further 3x is planned, see below |
 | Per-call allocations | About 6 KB of managed allocations per call today. Zero-allocation API and typed C# calls are planned |
 | Unity | Sample package exists, the Entities `ISystem` version is planned |
 
@@ -110,10 +110,10 @@ Measured on a 4-core Sapphire Rapids VM, NativeAOT, 4 threads, "what's it like i
 
 | Engine | Per call | Decode |
 |---|---|---|
-| needle-cs | 92-111 ms | 1.75-2.0 ms/token |
+| needle-cs | 73-84 ms | 1.37-1.55 ms/token |
 | Upstream `libneedle3.so` 3.3.3 | 95-129 ms | about 1.75 ms/token |
 
-The detailed profile and the plan to reach 25 ms per call are in [plan.md](plan.md).
+The 4-thread numbers include the faster Hadamard MLP (W12). The detailed profile and the plan to reach 25 ms per call are in [plan.md](plan.md).
 
 ### Reference numbers on an i9-14900K, NativeAOT
 
