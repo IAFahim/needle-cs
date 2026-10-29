@@ -284,6 +284,15 @@ internal static unsafe class Scalar
         }
     }
 
+    public static void AttentionTile(in AttentionTile tile)
+    {
+        for (var h = 0; h < tile.Heads; h++)
+            AttentionHead(
+                tile.Queries + h * 48, tile.QueryScales[h], tile.Keys, tile.KeyScales, tile.Values, tile.ValueScales,
+                tile.KeyStride, tile.ValueStride, tile.ScaleStride, tile.First, tile.First + tile.Count - 1, tile.Scores,
+                tile.Output + h * 64, tile.Probabilities == null ? null : tile.Probabilities + h * tile.ProbabilityStride);
+    }
+
     public static void Condition(float* condV, float* condU, float* input, int dim, int width, float* condition)
     {
         var weights = stackalloc float[8];

@@ -820,6 +820,91 @@ internal static unsafe class Neon
         Store4(output + 48, a12, a13, a14, a15);
     }
 
+    public static void AttentionTile(in AttentionTile tile)
+    {
+        var count = tile.Count;
+        for (var h = 0; h < tile.Heads; h++)
+        {
+            var scores = tile.Scores + h * count;
+            var query = tile.Queries + h * 48;
+            var scale = tile.QueryScales[h] * InverseSqrtQkDim;
+            for (var s = 0; s < count; s++)
+                scores[s] = DotInt8x48(query, tile.Keys + (long)(tile.First + s) * tile.KeyStride) * tile.KeyScales[(long)(tile.First + s) * tile.ScaleStride] * scale;
+            Softmax(scores, count);
+            if (tile.Probabilities != null)
+                for (var s = 0; s < count; s++) tile.Probabilities[h * tile.ProbabilityStride + tile.First + s] = scores[s];
+        }
+        for (var h = 0; h < tile.Heads; h += 2)
+            for (var column = 0; column < 64; column += 16)
+            {
+                if (tile.Heads - h >= 2) AccumulateValuePair(tile, h, column);
+                else AccumulateValueSingle(tile, h, column);
+            }
+    }
+
+    static void AccumulateValuePair(in AttentionTile tile, int head, int column)
+    {
+        var count = tile.Count;
+        var first = tile.Scores + head * count;
+        var second = first + count;
+        var a0 = Vector128<float>.Zero;
+        var a1 = a0;
+        var a2 = a0;
+        var a3 = a0;
+        var b0 = a0;
+        var b1 = a0;
+        var b2 = a0;
+        var b3 = a0;
+        for (var s = 0; s < count; s++)
+        {
+            Widen(AdvSimd.LoadVector128(tile.Values + (long)(tile.First + s) * tile.ValueStride + column), out var f0, out var f1, out var f2, out var f3);
+            var valueScale = tile.ValueScales[(long)(tile.First + s) * tile.ScaleStride];
+            var wa = Vector128.Create(first[s] * valueScale);
+            var wb = Vector128.Create(second[s] * valueScale);
+            a0 = AdvSimd.FusedMultiplyAdd(a0, wa, f0);
+            a1 = AdvSimd.FusedMultiplyAdd(a1, wa, f1);
+            a2 = AdvSimd.FusedMultiplyAdd(a2, wa, f2);
+            a3 = AdvSimd.FusedMultiplyAdd(a3, wa, f3);
+            b0 = AdvSimd.FusedMultiplyAdd(b0, wb, f0);
+            b1 = AdvSimd.FusedMultiplyAdd(b1, wb, f1);
+            b2 = AdvSimd.FusedMultiplyAdd(b2, wb, f2);
+            b3 = AdvSimd.FusedMultiplyAdd(b3, wb, f3);
+        }
+        Store4(tile.Output + head * 64 + column, a0, a1, a2, a3);
+        Store4(tile.Output + (head + 1) * 64 + column, b0, b1, b2, b3);
+    }
+
+    static void AccumulateValueSingle(in AttentionTile tile, int head, int column)
+    {
+        var count = tile.Count;
+        var weights = tile.Scores + head * count;
+        var a0 = Vector128<float>.Zero;
+        var a1 = a0;
+        var a2 = a0;
+        var a3 = a0;
+        for (var s = 0; s < count; s++)
+        {
+            Widen(AdvSimd.LoadVector128(tile.Values + (long)(tile.First + s) * tile.ValueStride + column), out var f0, out var f1, out var f2, out var f3);
+            var weight = Vector128.Create(weights[s] * tile.ValueScales[(long)(tile.First + s) * tile.ScaleStride]);
+            a0 = AdvSimd.FusedMultiplyAdd(a0, weight, f0);
+            a1 = AdvSimd.FusedMultiplyAdd(a1, weight, f1);
+            a2 = AdvSimd.FusedMultiplyAdd(a2, weight, f2);
+            a3 = AdvSimd.FusedMultiplyAdd(a3, weight, f3);
+        }
+        Store4(tile.Output + head * 64 + column, a0, a1, a2, a3);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    static void Widen(Vector128<sbyte> bytes, out Vector128<float> f0, out Vector128<float> f1, out Vector128<float> f2, out Vector128<float> f3)
+    {
+        var low = AdvSimd.SignExtendWideningLower(bytes.GetLower());
+        var high = AdvSimd.SignExtendWideningUpper(bytes);
+        f0 = AdvSimd.ConvertToSingle(AdvSimd.SignExtendWideningLower(low.GetLower()));
+        f1 = AdvSimd.ConvertToSingle(AdvSimd.SignExtendWideningUpper(low));
+        f2 = AdvSimd.ConvertToSingle(AdvSimd.SignExtendWideningLower(high.GetLower()));
+        f3 = AdvSimd.ConvertToSingle(AdvSimd.SignExtendWideningUpper(high));
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     static void Store4(float* destination, Vector128<float> a, Vector128<float> b, Vector128<float> c, Vector128<float> d)
     {
