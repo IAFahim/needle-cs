@@ -1,0 +1,39 @@
+{"tools":"dialogue","tags":["ci"],"query":"say hello traveler, the bridge is out","expected":[{"name":"say","args":{"text":{"contains":"bridge is out"}}}]}
+{"tools":"dialogue","query":"tell him welcome to Oakvale","expected":[{"name":"say","args":{"text":{"contains":"welcome to oakvale"}}}]}
+{"tools":"dialogue","query":"say good morning","expected":[{"name":"say","args":{"text":{"contains":"good morning"}}}]}
+{"tools":"dialogue","query":"shout: the king is dead!","expected":[{"name":"say","args":{"text":{"contains":"king is dead"}}}]}
+{"tools":"dialogue","query":"say thanks for the help","expected":[{"name":"say","args":{"text":{"contains":"thanks for the help"}}}]}
+{"tools":"dialogue","query":"tell her I'm sorry about yesterday","expected":[{"name":"say","args":{"text":{"contains":"sorry"}}}]}
+{"tools":"dialogue","tags":["ci"],"query":"whisper to Mira that the guard is lying","expected":[{"name":"whisper","args":{"target":"Mira","text":{"contains":"guard is lying"}}}]}
+{"tools":"dialogue","query":"quietly tell Borin to meet me at midnight","expected":[{"name":"whisper","args":{"target":"Borin","text":{"contains":"midnight"}}}]}
+{"tools":"dialogue","query":"whisper to the innkeeper: I need a room","expected":[{"name":"whisper","args":{"target":{"contains":"innkeeper"},"text":{"contains":"room"}}}]}
+{"tools":"dialogue","query":"secretly tell Lyra the vault code is 4412","expected":[{"name":"whisper","args":{"target":"Lyra","text":{"contains":"4412"}}}]}
+{"tools":"dialogue","query":"ask the blacksmith about the broken sword","expected":[{"name":"ask_about","args":{"npc":{"contains":"blacksmith"},"topic":{"contains":"sword"}}}]}
+{"tools":"dialogue","query":"ask Elara about the missing children","expected":[{"name":"ask_about","args":{"npc":"Elara","topic":{"contains":"children"}}}]}
+{"tools":"dialogue","query":"what does the old man know about the cave?","expected":[{"name":"ask_about","args":{"npc":{"contains":"old man"},"topic":{"contains":"cave"}}}]}
+{"tools":"dialogue","query":"ask the guard about the new tax","expected":[{"name":"ask_about","args":{"npc":{"contains":"guard"},"topic":{"contains":"tax"}}}]}
+{"tools":"dialogue","query":"ask Garrick where the dragon lives","expected":[{"name":"ask_about","args":{"npc":"Garrick","topic":{"contains":"dragon"}}}]}
+{"tools":"dialogue","query":"ask around about the stolen crown","expected":[{"name":"ask_about","args":{"npc":{"any":true},"topic":{"contains":"crown"}}}]}
+{"tools":"dialogue","tags":["ci"],"query":"goodbye","expected":[{"name":"end_conversation","args":{}}]}
+{"tools":"dialogue","query":"end conversation","expected":[{"name":"end_conversation","args":{}}]}
+{"tools":"dialogue","query":"I'm done talking to him","expected":[{"name":"end_conversation","args":{}}]}
+{"tools":"dialogue","query":"walk away from the merchant","expected":[{"name":"end_conversation","args":{}}]}
+{"tools":"dialogue","query":"ok bye","expected":[{"name":"end_conversation","args":{}}]}
+{"tools":"dialogue","query":"pick option 2","expected":[{"name":"choose_option","args":{"number":2}}]}
+{"tools":"dialogue","query":"choose the third one","expected":[{"name":"choose_option","args":{"number":3}}]}
+{"tools":"dialogue","query":"number one","expected":[{"name":"choose_option","args":{"number":1}}]}
+{"tools":"dialogue","query":"option four please","expected":[{"name":"choose_option","args":{"number":4}}]}
+{"tools":"dialogue","query":"go with the second choice","expected":[{"name":"choose_option","args":{"number":2}}]}
+{"tools":"dialogue","tags":["ci"],"query":"wave at him","expected":[{"name":"emote","args":{"emotion":"wave"}}]}
+{"tools":"dialogue","query":"bow to the queen","expected":[{"name":"emote","args":{"emotion":"bow"}}]}
+{"tools":"dialogue","query":"laugh","expected":[{"name":"emote","args":{"emotion":"laugh"}}]}
+{"tools":"dialogue","query":"start dancing","expected":[{"name":"emote","args":{"emotion":"dance"}}]}
+{"tools":"dialogue","query":"shrug it off","expected":[{"name":"emote","args":{"emotion":"shrug"}}]}
+{"tools":"dialogue","query":"burst into tears","expected":[{"name":"emote","args":{"emotion":"cry"}}]}
+{"tools":"dialogue","query":"do a little jig","expected":[{"name":"emote","args":{"emotion":"dance"}}]}
+{"tools":"dialogue","query":"set the volume to 50","expected":[]}
+{"tools":"dialogue","query":"equip the sword","expected":[]}
+{"tools":"dialogue","tags":["ci"],"query":"move to 10 20","expected":[]}
+{"tools":"dialogue","query":"what's the weather like","expected":[]}
+{"tools":"dialogue","query":"save my game","expected":[]}
+{"tools":"dialogue","query":"open the map","expected":[]}
