@@ -311,7 +311,6 @@ public sealed unsafe partial class Whistle : IDisposable
             var flat = stemFlat + (long)r * 10 * s;
             for (var f = 0; f < 10; f++)
                 for (var c = 0; c < s; c++) flat[c * 10 + f] = row[f * s + c];
-            Quant.FakeA8(flat, 10 * s);
         }
         Quant.Prepare(stemFlat, rows, 10 * s, 2, flatAct);
         var batch = new MatMulBatch(flatAct, rows);
@@ -336,7 +335,6 @@ public sealed unsafe partial class Whistle : IDisposable
             for (var t = 0; t < count; t++)
             {
                 Ops.RmsUnit(stream + (long)t * width, width, normalized + (long)t * width);
-                Quant.FakeA8(normalized + (long)t * width, width);
             }
             Quant.Prepare(normalized, count, width, 4, streamAct);
             var mix = new MatMulBatch(streamAct, count);
@@ -397,7 +395,6 @@ public sealed unsafe partial class Whistle : IDisposable
         {
             var r = quantizedRows + (long)t * dim;
             Ops.ZeroCenteredRms(residual + (long)t * dim, w->AttnNorm, dim, r);
-            Quant.FakeA8(r, dim);
         }
         Quant.Prepare(quantizedRows, count, dim, 2, dimAct);
         var projections = new MatMulBatch(dimAct, count);
@@ -434,7 +431,6 @@ public sealed unsafe partial class Whistle : IDisposable
         {
             var o = attnOut + (long)t * g.OutputWidth;
             Ops.MultiplyBySigmoid(o, gateOut + (long)t * g.OutputWidth, g.OutputWidth);
-            Quant.FakeA8(o, g.OutputWidth);
         }
         Quant.Prepare(attnOut, count, g.OutputWidth, 2, dimAct);
         var output = new MatMulBatch(dimAct, count);
@@ -453,7 +449,6 @@ public sealed unsafe partial class Whistle : IDisposable
         {
             var r = quantizedRows + (long)t * dim;
             Ops.ZeroCenteredRms(residual + (long)t * dim, w->ConvNorm, dim, r);
-            Quant.FakeA8(r, dim);
         }
         Quant.Prepare(quantizedRows, count, dim, 2, dimAct);
         var expand = new MatMulBatch(dimAct, count);

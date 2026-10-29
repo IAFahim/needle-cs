@@ -22,6 +22,8 @@ CLIPS = {
     "long25": ("test_long.wav", 25 * SAMPLE_RATE),
 }
 ABSOLUTE_FLOOR = 2.0 ** -24
+SITES = frozenset(["stem", "route", "attn_in", "qkv", "attn_out", "pw1_in", "pw2_in", "memory", "engram", "logits"])
+FLOAT_ENCODER = frozenset(["stem", "route", "attn_in", "attn_out", "pw1_in", "pw2_in"])
 RELATIVE_FLOOR = 1e-8
 
 
@@ -50,7 +52,8 @@ class Cursor:
 
 
 class Whistle:
-    def __init__(self, cact, quant=True, rotated=False, floor="relative"):
+    def __init__(self, cact, quant=True, rotated=False, floor="relative", encoder_float=True):
+        self.encoder_float = encoder_float
         self.floor = floor
         self.c = cact
         self.quant = quant
@@ -242,6 +245,15 @@ class Whistle:
         return x + 0.5 * self.mlp(zc(x, self.dense(w["pre_mlp_norm"])), w["mlp"])
 
     def encode(self, pcm):
+        decoder_quant = self.quant
+        if self.encoder_float:
+            self.quant = (SITES if self.quant is True else set(self.quant)) - FLOAT_ENCODER
+        try:
+            return self.encode_stages(pcm)
+        finally:
+            self.quant = decoder_quant
+
+    def encode_stages(self, pcm):
         pcm = pcm[:MAX_SAMPLES]
         stages = {}
         features = self.mel_features(pcm)

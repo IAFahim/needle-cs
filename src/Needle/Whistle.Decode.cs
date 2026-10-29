@@ -117,7 +117,20 @@ public sealed unsafe partial class Whistle
         if (Encode(pcm) == 0) return pass;
         BuildCrossMemory();
         pass.EncodeMs = (Stopwatch.GetTimestamp() - started) * 1000.0 / Stopwatch.Frequency;
+        return DecodeMemory(pass, started, language, keywords, align);
+    }
 
+    internal string TranscribeEmbedding(ReadOnlySpan<float> embedding, string? language)
+    {
+        EnsureDecoderBuffers();
+        frames = embedding.Length / dim;
+        embedding.CopyTo(new Span<float>(encoderOutput, embedding.Length));
+        BuildCrossMemory();
+        return DecodeMemory(new Pass(), Stopwatch.GetTimestamp(), language, null, false).Text;
+    }
+
+    Pass DecodeMemory(Pass pass, long started, string? language, IReadOnlyList<string>? keywords, bool align)
+    {
         Prime(language, align, pass);
         var one = stackalloc int[1];
         var logits = decoder.Logits;
