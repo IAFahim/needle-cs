@@ -6,6 +6,40 @@ Zero-allocation, unsafe C# inference engine for [Needle 3](https://huggingface.c
 
 Reads `.cact` model files directly in place with AVX2, ARM64 NEON (SDOT with a widening fallback for CPUs without FEAT_DotProd), and portable scalar backends, selected at runtime per core. Supports NativeAOT, standard .NET (`net10.0`), `netstandard2.1`, and Unity/Burst.
 
+## Status
+
+Early but usable for a showcase: everything below works on Linux x64 today and is covered by 71 passing tests (Linux x64, AVX2 and scalar).
+
+| Area | State |
+|---|---|
+| Tool calling, extraction, embeddings, voice to tool call | Working, golden-parity tested against a numpy reference |
+| Loading models | Portable file mapping (`Model.Open`), `FromBytes`, `FromMemory`, `FromStream`. Verified on Linux; Windows and macOS code exists but has not been run |
+| Threading | `ThreadPolicy` presets, the library never pins your calling thread, workers park when idle, `Pause`/`Resume` |
+| Speed | About the same as the upstream native engine (92-111 ms vs 95-129 ms per call on a 4-core VM). A 4x decode speedup is planned, see below |
+| Per-call allocations | About 6 KB of managed allocations per call today. Zero-allocation API and typed C# calls are planned |
+| Unity | Sample package exists, the Entities `ISystem` version is planned |
+
+The roadmap lives in [plan.md](plan.md), and every work item is a GitHub issue. Start at the tracking issue [#31](https://github.com/IAFahim/needle-cs/issues/31).
+
+## Try it in two minutes
+
+```sh
+tools/fetch.sh
+dotnet publish src/Needle.Cli -c Release -o out/aot
+```
+
+```sh
+NEEDLE_THREADS=4 out/aot/needle call ref/hf/needle3.cact tools/tools.json "what's it like in Lagos right now?" "set a timer for 12 minutes and play some Miles Davis"
+```
+
+```sh
+NEEDLE_THREADS=4 out/aot/needle run ref/hf/needle3.cact tools/tools.json "what's it like in Lagos right now?" 20
+```
+
+The first command prints one JSON result per query: the chosen tools, their arguments, the model's reasoning and a confidence score. The second repeats a query and reports prefill and decode timings. Voice works the same way: `out/aot/needle voice ref/hf/needle3.cact ref/hf/whistle/whistle.cact tools/tools.json ref/audio/record.wav`.
+
+These steps need no golden fixtures. Only `dotnet test` does.
+
 ## Features
 
 - **Needle 3 Tool Calling:** Schema-driven byte-level pushdown automaton grammar constraint, multi-turn sessions, confidence scoring, top-K tool retrieval, structured extraction, and 3072-d embeddings.
@@ -46,6 +80,17 @@ var followUp = session.CompleteWithToolResult("{\"status\":\"ok\"}");
 Console.WriteLine(followUp.Response);
 ```
 
+### Threading in a game
+
+```csharp
+var options = new NeedleOptions { Threading = ThreadPolicy.Game.WithThreads(3) };
+using var session = new NeedleSession(model, toolsJson, options);
+session.Pause();
+session.Resume();
+```
+
+Creating a session never changes the affinity or priority of the thread that creates it. Worker threads park shortly after finishing work (about 300 microseconds by default, 50 for `ThreadPolicy.Game`) and `Pause()` makes calls run inline on the caller while the workers sleep.
+
 ### Speech-to-Text & Voice-to-Tool
 
 ```csharp
@@ -59,7 +104,18 @@ using var voice = new VoiceSession(model, speech, toolsJson);
 var voiceCall = voice.Complete(pcm);
 ```
 
-## Performance (i9-14900K, NativeAOT)
+## Performance
+
+Measured on a 4-core Sapphire Rapids VM, NativeAOT, 4 threads, "what's it like in Lagos right now?" with the three-tool test set:
+
+| Engine | Per call | Decode |
+|---|---|---|
+| needle-cs | 92-111 ms | 1.75-2.0 ms/token |
+| Upstream `libneedle3.so` 3.3.3 | 95-129 ms | about 1.75 ms/token |
+
+The detailed profile and the plan to reach 25 ms per call are in [plan.md](plan.md).
+
+### Reference numbers on an i9-14900K, NativeAOT
 
 | Workload | Latency / Speed | Peak RSS (Private) |
 |---|---|---|
