@@ -32,7 +32,7 @@ public sealed class VoiceSession : IDisposable
 
     public VoiceSession(Model needleModel, Model whistleModel, string toolsJson, NeedleOptions? options = null)
     {
-        whistle = new Whistle(whistleModel, options?.Threads ?? 1);
+        whistle = new Whistle(whistleModel, options?.ResolvedThreading ?? ThreadPolicy.Default);
         needle = new NeedleSession(needleModel, toolsJson, options);
         vocabulary = EnumValues(new ToolSet(toolsJson));
     }
@@ -65,6 +65,18 @@ public sealed class VoiceSession : IDisposable
         }
         foreach (var tool in tools.Tools) Walk(tool);
         return found;
+    }
+
+    public void Pause()
+    {
+        whistle.Pause();
+        needle.Pause();
+    }
+
+    public void Resume()
+    {
+        whistle.Resume();
+        needle.Resume();
     }
 
     public void Dispose()

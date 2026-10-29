@@ -1,8 +1,44 @@
 # needle-cs
 
+[![CI](https://github.com/IAFahim/needle-cs/actions/workflows/ci.yml/badge.svg)](https://github.com/IAFahim/needle-cs/actions/workflows/ci.yml)
+
 Zero-allocation, unsafe C# inference engine for [Needle 3](https://huggingface.co/Cactus-Compute/needle3) (tool calling, extraction, retrieval, embeddings) and [Whistle](https://huggingface.co/Cactus-Compute/whistle) (speech-to-text).
 
 Reads `.cact` model files directly in place with AVX2, ARM64 NEON (SDOT with a widening fallback for CPUs without FEAT_DotProd), and portable scalar backends, selected at runtime per core. Supports NativeAOT, standard .NET (`net10.0`), `netstandard2.1`, and Unity/Burst.
+
+## Status
+
+Early but usable for a showcase: everything below works on Linux x64 today and is covered by 85 passing tests (Linux x64, AVX2 and scalar).
+
+| Area | State |
+|---|---|
+| Tool calling, extraction, embeddings, voice to tool call | Working, golden-parity tested against a numpy reference |
+| Loading models | Portable file mapping (`Model.Open`), `FromBytes`, `FromMemory`, `FromStream`. Verified on Linux; Windows and macOS code exists but has not been run |
+| Threading | `ThreadPolicy` presets, the library never pins your calling thread, workers park when idle, `Pause`/`Resume` |
+| Speed | Faster than the upstream native engine on the reference VM (73-84 ms vs 95-129 ms per call, 4 threads). A further 3x is planned, see below |
+| Per-call allocations | About 6 KB of managed allocations per call today. Zero-allocation API and typed C# calls are planned |
+| Unity | Sample package exists, the Entities `ISystem` version is planned |
+
+The roadmap lives in [plan.md](plan.md), and every work item is a GitHub issue. Start at the tracking issue [#31](https://github.com/IAFahim/needle-cs/issues/31).
+
+## Try it in two minutes
+
+```sh
+tools/fetch.sh
+dotnet publish src/Needle.Cli -c Release -o out/aot
+```
+
+```sh
+NEEDLE_THREADS=4 out/aot/needle call ref/hf/needle3.cact tools/tools.json "what's it like in Lagos right now?" "set a timer for 12 minutes and play some Miles Davis"
+```
+
+```sh
+NEEDLE_THREADS=4 out/aot/needle run ref/hf/needle3.cact tools/tools.json "what's it like in Lagos right now?" 20
+```
+
+The first command prints one JSON result per query: the chosen tools, their arguments, the model's reasoning and a confidence score. The second repeats a query and reports prefill and decode timings. Voice works the same way: `out/aot/needle voice ref/hf/needle3.cact ref/hf/whistle/whistle.cact tools/tools.json ref/audio/record.wav`.
+
+These steps need no golden fixtures. Only `dotnet test` does.
 
 ## Features
 
@@ -44,6 +80,17 @@ var followUp = session.CompleteWithToolResult("{\"status\":\"ok\"}");
 Console.WriteLine(followUp.Response);
 ```
 
+### Threading in a game
+
+```csharp
+var options = new NeedleOptions { Threading = ThreadPolicy.Game.WithThreads(3) };
+using var session = new NeedleSession(model, toolsJson, options);
+session.Pause();
+session.Resume();
+```
+
+Creating a session never changes the affinity or priority of the thread that creates it. Worker threads park shortly after finishing work (about 300 microseconds by default, 50 for `ThreadPolicy.Game`) and `Pause()` makes calls run inline on the caller while the workers sleep.
+
 ### Speech-to-Text & Voice-to-Tool
 
 ```csharp
@@ -57,7 +104,18 @@ using var voice = new VoiceSession(model, speech, toolsJson);
 var voiceCall = voice.Complete(pcm);
 ```
 
-## Performance (i9-14900K, NativeAOT)
+## Performance
+
+Measured on a 4-core Sapphire Rapids VM, NativeAOT, 4 threads, "what's it like in Lagos right now?" with the three-tool test set:
+
+| Engine | Per call | Decode |
+|---|---|---|
+| needle-cs | 73-84 ms | 1.37-1.55 ms/token |
+| Upstream `libneedle3.so` 3.3.3 | 95-129 ms | about 1.75 ms/token |
+
+The 4-thread numbers include the faster Hadamard MLP (W12). The detailed profile and the plan to reach 25 ms per call are in [plan.md](plan.md).
+
+### Reference numbers on an i9-14900K, NativeAOT
 
 | Workload | Latency / Speed | Peak RSS (Private) |
 |---|---|---|
@@ -69,15 +127,76 @@ The full parity suite (golden logits, greedy decode, tokenizer) passes on AVX2, 
 
 ## Build & Test
 
+Requirements: the [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0) (the 8.0 SDK fails with `NETSDK1045`), Python 3 with `numpy` and `sentencepiece`, and `curl`.
+
 ```sh
-# Fetch models & fixtures, then run tests
+# 1. Fetch the model, tokenizer, upstream wheel, Whistle and audio clips into ref/
 tools/fetch.sh
+
+# 2. Generate the golden fixtures (numpy reference forward pass)
+pip install numpy sentencepiece
+python3 tools/golden.py               # about 15 CPU minutes
+python3 tools/golden_confidence.py    # needs the output of golden.py; takes seconds
+
+# 3. Run the 54 tests (about 2 minutes each)
 dotnet test tests/Needle.Tests -c Release
 NEEDLE_SCALAR=1 dotnet test tests/Needle.Tests -c Release
+```
 
+The greedy decode budget is `DECODE_BUDGET` in `tools/golden.py` (`python3 tools/golden.py 64` overrides it). The script records the budget it used in `ref/golden/golden.json` and `ParityTests.GenerationMatchesReferenceGreedyDecode` decodes exactly that many tokens, so the fixture and the test cannot drift.
+
+```sh
 # Build NativeAOT CLI
 dotnet publish src/Needle.Cli -c Release
 
 # Build Unity netstandard2.1 DLL
 dotnet build src/Needle -f netstandard2.1 -c Release
 ```
+
+## Licensing and model files
+
+- **This repository's code license is pending.** The owner has not yet chosen one, so there is no `LICENSE` file. See [CONTRIBUTING.md](CONTRIBUTING.md).
+- **Model weights are not in this repository.** `needle3.cact` and `whistle.cact` come from the [Needle 3](https://huggingface.co/Cactus-Compute/needle3) and [Whistle](https://huggingface.co/Cactus-Compute/whistle) Hugging Face repositories, whose model cards declare `license: apache-2.0`. `tools/fetch.sh` downloads them into `ref/`, which is git-ignored.
+- **Game builds that ship the weights** must comply with the Apache License 2.0 for those files: include its license text and keep the attribution notices. Credits are in [NOTICE](NOTICE).
+- **The upstream wheel and `libneedle3.so`** that `tools/fetch.sh` downloads are for local benchmarking only. Never commit or ship them.
+- **Clean-room:** no code from [`cactus-compute/cactus`](https://github.com/cactus-compute/cactus), which has a custom non-Apache license, may be used here. Details are in [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Loading models on mobile and consoles
+
+Files inside an Android APK (StreamingAssets) cannot be memory-mapped. Either read them into a `byte[]` and call `Model.FromBytes`, stream them with `Model.FromStream`, or copy the file once to `persistentDataPath` and call `Model.Open` on that path. iOS can map the file from the bundle path directly.
+
+## Benchmarking
+
+One harness covers end-to-end latency, the per-stage profile, kernels, allocations and the upstream native library. Build the CLI first (`dotnet publish src/Needle.Cli -c Release -o out/aot`).
+
+```sh
+# End to end: the two golden prompts (tools.json) plus a 10-prompt game set with 7 tools (tools/game_tools.json)
+out/aot/needle bench-e2e ref/hf/needle3.cact tools/tools.json --threads 1,2,4 --reps 5
+
+# Same run as JSON (CI artifact), with the per-stage profile of the first prompt
+out/aot/needle bench-e2e ref/hf/needle3.cact tools/tools.json --threads 4 --reps 9 --profile --json > e2e.json
+
+# Kernels: every CQ matmul shape at T=1,2,4,8,16,64 (serial and pooled), Prepare, HadamardMlp, Sinkhorn, softmax/argmax, Pool.Run barrier, TokenTrie.Allow
+out/aot/needle bench ref/hf/needle3.cact --threads 4
+
+# Upstream libneedle3.so through ctypes on the same prompts and the same prefix (never commit the wheel or the .so)
+python3 tools/native_bench.py ref/hf/wheel ref/hf/needle3.cact tools/tools.json --json > native.json
+```
+
+- `bench-e2e` runs `NeedleSession` with `AutoDate = false` and an empty system prompt, so the prefix is identical to upstream `needle_init(system="")`. Tool retrieval is off. It reports prefill ms, decode us/token, TTFT, total ms and token counts as best and median over `--reps`, plus managed bytes per call (`GC.GetTotalAllocatedBytes(true)` delta, which covers worker threads) and native allocations per call.
+- `--profile` drives a greedy decode (40 tokens after the prefill) on an engine instantiated with a real stage clock and prints embed, hyper (prepare, phi, mix), engram, attention (prep, QKVG, post-projection, core, gate, out, post-norm), cross, MLP, combine and logits in us/token, the `Pool.Run` count per token, and the same split for the prefill. Without `--profile` the engine uses `NoClock`, an empty struct whose calls are inlined away.
+- Native allocation counts need a build with the counters compiled in: `dotnet publish src/Needle.Cli -c Release -p:NeedleAllocCounters=true -o out/aot-counters`. Otherwise the field is `null` (JSON) or `n/a` (text).
+- Allocation gate: `--max-managed-bytes N` and `--max-native-allocs N` make the command exit with status 1 when the median per call exceeds the limit.
+- Kernel GB/s is weight bytes per call over the best time, with the weights cycled across layers; GMAC/s counts multiply-accumulates (Kron only for `hadamard_mlp_apply`). The `Pool.Run` barrier rows need an idle machine: if workers do not get a core, the calling thread drains the empty tasks alone and the figure collapses.
+
+### A/B method
+
+Every performance claim compares two builds on the same machine, interleaved, best of at least 5 rounds:
+
+```sh
+python3 tools/bench_ab.py --rounds 6 \
+  --a "out/base/needle bench-e2e ref/hf/needle3.cact tools/tools.json --threads 4 --reps 5 --sets golden --json" \
+  --b "out/aot/needle bench-e2e ref/hf/needle3.cact tools/tools.json --threads 4 --reps 5 --sets golden --json"
+```
+
+`bench_ab.py` alternates A,B / B,A rounds, then reports the best of the per-round bests and the median of the per-round medians for both variants, with the percentage change. Expect about 15% noise on a shared machine; trust the best-of figures and repeat when A and B differ by less than the spread between rounds. `tools/native_bench.py --json` produces the same schema, so a native run can be passed as `--b` against a C# `--a` (its `threads` is `null`, which matches every thread count). The upstream C API reports tokens per second and no token counts or TTFT, so the native JSON carries `prefill_tps`, `decode_tps`, `decode_us_per_token` and a wall-clock `total_ms` around `needle_complete`; `bench-e2e` emits the same `prefill_tps` and `decode_tps` fields for a like-for-like comparison. The library spins its own worker threads and degrades badly on a loaded machine, so run it on an idle one.

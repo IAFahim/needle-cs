@@ -5,11 +5,13 @@ using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using Needle;
+using Needle.Cli;
 
 return args switch
 {
     ["verify", var model, var golden] => Verify(model, golden),
-    ["bench", var model] => Bench(model),
+    ["bench", var model, .. var options] => BenchKernels.Run(model, options),
+    ["bench-e2e", var model, var tools, .. var options] => BenchE2E.Run(model, tools, options),
     ["generate", var model, var text, .. var count] => Generate(model, text, count.Length > 0 ? int.Parse(count[0]) : 80),
     ["transcribe", var model, var wav, .. var options] => Transcribe(model, wav, options),
     ["stream", var model, var wav] => StreamClip(model, wav),
@@ -24,6 +26,8 @@ static int Usage()
 {
     Console.Error.WriteLine("needle verify <model.cact> <golden-dir>");
     Console.Error.WriteLine("needle run <model.cact> <tools.json> <query> [repeat]");
+    Console.Error.WriteLine("needle bench <needle3.cact> [--threads 4] [--json]");
+    Console.Error.WriteLine("needle bench-e2e <needle3.cact> <tools.json> [--threads 1,2,4] [--reps N] [--sets golden|game|all] [--profile] [--json] [--max-managed-bytes N] [--max-native-allocs N]");
     Console.Error.WriteLine("needle call <needle3.cact> <tools.json> <query>... ('tool:<json>' feeds a tool result)");
     Console.Error.WriteLine("needle transcribe <whistle.cact> <clip.wav> [--language xx] [--words] [--keywords a,b] [--repeat n]");
     Console.Error.WriteLine("needle stream <whistle.cact> <clip.wav>");
@@ -107,43 +111,6 @@ static void CompareLayer(int layer, ReadOnlySpan<float> stream, string goldenDir
             worst = Math.Max(worst, Math.Abs(a - b));
         }
     Console.WriteLine($"layer {layer,2}: cosine={dot / Math.Sqrt(na * nb):F6} maxAbs={worst:F4} rms={Math.Sqrt(nb / (tokens * lanes * 768)):F3}");
-}
-
-static unsafe int Bench(string modelPath)
-{
-    using var model = Model.Open(modelPath);
-    var arena = new Arena(64 << 20);
-    foreach (var (name, w) in new (string, Cq)[] { ("q_proj 576x768 2b", model.Blocks[5].Q), ("out_proj 768x768 2b", model.Blocks[5].Out), ("head 8192x768 4b", model.Embedding), ("phi_res 320x3072 4b", model.Hyper.PhiRes) })
-    {
-        foreach (var tokens in new[] { 1, 4, 64 })
-        {
-            var act = new Activations(ref arena, tokens, w.Cols);
-            var x = arena.Take<float>((nuint)(tokens * w.Cols));
-            for (var i = 0; i < tokens * w.Cols; i++) x[i] = MathF.Sin(i * 0.37f);
-            Quant.Prepare(x, tokens, w.Cols, w.Bits, act);
-            var y = arena.Take<float>((nuint)(tokens * w.Rows));
-            for (var i = 0; i < 20; i++) Quant.MatMul(w, act, tokens, y, w.Rows);
-            var iterations = Math.Max(20, 4000 / tokens);
-            var start = Stopwatch.GetTimestamp();
-            for (var i = 0; i < iterations; i++) Quant.MatMul(w, act, tokens, y, w.Rows);
-            var ns = (Stopwatch.GetTimestamp() - start) * 1e9 / Stopwatch.Frequency / iterations;
-            var bytes = (double)w.Rows * w.RowBytes;
-            Console.WriteLine($"{name,-22} T={tokens,-3} {ns / 1000,9:F2} us  {ns / (w.Rows * w.Groups):F2} ns/group-dot  {bytes / ns:F1} GB/s weights");
-        }
-    }
-    Console.WriteLine($"prepare 3072 cols 4b T=1: {PrepareNs(arena, 3072, 4):F0} ns   768 cols 2b: {PrepareNs(arena, 768, 2):F0} ns");
-    return 0;
-}
-
-static unsafe double PrepareNs(Arena arena, int cols, int bits)
-{
-    var act = new Activations(ref arena, 1, cols);
-    var x = arena.Take<float>((nuint)cols);
-    for (var i = 0; i < cols; i++) x[i] = MathF.Sin(i * 0.37f);
-    for (var i = 0; i < 100; i++) Quant.Prepare(x, 1, cols, bits, act);
-    var start = Stopwatch.GetTimestamp();
-    for (var i = 0; i < 2000; i++) Quant.Prepare(x, 1, cols, bits, act);
-    return (Stopwatch.GetTimestamp() - start) * 1e9 / Stopwatch.Frequency / 2000;
 }
 
 static int Call(string modelPath, string toolsPath, string[] queries)

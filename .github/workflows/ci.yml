@@ -1,0 +1,161 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  DOTNET_NOLOGO: "1"
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: "1"
+
+jobs:
+  fixtures:
+    name: Model and golden fixtures
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Restore cached ref directory
+        id: ref-cache
+        uses: actions/cache@v4
+        with:
+          path: ref
+          key: ref-v1-${{ hashFiles('tools/fetch.sh', 'tools/golden.py', 'tools/golden_confidence.py') }}
+
+      - name: Set up Python
+        if: steps.ref-cache.outputs.cache-hit != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        if: steps.ref-cache.outputs.cache-hit != 'true'
+        run: pip install numpy sentencepiece
+
+      - name: Download models, tokenizer and audio clips
+        if: steps.ref-cache.outputs.cache-hit != 'true'
+        run: bash tools/fetch.sh
+
+      - name: Generate golden logits and greedy decode (40 tokens)
+        if: steps.ref-cache.outputs.cache-hit != 'true'
+        run: python3 tools/golden.py 40
+
+      - name: Generate golden confidence-head fixtures
+        if: steps.ref-cache.outputs.cache-hit != 'true'
+        run: python3 tools/golden_confidence.py
+
+      - name: Verify fixtures are present
+        run: |
+          test -s ref/hf/needle3.cact
+          test -s ref/hf/tokenizer/tokenizer.model
+          test -s ref/hf/whistle/whistle.cact
+          test -s ref/audio/record.wav
+          test -s ref/golden/golden.json
+          test -s ref/golden/case0/logits.bin
+          du -sh ref
+
+      - name: Publish fixtures for the test matrix
+        uses: actions/upload-artifact@v4
+        with:
+          name: ref-fixtures
+          path: ref
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 1
+
+  test:
+    name: Test (${{ matrix.name }})
+    needs: fixtures
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.expected-fail }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-latest
+            expected-fail: false
+            scalar: true
+            netstandard: true
+            neon: false
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+            expected-fail: false
+            scalar: false
+            netstandard: false
+            neon: true
+          - name: windows-x64
+            os: windows-latest
+            expected-fail: true
+            scalar: false
+            netstandard: false
+            neon: false
+          - name: macos-arm64
+            os: macos-14
+            expected-fail: true
+            scalar: false
+            netstandard: false
+            neon: false
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up .NET 10 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Download fixtures into ref
+        uses: actions/download-artifact@v4
+        with:
+          name: ref-fixtures
+          path: ref
+
+      - name: Run unit and parity tests (Release)
+        run: dotnet test tests/Needle.Tests -c Release
+
+      - name: Run NeonTests natively with verbose output
+        if: matrix.neon
+        run: dotnet test tests/Needle.Tests -c Release --no-build --filter "FullyQualifiedName~NeonTests" --logger "console;verbosity=normal"
+
+      - name: Run tests on the NEON widening fallback tier (NEEDLE_NODP=1)
+        if: matrix.neon
+        env:
+          NEEDLE_NODP: "1"
+        run: dotnet test tests/Needle.Tests -c Release --no-build
+
+      - name: Run tests on the scalar backend (NEEDLE_SCALAR=1)
+        if: matrix.scalar
+        env:
+          NEEDLE_SCALAR: "1"
+        run: dotnet test tests/Needle.Tests -c Release --no-build
+
+      - name: Build netstandard2.1 library (Release)
+        if: matrix.netstandard
+        run: dotnet build src/Needle -f netstandard2.1 -c Release
+
+      - name: Publish NativeAOT CLI
+        run: dotnet publish src/Needle.Cli -c Release -o out/aot
+
+      - name: NativeAOT smoke run (tool call for a Lagos weather query)
+        run: |
+          exe=out/aot/needle
+          if [ "$RUNNER_OS" = "Windows" ]; then exe=out/aot/needle.exe; fi
+          "$exe" run ref/hf/needle3.cact tools/tools.json "what's it like in Lagos right now?" 1 | tee smoke.txt
+          grep -q "get_weather" smoke.txt

@@ -293,9 +293,8 @@ internal static unsafe class Scalar
                 tile.Output + h * 64, tile.Probabilities == null ? null : tile.Probabilities + h * tile.ProbabilityStride);
     }
 
-    public static void Condition(float* condV, float* condU, float* input, int dim, int width, float* condition)
+    public static void ConditionWeights(float* condV, float* input, int dim, float* weights)
     {
-        var weights = stackalloc float[8];
         for (var j = 0; j < 8; j++)
         {
             var sum = 0f;
@@ -303,35 +302,53 @@ internal static unsafe class Scalar
             weights[j] = sum;
         }
         Softmax(weights, 8);
+    }
+
+    public static void ScaleInput(float* input, float* d1, int dim, int padded, float* destination)
+    {
+        for (var i = 0; i < dim; i++) destination[i] = input[i] * d1[i];
+        for (var i = dim; i < padded; i++) destination[i] = 0f;
+    }
+
+    public static void PermuteModulateActivate(int* permutation, float* source, float* d2, float* weights, float* condU, float* b2, int width, float* destination)
+    {
         for (var n = 0; n < width; n++)
         {
-            var sum = 1f;
-            for (var j = 0; j < 8; j++) sum += weights[j] * condU[j * width + n];
-            condition[n] = sum;
+            var condition = 1f;
+            for (var j = 0; j < 8; j++) condition += weights[j] * condU[j * width + n];
+            var v = d2[n] * condition * source[permutation[n]] + b2[n];
+            destination[n] = v * Sigmoid(v);
         }
     }
 
-    public static void ModulateActivate(float* d2, float* condition, float* a, float* b2, int width)
+    public static void PermuteScale(int* permutation, float* source, float* scale, int width, float* destination)
     {
-        for (var i = 0; i < width; i++) a[i] = d2[i] * condition[i] * a[i] + b2[i];
+        for (var n = 0; n < width; n++) destination[n] = source[permutation[n]] * scale[n];
     }
 
-    public static void Kron(float* z, float* left, float* right, int rows, int cols, float* result)
+    public static void AccumulateOutput(float* residual, float* product, float* d4, float scale, int count)
     {
-        var scratch = stackalloc float[rows * cols];
-        for (var k = 0; k < rows; k++)
+        for (var i = 0; i < count; i++) residual[i] += scale * (product[i] * d4[i]);
+    }
+
+    [System.Runtime.CompilerServices.SkipLocalsInit]
+    public static void Kron(float* z, int activeRows, float* left, float* right, int rows, int cols, int resultRows, float* result)
+    {
+        var scratch = stackalloc float[cols];
+        for (var k = 0; k < resultRows; k++)
+        {
             for (var c = 0; c < cols; c++)
             {
                 var sum = 0f;
-                for (var i = 0; i < rows; i++) sum += left[i * rows + k] * z[i * cols + c];
-                scratch[k * cols + c] = sum;
+                for (var i = 0; i < activeRows; i++) sum += left[i * rows + k] * z[i * cols + c];
+                scratch[c] = sum;
             }
-        for (var k = 0; k < rows; k++)
             for (var c = 0; c < cols; c++)
             {
                 var sum = 0f;
-                for (var j = 0; j < cols; j++) sum += scratch[k * cols + j] * right[j * cols + c];
+                for (var j = 0; j < cols; j++) sum += scratch[j] * right[j * cols + c];
                 result[k * cols + c] = sum;
             }
+        }
     }
 }

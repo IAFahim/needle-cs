@@ -6,8 +6,11 @@ namespace Needle;
 
 internal sealed unsafe class TokenTrie : IDisposable
 {
+    const int MaxTokenBytes = 64;
+
     readonly int vocab;
     readonly int maskWords;
+    readonly GrammarState* walkStates;
     int* edgeStart;
     int* edgeCount;
     byte* edgeByte;
@@ -27,6 +30,7 @@ internal sealed unsafe class TokenTrie : IDisposable
     {
         vocab = vocabSize;
         maskWords = (vocab + 31) / 32;
+        walkStates = (GrammarState*)Mem.Alloc((nuint)(MaxTokenBytes + 1) * (nuint)sizeof(GrammarState));
         var children = new List<SortedDictionary<byte, int>> { new() };
         var heads = new List<int> { -1 };
         var next = new int[vocab];
@@ -128,8 +132,7 @@ internal sealed unsafe class TokenTrie : IDisposable
 
     void Walk(GrammarProgram* g, GrammarState* start, uint* mask)
     {
-        const int MaxTokenBytes = 64;
-        var states = (GrammarState*)Mem.Alloc((nuint)(MaxTokenBytes + 1) * (nuint)sizeof(GrammarState));
+        var states = walkStates;
         var nodes = stackalloc int[MaxTokenBytes + 1];
         var cursors = stackalloc int[MaxTokenBytes + 1];
         states[0] = *start;
@@ -152,11 +155,11 @@ internal sealed unsafe class TokenTrie : IDisposable
             nodes[depth] = child;
             cursors[depth] = 0;
         }
-        Mem.Free(states);
     }
 
     public void Dispose()
     {
+        Mem.Free(walkStates);
         Mem.Free(edgeStart);
         Mem.Free(edgeCount);
         Mem.Free(tokenHead);

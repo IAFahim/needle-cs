@@ -410,23 +410,44 @@ public sealed unsafe class NeonTests
         var input = stackalloc float[dim];
         for (var i = 0; i < dim; i++) input[i] = (float)(random.NextDouble() * 2 - 1);
 
-        var expectedCondition = stackalloc float[width];
-        var actualCondition = stackalloc float[width];
-        Scalar.Condition(condV, condU, input, dim, width, expectedCondition);
-        Neon.Condition(condV, condU, input, dim, width, actualCondition);
-        AssertClose(actualCondition, expectedCondition, width, "Condition");
+        var permutation = stackalloc int[width];
+        for (var i = 0; i < width; i++) permutation[i] = (i * 389 + 17) % width;
 
+        var expectedWeights = stackalloc float[8];
+        var actualWeights = stackalloc float[8];
+        Scalar.ConditionWeights(condV, input, dim, expectedWeights);
+        Neon.ConditionWeights(condV, input, dim, actualWeights);
+        AssertClose(actualWeights, expectedWeights, 8, "ConditionWeights");
+
+        var expectedInput = stackalloc float[width];
+        var actualInput = stackalloc float[width];
+        Scalar.ScaleInput(input, d2, dim, 160, expectedInput);
+        Neon.ScaleInput(input, d2, dim, 160, actualInput);
+        AssertClose(actualInput, expectedInput, 160, "ScaleInput");
+
+        var source = stackalloc float[width];
+        for (var i = 0; i < width; i++) source[i] = (float)(random.NextDouble() * 2 - 1);
         var expectedA = stackalloc float[width];
         var actualA = stackalloc float[width];
-        for (var i = 0; i < width; i++) { expectedA[i] = actualA[i] = (float)(random.NextDouble() * 2 - 1); }
-        Scalar.ModulateActivate(d2, expectedCondition, expectedA, b2, width);
-        Neon.ModulateActivate(d2, actualCondition, actualA, b2, width);
-        AssertClose(actualA, expectedA, width, "ModulateActivate");
+        Scalar.PermuteModulateActivate(permutation, source, d2, expectedWeights, condU, b2, width, expectedA);
+        Neon.PermuteModulateActivate(permutation, source, d2, expectedWeights, condU, b2, width, actualA);
+        AssertClose(actualA, expectedA, width, "PermuteModulateActivate");
+
+        Scalar.PermuteScale(permutation, source, d2, width, expectedA);
+        Neon.PermuteScale(permutation, source, d2, width, actualA);
+        AssertClose(actualA, expectedA, width, "PermuteScale");
 
         var expectedOut = stackalloc float[width];
         var actualOut = stackalloc float[width];
-        Scalar.Kron(expectedA, left, right, 32, 32, expectedOut);
-        Neon.Kron(actualA, left, right, 32, 32, actualOut);
+        Scalar.Kron(expectedA, 24, left, right, 32, 32, 32, expectedOut);
+        Neon.Kron(actualA, 24, left, right, 32, 32, 32, actualOut);
         AssertClose(actualOut, expectedOut, width, "Kron");
+
+        var expectedResidual = stackalloc float[dim];
+        var actualResidual = stackalloc float[dim];
+        for (var i = 0; i < dim; i++) expectedResidual[i] = actualResidual[i] = input[i];
+        Scalar.AccumulateOutput(expectedResidual, expectedOut, d2, 0.5f, dim);
+        Neon.AccumulateOutput(actualResidual, actualOut, d2, 0.5f, dim);
+        AssertClose(actualResidual, expectedResidual, dim, "AccumulateOutput");
     }
 }

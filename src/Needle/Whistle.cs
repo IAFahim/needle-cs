@@ -51,14 +51,19 @@ public sealed unsafe partial class Whistle : IDisposable
     public IReadOnlyList<string> Languages => languages;
 
     public Whistle(Model model, int threads = 1)
+        : this(model, ThreadPolicy.Default.WithThreads(threads))
+    {
+    }
+
+    public Whistle(Model model, ThreadPolicy policy)
     {
         if (model.Audio == null) throw new ArgumentException("this .cact has no speech model");
         this.model = model;
         audio = model.Audio;
         g = model.Geometry;
         dim = g.Dim;
-        pool = new Pool(threads);
-        decoder = new Engine(model, g.MaxSeq, 64, threads, pool);
+        pool = new Pool(policy);
+        decoder = new Engine(model, g.MaxSeq, 64, policy, pool);
         tokenizer = new Tokenizer(model, 1 << 12);
         var rawFrames = MaxSeconds * audio->SampleRate / audio->Hop;
         maxFrames = ((((rawFrames + 1) / 2 + 1) / 2 + 1) / 2) + 2;
@@ -520,6 +525,10 @@ public sealed unsafe partial class Whistle : IDisposable
         memory.Frames = count;
         decoder.Attach(memory);
     }
+
+    public void Pause() => pool.Pause();
+
+    public void Resume() => pool.Resume();
 
     public void Dispose()
     {
