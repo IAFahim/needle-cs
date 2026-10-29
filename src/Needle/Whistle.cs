@@ -33,6 +33,7 @@ public sealed unsafe partial class Whistle : IDisposable
     readonly Engine decoder;
     readonly Tokenizer tokenizer;
     readonly int dim, maxFrames, textVocab;
+    readonly ThreadPolicy policy;
     readonly string[] languages;
     Arena arena;
     Frontend front;
@@ -63,6 +64,7 @@ public sealed unsafe partial class Whistle : IDisposable
     {
         if (model.Audio == null) throw new ArgumentException("this .cact has no speech model");
         this.model = model;
+        this.policy = policy;
         audio = model.Audio;
         g = model.Geometry;
         dim = g.Dim;
@@ -560,6 +562,7 @@ public sealed unsafe partial class Whistle : IDisposable
     public void Dispose()
     {
         decoder.Dispose();
+        DisposeBeams();
         tokenizer.Dispose();
         pool.Dispose();
         front.Free();
