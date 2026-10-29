@@ -58,6 +58,8 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
 
     public int Length { get; private set; }
 
+    internal long StateBytes => (long)stateBytes;
+
     public LayerObserver? Observer { get; set; }
 
     public int Greedy() => Ops.ArgMax(logits, model.Embedding.Rows);
