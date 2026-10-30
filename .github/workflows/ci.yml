@@ -32,7 +32,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ref
-          key: ref-v1-${{ hashFiles('tools/fetch.sh', 'tools/golden.py', 'tools/golden_confidence.py') }}
+          key: ref-v2-${{ hashFiles('tools/fetch.sh', 'tools/golden.py', 'tools/golden_confidence.py', 'tools/golden_whistle.py') }}
 
       - name: Set up Python
         if: steps.ref-cache.outputs.cache-hit != 'true'
@@ -42,7 +42,7 @@ jobs:
 
       - name: Install Python dependencies
         if: steps.ref-cache.outputs.cache-hit != 'true'
-        run: pip install numpy sentencepiece
+        run: pip install numpy sentencepiece soxr
 
       - name: Download models, tokenizer and audio clips
         if: steps.ref-cache.outputs.cache-hit != 'true'
@@ -56,6 +56,10 @@ jobs:
         if: steps.ref-cache.outputs.cache-hit != 'true'
         run: python3 tools/golden_confidence.py
 
+      - name: Generate Whistle stage goldens
+        if: steps.ref-cache.outputs.cache-hit != 'true'
+        run: python3 tools/golden_whistle.py
+
       - name: Verify fixtures are present
         run: |
           test -s ref/hf/needle3.cact
@@ -64,6 +68,13 @@ jobs:
           test -s ref/audio/record.wav
           test -s ref/golden/golden.json
           test -s ref/golden/case0/logits.bin
+          for clip in record hotword; do
+            test -s "ref/golden/whistle/$clip/mel.f32"
+            test -s "ref/golden/whistle/$clip/encoder.f32"
+            test -s "ref/golden/whistle/$clip/memory.f32"
+            test -s "ref/golden/whistle/$clip/logits_bos.f32"
+            test -s "ref/golden/whistle/$clip/meta.json"
+          done
           du -sh ref
 
       - name: Publish fixtures for the test matrix
