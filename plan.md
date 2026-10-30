@@ -157,7 +157,17 @@ Setup: 14 prompts (4 with the default 3 tools, 10 with a 7-tool game set); 636 g
 - Each `NeedleSession` commits about 64 MB of private memory (RSS +12–18 MB). The constructor takes 300–640 ms on 1 thread and rebuilds model-level data, the tokenizer and the trie, for every session. Arenas are sized for 64 KB of input and 64-token chunks.
 - One warm `NeedleSession.Complete` allocates about 6.2 KB of managed memory and still mallocs native buffers (`Engine.ConfidenceLogit`, `TokenTrie.Walk`).
 
-### 2.6 Platform and hosting findings
+### 2.6 Zero-alloc follow-up measurements (F08, #40)
+
+Indicative numbers from the loaded 32-core dev box (JIT, avx2); latency is too noisy there to conclude anything, allocation counts are exact.
+
+- Full-vocabulary softmax over 8192 floats — what the legacy `ArgMaxMasked` ran on every reasoning and response step — costs best 36.2 µs / median 37.2 µs (9 rounds). Same order as the 27 µs reference-box figure; the new masked argmax skips it outside call generation.
+- `GrammarState` is 392 B, so the pre-#7 per-step `Mem.Alloc`/`Mem.Free` in `TokenTrie.Walk` was 65 × 392 = 25,480 B (~24.9 KB) per call-generation step; it is now one preallocated per-session buffer.
+- `bench-e2e --api span` with `-p:NeedleAllocCounters=true` (1 thread, golden set): median 0 managed B and 0 native allocs per call on both prompts; `--api text` on the same build measures 664 B (Lagos) and 800 B (timer+music) managed per call, so the string wrapper's only per-call cost is the `CallResult` itself.
+- `LD_PRELOAD` probes (`tools/malloc_counter.c`, 20 warm + 100 measured span calls): `plain:1` → 0 managed / 0 mallocs; `retrieval:1` → 0 / 0; `plain:4` → 0 / 0 in 3 of 4 runs, with one run showing a single stray libc malloc from CLR background activity (Mem accounting stayed 0 throughout).
+- End-to-end latency on the loaded box swings run to run (identical Lagos call: 55–178 ms), so no speedup claim is made here; re-measure on an idle box with `bench-e2e` per #39.
+
+### 2.7 Platform and hosting findings
 
 - **`Model.Open` is Linux-only on net10.0.** It calls `mmap` from `"libc"` with `MAP_PRIVATE|MAP_POPULATE` and passes the `SafeFileHandle` value as an fd. That fails on Windows, and the flag means something else on macOS.
 - **`new Pool(n)` pins the calling thread** to the first fast core (`sched_setaffinity(0, …)`). Creating a session on the main thread pins the main thread.
@@ -166,7 +176,7 @@ Setup: 14 prompts (4 with the default 3 tools, 10 with a 7-tool game set); 636 g
 - `Geometry.KvWindow` (`kv_window` = 256) is parsed but never used.
 - `AutoDate` defaults on and adds a wall-clock line to the prefix (141 tokens instead of 125). With `AutoDate=false` the prefix is identical to native `needle_init` with an empty system prompt.
 
-### 2.7 .NET 10 SIMD facts and platform tiers
+### 2.8 .NET 10 SIMD facts and platform tiers
 
 - .NET 10 has:
   - `AvxVnni`: VEX encoding, 128/256-bit `VPDPBUSD`.
@@ -421,3 +431,11 @@ dotnet publish src/Needle.Cli -c Release -o out/aot
 5. **AutoDate.** For games, default to off or a fixed caller-supplied date, so outputs are reproducible and primed prefixes stay valid (W09, W29).
 6. **Many NPCs.** Default to stateless commands plus batched decode (W26); per-NPC sessions are opt-in because of memory.
 7. **Upstream churn.** `config.json` says `engine_version` 3.1.0 and the wheel is 3.3.3. Fail fast on unknown `.cact` versions (W30).
+
+8. **F08 behavior reviews from the zero-alloc session core (#40).** All four changes are kept; each is test-pinned and `NeedleSession.cs` needs no code change:
+   - Empty query now fails with `EmptyInput` instead of running. Keep: an empty prompt decodes to no tokens, so running it only burns a full inference; the string API maps `null` to `""` consistently. Pinned by `SpanApiTests.FailuresReturnStatusesInsteadOfThrowing`.
+   - A failed or cancelled turn rewinds to the primed state (`Abandon` → `Reset`). Keep: mid-turn tokens are unrecoverable without per-turn checkpoints (out of scope), and a deterministic known-good state keeps the session usable. Pinned by the `ContextUsed == primed` asserts after budget exhaustion and by the cancel test. Multi-turn callers replay from an explicit `Reset`.
+   - Query size is capped at `min(65408, Context*16)` (`MaxInputBytes`). Keep: the tokenizer input buffer is 64 KB (`TokenizerInputBytes − InputOverheadBytes`), the cap scales down with `Context`, and oversize input now fails cleanly with `InputTooLong`. Pinned by the `MaxInputBytes + 1` cases.
+   - A lone-surrogate `\uXXXX` escape in generated JSON now restores as U+FFFD. Keep: matches `Encoding.UTF8.GetString` replacement behavior and the JSON recommendation, and prevents emitting invalid UTF-16 that throws on later UTF-8 encoding. Pinned by `CallRestorerTests.LoneSurrogateEscapesBecomeReplacementCharacters`.
+9. **F08 allocation gates (#40).** `bench-e2e --api span` exercises the zero-alloc path with reusable scratch buffers, so `--max-managed-bytes 0 --max-native-allocs 0` gates the session instead of the string wrapper (the default stays `text` to keep existing dashboards comparable). CI enforcement (owned by #32) is: build with `-p:NeedleAllocCounters=true`, then `needle bench-e2e <model> <tools> --threads 1,4 --sets all --api span --max-managed-bytes 0 --max-native-allocs 0`. Without the counter build the native gate reports an explicit needs-build violation rather than passing silently; `BenchMachine` prints `alloc-counters=on|off` in every report header. `BenchHarnessTests.ZeroGatesPassOnlyWhenNothingWasAllocated` pins the gate logic in both builds, and `SpanApiModeMatchesTextMode` pins span/text parity through the harness.
+10. **F08 test robustness (#40 item 4).** The cancel test now retries (up to 5) until a 30 ms timer lands mid-flight, removing the fast-machine flake while still failing if `RequestCancel` is broken. The 30-minute loaded-box scalar run and CI stability stay with #32.

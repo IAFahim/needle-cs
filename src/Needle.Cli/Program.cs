@@ -28,7 +28,7 @@ static int Usage()
     Console.Error.WriteLine("needle verify <model.cact> <golden-dir>");
     Console.Error.WriteLine("needle run <model.cact> <tools.json> <query> [repeat]");
     Console.Error.WriteLine("needle bench <needle3.cact> [--threads 4] [--json]");
-    Console.Error.WriteLine("needle bench-e2e <needle3.cact> <tools.json> [--threads 1,2,4] [--reps N] [--sets golden|game|all] [--profile] [--json] [--max-managed-bytes N] [--max-native-allocs N]");
+    Console.Error.WriteLine("needle bench-e2e <needle3.cact> <tools.json> [--threads 1,2,4] [--reps N] [--sets golden|game|all] [--api span|text] [--profile] [--json] [--max-managed-bytes N] [--max-native-allocs N]");
     Console.Error.WriteLine(Eval.Usage);
     Console.Error.WriteLine("needle call <needle3.cact> <tools.json> [--no-date] [--no-retrieval] <query>... ('tool:<json>' feeds a tool result)");
     Console.Error.WriteLine("needle transcribe <whistle.cact> <clip.wav> [--language xx] [--words] [--keywords a,b] [--repeat n]");
