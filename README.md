@@ -107,6 +107,12 @@ session.Resume();
 
 Creating a session never changes the affinity or priority of the thread that creates it. Worker threads park shortly after finishing work (about 300 microseconds by default, 50 for `ThreadPolicy.Game`) and `Pause()` makes calls run inline on the caller while the workers sleep.
 
+```csharp
+var budgeted = new NeedleOptions { Threading = ThreadPolicy.Game.WithThreads(3), FrameBudget = FrameBudget.FromMilliseconds(4) };
+```
+
+`FrameBudget` caps the decode work of one call by token count, by milliseconds, or both; an over-budget call fails with `FrameBudgetExceeded` and leaves the session ready for the next frame. Prefill and tool shortlisting run uncapped.
+
 ### Speech-to-Text & Voice-to-Tool
 
 ```csharp

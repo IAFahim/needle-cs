@@ -231,6 +231,41 @@ public sealed class SpanApiTests : IDisposable
     }
 
     [Fact]
+    public void AFrameTokenBudgetYieldsAfterExactlyThatManyTokensAndLeavesTheSessionUsable()
+    {
+        var budgeted = new NeedleOptions { Threads = 4, AutoDate = false, FrameBudget = FrameBudget.FromTokens(3) };
+        using var session = new NeedleSession(model, SessionCases.DefaultTools(), budgeted);
+        var calls = new byte[4096];
+        var primed = session.ContextUsed;
+        var reply = session.Complete("what's it like in Lagos right now?"u8, calls);
+        Assert.Equal(ReplyStatus.Failed, reply.Status);
+        Assert.Equal(FailureReason.FrameBudgetExceeded, reply.Failure);
+        Assert.Equal(3, reply.DecodeTokens);
+        var result = session.Complete("what's it like in Lagos right now?");
+        Assert.False(result.Success);
+        Assert.Equal("the frame budget ran out", result.Error);
+        Assert.Equal(primed, session.ContextUsed);
+    }
+
+    [Fact]
+    public void AGenerousFrameBudgetLeavesTheCallBitIdentical()
+    {
+        var options = new NeedleOptions { Threads = 4, AutoDate = false, FrameBudget = FrameBudget.FromTokens(10000).WithMaxMillisecondsPerSlice(60000) };
+        using var budgeted = new NeedleSession(model, SessionCases.DefaultTools(), options);
+        using var plain = new NeedleSession(model, SessionCases.DefaultTools(), new NeedleOptions { Threads = 4, AutoDate = false });
+        var budgetedCalls = new byte[4096];
+        var plainCalls = new byte[4096];
+        var capped = budgeted.Complete("what's it like in Lagos right now?"u8, budgetedCalls);
+        var free = plain.Complete("what's it like in Lagos right now?"u8, plainCalls);
+        Assert.Equal(free.Status, capped.Status);
+        Assert.Equal(free.Failure, capped.Failure);
+        Assert.Equal(free.DecodeTokens, capped.DecodeTokens);
+        Assert.Equal(free.Utf8Length, capped.Utf8Length);
+        Assert.Equal(free.Confidence, capped.Confidence);
+        Assert.Equal(Encoding.UTF8.GetString(plainCalls, 0, free.Utf8Length), Encoding.UTF8.GetString(budgetedCalls, 0, capped.Utf8Length));
+    }
+
+    [Fact]
     public void ContextExhaustionFailsWithoutThrowing()
     {
         using var session = new NeedleSession(model, SessionCases.DefaultTools(), new NeedleOptions { Threads = 4, AutoDate = false, Context = 300 });

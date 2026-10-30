@@ -18,6 +18,7 @@ public enum FailureReason : byte
     CallsBufferTooSmall,
     MalformedCalls,
     ToolContextFailed,
+    FrameBudgetExceeded,
 }
 
 [Flags]
