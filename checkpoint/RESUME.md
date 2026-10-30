@@ -1,9 +1,9 @@
 # Checkpoint: resume here
 
-Updated 2026-10-30 ~01:35 UTC. Designated branch: `claude/zealous-mayer-9vx4qp`; everything below is merged and pushed there. No PR has been opened and no other branch has been pushed. Delete `checkpoint/` when you no longer need it.
+Updated 2026-10-30 ~08:30 UTC. Designated branch: `claude/zealous-mayer-9vx4qp` (pushed through 18a1f06); PR #43 into `master` is open to run the CI matrix. Sibling branches `v01-testwav-bisect` (test.wav front-end bisect, still running) and `BisectProbe.cs` scratch are NOT merged — check them before closing #38. Delete `checkpoint/` when you no longer need it.
 
 ## State
-Wave 1 and wave 2 are merged: #1-#7, #12, #14, #18, #19, #28, #30 (closed). #38 (voice) is partly fixed and still open. Full suite on the merged tree: 216 tests pass (default and `NEEDLE_NOAVX512=1`), netstandard2.1 build clean; a `NEEDLE_SCALAR=1` run was started at ~01:30 UTC (log was /tmp/scalar.log, takes ~22 min) - re-run it to confirm. Speed on the 4-core reference VM at 4 threads: ~74 ms per call, decode ~1.3 ms/token (upstream native 95-129 ms).
+Wave 1 and wave 2 merged (#1-#7, #12, #14, #18, #19, #28, #30 closed), plus since: Apache-2.0 LICENSE (#34 closed), CI whistle goldens (fixtures job now runs `golden_whistle.py`, cache key ref-v2, README fixed), fp16-subnormal decode policy (needle3 IEEE-exact, whistle body keeps the native shift-trick decode, confidence window 0.15→0.25 with the realization table in commit 27aed3f). Full suite on the merged tree: 218/218 pass (default and `NEEDLE_NOAVX512=1`), netstandard2.1 clean. #38 still open: test.wav keeps a 2-word gap ("grading away a file"/"white file" vs upstream "creating a way of file"/"Wi-Fi"); bisect agent comparing per-stage cosines vs native `needle_embed`, lead hypothesis front end (mel floor/window/norm). Known pre-existing, not caused by this round: `NEEDLE_SCALAR=1` hotword phrases fail on pristine c0ce0f9 too (scalar whistle realization diverges), `HadamardMlpTests.MatchesDoublePrecisionReference` flaky ~1/8 runs.
 
 ## Do locally (in this order)
 ```bash
@@ -30,4 +30,4 @@ Then pick work from the issue board. Tracking issue #31. Order I recommend:
 - Timings are meaningless while agents run in parallel; use an idle machine and interleaved A/B, best of N.
 
 ## Decisions waiting on the user
-LICENSE (#34); whether to open a PR into `master`; #33 spin default (300 us chosen over 50 us); #40 behavior changes of the span API; Whistle default `BeamWidth` 4 (better accuracy, ~2x slower transcription) vs 1.
+Decided with owner: Apache-2.0 (#34, done), PR into `master` opened (#43), Whistle default `BeamWidth` 4 (accuracy; `=1` restores greedy). Still open: #33 spin default (300 us chosen over 50 us); #40 behavior changes of the span API.
