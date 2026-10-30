@@ -475,6 +475,8 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         public float* AttnPartials;
         public float* QkvBase;
         public float* EngramBase;
+        public float* QkvLive;
+        public float* EngramLive;
         public sbyte* QueryInt8;
         public sbyte* KeyCache;
         public sbyte* ValueCache;
@@ -540,8 +542,10 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
             ResOut = resOut,
             AttnPartials = attnPartials,
             AttnArrivals = attnArrivals,
-            QkvBase = historyPending ? snapshot + (qkvHistory - state) : qkvHistory,
-            EngramBase = historyPending ? snapshot + (engramHistory - state) : engramHistory,
+            QkvBase = (historyPending ? snapshot + (qkvHistory - state) : qkvHistory) + (long)l * historyPerLayer,
+            EngramBase = (historyPending ? snapshot + (engramHistory - state) : engramHistory) + (long)(site >= 0 ? site : 0) * EngramHistory * dim,
+            QkvLive = qkvHistory + (long)l * historyPerLayer,
+            EngramLive = engramHistory + (long)(site >= 0 ? site : 0) * EngramHistory * dim,
             QueryInt8 = queryInt8,
             KeyCache = keyCache,
             ValueCache = valueCache,
@@ -563,7 +567,7 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         Pool.Barrier(job.Barrier);
         HyperPhi(in job, member, members);
         Pool.Barrier(job.Barrier);
-        HyperMix(in job, member);
+        HyperMix(in job, member, members);
         if (job.HasEngram != 0)
         {
             EngramGather(in job, member, members);
@@ -620,14 +624,15 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         if (member == 0) job.Clock.Lap(Stage.HyperPhi);
     }
 
-    static void HyperMix(in LayerJob job, int member)
+    static void HyperMix(in LayerJob job, int member, int members)
     {
         var dim = job.Geometry.Dim;
         var lane = job.Lane;
         var l = job.Layer;
         var mixLogits = stackalloc float[Lanes * Lanes];
         var hpre = stackalloc float[Lanes];
-        for (var t = 0; t < job.Count; t++)
+        Shard(job.Count, member, members, out var first, out var count);
+        for (var t = first; t < first + count; t++)
         {
             var s = job.Stream + (long)t * Lanes * dim;
             var u = job.Input + (long)t * dim;
@@ -690,7 +695,7 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
             for (var j = 0; j < EngramTaps; j++)
                 Ops.MultiplyAccumulate(o, job.Engram.Taps + j * dim, job.EngramValueBuffer + (long)(EngramHistory + t - j * job.Geometry.EngramDilation) * dim, dim);
         }
-        if (member == 0) Buffer.MemoryCopy(job.EngramValueBuffer + (long)job.Count * dim, job.EngramBase, EngramHistory * dim * 4, EngramHistory * dim * 4);
+        if (member == 0) Buffer.MemoryCopy(job.EngramValueBuffer + (long)job.Count * dim, job.EngramLive, EngramHistory * dim * 4, EngramHistory * dim * 4);
         for (var t = first; t < first + count; t++)
         {
             var x = job.Input + (long)t * dim;
@@ -737,6 +742,9 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         var qHistory = job.QkvBase;
         var kHistory = qHistory + (ConvTaps - 1) * qWidth;
         var vHistory = kHistory + (ConvTaps - 1) * kWidth;
+        var qLive = job.QkvLive;
+        var kLive = qLive + (ConvTaps - 1) * qWidth;
+        var vLive = kLive + (ConvTaps - 1) * kWidth;
         if (member == 0)
         {
             LoadHistory(qHistory, job.QRaw, qWidth);
@@ -754,9 +762,9 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         Pool.Barrier(job.Barrier);
         if (member == 0)
         {
-            SaveHistory(qHistory, job.QRaw, job.Count, qWidth);
-            SaveHistory(kHistory, job.KRaw, job.Count, kWidth);
-            SaveHistory(vHistory, job.VRaw, job.Count, vWidth);
+            SaveHistory(qLive, job.QRaw, job.Count, qWidth);
+            SaveHistory(kLive, job.KRaw, job.Count, kWidth);
+            SaveHistory(vLive, job.VRaw, job.Count, vWidth);
         }
     }
 
@@ -821,6 +829,8 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
             Capacity = job.Capacity,
         };
         batch.Plan(members, job.Count, job.AttnPartials, job.AttnArrivals);
+        if (member == 0) for (var g = 0; g < job.Count * kvHeads; g++) job.AttnArrivals[g] = 0;
+        Pool.Barrier(job.Barrier);
         Shard(batch.TeamTasks, member, members, out var first, out var count);
         for (var i = first; i < first + count; i++) AttentionBatch.RunTask(&batch, i);
         if (member == 0) job.Clock.Lap(Stage.AttentionCore);

@@ -652,10 +652,9 @@ internal unsafe struct AttentionBatch
         planGroups = tokens * KvHeads;
         var splittable = Attention.CanSplitPositions && tilesPerGroup == 1 && group > 1 && Probabilities == null;
         chunks = splittable ? Math.Clamp((threads + planGroups - 1) / planGroups, 1, MaxChunks) : 1;
-        if (chunks == 1) return;
+        if (chunks == 1 || partials == null || arrivals == null) return;
         this.partials = partials;
         this.arrivals = arrivals;
-        for (var i = 0; i < planGroups; i++) arrivals[i] = 0;
     }
 
     public int TeamTasks => planGroups * (chunks == 1 ? tilesPerGroup : chunks);
@@ -672,6 +671,7 @@ internal unsafe struct AttentionBatch
         var partials = stackalloc float[batch->planGroups * batch->chunks * Attention.PartialFloats];
         var arrivals = stackalloc int[batch->planGroups];
         batch->Plan(pool.Threads, batch->planGroups / batch->KvHeads, partials, arrivals);
+        for (var i = 0; i < batch->planGroups; i++) arrivals[i] = 0;
         pool.Run(&ExecuteChunk, batch, batch->TeamTasks);
     }
 
