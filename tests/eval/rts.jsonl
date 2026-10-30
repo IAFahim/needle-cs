@@ -1,0 +1,43 @@
+{"tools":"rts","tags":["ci"],"query":"move to 120, 45","expected":[{"name":"move_to","args":{"x":120,"y":45}}]}
+{"tools":"rts","query":"send the squad to 300 80","expected":[{"name":"move_to","args":{"x":300,"y":80}}]}
+{"tools":"rts","query":"go to x 15 y 200","expected":[{"name":"move_to","args":{"x":15,"y":200}}]}
+{"tools":"rts","query":"move out to coordinates fifty, seventy","expected":[{"name":"move_to","args":{"x":50,"y":70}}]}
+{"tools":"rts","query":"head to 0,0","expected":[{"name":"move_to","args":{"x":0,"y":0}}]}
+{"tools":"rts","query":"fall back to 12 12 now","expected":[{"name":"move_to","args":{"x":12,"y":12}}]}
+{"tools":"rts","query":"mve to 64 64","expected":[{"name":"move_to","args":{"x":64,"y":64}}]}
+{"tools":"rts","tags":["ci"],"query":"attack the orc chieftain","expected":[{"name":"attack","args":{"target":{"contains":"orc chieftain"}}}]}
+{"tools":"rts","query":"kill the enemy archers","expected":[{"name":"attack","args":{"target":{"contains":"archer"}}}]}
+{"tools":"rts","query":"atack the watchtower near the river","expected":[{"name":"attack","args":{"target":{"contains":"watchtower"}}}]}
+{"tools":"rts","query":"everyone hit the catapult","expected":[{"name":"attack","args":{"target":{"contains":"catapult"}}}]}
+{"tools":"rts","query":"focus fire on the ogre","expected":[{"name":"attack","args":{"target":{"contains":"ogre"}}}]}
+{"tools":"rts","query":"destroy the enemy barracks","expected":[{"name":"attack","args":{"target":{"contains":"barracks"}}}]}
+{"tools":"rts","tags":["ci"],"query":"form a circle","expected":[{"name":"set_formation","args":{"formation":"circle"}}]}
+{"tools":"rts","query":"switch to wedge formation","expected":[{"name":"set_formation","args":{"formation":"wedge"}}]}
+{"tools":"rts","query":"line up","expected":[{"name":"set_formation","args":{"formation":"line"}}]}
+{"tools":"rts","query":"get in a column","expected":[{"name":"set_formation","args":{"formation":"column"}}]}
+{"tools":"rts","query":"formation wedge pls","expected":[{"name":"set_formation","args":{"formation":"wedge"}}]}
+{"tools":"rts","query":"follow Mira","expected":[{"name":"follow","args":{"target":"Mira"}}]}
+{"tools":"rts","query":"stick with the captain","expected":[{"name":"follow","args":{"target":{"contains":"captain"}}}]}
+{"tools":"rts","query":"follow the scout please","expected":[{"name":"follow","args":{"target":{"contains":"scout"}}}]}
+{"tools":"rts","query":"stop","expected":[{"name":"stop","args":{}}]}
+{"tools":"rts","query":"halt!","expected":[{"name":"stop","args":{}}]}
+{"tools":"rts","query":"stop everything","expected":[{"name":"stop","args":{}}]}
+{"tools":"rts","query":"hold on, cancel all orders","expected":[{"name":"stop","args":{}}]}
+{"tools":"rts","query":"build a barracks at 40, 60","expected":[{"name":"build","args":{"structure":"barracks","x":40,"y":60}}]}
+{"tools":"rts","query":"put a tower at 100 100","expected":[{"name":"build","args":{"structure":"tower","x":100,"y":100}}]}
+{"tools":"rts","query":"construct a farm at 22,35","expected":[{"name":"build","args":{"structure":"farm","x":22,"y":35}}]}
+{"tools":"rts","query":"wall at 8 9","expected":[{"name":"build","args":{"structure":"wall","x":8,"y":9}}]}
+{"tools":"rts","query":"gather wood","expected":[{"name":"gather","args":{"resource":"wood"}}]}
+{"tools":"rts","query":"send the workers to mine gold","expected":[{"name":"gather","args":{"resource":"gold"}}]}
+{"tools":"rts","query":"we need stone, get some","expected":[{"name":"gather","args":{"resource":"stone"}}]}
+{"tools":"rts","query":"we're starving, harvest food","expected":[{"name":"gather","args":{"resource":"food"}}]}
+{"tools":"rts","query":"go aggressive","expected":[{"name":"set_stance","args":{"stance":"aggressive"}}]}
+{"tools":"rts","query":"defensive stance please","expected":[{"name":"set_stance","args":{"stance":"defensive"}}]}
+{"tools":"rts","query":"hold fire, stay passive","expected":[{"name":"set_stance","args":{"stance":"passive"}}]}
+{"tools":"rts","tags":["ci"],"query":"what's the weather like in the valley","expected":[]}
+{"tools":"rts","query":"tell me a joke","expected":[]}
+{"tools":"rts","query":"how much gold do we have left","expected":[]}
+{"tools":"rts","query":"save the game","expected":[]}
+{"tools":"rts","query":"hello there","expected":[]}
+{"tools":"rts","query":"turn the music up","expected":[]}
+{"tools":"rts","query":"who is winning this match","expected":[]}

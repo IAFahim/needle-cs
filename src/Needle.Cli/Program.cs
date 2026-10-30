@@ -17,6 +17,7 @@ return args switch
     ["stream", var model, var wav] => StreamClip(model, wav),
     ["voice", var needle, var whistle, var tools, var wav] => Voice(needle, whistle, tools, wav),
     ["embed", var model, var text] => EmbedText(model, text),
+    ["eval", var model, var dataset, .. var options] => Eval.Run(model, dataset, options),
     ["call", var model, var tools, .. var queries] => Call(model, tools, queries),
     ["run", var model, var tools, var query, .. var rest] => Run(model, tools, query, rest),
     _ => Usage(),
@@ -28,6 +29,7 @@ static int Usage()
     Console.Error.WriteLine("needle run <model.cact> <tools.json> <query> [repeat]");
     Console.Error.WriteLine("needle bench <needle3.cact> [--threads 4] [--json]");
     Console.Error.WriteLine("needle bench-e2e <needle3.cact> <tools.json> [--threads 1,2,4] [--reps N] [--sets golden|game|all] [--profile] [--json] [--max-managed-bytes N] [--max-native-allocs N]");
+    Console.Error.WriteLine(Eval.Usage);
     Console.Error.WriteLine("needle call <needle3.cact> <tools.json> <query>... ('tool:<json>' feeds a tool result)");
     Console.Error.WriteLine("needle transcribe <whistle.cact> <clip.wav> [--language xx] [--words] [--keywords a,b] [--repeat n]");
     Console.Error.WriteLine("needle stream <whistle.cact> <clip.wav>");

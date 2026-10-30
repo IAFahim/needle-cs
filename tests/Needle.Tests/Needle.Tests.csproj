@@ -11,6 +11,7 @@
   </ItemGroup>
   <ItemGroup>
     <Compile Include="..\..\src\Needle.Cli\Bench*.cs" LinkBase="Bench" />
+    <Compile Include="..\..\src\Needle.Cli\Eval*.cs" LinkBase="Eval" />
     <EmbeddedResource Include="..\..\tools\game_tools.json" LogicalName="game_tools.json" />
   </ItemGroup>
   <ItemGroup>

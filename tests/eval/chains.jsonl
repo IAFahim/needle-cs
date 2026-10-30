@@ -1,0 +1,39 @@
+{"tools":"chains","tags":["ci"],"query":"give 50 gold to Borin then move to 10, 20","expected":[{"name":"give_item","args":{"item":"gold","count":50,"to":"Borin"}},{"name":"move_to","args":{"x":10,"y":20}}]}
+{"tools":"chains","query":"move to 5 5 and attack the goblin","expected":[{"name":"move_to","args":{"x":5,"y":5}},{"name":"attack","args":{"target":{"contains":"goblin"}}}]}
+{"tools":"chains","query":"attack the orc chieftain then stop","expected":[{"name":"attack","args":{"target":{"contains":"orc chieftain"}}},{"name":"stop","args":{}}]}
+{"tools":"chains","query":"form a circle and follow Mira","expected":[{"name":"set_formation","args":{"formation":"circle"}},{"name":"follow","args":{"target":"Mira"}}]}
+{"tools":"chains","query":"switch to wedge formation and follow the captain","expected":[{"name":"set_formation","args":{"formation":"wedge"}},{"name":"follow","args":{"target":{"contains":"captain"}}}]}
+{"tools":"chains","query":"give Lyra 3 potions and use a potion on Borin","expected":[{"name":"give_item","args":{"item":"potion","count":3,"to":"Lyra"}},{"name":"use_item","args":{"item":"potion","target":"Borin"}}]}
+{"tools":"chains","query":"say we attack at dawn, then move to 300 40","expected":[{"name":"say","args":{"text":{"contains":"attack at dawn"}}},{"name":"move_to","args":{"x":300,"y":40}}]}
+{"tools":"chains","query":"go to 10 10, then 20 20","expected":[{"name":"move_to","args":{"x":10,"y":10}},{"name":"move_to","args":{"x":20,"y":20}}]}
+{"tools":"chains","tags":["ci"],"query":"move to 1 1, then 2 2, then 3 3","expected":[{"name":"move_to","args":{"x":1,"y":1}},{"name":"move_to","args":{"x":2,"y":2}},{"name":"move_to","args":{"x":3,"y":3}}]}
+{"tools":"chains","query":"stop and form a column","expected":[{"name":"stop","args":{}},{"name":"set_formation","args":{"formation":"column"}}]}
+{"tools":"chains","query":"follow Tomas, then attack the bandit leader","expected":[{"name":"follow","args":{"target":"Tomas"}},{"name":"attack","args":{"target":{"contains":"bandit leader"}}}]}
+{"tools":"chains","query":"use a potion on Lyra and give her 2 arrows","expected":[{"name":"use_item","args":{"item":"potion","target":"Lyra"}},{"name":"give_item","args":{"item":"arrow","count":2,"to":"Lyra"}}]}
+{"tools":"chains","query":"give Mira a shield, then form a line","expected":[{"name":"give_item","args":{"item":"shield","count":1,"to":"Mira"}},{"name":"set_formation","args":{"formation":"line"}}]}
+{"tools":"chains","query":"tell everyone to run and move to 400 400","expected":[{"name":"say","args":{"text":{"contains":"run"}}},{"name":"move_to","args":{"x":400,"y":400}}]}
+{"tools":"chains","query":"attack the tower and the barracks","expected":[{"name":"attack","args":{"target":{"contains":"tower"}}},{"name":"attack","args":{"target":{"contains":"barracks"}}}]}
+{"tools":"chains","query":"hand Borin 5 potions and Kara 5 potions","expected":[{"name":"give_item","args":{"item":"potion","count":5,"to":"Borin"}},{"name":"give_item","args":{"item":"potion","count":5,"to":"Kara"}}]}
+{"tools":"chains","query":"move to 50 50, switch to wedge, and attack the ogre","expected":[{"name":"move_to","args":{"x":50,"y":50}},{"name":"set_formation","args":{"formation":"wedge"}},{"name":"attack","args":{"target":{"contains":"ogre"}}}]}
+{"tools":"chains","query":"stop, then say hold the line","expected":[{"name":"stop","args":{}},{"name":"say","args":{"text":{"contains":"hold the line"}}}]}
+{"tools":"chains","query":"give 100 gold to Elric and 3 swords to Elric","expected":[{"name":"give_item","args":{"item":"gold","count":100,"to":"Elric"}},{"name":"give_item","args":{"item":"sword","count":3,"to":"Elric"}}]}
+{"tools":"chains","query":"form a circle then stop","expected":[{"name":"set_formation","args":{"formation":"circle"}},{"name":"stop","args":{}}]}
+{"tools":"chains","query":"follow Mira and say thanks for waiting","expected":[{"name":"follow","args":{"target":"Mira"}},{"name":"say","args":{"text":{"contains":"thanks for waiting"}}}]}
+{"tools":"chains","query":"gimme 20 arrows for Lyra then go to 7 7","expected":[{"name":"give_item","args":{"item":"arrow","count":20,"to":"Lyra"}},{"name":"move_to","args":{"x":7,"y":7}}]}
+{"tools":"chains","query":"attack the dragon and use an antidote on Borin","expected":[{"name":"attack","args":{"target":{"contains":"dragon"}}},{"name":"use_item","args":{"item":"antidote","target":"Borin"}}]}
+{"tools":"chains","query":"say hi, follow Nyx, then attack the crow","expected":[{"name":"say","args":{"text":{"contains":"hi"}}},{"name":"follow","args":{"target":"Nyx"}},{"name":"attack","args":{"target":{"contains":"crow"}}}]}
+{"tools":"chains","query":"send 30 gold to Kara and 40 gold to Tomas then move to 9 9","expected":[{"name":"give_item","args":{"item":"gold","count":30,"to":"Kara"}},{"name":"give_item","args":{"item":"gold","count":40,"to":"Tomas"}},{"name":"move_to","args":{"x":9,"y":9}}]}
+{"tools":"chains","query":"use a potion on Elric, use an ether on Mira","expected":[{"name":"use_item","args":{"item":"potion","target":"Elric"}},{"name":"use_item","args":{"item":"ether","target":"Mira"}}]}
+{"tools":"chains","query":"move to 250,90 and form a column","expected":[{"name":"move_to","args":{"x":250,"y":90}},{"name":"set_formation","args":{"formation":"column"}}]}
+{"tools":"chains","query":"attack the wolf and follow Garrick","expected":[{"name":"attack","args":{"target":{"contains":"wolf"}}},{"name":"follow","args":{"target":"Garrick"}}]}
+{"tools":"chains","query":"stop everything and tell them to retreat","expected":[{"name":"stop","args":{}},{"name":"say","args":{"text":{"contains":"retreat"}}}]}
+{"tools":"chains","query":"first move to 33 66 then attack the camp","expected":[{"name":"move_to","args":{"x":33,"y":66}},{"name":"attack","args":{"target":{"contains":"camp"}}}]}
+{"tools":"chains","query":"form a wedge, move to 80 20, attack the gate","expected":[{"name":"set_formation","args":{"formation":"wedge"}},{"name":"move_to","args":{"x":80,"y":20}},{"name":"attack","args":{"target":{"contains":"gate"}}}]}
+{"tools":"chains","query":"give Borin a sword and a shield","expected":[{"name":"give_item","args":{"item":"sword","count":1,"to":"Borin"}},{"name":"give_item","args":{"item":"shield","count":1,"to":"Borin"}}]}
+{"tools":"chains","query":"go 5 5 attack ogre","expected":[{"name":"move_to","args":{"x":5,"y":5}},{"name":"attack","args":{"target":{"contains":"ogre"}}}]}
+{"tools":"chains","query":"give Lyra two potions and tell her to be careful","expected":[{"name":"give_item","args":{"item":"potion","count":2,"to":"Lyra"}},{"name":"say","args":{"text":{"contains":"careful"}}}]}
+{"tools":"chains","tags":["ci"],"query":"what's the weather like today","expected":[]}
+{"tools":"chains","query":"tell me a joke","expected":[]}
+{"tools":"chains","query":"open the map and save the game","expected":[]}
+{"tools":"chains","query":"set the volume to 10","expected":[]}
+{"tools":"chains","query":"heal everyone in the party","expected":[]}
