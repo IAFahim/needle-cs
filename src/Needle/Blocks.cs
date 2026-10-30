@@ -756,7 +756,11 @@ internal static unsafe class HadamardMlp
     const int TileRows = 4;
     const int TileColumns = 16;
 
-    public static int ScratchFloats(int dim, int width) => Conditions + dim + 2 * width;
+    // +8 floats of headroom so Apply can align the base to 32 bytes: every
+    // partition offset (Conditions, dim, width) is a multiple of 8 floats on
+    // supported geometries, so one alignment keeps weights/normalized/front/back
+    // 32-byte aligned and avoids split AVX loads on 16-byte stackalloc scratch.
+    public static int ScratchFloats(int dim, int width) => Conditions + dim + 2 * width + 8;
 
     static bool Blocked(int rows, int cols) => Simd.Enabled && rows % TileRows == 0 && cols % TileColumns == 0;
 
@@ -769,7 +773,8 @@ internal static unsafe class HadamardMlp
         var width = b->Width;
         var inputRows = (dim + cols - 1) / cols;
         var outputRows = Math.Min(rows, (inputRows + TileRows - 1) / TileRows * TileRows);
-        var weights = scratch;
+        var aligned = (float*)(((nuint)scratch + 31) & ~(nuint)31);
+        var weights = aligned;
         var normalized = weights + Conditions;
         var front = normalized + dim;
         var back = front + width;
@@ -900,9 +905,14 @@ internal static unsafe class HadamardMlp
 #if NEEDLE_SIMD
     public static readonly bool Wide = Simd.UseAvx && Avx512F.IsSupported && Vector512.IsHardwareAccelerated && Environment.GetEnvironmentVariable("NEEDLE_NOAVX512") == null;
 
+    [System.Runtime.CompilerServices.SkipLocalsInit]
     public static void KronAvx512(float* z, int activeRows, float* left, float* right, int rows, int cols, int resultRows, float* result)
     {
-        var tile = stackalloc float[TileRows * cols];
+        // Over-allocate so the tile stays 64-byte aligned when the stack slot is
+        // only 16-byte aligned; every phase fully writes the tile before reading
+        // it, so skipping zero-init is safe.
+        var raw = stackalloc float[TileRows * cols + 16];
+        var tile = (float*)(((nuint)raw + 63) & ~(nuint)63);
         nint stride1 = cols;
         nint stride2 = 2 * cols;
         nint stride3 = 3 * cols;
@@ -1004,9 +1014,14 @@ internal static unsafe class HadamardMlp
     }
 
 #if NEEDLE_SIMD
+    [System.Runtime.CompilerServices.SkipLocalsInit]
     public static void KronAvx2(float* z, int activeRows, float* left, float* right, int rows, int cols, int resultRows, float* result)
     {
-        var tile = stackalloc float[TileRows * cols];
+        // Over-allocate so the tile stays 32-byte aligned when the stack slot is
+        // only 16-byte aligned; every phase fully writes the tile before reading
+        // it, so skipping zero-init is safe.
+        var raw = stackalloc float[TileRows * cols + 8];
+        var tile = (float*)(((nuint)raw + 31) & ~(nuint)31);
         nint stride1 = cols;
         nint stride2 = 2 * cols;
         nint stride3 = 3 * cols;
