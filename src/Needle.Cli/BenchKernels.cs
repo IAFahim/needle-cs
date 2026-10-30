@@ -34,7 +34,7 @@ internal sealed record BenchKernelOptions(int[] PoolThreads, bool Json)
 
 internal static unsafe class BenchKernels
 {
-    static readonly int[] TokenCounts = { 1, 2, 4, 8, 16, 64 };
+    static readonly int[] TokenCounts = { 1, 2, 4, 8, 16, 32, 64 };
     static readonly int[] PrepareTokenCounts = { 1, 4, 64 };
     static readonly (string Name, string Prefix)[] TrieProbes =
     {

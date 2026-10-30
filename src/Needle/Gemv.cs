@@ -251,64 +251,222 @@ internal static unsafe class Gemv
         return Vector256.Sum(accumulator);
     }
 
-    public static void Tile(in Cq w, in Activations a, int token, float* y, int ldy, int rowStart, int rowEnd)
+    public static void Tile4(in Cq w, in Activations a, int token, float* y, int ldy, int rowStart, int rowEnd)
     {
         if (UsePermute)
         {
-            if (w.Bits == 2) Tile<PermuteTwoBitPlanes>(w, a, token, y, ldy, rowStart, rowEnd);
-            else Tile<PermuteFourBitPlanes>(w, a, token, y, ldy, rowStart, rowEnd);
+            if (w.Bits == 2) Tile4<PermuteTwoBitPlanes>(w, a, token, y, ldy, rowStart, rowEnd);
+            else Tile4<PermuteFourBitPlanes>(w, a, token, y, ldy, rowStart, rowEnd);
         }
-        else if (w.Bits == 2) Tile<TwoBitPlanes>(w, a, token, y, ldy, rowStart, rowEnd);
-        else Tile<FourBitPlanes>(w, a, token, y, ldy, rowStart, rowEnd);
+        else if (w.Bits == 2) Tile4<TwoBitPlanes>(w, a, token, y, ldy, rowStart, rowEnd);
+        else Tile4<FourBitPlanes>(w, a, token, y, ldy, rowStart, rowEnd);
     }
 
-    static void Tile<TPlanes>(in Cq w, in Activations a, int token, float* y, int ldy, int rowStart, int rowEnd) where TPlanes : struct, IPlaneLayout
+    public static void Tile2(in Cq w, in Activations a, int token, float* y, int ldy, int rowStart, int rowEnd)
+    {
+        if (UsePermute)
+        {
+            if (w.Bits == 2) Tile2<PermuteTwoBitPlanes>(w, a, token, y, ldy, rowStart, rowEnd);
+            else Tile2<PermuteFourBitPlanes>(w, a, token, y, ldy, rowStart, rowEnd);
+        }
+        else if (w.Bits == 2) Tile2<TwoBitPlanes>(w, a, token, y, ldy, rowStart, rowEnd);
+        else Tile2<FourBitPlanes>(w, a, token, y, ldy, rowStart, rowEnd);
+    }
+
+    static void Tile4<TPlanes>(in Cq w, in Activations a, int token, float* y, int ldy, int rowStart, int rowEnd) where TPlanes : struct, IPlaneLayout
     {
         var groups = w.Groups;
         var stride = a.Stride;
         var cols = a.Cols;
         var tables = TPlanes.Tables(Avx.LoadVector256(w.Book->Bytes));
         var weightedScales = stackalloc float[TileTokens * stride];
-        var scaled = stackalloc float[TileTokens * stride];
-        var rowFactors = stackalloc float[stride];
+        var scaled = stackalloc float[2 * TileTokens * stride];
+        var rowFactors = stackalloc float[2 * stride];
         var byteScale = Vector256.Create(w.Book->ByteScale * HalfExponentRebias);
         for (var t = 0; t < TileTokens; t++)
             for (var v = 0; v < stride; v += HalvesPerVector)
                 Avx.Store(weightedScales + t * stride + v, Avx.Multiply(Avx.LoadVector256(a.Scales + (token + t) * stride + v), byteScale));
         var offsets = a.Offsets + token * stride;
         var values = a.Values + (long)token * cols;
+        var rowBytes = w.RowBytes;
+        var groupBytes = TPlanes.GroupBytes;
         var paddedGroups = (groups + HalvesPerVector - 1) & ~(HalvesPerVector - 1);
         var convertibleRows = (long)w.Rows * groups < paddedGroups ? 0 : (int)(((long)w.Rows * groups - paddedGroups) / groups) + 1;
-        var groupBytes = TPlanes.GroupBytes;
-        for (var n = rowStart; n < rowEnd; n++)
-        {
-            var norms = w.Norms + (long)n * groups;
-            if (n < convertibleRows)
-                for (var v = 0; v < stride; v += HalvesPerVector) Avx.Store(rowFactors + v, UnbiasedHalfToSingle(Avx2.ConvertToVector256Int32(norms + v)));
-            else
-                for (var i = 0; i < stride; i++) rowFactors[i] = i < groups ? BitConverter.Int32BitsToSingle(norms[i] << 13) : 0f;
-            var accumulator0 = TileCorrections(rowFactors, weightedScales, offsets, scaled, stride);
-            var accumulator1 = TileCorrections(rowFactors, weightedScales + stride, offsets + stride, scaled + stride, stride);
-            var accumulator2 = TileCorrections(rowFactors, weightedScales + 2 * stride, offsets + 2 * stride, scaled + 2 * stride, stride);
-            var accumulator3 = TileCorrections(rowFactors, weightedScales + 3 * stride, offsets + 3 * stride, scaled + 3 * stride, stride);
-            var packed = w.Indices + (long)n * w.RowBytes;
-            for (var g = 0; g < groups; g++)
-            {
-                TPlanes.Expand(packed + g * groupBytes, tables, out var p0, out var p1, out var p2, out var p3);
-                var x = values + g * Cq.GroupSize;
-                accumulator0 = Fma.MultiplyAdd(Avx.ConvertToVector256Single(Dot(p0, p1, p2, p3, x)), Avx.BroadcastScalarToVector256(scaled + g), accumulator0);
-                accumulator1 = Fma.MultiplyAdd(Avx.ConvertToVector256Single(Dot(p0, p1, p2, p3, x + cols)), Avx.BroadcastScalarToVector256(scaled + stride + g), accumulator1);
-                accumulator2 = Fma.MultiplyAdd(Avx.ConvertToVector256Single(Dot(p0, p1, p2, p3, x + 2 * cols)), Avx.BroadcastScalarToVector256(scaled + 2 * stride + g), accumulator2);
-                accumulator3 = Fma.MultiplyAdd(Avx.ConvertToVector256Single(Dot(p0, p1, p2, p3, x + 3 * cols)), Avx.BroadcastScalarToVector256(scaled + 3 * stride + g), accumulator3);
-            }
-            var quads = Avx.HorizontalAdd(Avx.HorizontalAdd(accumulator0, accumulator1), Avx.HorizontalAdd(accumulator2, accumulator3));
-            var sums = Sse.Add(quads.GetLower(), quads.GetUpper());
-            y[n] = sums.ToScalar();
-            y[ldy + n] = Sse41.Extract(sums, 1);
-            y[2 * ldy + n] = Sse41.Extract(sums, 2);
-            y[3 * ldy + n] = Sse41.Extract(sums, 3);
-        }
+        var prefetchDistance = (long)PrefetchBlocks * 2 * rowBytes;
+        var n = rowStart;
+        for (; n + 2 <= rowEnd && n + 2 <= convertibleRows; n += 2)
+            Pair4<TPlanes>(w.Indices + (long)n * rowBytes, rowBytes, w.Norms + (long)n * groups, groups, stride, cols, tables, weightedScales, offsets, values, scaled, rowFactors, groupBytes, prefetchDistance, y + n, ldy);
+        for (; n < rowEnd; n++)
+            Row4<TPlanes>(w.Indices + (long)n * rowBytes, w.Norms + (long)n * groups, n < convertibleRows, groups, stride, cols, tables, weightedScales, offsets, values, scaled, rowFactors, groupBytes, prefetchDistance, y + n, ldy);
     }
+
+    static void Tile2<TPlanes>(in Cq w, in Activations a, int token, float* y, int ldy, int rowStart, int rowEnd) where TPlanes : struct, IPlaneLayout
+    {
+        const int Tokens = 2;
+        var groups = w.Groups;
+        var stride = a.Stride;
+        var cols = a.Cols;
+        var tables = TPlanes.Tables(Avx.LoadVector256(w.Book->Bytes));
+        var weightedScales = stackalloc float[Tokens * stride];
+        var scaled = stackalloc float[2 * Tokens * stride];
+        var rowFactors = stackalloc float[2 * stride];
+        var byteScale = Vector256.Create(w.Book->ByteScale * HalfExponentRebias);
+        for (var t = 0; t < Tokens; t++)
+            for (var v = 0; v < stride; v += HalvesPerVector)
+                Avx.Store(weightedScales + t * stride + v, Avx.Multiply(Avx.LoadVector256(a.Scales + (token + t) * stride + v), byteScale));
+        var offsets = a.Offsets + token * stride;
+        var values = a.Values + (long)token * cols;
+        var rowBytes = w.RowBytes;
+        var groupBytes = TPlanes.GroupBytes;
+        var paddedGroups = (groups + HalvesPerVector - 1) & ~(HalvesPerVector - 1);
+        var convertibleRows = (long)w.Rows * groups < paddedGroups ? 0 : (int)(((long)w.Rows * groups - paddedGroups) / groups) + 1;
+        var prefetchDistance = (long)PrefetchBlocks * 2 * rowBytes;
+        var n = rowStart;
+        for (; n + 2 <= rowEnd && n + 2 <= convertibleRows; n += 2)
+            Pair2<TPlanes>(w.Indices + (long)n * rowBytes, rowBytes, w.Norms + (long)n * groups, groups, stride, cols, tables, weightedScales, offsets, values, scaled, rowFactors, groupBytes, prefetchDistance, y + n, ldy);
+        for (; n < rowEnd; n++)
+            Row2<TPlanes>(w.Indices + (long)n * rowBytes, w.Norms + (long)n * groups, n < convertibleRows, groups, stride, cols, tables, weightedScales, offsets, values, scaled, rowFactors, groupBytes, prefetchDistance, y + n, ldy);
+    }
+
+    static void Pair4<TPlanes>(byte* packed, int rowBytes, ushort* norms, int groups, int stride, int cols, in PlaneTables tables, float* weightedScales, float* offsets, sbyte* values, float* scaled, float* rowFactors, int groupBytes, long prefetchDistance, float* y, int ldy) where TPlanes : struct, IPlaneLayout
+    {
+        for (var v = 0; v < stride; v += HalvesPerVector)
+        {
+            Avx.Store(rowFactors + v, UnbiasedHalfToSingle(Avx2.ConvertToVector256Int32(norms + v)));
+            Avx.Store(rowFactors + stride + v, UnbiasedHalfToSingle(Avx2.ConvertToVector256Int32(norms + groups + v)));
+        }
+        var accumulator00 = TileCorrections(rowFactors, weightedScales, offsets, scaled, stride);
+        var accumulator01 = TileCorrections(rowFactors, weightedScales + stride, offsets + stride, scaled + stride, stride);
+        var accumulator02 = TileCorrections(rowFactors, weightedScales + 2 * stride, offsets + 2 * stride, scaled + 2 * stride, stride);
+        var accumulator03 = TileCorrections(rowFactors, weightedScales + 3 * stride, offsets + 3 * stride, scaled + 3 * stride, stride);
+        var accumulator10 = TileCorrections(rowFactors + stride, weightedScales, offsets, scaled + 4 * stride, stride);
+        var accumulator11 = TileCorrections(rowFactors + stride, weightedScales + stride, offsets + stride, scaled + 5 * stride, stride);
+        var accumulator12 = TileCorrections(rowFactors + stride, weightedScales + 2 * stride, offsets + 2 * stride, scaled + 6 * stride, stride);
+        var accumulator13 = TileCorrections(rowFactors + stride, weightedScales + 3 * stride, offsets + 3 * stride, scaled + 7 * stride, stride);
+        var row1 = packed + rowBytes;
+        for (var g = 0; g < groups; g++)
+        {
+            if ((g * groupBytes & CacheLine - 1) == 0)
+            {
+                var ahead = g * groupBytes + prefetchDistance;
+                Sse.Prefetch0(packed + ahead);
+                Sse.Prefetch0(row1 + ahead);
+            }
+            TPlanes.Expand(packed + g * groupBytes, tables, out var p0, out var p1, out var p2, out var p3);
+            TPlanes.Expand(row1 + g * groupBytes, tables, out var q0, out var q1, out var q2, out var q3);
+            var x = values + g * Cq.GroupSize;
+            var x1 = x + cols;
+            var x2 = x + 2 * cols;
+            var x3 = x + 3 * cols;
+            accumulator00 = ApplyPlanes(p0, p1, p2, p3, x, scaled + g, accumulator00);
+            accumulator10 = ApplyPlanes(q0, q1, q2, q3, x, scaled + 4 * stride + g, accumulator10);
+            accumulator01 = ApplyPlanes(p0, p1, p2, p3, x1, scaled + stride + g, accumulator01);
+            accumulator11 = ApplyPlanes(q0, q1, q2, q3, x1, scaled + 5 * stride + g, accumulator11);
+            accumulator02 = ApplyPlanes(p0, p1, p2, p3, x2, scaled + 2 * stride + g, accumulator02);
+            accumulator12 = ApplyPlanes(q0, q1, q2, q3, x2, scaled + 6 * stride + g, accumulator12);
+            accumulator03 = ApplyPlanes(p0, p1, p2, p3, x3, scaled + 3 * stride + g, accumulator03);
+            accumulator13 = ApplyPlanes(q0, q1, q2, q3, x3, scaled + 7 * stride + g, accumulator13);
+        }
+        var quads0 = Avx.HorizontalAdd(Avx.HorizontalAdd(accumulator00, accumulator01), Avx.HorizontalAdd(accumulator02, accumulator03));
+        var sums0 = Sse.Add(quads0.GetLower(), quads0.GetUpper());
+        y[0] = sums0.ToScalar();
+        y[ldy] = Sse41.Extract(sums0, 1);
+        y[2 * ldy] = Sse41.Extract(sums0, 2);
+        y[3 * ldy] = Sse41.Extract(sums0, 3);
+        var quads1 = Avx.HorizontalAdd(Avx.HorizontalAdd(accumulator10, accumulator11), Avx.HorizontalAdd(accumulator12, accumulator13));
+        var sums1 = Sse.Add(quads1.GetLower(), quads1.GetUpper());
+        y[1] = sums1.ToScalar();
+        y[ldy + 1] = Sse41.Extract(sums1, 1);
+        y[2 * ldy + 1] = Sse41.Extract(sums1, 2);
+        y[3 * ldy + 1] = Sse41.Extract(sums1, 3);
+    }
+
+    static void Row4<TPlanes>(byte* packed, ushort* norms, bool convertible, int groups, int stride, int cols, in PlaneTables tables, float* weightedScales, float* offsets, sbyte* values, float* scaled, float* rowFactors, int groupBytes, long prefetchDistance, float* y, int ldy) where TPlanes : struct, IPlaneLayout
+    {
+        if (convertible)
+            for (var v = 0; v < stride; v += HalvesPerVector) Avx.Store(rowFactors + v, UnbiasedHalfToSingle(Avx2.ConvertToVector256Int32(norms + v)));
+        else
+            for (var i = 0; i < stride; i++) rowFactors[i] = i < groups ? BitConverter.Int32BitsToSingle(norms[i] << 13) : 0f;
+        var accumulator0 = TileCorrections(rowFactors, weightedScales, offsets, scaled, stride);
+        var accumulator1 = TileCorrections(rowFactors, weightedScales + stride, offsets + stride, scaled + stride, stride);
+        var accumulator2 = TileCorrections(rowFactors, weightedScales + 2 * stride, offsets + 2 * stride, scaled + 2 * stride, stride);
+        var accumulator3 = TileCorrections(rowFactors, weightedScales + 3 * stride, offsets + 3 * stride, scaled + 3 * stride, stride);
+        for (var g = 0; g < groups; g++)
+        {
+            if ((g * groupBytes & CacheLine - 1) == 0) Sse.Prefetch0(packed + g * groupBytes + prefetchDistance);
+            TPlanes.Expand(packed + g * groupBytes, tables, out var p0, out var p1, out var p2, out var p3);
+            var x = values + g * Cq.GroupSize;
+            accumulator0 = ApplyPlanes(p0, p1, p2, p3, x, scaled + g, accumulator0);
+            accumulator1 = ApplyPlanes(p0, p1, p2, p3, x + cols, scaled + stride + g, accumulator1);
+            accumulator2 = ApplyPlanes(p0, p1, p2, p3, x + 2 * cols, scaled + 2 * stride + g, accumulator2);
+            accumulator3 = ApplyPlanes(p0, p1, p2, p3, x + 3 * cols, scaled + 3 * stride + g, accumulator3);
+        }
+        var quads = Avx.HorizontalAdd(Avx.HorizontalAdd(accumulator0, accumulator1), Avx.HorizontalAdd(accumulator2, accumulator3));
+        var sums = Sse.Add(quads.GetLower(), quads.GetUpper());
+        y[0] = sums.ToScalar();
+        y[ldy] = Sse41.Extract(sums, 1);
+        y[2 * ldy] = Sse41.Extract(sums, 2);
+        y[3 * ldy] = Sse41.Extract(sums, 3);
+    }
+
+    static void Pair2<TPlanes>(byte* packed, int rowBytes, ushort* norms, int groups, int stride, int cols, in PlaneTables tables, float* weightedScales, float* offsets, sbyte* values, float* scaled, float* rowFactors, int groupBytes, long prefetchDistance, float* y, int ldy) where TPlanes : struct, IPlaneLayout
+    {
+        for (var v = 0; v < stride; v += HalvesPerVector)
+        {
+            Avx.Store(rowFactors + v, UnbiasedHalfToSingle(Avx2.ConvertToVector256Int32(norms + v)));
+            Avx.Store(rowFactors + stride + v, UnbiasedHalfToSingle(Avx2.ConvertToVector256Int32(norms + groups + v)));
+        }
+        var accumulator00 = TileCorrections(rowFactors, weightedScales, offsets, scaled, stride);
+        var accumulator01 = TileCorrections(rowFactors, weightedScales + stride, offsets + stride, scaled + stride, stride);
+        var accumulator10 = TileCorrections(rowFactors + stride, weightedScales, offsets, scaled + 2 * stride, stride);
+        var accumulator11 = TileCorrections(rowFactors + stride, weightedScales + stride, offsets + stride, scaled + 3 * stride, stride);
+        var row1 = packed + rowBytes;
+        for (var g = 0; g < groups; g++)
+        {
+            if ((g * groupBytes & CacheLine - 1) == 0)
+            {
+                var ahead = g * groupBytes + prefetchDistance;
+                Sse.Prefetch0(packed + ahead);
+                Sse.Prefetch0(row1 + ahead);
+            }
+            TPlanes.Expand(packed + g * groupBytes, tables, out var p0, out var p1, out var p2, out var p3);
+            TPlanes.Expand(row1 + g * groupBytes, tables, out var q0, out var q1, out var q2, out var q3);
+            var x = values + g * Cq.GroupSize;
+            var x1 = x + cols;
+            accumulator00 = ApplyPlanes(p0, p1, p2, p3, x, scaled + g, accumulator00);
+            accumulator10 = ApplyPlanes(q0, q1, q2, q3, x, scaled + 2 * stride + g, accumulator10);
+            accumulator01 = ApplyPlanes(p0, p1, p2, p3, x1, scaled + stride + g, accumulator01);
+            accumulator11 = ApplyPlanes(q0, q1, q2, q3, x1, scaled + 3 * stride + g, accumulator11);
+        }
+        y[0] = Vector256.Sum(accumulator00);
+        y[ldy] = Vector256.Sum(accumulator01);
+        y[1] = Vector256.Sum(accumulator10);
+        y[ldy + 1] = Vector256.Sum(accumulator11);
+    }
+
+    static void Row2<TPlanes>(byte* packed, ushort* norms, bool convertible, int groups, int stride, int cols, in PlaneTables tables, float* weightedScales, float* offsets, sbyte* values, float* scaled, float* rowFactors, int groupBytes, long prefetchDistance, float* y, int ldy) where TPlanes : struct, IPlaneLayout
+    {
+        if (convertible)
+            for (var v = 0; v < stride; v += HalvesPerVector) Avx.Store(rowFactors + v, UnbiasedHalfToSingle(Avx2.ConvertToVector256Int32(norms + v)));
+        else
+            for (var i = 0; i < stride; i++) rowFactors[i] = i < groups ? BitConverter.Int32BitsToSingle(norms[i] << 13) : 0f;
+        var accumulator0 = TileCorrections(rowFactors, weightedScales, offsets, scaled, stride);
+        var accumulator1 = TileCorrections(rowFactors, weightedScales + stride, offsets + stride, scaled + stride, stride);
+        for (var g = 0; g < groups; g++)
+        {
+            if ((g * groupBytes & CacheLine - 1) == 0) Sse.Prefetch0(packed + g * groupBytes + prefetchDistance);
+            TPlanes.Expand(packed + g * groupBytes, tables, out var p0, out var p1, out var p2, out var p3);
+            var x = values + g * Cq.GroupSize;
+            accumulator0 = ApplyPlanes(p0, p1, p2, p3, x, scaled + g, accumulator0);
+            accumulator1 = ApplyPlanes(p0, p1, p2, p3, x + cols, scaled + stride + g, accumulator1);
+        }
+        y[0] = Vector256.Sum(accumulator0);
+        y[ldy] = Vector256.Sum(accumulator1);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    static Vector256<float> ApplyPlanes(Vector256<byte> p0, Vector256<byte> p1, Vector256<byte> p2, Vector256<byte> p3, sbyte* x, float* scale, Vector256<float> accumulator) =>
+        Fma.MultiplyAdd(Avx.ConvertToVector256Single(Dot(p0, p1, p2, p3, x)), Avx.BroadcastScalarToVector256(scale), accumulator);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     static Vector256<float> TileCorrections(float* rowFactors, float* weightedScales, float* offsets, float* scaled, int stride)

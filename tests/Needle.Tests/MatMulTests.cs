@@ -36,6 +36,30 @@ public sealed unsafe class MatMulTests : IDisposable
         }
     }
 
+    public static IEnumerable<object[]> WideShapes()
+    {
+        foreach (var bits in new[] { 2, 4 })
+            foreach (var (rows, cols) in new[] { (1, 128), (2, 128), (5, 768), (97, 768), (576, 768), (320, 3072) })
+                foreach (var tokens in new[] { 10, 15, 16, 17, 24, 31, 32, 33, 64 })
+                    yield return new object[] { bits, rows, cols, tokens };
+    }
+
+    [Theory]
+    [MemberData(nameof(WideShapes))]
+    public void MatchesScalarReferenceForWideTokens(int bits, int rows, int cols, int tokens)
+    {
+        var random = new Random(rows * 31 + cols + bits);
+        var w = Weights(random, rows, cols, bits);
+        var a = Prepared(random, tokens, cols, bits);
+        var expected = (float*)Allocate((nuint)(tokens * rows) * 4);
+        var actual = (float*)Allocate((nuint)(tokens * rows) * 4);
+        Fill(expected, tokens * rows, Sentinel);
+        Fill(actual, tokens * rows, Sentinel);
+        Scalar.MatMulRows(w, a, tokens, expected, rows, 0, rows);
+        Quant.MatMulRows(w, a, tokens, actual, rows, 0, rows);
+        AssertClose(expected, actual, tokens * rows);
+    }
+
     [Fact]
     public void HalfToSingleDecodesEveryFiniteBitPatternPerIeee754()
     {
@@ -73,7 +97,7 @@ public sealed unsafe class MatMulTests : IDisposable
     {
         var random = new Random(rows + rowStart);
         var w = Weights(random, rows, cols, bits);
-        foreach (var tokens in new[] { 1, 2, 5, 8 })
+        foreach (var tokens in new[] { 1, 2, 3, 5, 6, 7, 8, 16 })
         {
             var a = Prepared(random, tokens, cols, bits);
             var ldy = rows + 3;
