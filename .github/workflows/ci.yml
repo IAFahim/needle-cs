@@ -150,7 +150,7 @@ jobs:
           path: ref
 
       - name: Run unit and parity tests (Release)
-        run: dotnet test tests/Needle.Tests -c Release
+        run: dotnet test tests/Needle.Tests -c Release --logger "console;verbosity=normal"
 
       - name: Run NeonTests natively with verbose output
         if: matrix.neon
