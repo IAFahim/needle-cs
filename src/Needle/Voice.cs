@@ -58,6 +58,15 @@ public sealed class VoiceSession : IDisposable
         return (reply, speech);
     }
 
+    public VoiceResult Complete(ReadOnlySpan<float> pcm, string? language = null)
+    {
+        var speech = whistle.Transcribe(pcm, language, vocabulary);
+        var call = speech.Text.Length == 0
+            ? new CallResult { Reasoning = "no speech detected", Confidence = 0f }
+            : needle.Complete(speech.Text);
+        return new VoiceResult { Speech = speech, Call = call };
+    }
+
 
     internal static System.Collections.Generic.List<string> EnumKeywords(string toolsJson) => EnumValues(new ToolSet(toolsJson));
 
