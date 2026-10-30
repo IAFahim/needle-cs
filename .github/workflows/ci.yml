@@ -87,7 +87,7 @@ jobs:
           compression-level: 1
 
   test:
-    name: Test (${{ matrix.name }})
+    name: Test (${{ matrix.name }} / ${{ matrix.shard }})
     needs: fixtures
     runs-on: ${{ matrix.os }}
     continue-on-error: ${{ matrix.expected-fail }}
@@ -106,6 +106,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        shard: [unit, core, heavy]
         include:
           - name: linux-x64
             os: ubuntu-latest
@@ -149,24 +150,32 @@ jobs:
           name: ref-fixtures
           path: ref
 
-      - name: Run unit and parity tests (Release)
-        run: dotnet test tests/Needle.Tests -c Release --logger "console;verbosity=normal"
+      - name: Select shard filter
+        run: |
+          case "${{ matrix.shard }}" in
+            unit) echo 'FILTER=FullyQualifiedName~AttentionBatchTests|FullyQualifiedName~AttentionTileTests|FullyQualifiedName~BackendTests|FullyQualifiedName~CallRestorerTests|FullyQualifiedName~EvalDatasetTests|FullyQualifiedName~FormatTests|FullyQualifiedName~FusedKernelTests|FullyQualifiedName~GrammarTests|FullyQualifiedName~HadamardMlpTests|FullyQualifiedName~Int8DotTierTests|FullyQualifiedName~KernelTests|FullyQualifiedName~MatMulTests|FullyQualifiedName~NeonTests|FullyQualifiedName~PoolTests|FullyQualifiedName~TeamBarrierTests|FullyQualifiedName~TelemetryTests|FullyQualifiedName~TierSelectionTests|FullyQualifiedName~ToolGenTests' >> $GITHUB_ENV ;;
+            core) echo 'FILTER=FullyQualifiedName~ChannelTests|FullyQualifiedName~ChunkParityTests|FullyQualifiedName~EvalTests|FullyQualifiedName~HugePagesTests|FullyQualifiedName~JumpForwardTests|FullyQualifiedName~LoadingTests|FullyQualifiedName~MaskedDecodingTests|FullyQualifiedName~NativeParityTests|FullyQualifiedName~ParityTests|FullyQualifiedName~RewindTests|FullyQualifiedName~ServiceTests|FullyQualifiedName~SessionStartupTests|FullyQualifiedName~SessionTests|FullyQualifiedName~SpanApiTests|FullyQualifiedName~SpeculativeTests|FullyQualifiedName~ToolGenSessionTests|FullyQualifiedName~TypedHostTests|FullyQualifiedName~TypedSinkTests' >> $GITHUB_ENV ;;
+            heavy) echo 'FILTER=FullyQualifiedName~BatchedDecodeTests|FullyQualifiedName~BenchHarnessTests|FullyQualifiedName~SpeechTests|FullyQualifiedName~VoiceTests|FullyQualifiedName~WhistleStageTests|FullyQualifiedName~ZeroAllocationTests' >> $GITHUB_ENV ;;
+          esac
+
+      - name: Run shard tests (Release)
+        run: dotnet test tests/Needle.Tests -c Release --filter "$FILTER" --logger "console;verbosity=normal"
+
+      - name: Run shard tests on the scalar backend (NEEDLE_SCALAR=1)
+        if: matrix.scalar
+        env:
+          NEEDLE_SCALAR: "1"
+        run: dotnet test tests/Needle.Tests -c Release --no-build --filter "$FILTER"
 
       - name: Run NeonTests natively with verbose output
         if: matrix.neon
         run: dotnet test tests/Needle.Tests -c Release --no-build --filter "FullyQualifiedName~NeonTests" --logger "console;verbosity=normal"
 
-      - name: Run tests on the NEON widening fallback tier (NEEDLE_NODP=1)
+      - name: Run shard tests on the NEON widening fallback tier (NEEDLE_NODP=1)
         if: matrix.neon
         env:
           NEEDLE_NODP: "1"
-        run: dotnet test tests/Needle.Tests -c Release --no-build
-
-      - name: Run tests on the scalar backend (NEEDLE_SCALAR=1)
-        if: matrix.scalar
-        env:
-          NEEDLE_SCALAR: "1"
-        run: dotnet test tests/Needle.Tests -c Release --no-build
+        run: dotnet test tests/Needle.Tests -c Release --no-build --filter "$FILTER"
 
       - name: Build netstandard2.1 library (Release)
         if: matrix.netstandard
