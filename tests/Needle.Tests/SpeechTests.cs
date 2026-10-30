@@ -65,7 +65,9 @@ public sealed class SpeechTests : IDisposable
     public void TestClipAndHotwordClipKeepUpstreamPhrases()
     {
         Assert.Contains("this will transcribe properly", whistle.Transcribe(Clip("test.wav")).Text);
-        Assert.Contains("called Omep Brazil", whistle.Transcribe(Clip("hotword.wav")).Text);
+        var hotword = whistle.Transcribe(Clip("hotword.wav")).Text;
+        Assert.Contains("part of the cactus team and, you know, I also", hotword);
+        Assert.Contains("called Omep Brazil", hotword);
     }
 
     [Fact]
