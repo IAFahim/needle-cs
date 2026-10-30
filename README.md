@@ -8,7 +8,7 @@ Reads `.cact` model files directly in place with AVX2, ARM64 NEON (SDOT with a w
 
 ## Status
 
-Early but usable for a showcase: everything below works on Linux x64 today and is covered by 216 passing tests (Linux x64, AVX2 and scalar).
+Early but usable for a showcase: everything below works on Linux x64 today and is covered by 241 passing tests (Linux x64, AVX2 and scalar).
 
 | Area | State |
 |---|---|
@@ -155,7 +155,7 @@ python3 tools/golden.py               # about 15 CPU minutes
 python3 tools/golden_confidence.py    # needs the output of golden.py; takes seconds
 python3 tools/golden_whistle.py       # Whistle stage goldens; soxr resamples the 48 kHz clips; takes seconds
 
-# 3. Run the 54 tests (about 2 minutes each)
+# 3. Run the 241 tests (under a minute)
 dotnet test tests/Needle.Tests -c Release
 NEEDLE_SCALAR=1 dotnet test tests/Needle.Tests -c Release
 ```
