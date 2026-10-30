@@ -674,34 +674,228 @@ internal static unsafe class Neon
         sum3 = Dot16(sum3, weights, AdvSimd.LoadVector128(v3 + offset));
     }
 
+    // Multi-row decode block: 4 rows x 1 token (the x64 Gemv.Block counterpart).
+    // Activation vectors are loaded once per plane and shared across four rows,
+    // so decode pays one activation pass per four rows instead of one per row.
+    static void DotBlock(in Cq w, byte* packed, int rowBytes, ushort* norms, int groups, in Activations a, int token, float* rowFactors, float* scaled, float* y, Vector128<byte> table, Vector128<byte> mask)
+    {
+        var stride = a.Stride;
+        for (var r = 0; r < 4; r++)
+            LoadFactors(norms + (long)r * groups, groups, w.Book->ByteScale, rowFactors + r * stride);
+        var bias0 = ScaleFactors(rowFactors, scaled, a.Scales + token * stride, a.Offsets + token * stride, stride);
+        var bias1 = ScaleFactors(rowFactors + stride, scaled + stride, a.Scales + token * stride, a.Offsets + token * stride, stride);
+        var bias2 = ScaleFactors(rowFactors + 2 * stride, scaled + 2 * stride, a.Scales + token * stride, a.Offsets + token * stride, stride);
+        var bias3 = ScaleFactors(rowFactors + 3 * stride, scaled + 3 * stride, a.Scales + token * stride, a.Offsets + token * stride, stride);
+        var values = a.Values + (long)token * a.Cols;
+        var accumulator0 = 0f;
+        var accumulator1 = 0f;
+        var accumulator2 = 0f;
+        var accumulator3 = 0f;
+        var packedStep = w.RowBytes / groups;
+        var regs = w.Bits == 2 ? 2 : 4;
+        var row1 = packed + rowBytes;
+        var row2 = packed + 2 * rowBytes;
+        var row3 = packed + 3 * rowBytes;
+        for (var g = 0; g < groups; g++)
+        {
+            var sum0 = Vector128<int>.Zero;
+            var sum1 = Vector128<int>.Zero;
+            var sum2 = Vector128<int>.Zero;
+            var sum3 = Vector128<int>.Zero;
+            var offset = g * packedStep;
+            for (var r = 0; r < regs; r++)
+            {
+                var s0 = AdvSimd.LoadVector128(packed + offset + r * 16);
+                var s1 = AdvSimd.LoadVector128(row1 + offset + r * 16);
+                var s2 = AdvSimd.LoadVector128(row2 + offset + r * 16);
+                var s3 = AdvSimd.LoadVector128(row3 + offset + r * 16);
+                var act = g * Cq.GroupSize + (w.Bits == 2 ? r * 16 : (r >> 1) * 64 + (r & 1) * 16);
+                if (w.Bits == 2)
+                {
+                    BlockPlane(table, mask, s0, s1, s2, s3, 0, act, values, ref sum0, ref sum1, ref sum2, ref sum3);
+                    BlockPlane(table, mask, AdvSimd.ShiftRightLogical(s0, 2), AdvSimd.ShiftRightLogical(s1, 2), AdvSimd.ShiftRightLogical(s2, 2), AdvSimd.ShiftRightLogical(s3, 2), 1, act, values, ref sum0, ref sum1, ref sum2, ref sum3);
+                    BlockPlane(table, mask, AdvSimd.ShiftRightLogical(s0, 4), AdvSimd.ShiftRightLogical(s1, 4), AdvSimd.ShiftRightLogical(s2, 4), AdvSimd.ShiftRightLogical(s3, 4), 2, act, values, ref sum0, ref sum1, ref sum2, ref sum3);
+                    BlockPlane(table, mask, AdvSimd.ShiftRightLogical(s0, 6), AdvSimd.ShiftRightLogical(s1, 6), AdvSimd.ShiftRightLogical(s2, 6), AdvSimd.ShiftRightLogical(s3, 6), 3, act, values, ref sum0, ref sum1, ref sum2, ref sum3);
+                }
+                else
+                {
+                    BlockPlane(table, mask, s0, s1, s2, s3, 0, act, values, ref sum0, ref sum1, ref sum2, ref sum3);
+                    BlockPlane(table, mask, AdvSimd.ShiftRightLogical(s0, 4), AdvSimd.ShiftRightLogical(s1, 4), AdvSimd.ShiftRightLogical(s2, 4), AdvSimd.ShiftRightLogical(s3, 4), 1, act, values, ref sum0, ref sum1, ref sum2, ref sum3);
+                }
+            }
+            accumulator0 += HorizontalSum(AdvSimd.ConvertToSingle(sum0)) * scaled[g];
+            accumulator1 += HorizontalSum(AdvSimd.ConvertToSingle(sum1)) * scaled[stride + g];
+            accumulator2 += HorizontalSum(AdvSimd.ConvertToSingle(sum2)) * scaled[2 * stride + g];
+            accumulator3 += HorizontalSum(AdvSimd.ConvertToSingle(sum3)) * scaled[3 * stride + g];
+        }
+        y[0] = accumulator0 - bias0;
+        y[1] = accumulator1 - bias1;
+        y[2] = accumulator2 - bias2;
+        y[3] = accumulator3 - bias3;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    static void BlockPlane(Vector128<byte> table, Vector128<byte> mask, Vector128<byte> i0, Vector128<byte> i1, Vector128<byte> i2, Vector128<byte> i3, int plane, int act, sbyte* values, ref Vector128<int> sum0, ref Vector128<int> sum1, ref Vector128<int> sum2, ref Vector128<int> sum3)
+    {
+        var activation = AdvSimd.LoadVector128(values + act + plane * 32);
+        sum0 = Dot16(sum0, Weights(table, AdvSimd.And(i0, mask)), activation);
+        sum1 = Dot16(sum1, Weights(table, AdvSimd.And(i1, mask)), activation);
+        sum2 = Dot16(sum2, Weights(table, AdvSimd.And(i2, mask)), activation);
+        sum3 = Dot16(sum3, Weights(table, AdvSimd.And(i3, mask)), activation);
+    }
+
+    // Prefill tile: 2 rows x 4 tokens (the x64 Gemv.Pair4 counterpart). Each
+    // weight plane is expanded once and dotted against all four token activation
+    // vectors, halving weight traffic versus one DotTile per row.
+    static void DotPair(in Cq w, byte* packed, int rowBytes, ushort* norms, int groups, in Activations a, int token, float* rowFactors, float* scaled, float* y, int ldy, Vector128<byte> table, Vector128<byte> mask)
+    {
+        var stride = a.Stride;
+        var cols = a.Cols;
+        LoadFactors(norms, groups, w.Book->ByteScale, rowFactors);
+        LoadFactors(norms + groups, groups, w.Book->ByteScale, rowFactors + stride);
+        var bias00 = ScaleFactors(rowFactors, scaled, a.Scales + token * stride, a.Offsets + token * stride, stride);
+        var bias01 = ScaleFactors(rowFactors, scaled + stride, a.Scales + (token + 1) * stride, a.Offsets + (token + 1) * stride, stride);
+        var bias02 = ScaleFactors(rowFactors, scaled + 2 * stride, a.Scales + (token + 2) * stride, a.Offsets + (token + 2) * stride, stride);
+        var bias03 = ScaleFactors(rowFactors, scaled + 3 * stride, a.Scales + (token + 3) * stride, a.Offsets + (token + 3) * stride, stride);
+        var bias10 = ScaleFactors(rowFactors + stride, scaled + 4 * stride, a.Scales + token * stride, a.Offsets + token * stride, stride);
+        var bias11 = ScaleFactors(rowFactors + stride, scaled + 5 * stride, a.Scales + (token + 1) * stride, a.Offsets + (token + 1) * stride, stride);
+        var bias12 = ScaleFactors(rowFactors + stride, scaled + 6 * stride, a.Scales + (token + 2) * stride, a.Offsets + (token + 2) * stride, stride);
+        var bias13 = ScaleFactors(rowFactors + stride, scaled + 7 * stride, a.Scales + (token + 3) * stride, a.Offsets + (token + 3) * stride, stride);
+        var v0 = a.Values + (long)token * cols;
+        var v1 = v0 + cols;
+        var v2 = v1 + cols;
+        var v3 = v2 + cols;
+        var accumulator00 = 0f;
+        var accumulator01 = 0f;
+        var accumulator02 = 0f;
+        var accumulator03 = 0f;
+        var accumulator10 = 0f;
+        var accumulator11 = 0f;
+        var accumulator12 = 0f;
+        var accumulator13 = 0f;
+        var packedStep = w.RowBytes / groups;
+        var regs = w.Bits == 2 ? 2 : 4;
+        var row1 = packed + rowBytes;
+        for (var g = 0; g < groups; g++)
+        {
+            var sum00 = Vector128<int>.Zero;
+            var sum01 = Vector128<int>.Zero;
+            var sum02 = Vector128<int>.Zero;
+            var sum03 = Vector128<int>.Zero;
+            var sum10 = Vector128<int>.Zero;
+            var sum11 = Vector128<int>.Zero;
+            var sum12 = Vector128<int>.Zero;
+            var sum13 = Vector128<int>.Zero;
+            var offset = g * packedStep;
+            for (var r = 0; r < regs; r++)
+            {
+                var s0 = AdvSimd.LoadVector128(packed + offset + r * 16);
+                var s1 = AdvSimd.LoadVector128(row1 + offset + r * 16);
+                var act = g * Cq.GroupSize + (w.Bits == 2 ? r * 16 : (r >> 1) * 64 + (r & 1) * 16);
+                if (w.Bits == 2)
+                {
+                    PairPlane(table, mask, s0, s1, 0, act, v0, v1, v2, v3, ref sum00, ref sum01, ref sum02, ref sum03, ref sum10, ref sum11, ref sum12, ref sum13);
+                    PairPlane(table, mask, AdvSimd.ShiftRightLogical(s0, 2), AdvSimd.ShiftRightLogical(s1, 2), 1, act, v0, v1, v2, v3, ref sum00, ref sum01, ref sum02, ref sum03, ref sum10, ref sum11, ref sum12, ref sum13);
+                    PairPlane(table, mask, AdvSimd.ShiftRightLogical(s0, 4), AdvSimd.ShiftRightLogical(s1, 4), 2, act, v0, v1, v2, v3, ref sum00, ref sum01, ref sum02, ref sum03, ref sum10, ref sum11, ref sum12, ref sum13);
+                    PairPlane(table, mask, AdvSimd.ShiftRightLogical(s0, 6), AdvSimd.ShiftRightLogical(s1, 6), 3, act, v0, v1, v2, v3, ref sum00, ref sum01, ref sum02, ref sum03, ref sum10, ref sum11, ref sum12, ref sum13);
+                }
+                else
+                {
+                    PairPlane(table, mask, s0, s1, 0, act, v0, v1, v2, v3, ref sum00, ref sum01, ref sum02, ref sum03, ref sum10, ref sum11, ref sum12, ref sum13);
+                    PairPlane(table, mask, AdvSimd.ShiftRightLogical(s0, 4), AdvSimd.ShiftRightLogical(s1, 4), 1, act, v0, v1, v2, v3, ref sum00, ref sum01, ref sum02, ref sum03, ref sum10, ref sum11, ref sum12, ref sum13);
+                }
+            }
+            accumulator00 += HorizontalSum(AdvSimd.ConvertToSingle(sum00)) * scaled[g];
+            accumulator01 += HorizontalSum(AdvSimd.ConvertToSingle(sum01)) * scaled[stride + g];
+            accumulator02 += HorizontalSum(AdvSimd.ConvertToSingle(sum02)) * scaled[2 * stride + g];
+            accumulator03 += HorizontalSum(AdvSimd.ConvertToSingle(sum03)) * scaled[3 * stride + g];
+            accumulator10 += HorizontalSum(AdvSimd.ConvertToSingle(sum10)) * scaled[4 * stride + g];
+            accumulator11 += HorizontalSum(AdvSimd.ConvertToSingle(sum11)) * scaled[5 * stride + g];
+            accumulator12 += HorizontalSum(AdvSimd.ConvertToSingle(sum12)) * scaled[6 * stride + g];
+            accumulator13 += HorizontalSum(AdvSimd.ConvertToSingle(sum13)) * scaled[7 * stride + g];
+        }
+        y[0] = accumulator00 - bias00;
+        y[ldy] = accumulator01 - bias01;
+        y[2 * ldy] = accumulator02 - bias02;
+        y[3 * ldy] = accumulator03 - bias03;
+        y[1] = accumulator10 - bias10;
+        y[ldy + 1] = accumulator11 - bias11;
+        y[2 * ldy + 1] = accumulator12 - bias12;
+        y[3 * ldy + 1] = accumulator13 - bias13;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    static void PairPlane(Vector128<byte> table, Vector128<byte> mask, Vector128<byte> i0, Vector128<byte> i1, int plane, int act, sbyte* v0, sbyte* v1, sbyte* v2, sbyte* v3, ref Vector128<int> sum00, ref Vector128<int> sum01, ref Vector128<int> sum02, ref Vector128<int> sum03, ref Vector128<int> sum10, ref Vector128<int> sum11, ref Vector128<int> sum12, ref Vector128<int> sum13)
+    {
+        var w0 = Weights(table, AdvSimd.And(i0, mask));
+        var w1 = Weights(table, AdvSimd.And(i1, mask));
+        var offset = act + plane * 32;
+        var a0 = AdvSimd.LoadVector128(v0 + offset);
+        var a1 = AdvSimd.LoadVector128(v1 + offset);
+        var a2 = AdvSimd.LoadVector128(v2 + offset);
+        var a3 = AdvSimd.LoadVector128(v3 + offset);
+        sum00 = Dot16(sum00, w0, a0);
+        sum01 = Dot16(sum01, w0, a1);
+        sum02 = Dot16(sum02, w0, a2);
+        sum03 = Dot16(sum03, w0, a3);
+        sum10 = Dot16(sum10, w1, a0);
+        sum11 = Dot16(sum11, w1, a1);
+        sum12 = Dot16(sum12, w1, a2);
+        sum13 = Dot16(sum13, w1, a3);
+    }
+
+    // One decode token across a row range: 4-row DotBlock slices with a
+    // single-row DotRow tail.
+    static void BlockToken(in Cq w, in Activations a, int token, float* yToken, int rowStart, int rowEnd, float* rowFactors, float* scaled, Vector128<byte> table, Vector128<byte> mask)
+    {
+        var groups = w.Groups;
+        var n = rowStart;
+        for (; n + 4 <= rowEnd; n += 4)
+            DotBlock(w, w.Indices + (long)n * w.RowBytes, w.RowBytes, w.Norms + (long)n * groups, groups, a, token, rowFactors, scaled, yToken + n, table, mask);
+        for (; n < rowEnd; n++)
+        {
+            LoadFactors(w.Norms + (long)n * groups, groups, w.Book->ByteScale, rowFactors);
+            yToken[n] = DotRow(w, w.Indices + (long)n * w.RowBytes, a, token, rowFactors, scaled);
+        }
+    }
+
     public static void MatMulRows(in Cq w, in Activations a, int tokens, float* y, int ldy, int rowStart, int rowEnd)
     {
-        var factors = stackalloc float[a.Stride];
-        var scaled = stackalloc float[a.Stride * 4];
+        // Row factors for up to a 4-row decode block; scaled for up to a
+        // 2-row x 4-token pair tile (DotBlock uses the first four slots).
+        var rowFactors = stackalloc float[a.Stride * 4];
+        var scaled = stackalloc float[a.Stride * 8];
         var groups = w.Groups;
+        var table = AdvSimd.LoadVector128(w.Book->Bytes);
+        var mask = Vector128.Create(w.Bits == 2 ? (byte)0x03 : (byte)0x0F);
         if ((rowEnd - rowStart) * 4 <= tokens)
         {
+            // Prefill-leaning: token-major; row pairs share weight-plane expansion.
             for (var t = 0; t + 4 <= tokens; t += 4)
-                for (var n = rowStart; n < rowEnd; n++)
+            {
+                var n = rowStart;
+                for (; n + 2 <= rowEnd; n += 2)
+                    DotPair(w, w.Indices + (long)n * w.RowBytes, w.RowBytes, w.Norms + (long)n * groups, groups, a, t, rowFactors, scaled, y + (long)t * ldy + n, ldy, table, mask);
+                for (; n < rowEnd; n++)
                 {
-                    LoadFactors(w.Norms + (long)n * groups, groups, w.Book->ByteScale, factors);
-                    DotTile(w, w.Indices + (long)n * w.RowBytes, a, t, factors, scaled, y + (long)t * ldy + n, ldy);
+                    LoadFactors(w.Norms + (long)n * groups, groups, w.Book->ByteScale, rowFactors);
+                    DotTile(w, w.Indices + (long)n * w.RowBytes, a, t, rowFactors, scaled, y + (long)t * ldy + n, ldy);
                 }
+            }
             for (var t = tokens & ~3; t < tokens; t++)
-                for (var n = rowStart; n < rowEnd; n++)
-                {
-                    LoadFactors(w.Norms + (long)n * groups, groups, w.Book->ByteScale, factors);
-                    y[(long)t * ldy + n] = DotRow(w, w.Indices + (long)n * w.RowBytes, a, t, factors, scaled);
-                }
+                BlockToken(w, a, t, y + (long)t * ldy, rowStart, rowEnd, rowFactors, scaled, table, mask);
             return;
         }
+        // Decode-leaning: row-major full tiles, then blocked tail tokens.
+        var full = tokens & ~3;
         for (var n = rowStart; n < rowEnd; n++)
         {
-            LoadFactors(w.Norms + (long)n * groups, groups, w.Book->ByteScale, factors);
-            var t = 0;
-            for (; t + 4 <= tokens; t += 4) DotTile(w, w.Indices + (long)n * w.RowBytes, a, t, factors, scaled, y + (long)t * ldy + n, ldy);
-            for (; t < tokens; t++) y[(long)t * ldy + n] = DotRow(w, w.Indices + (long)n * w.RowBytes, a, t, factors, scaled);
+            LoadFactors(w.Norms + (long)n * groups, groups, w.Book->ByteScale, rowFactors);
+            for (var t = 0; t < full; t += 4)
+                DotTile(w, w.Indices + (long)n * w.RowBytes, a, t, rowFactors, scaled, y + (long)t * ldy + n, ldy);
         }
+        for (var t = full; t < tokens; t++)
+            BlockToken(w, a, t, y + (long)t * ldy, rowStart, rowEnd, rowFactors, scaled, table, mask);
     }
 
     public static void ConditionWeights(float* condV, float* input, int dim, float* weights)
