@@ -9,3 +9,4 @@ __pycache__/
 *.pyc
 
 /ref
+unity/com.needle.inference/Runtime/Plugins/net10.0/Needle.Inference.dll
