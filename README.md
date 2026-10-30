@@ -145,6 +145,13 @@ NEEDLE_SCALAR=1 dotnet test tests/Needle.Tests -c Release
 
 The greedy decode budget is `DECODE_BUDGET` in `tools/golden.py` (`python3 tools/golden.py 64` overrides it). The script records the budget it used in `ref/golden/golden.json` and `ParityTests.GenerationMatchesReferenceGreedyDecode` decodes exactly that many tokens, so the fixture and the test cannot drift. It also records the SHA-256 of the model it used, and the tests fail with "fixtures were generated from a different model" if the loaded model differs. To adopt a newer upstream model on purpose, follow "Refreshing the upstream model" in [CONTRIBUTING.md](CONTRIBUTING.md).
 
+The Whistle stage goldens come from a second numpy reference, `tools/golden_whistle.py`. It reads `whistle.cact` and the clips in `ref/audio`, and writes the log-mel features, stem output, encoder layers, encoder output, cross-attention memory and the first decoder logits to `ref/golden/whistle/<clip>/`. `WhistleStageTests` compares the C# stages against them. It needs `pip install numpy sentencepiece soxr` (soxr resamples the 48 kHz clips) and takes a few minutes. Whistle decodes with beam search (width 4, mean log-probability), which is what the upstream library does.
+
+```bash
+python3 tools/golden_whistle.py record hotword
+```
+
+
 ```sh
 # Build NativeAOT CLI
 dotnet publish src/Needle.Cli -c Release

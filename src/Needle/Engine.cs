@@ -275,6 +275,23 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         Length = 0;
     }
 
+    internal void CopyFrom(EngineCore<TClock> source)
+    {
+        Buffer.MemoryCopy(source.state, state, stateBytes, stateBytes);
+        Length = source.Length;
+        CopyPrefix(source.logits, logits, 0, model.Embedding.Rows);
+        for (var l = 0; l < g.Layers; l++)
+        {
+            CopyPrefix(source.keyCache, keyCache, (long)l * capacity * kWidth, (long)Length * kWidth);
+            CopyPrefix(source.valueCache, valueCache, (long)l * capacity * vWidth, (long)Length * vWidth);
+            CopyPrefix(source.keyScale, keyScale, (long)l * capacity * g.KvHeads, (long)Length * g.KvHeads);
+            CopyPrefix(source.valueScale, valueScale, (long)l * capacity * g.KvHeads, (long)Length * g.KvHeads);
+        }
+    }
+
+    static void CopyPrefix<T>(T* from, T* to, long offset, long count) where T : unmanaged =>
+        Buffer.MemoryCopy(from + offset, to + offset, count * sizeof(T), count * sizeof(T));
+
     public void Mark()
     {
         if (!historyPending) Buffer.MemoryCopy(state, snapshot, historyBytes, historyBytes);

@@ -92,6 +92,13 @@ internal static unsafe class Scalar
                     }
     }
 
+    public static float HalfToSingleExact(ushort half)
+    {
+        var magnitude = half & 0x7FFF;
+        if (magnitude >= 0x0400) return HalfToSingle(half);
+        return (half & 0x8000) != 0 ? -magnitude * 5.9604645e-8f : magnitude * 5.9604645e-8f;
+    }
+
     public static float HalfToSingle(ushort half)
     {
         var magnitude = half & 0x7FFF;

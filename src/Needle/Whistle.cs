@@ -6,6 +6,8 @@ using System.Text;
 
 namespace Needle;
 
+internal delegate void StageObserver(string stage, ReadOnlySpan<float> values);
+
 public readonly record struct Word(string Text, double Start, double End, double Probability);
 
 public sealed class Transcription
@@ -31,11 +33,12 @@ public sealed unsafe partial class Whistle : IDisposable
     readonly Engine decoder;
     readonly Tokenizer tokenizer;
     readonly int dim, maxFrames, textVocab;
+    readonly ThreadPolicy policy;
     readonly string[] languages;
     Arena arena;
     Frontend front;
 
-    float* padded, features, stemOut;
+    float* padded, features, featurePeaks, stemOut;
     float* streamA, streamB, normalized, residual, input, hidden, attnOut, gateOut, attnProj, glu, conv;
     float* preOut, postOut, resOut, postGate, residualMix, rowScratch, quantizedRows;
     sbyte* qInt8, kInt8, vInt8;
@@ -46,6 +49,8 @@ public sealed unsafe partial class Whistle : IDisposable
     float* encoderOutput, crossKRaw, crossVRaw;
     CrossMemory memory;
     int frames;
+
+    internal StageObserver? Observer { get; set; }
 
     public int Frames => frames;
     public IReadOnlyList<string> Languages => languages;
@@ -59,6 +64,7 @@ public sealed unsafe partial class Whistle : IDisposable
     {
         if (model.Audio == null) throw new ArgumentException("this .cact has no speech model");
         this.model = model;
+        this.policy = policy;
         audio = model.Audio;
         g = model.Geometry;
         dim = g.Dim;
@@ -92,6 +98,7 @@ public sealed unsafe partial class Whistle : IDisposable
         arena = new Arena((nuint)(256u << 20));
         padded = arena.TakeUncleared<float>((nuint)samples + 512);
         features = arena.TakeUncleared<float>((nuint)(rawFrames * audio->Mels));
+        featurePeaks = arena.TakeUncleared<float>((nuint)FeatureJob.Tasks(rawFrames));
         var f = maxFrames;
         stemOut = arena.TakeUncleared<float>((nuint)(f * dim));
         var streamWidth = 4 * dim;
@@ -166,11 +173,13 @@ public sealed unsafe partial class Whistle : IDisposable
         for (var i = 0; i < samples; i++) padded[half + i] = pcm[i];
         fixed (Frontend* fp = &front)
         {
-            var job = new FeatureJob { Front = fp, Padded = padded, Output = features, Frames = l0 };
+            var job = new FeatureJob { Front = fp, Padded = padded, Output = features, TaskPeaks = featurePeaks, Frames = l0 };
             FeatureJob.Run(pool, &job);
         }
         Normalize(features, l0, audio->Mels);
+        Observer?.Invoke("mel", new ReadOnlySpan<float>(features, l0 * audio->Mels));
         frames = Stem(l0);
+        Observer?.Invoke("stem", new ReadOnlySpan<float>(stemOut, frames * dim));
         RunEncoder(frames);
         return frames;
     }
@@ -304,7 +313,6 @@ public sealed unsafe partial class Whistle : IDisposable
             var flat = stemFlat + (long)r * 10 * s;
             for (var f = 0; f < 10; f++)
                 for (var c = 0; c < s; c++) flat[c * 10 + f] = row[f * s + c];
-            Quant.FakeA8(flat, 10 * s);
         }
         Quant.Prepare(stemFlat, rows, 10 * s, 2, flatAct);
         var batch = new MatMulBatch(flatAct, rows);
@@ -329,7 +337,6 @@ public sealed unsafe partial class Whistle : IDisposable
             for (var t = 0; t < count; t++)
             {
                 Ops.RmsUnit(stream + (long)t * width, width, normalized + (long)t * width);
-                Quant.FakeA8(normalized + (long)t * width, width);
             }
             Quant.Prepare(normalized, count, width, 4, streamAct);
             var mix = new MatMulBatch(streamAct, count);
@@ -364,12 +371,14 @@ public sealed unsafe partial class Whistle : IDisposable
             var swap = stream;
             stream = next;
             next = swap;
+            Observer?.Invoke("layer" + l, new ReadOnlySpan<float>(stream, count * width));
         }
         for (var t = 0; t < count; t++)
         {
             Ops.Mix4(stream + (long)t * width, dim, 0.25f, 0.25f, 0.25f, 0.25f, rowScratch);
             Ops.ZeroCenteredRms(rowScratch, audio->EncoderFinalNorm, dim, encoderOutput + (long)t * dim);
         }
+        Observer?.Invoke("encoder", new ReadOnlySpan<float>(encoderOutput, count * dim));
     }
 
     void RunMlp(MlpWeights* weights, float* preNorm, int count)
@@ -388,7 +397,6 @@ public sealed unsafe partial class Whistle : IDisposable
         {
             var r = quantizedRows + (long)t * dim;
             Ops.ZeroCenteredRms(residual + (long)t * dim, w->AttnNorm, dim, r);
-            Quant.FakeA8(r, dim);
         }
         Quant.Prepare(quantizedRows, count, dim, 2, dimAct);
         var projections = new MatMulBatch(dimAct, count);
@@ -425,7 +433,6 @@ public sealed unsafe partial class Whistle : IDisposable
         {
             var o = attnOut + (long)t * g.OutputWidth;
             Ops.MultiplyBySigmoid(o, gateOut + (long)t * g.OutputWidth, g.OutputWidth);
-            Quant.FakeA8(o, g.OutputWidth);
         }
         Quant.Prepare(attnOut, count, g.OutputWidth, 2, dimAct);
         var output = new MatMulBatch(dimAct, count);
@@ -444,7 +451,6 @@ public sealed unsafe partial class Whistle : IDisposable
         {
             var r = quantizedRows + (long)t * dim;
             Ops.ZeroCenteredRms(residual + (long)t * dim, w->ConvNorm, dim, r);
-            Quant.FakeA8(r, dim);
         }
         Quant.Prepare(quantizedRows, count, dim, 2, dimAct);
         var expand = new MatMulBatch(dimAct, count);
@@ -471,7 +477,6 @@ public sealed unsafe partial class Whistle : IDisposable
             var r = quantizedRows + (long)t * dim;
             Ops.ZeroCenteredRms(o, w->ConvOutNorm, dim, r);
             Ops.Silu(r, dim);
-            Quant.FakeA8(r, dim);
         }
         Quant.Prepare(quantizedRows, count, dim, 2, dimAct);
         var project = new MatMulBatch(dimAct, count);
@@ -504,6 +509,7 @@ public sealed unsafe partial class Whistle : IDisposable
             }
             Quant.FakeA8(row, dim);
         }
+        Observer?.Invoke("memory", new ReadOnlySpan<float>(quantizedRows, count * dim));
         Quant.Prepare(quantizedRows, count, dim, 2, memoryAct);
         for (var l = 0; l < g.Layers; l++)
         {
@@ -524,6 +530,29 @@ public sealed unsafe partial class Whistle : IDisposable
         }
         memory.Frames = count;
         decoder.Attach(memory);
+        if (Observer != null)
+        {
+            Observer("cross_key0", DequantizedCross(memory.Keys, memory.KeyScales, g.QkDim, 0));
+            Observer("cross_value_last", DequantizedCross(memory.Values, memory.ValueScales, g.VDim, g.Layers - 1));
+        }
+    }
+
+    float[] DequantizedCross(sbyte* values, float* scales, int width, int layer)
+    {
+        var slots = frames * g.Heads;
+        var result = new float[slots * width];
+        var first = (long)layer * slots;
+        for (var slot = 0; slot < slots; slot++)
+            for (var i = 0; i < width; i++) result[slot * width + i] = values[(first + slot) * width + i] * scales[first + slot];
+        return result;
+    }
+
+    internal void Observe(ReadOnlySpan<float> pcm, string? language)
+    {
+        if (Encode(pcm) == 0) return;
+        EnsureDecoderBuffers();
+        BuildCrossMemory();
+        Prime(language, false, new Pass());
     }
 
     public void Pause() => pool.Pause();
@@ -533,6 +562,7 @@ public sealed unsafe partial class Whistle : IDisposable
     public void Dispose()
     {
         decoder.Dispose();
+        DisposeBeams();
         tokenizer.Dispose();
         pool.Dispose();
         front.Free();
