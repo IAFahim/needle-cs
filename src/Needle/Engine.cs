@@ -48,7 +48,11 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
 
     readonly float* state;
     readonly float* snapshot;
-    readonly nuint stateBytes;
+    readonly nuint stateBytes, historyBytes, poolBytes;
+    readonly int poolRows;
+    int* snapshotTokens;
+    float* snapshotPoolMax, snapshotPoolSum, snapshotPoolAcc;
+    bool historyPending, poolPending;
     float* qkvHistory, engramHistory;
     int* previousTokens;
     int markedLength;
@@ -57,6 +61,8 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
     CrossMemory cross;
 
     public int Length { get; private set; }
+
+    internal long StateBytes => (long)stateBytes;
 
     public LayerObserver? Observer { get; set; }
 
@@ -122,7 +128,7 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         valueScale = arena.TakeUncleared<float>((nuint)capacity * (nuint)g.Layers * (nuint)g.KvHeads);
         BuildRopeTables();
 
-        var poolRows = model.Confidence != null ? (g.Layers + 1) * model.Confidence->Probes : 0;
+        poolRows = model.Confidence != null ? (g.Layers + 1) * model.Confidence->Probes : 0;
         var poolFloats = poolRows * (dim + 2);
         cell = arena.Take<float>((nuint)dim);
         var stateFloats = (nuint)(g.Layers * historyPerLayer + g.SiteCount * EngramHistory * dim + 2 + poolFloats);
@@ -135,14 +141,35 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         poolMax = (float*)(previousTokens + 2);
         poolSum = poolMax + poolRows;
         poolAcc = poolSum + poolRows;
+        historyBytes = (nuint)((byte*)previousTokens - (byte*)state);
+        poolBytes = (nuint)poolFloats * sizeof(float);
+        snapshotTokens = (int*)(snapshot + ((float*)previousTokens - state));
+        snapshotPoolMax = snapshot + (poolMax - state);
+        snapshotPoolSum = snapshot + (poolSum - state);
+        snapshotPoolAcc = snapshot + (poolAcc - state);
         ResetPool();
     }
 
     void ResetPool()
     {
         if (model.Confidence == null) return;
-        var rows = (g.Layers + 1) * model.Confidence->Probes;
-        for (var i = 0; i < rows; i++) poolMax[i] = -1e30f;
+        for (var i = 0; i < poolRows; i++) poolMax[i] = -1e30f;
+    }
+
+    float* HistoryRead(float* live) => historyPending ? snapshot + (live - state) : live;
+
+    void RestorePoolRow(int index)
+    {
+        poolMax[index] = snapshotPoolMax[index];
+        poolSum[index] = snapshotPoolSum[index];
+        Buffer.MemoryCopy(snapshotPoolAcc + (long)index * dim, poolAcc + (long)index * dim, dim * 4, dim * 4);
+    }
+
+    void RestorePool()
+    {
+        if (!poolPending) return;
+        Buffer.MemoryCopy(snapshotPoolMax, poolMax, poolBytes, poolBytes);
+        poolPending = false;
     }
 
     internal bool Pooling
@@ -166,6 +193,7 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
             for (var p = 0; p < probes; p++)
             {
                 var index = row * probes + p;
+                if (poolPending && t == 0) RestorePoolRow(index);
                 var score = Ops.Dot(cell, head->ProbeVectors + (long)index * dim, dim) * inverseRoot;
                 var acc = poolAcc + (long)index * dim;
                 if (score > poolMax[index])
@@ -195,6 +223,7 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
 
     internal float ConfidenceLogit(float* pooledOut, float* scratchRows)
     {
+        RestorePool();
         var head = model.Confidence;
         var probes = head->Probes;
         var rows = (g.Layers + 1) * probes;
@@ -241,18 +270,26 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
     {
         Mem.Clear(state, stateBytes);
         ResetPool();
+        historyPending = false;
+        poolPending = false;
         Length = 0;
     }
 
     public void Mark()
     {
-        Buffer.MemoryCopy(state, snapshot, stateBytes, stateBytes);
+        if (!historyPending) Buffer.MemoryCopy(state, snapshot, historyBytes, historyBytes);
+        snapshotTokens[0] = previousTokens[0];
+        snapshotTokens[1] = previousTokens[1];
+        if (!poolPending) Buffer.MemoryCopy(poolMax, snapshotPoolMax, poolBytes, poolBytes);
         markedLength = Length;
     }
 
     public void Rewind()
     {
-        Buffer.MemoryCopy(snapshot, state, stateBytes, stateBytes);
+        previousTokens[0] = snapshotTokens[0];
+        previousTokens[1] = snapshotTokens[1];
+        historyPending = true;
+        poolPending = poolRows > 0;
         Length = markedLength;
     }
 
@@ -296,6 +333,8 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
             if (pooling) PoolTokens(layer + 1, count, false);
             Observer?.Invoke(layer, new ReadOnlySpan<float>(stream, count * streamWidth));
         }
+        historyPending = false;
+        if (pooling) poolPending = false;
         if (wantLogits) ComputeLogits(count - 1);
     }
 
@@ -379,7 +418,7 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         }
         Quant.Prepare(engramInput, count, dim, 2, dimAct);
         var history = engramHistory + (long)site * EngramHistory * dim;
-        Buffer.MemoryCopy(history, engramValueBuffer, EngramHistory * dim * 4, EngramHistory * dim * 4);
+        Buffer.MemoryCopy(HistoryRead(history), engramValueBuffer, EngramHistory * dim * 4, EngramHistory * dim * 4);
         var batch = new MatMulBatch(dimAct, count);
         batch.Add(s.Key, engramKey, dim);
         batch.Add(s.Value, engramValueBuffer + EngramHistory * dim, dim);
@@ -424,9 +463,9 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         var qHistory = history;
         var kHistory = qHistory + (ConvTaps - 1) * qWidth;
         var vHistory = kHistory + (ConvTaps - 1) * kWidth;
-        LoadHistory(qHistory, qRaw, qWidth);
-        LoadHistory(kHistory, kRaw, kWidth);
-        LoadHistory(vHistory, vRaw, vWidth);
+        LoadHistory(HistoryRead(qHistory), qRaw, qWidth);
+        LoadHistory(HistoryRead(kHistory), kRaw, kWidth);
+        LoadHistory(HistoryRead(vHistory), vRaw, vWidth);
         var projections = new MatMulBatch(dimAct, count);
         projections.Add(w.Q, qRaw + (ConvTaps - 1) * qWidth, qWidth);
         projections.Add(w.K, kRaw + (ConvTaps - 1) * kWidth, kWidth);
