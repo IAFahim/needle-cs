@@ -141,8 +141,9 @@ internal sealed unsafe class TokenTrie : IDisposable
                 for (var i = 0; i < specialCount; i++)
                 {
                     var copy = *start;
+                    var probe = new Tools.NoSink();
                     var ok = true;
-                    for (var b = 0; b < specialLength[i] && ok; b++) ok = Grammar.Advance(g, &copy, specialBytes[i][b]);
+                    for (var b = 0; b < specialLength[i] && ok; b++) ok = Grammar.Advance(g, &copy, specialBytes[i][b], ref probe);
                     if (ok) mask[special[i] / 32] |= 1u << (special[i] % 32);
                 }
                 return;
@@ -168,7 +169,8 @@ internal sealed unsafe class TokenTrie : IDisposable
             cursors[depth]++;
             var edge = edgeStart[node] + index;
             states[depth + 1] = states[depth];
-            if (!Grammar.Advance(g, &states[depth + 1], edgeByte[edge])) continue;
+            var sink = new Tools.NoSink();
+            if (!Grammar.Advance(g, &states[depth + 1], edgeByte[edge], ref sink)) continue;
             var child = edgeNode[edge];
             for (var t = tokenHead[child]; t >= 0; t = tokenNext[t]) mask[t / 32] |= 1u << (t % 32);
             if (edgeCount[child] == 0) continue;
