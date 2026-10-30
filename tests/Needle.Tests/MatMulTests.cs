@@ -36,6 +36,33 @@ public sealed unsafe class MatMulTests : IDisposable
         }
     }
 
+    [Fact]
+    public void HalfToSingleDecodesEveryFiniteBitPatternPerIeee754()
+    {
+        for (var bits = 0; bits < 0x10000; bits++)
+        {
+            var half = (ushort)bits;
+            var magnitude = half & 0x7FFF;
+            if (magnitude >= 0x7C00) continue;
+            var expected = magnitude < 0x0400
+                ? ((half & 0x8000) != 0 ? -1f : 1f) * magnitude * 5.9604645e-8f
+                : BitConverter.Int32BitsToSingle(((magnitude << 13) + 0x38000000) | ((half & 0x8000) << 16));
+            Assert.Equal(expected, Scalar.HalfToSingle(half));
+        }
+    }
+
+    [Fact]
+    public void HalfToSingleUpstreamDecodesSubnormalsWithImplicitExponent()
+    {
+        for (var bits = 0; bits < 0x10000; bits++)
+        {
+            var half = (ushort)bits;
+            var magnitude = half & 0x7FFF;
+            if (magnitude == 0 || magnitude >= 0x0400) continue;
+            Assert.Equal(((half & 0x8000) != 0 ? -1f : 1f) * (0x0400 + magnitude) * 2.9802322e-8f, Scalar.HalfToSingleUpstream(half));
+        }
+    }
+
     [Theory]
     [InlineData(2, 37, 768, 5, 29)]
     [InlineData(2, 37, 768, 1, 2)]
