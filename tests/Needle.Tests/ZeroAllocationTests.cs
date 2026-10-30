@@ -95,11 +95,18 @@ public sealed class ZeroAllocationTests
         foreach (var argument in new[] { "exec", "--runtimeconfig", stem + ".runtimeconfig.json", "--depsfile", stem + ".deps.json", assembly }) start.ArgumentList.Add(argument);
         start.Environment[AllocationProbe.Variable] = $"{mode}:{threads}";
         using var process = Process.Start(start)!;
-        var error = process.StandardError.ReadToEndAsync();
-        var output = process.StandardOutput.ReadToEnd();
-        process.WaitForExit();
-        var line = output.Split('\n', StringSplitOptions.RemoveEmptyEntries)[^1].Trim();
-        Assert.True(line.StartsWith("probe ", StringComparison.Ordinal), $"{line} {error.Result}");
+        var errorTask = process.StandardError.ReadToEndAsync();
+        var outputTask = process.StandardOutput.ReadToEndAsync();
+        if (!process.WaitForExit(300_000))
+        {
+            try { process.Kill(entireProcessTree: true); } catch { }
+            throw new Xunit.Sdk.XunitException($"probe child hung and was killed; stdout so far: {outputTask.Result}; stderr so far: {errorTask.Result}");
+        }
+        var output = outputTask.Result;
+        var lines = output.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        Assert.True(lines.Length > 0, $"probe child produced no output; stderr: {errorTask.Result}");
+        var line = lines[^1].Trim();
+        Assert.True(line.StartsWith("probe ", StringComparison.Ordinal), $"{line} {errorTask.Result}");
         var fields = line[6..].Split(' ');
         long Field(int index) => long.Parse(fields[index][(fields[index].IndexOf('=') + 1)..]);
         return new AllocationProbe.Measurement(Field(0), Field(1), Field(2), fields[3].EndsWith("True", StringComparison.Ordinal), (int)Field(4));
