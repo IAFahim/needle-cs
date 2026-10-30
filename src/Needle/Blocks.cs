@@ -161,11 +161,37 @@ internal static unsafe class Attention
         Avx.Store(inverse, Vector256.Create(1f));
     }
 
+    [SkipLocalsInit]
     public static void MergePartials(float* partials, int count, int heads, float* output)
     {
-        var weights = stackalloc float[count];
+        // Decode always lands on count == 2: same accumulation order as the
+        // generic loop (identical bits), with the weight broadcasts hoisted
+        // out of the dim loop.
+        var weights = stackalloc float[Lanes];
         for (var h = 0; h < heads; h++)
         {
+            if (count == 2)
+            {
+                var peak0 = partials[MaxTileHeads * VDim + h];
+                var peak1 = partials[PartialFloats + MaxTileHeads * VDim + h];
+                var pk = MathF.Max(peak0, peak1);
+                var w0 = MathF.Exp(peak0 - pk);
+                var w1 = MathF.Exp(peak1 - pk);
+                var tot = 0f;
+                tot += w0 * partials[MaxTileHeads * VDim + Lanes + h];
+                tot += w1 * partials[PartialFloats + MaxTileHeads * VDim + Lanes + h];
+                var inv = Vector256.Create(1f / tot);
+                var w0v = Vector256.Create(w0);
+                var w1v = Vector256.Create(w1);
+                for (var d = 0; d < VDim; d += Lanes)
+                {
+                    var sum = Vector256<float>.Zero;
+                    sum = Fma.MultiplyAdd(w0v, Avx.LoadVector256(partials + h * VDim + d), sum);
+                    sum = Fma.MultiplyAdd(w1v, Avx.LoadVector256(partials + PartialFloats + h * VDim + d), sum);
+                    Avx.Store(output + h * VDim + d, Avx.Multiply(sum, inv));
+                }
+                continue;
+            }
             var peak = float.NegativeInfinity;
             for (var c = 0; c < count; c++) peak = MathF.Max(peak, partials[c * PartialFloats + MaxTileHeads * VDim + h]);
             var total = 0f;
@@ -286,20 +312,34 @@ internal static unsafe class Attention
 
     static void PackVnniQueries(sbyte* queries, int heads, uint* packed)
     {
+        // Branchless: clear once with vector stores, pack only live heads,
+        // then stamp the ones-lane used by Debias. Zeroed lanes contribute
+        // nothing downstream (their scale lane is 0 in ScaleVector).
+        for (var j = 0; j < QkDim / 4; j++) Avx.Store(packed + j * Lanes, Vector256<uint>.Zero);
         for (var j = 0; j < QkDim / 4; j++)
-            for (var h = 0; h < Lanes; h++)
+        {
+            for (var h = 0; h < heads; h++)
             {
-                if (h > heads) { packed[j * Lanes + h] = 0; continue; }
-                if (h == heads) { packed[j * Lanes + h] = 0x01010101u; continue; }
                 var q = queries + h * QkDim + 4 * j;
                 packed[j * Lanes + h] = (uint)(byte)(q[0] + 128) | (uint)(byte)(q[1] + 128) << 8 | (uint)(byte)(q[2] + 128) << 16 | (uint)(byte)(q[3] + 128) << 24;
             }
+            packed[j * Lanes + heads] = 0x01010101u;
+        }
     }
 
     static Vector256<float> ScaleVector(in AttentionTile tile)
     {
         var lanes = stackalloc float[Lanes];
-        for (var h = 0; h < Lanes; h++) lanes[h] = h < tile.Heads ? tile.QueryScales[h] * InverseSqrtQkDim : 0f;
+        var scales = tile.QueryScales;
+        var heads = tile.Heads;
+        lanes[0] = scales[0] * InverseSqrtQkDim;
+        lanes[1] = heads > 1 ? scales[1] * InverseSqrtQkDim : 0f;
+        lanes[2] = heads > 2 ? scales[2] * InverseSqrtQkDim : 0f;
+        lanes[3] = heads > 3 ? scales[3] * InverseSqrtQkDim : 0f;
+        lanes[4] = heads > 4 ? scales[4] * InverseSqrtQkDim : 0f;
+        lanes[5] = heads > 5 ? scales[5] * InverseSqrtQkDim : 0f;
+        lanes[6] = 0f;
+        lanes[7] = 0f;
         return Avx.LoadVector256(lanes);
     }
 
