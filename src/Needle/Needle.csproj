@@ -18,7 +18,4 @@
     <InternalsVisibleTo Include="needle" />
     <InternalsVisibleTo Include="Needle.Unity" />
   </ItemGroup>
-  <ItemGroup>
-    <PackageReference Include="System.Runtime.CompilerServices.Unsafe" Version="6.0.0" />
-  </ItemGroup>
 </Project>
