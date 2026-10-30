@@ -297,10 +297,10 @@ public sealed unsafe class Model : IDisposable
         var map = memory.Address;
         var length = memory.Length;
         var header = (uint*)map;
-        if (length < 196 || header[0] != 0x05E12A84) throw new InvalidDataException("not a Needle 3 .cact archive");
+        RequireWellFormed(map, length);
         var count = (int)header[1];
-        var codebook = (float*)(map + 196);
-        var records = (Record*)(map + 196 + header[2] * 4);
+        var codebook = (float*)(map + ModelInfo.HeaderBytes);
+        var records = (Record*)(map + ModelInfo.HeaderBytes + header[2] * 4);
 
         nuint denseBytes = 0;
         for (var i = 0; i < count; i++)
@@ -310,9 +310,12 @@ public sealed unsafe class Model : IDisposable
         var orders = arena.Take<int>(4);
         var sites = arena.Take<int>(16);
         Geometry = new Geometry(header, orders, sites);
-        Require(Geometry.QkDim == 48 && Geometry.VDim == 64 && Geometry.Lanes == 4, "unsupported head geometry");
-        Require(Geometry.HadaCols % 8 == 0 && Geometry.HadaRows * Geometry.HadaCols == Geometry.HadaN, "unsupported MLP geometry");
-        Require(Geometry.ConvTaps == 3 && Geometry.EngramConvTaps == 4 && Geometry.Dim % Cq.GroupSize == 0, "unsupported convolution geometry");
+        Require(Geometry.QkDim == 48 && Geometry.VDim == 64 && Geometry.Lanes == 4,
+            $"unsupported head geometry: found QkDim={Geometry.QkDim}, VDim={Geometry.VDim}, Lanes={Geometry.Lanes}; this build supports QkDim=48, VDim=64, Lanes=4");
+        Require(Geometry.HadaCols % 8 == 0 && Geometry.HadaRows * Geometry.HadaCols == Geometry.HadaN,
+            $"unsupported MLP geometry: found HadaN={Geometry.HadaN}; this build supports sizes that split into rows by columns with columns divisible by 8");
+        Require(Geometry.ConvTaps == 3 && Geometry.EngramConvTaps == 4 && Geometry.Dim % Cq.GroupSize == 0,
+            $"unsupported convolution geometry: found ConvTaps={Geometry.ConvTaps}, EngramConvTaps={Geometry.EngramConvTaps}, Dim={Geometry.Dim}; this build supports ConvTaps=3, EngramConvTaps=4 and Dim divisible by {Cq.GroupSize}");
 
         var reader = new Reader(map, records, arena, codebook);
         Embedding = reader.Quantized();
@@ -342,11 +345,35 @@ public sealed unsafe class Model : IDisposable
         }
 
         var tokenizer = records + count - 1;
-        Require(tokenizer->Dtype == Reader.Raw, "tokenizer blob missing");
+        Require(tokenizer->Dtype == Reader.Raw, $"tokenizer blob missing: the last tensor has dtype {tokenizer->Dtype}, expected {Reader.Raw}");
         TokenizerBlob = map + tokenizer->Offset;
         TokenizerLength = (nuint)tokenizer->Bytes;
         arena = reader.Arena;
+        Info = new ModelInfo(Geometry, header[0], (long)length, count, (int)header[2], (long)tokenizer->Bytes, Audio != null, Confidence != null, EmbeddingHead != null);
     }
+
+    public ModelInfo Info { get; }
+
+    static void RequireWellFormed(byte* map, nuint length)
+    {
+        if (length < ModelInfo.HeaderBytes)
+            throw Malformed($"not a Needle 3 .cact archive: the file has {length} bytes, shorter than the {ModelInfo.HeaderBytes}-byte header");
+        var header = (uint*)map;
+        if (header[0] != ModelInfo.SupportedMagic)
+            throw Malformed($"not a supported Needle 3 .cact archive: found magic 0x{header[0]:X8}, supported magic is 0x{ModelInfo.SupportedMagic:X8}");
+        var count = header[1];
+        var tableEnd = (ulong)ModelInfo.HeaderBytes + (ulong)header[2] * 4 + (ulong)count * (ulong)sizeof(Record);
+        if (count == 0 || tableEnd > length)
+            throw Malformed($"truncated or corrupt .cact archive: the header declares {count} tensors and {header[2]} codebook entries, needing {tableEnd} bytes of tables, but the file has {length} bytes");
+        var records = (Record*)(map + ModelInfo.HeaderBytes + (nuint)header[2] * 4);
+        for (uint i = 0; i < count; i++)
+            if (records[i].Offset > length || records[i].Bytes > length - records[i].Offset)
+                throw Malformed($"truncated .cact archive: tensor {i} ends at byte {records[i].Offset + records[i].Bytes}, but the file has {length} bytes");
+        if (header[26] > 4 || header[31] > 16)
+            throw new NotSupportedException($"unsupported engram layout: found {header[26]} orders and {header[31]} sites; this build supports at most 4 orders and 16 sites. {ModelInfo.RefreshGuidance}");
+    }
+
+    static InvalidDataException Malformed(string facts) => new($"{facts}. {ModelInfo.RefreshGuidance}");
 
     public static Model Open(string path) => Open(path, true);
 
@@ -380,7 +407,7 @@ public sealed unsafe class Model : IDisposable
 
     static void Require(bool condition, string message)
     {
-        if (!condition) throw new NotSupportedException(message);
+        if (!condition) throw new NotSupportedException($"{message}. {ModelInfo.RefreshGuidance}");
     }
 
     public void Dispose()

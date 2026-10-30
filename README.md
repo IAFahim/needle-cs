@@ -130,7 +130,7 @@ The full parity suite (golden logits, greedy decode, tokenizer) passes on AVX2, 
 Requirements: the [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0) (the 8.0 SDK fails with `NETSDK1045`), Python 3 with `numpy` and `sentencepiece`, and `curl`.
 
 ```sh
-# 1. Fetch the model, tokenizer, upstream wheel, Whistle and audio clips into ref/
+# 1. Fetch the pinned model, tokenizer, upstream wheel, Whistle and audio clips into ref/ (SHA-256 checked against tools/ref.lock)
 tools/fetch.sh
 
 # 2. Generate the golden fixtures (numpy reference forward pass)
@@ -143,7 +143,7 @@ dotnet test tests/Needle.Tests -c Release
 NEEDLE_SCALAR=1 dotnet test tests/Needle.Tests -c Release
 ```
 
-The greedy decode budget is `DECODE_BUDGET` in `tools/golden.py` (`python3 tools/golden.py 64` overrides it). The script records the budget it used in `ref/golden/golden.json` and `ParityTests.GenerationMatchesReferenceGreedyDecode` decodes exactly that many tokens, so the fixture and the test cannot drift.
+The greedy decode budget is `DECODE_BUDGET` in `tools/golden.py` (`python3 tools/golden.py 64` overrides it). The script records the budget it used in `ref/golden/golden.json` and `ParityTests.GenerationMatchesReferenceGreedyDecode` decodes exactly that many tokens, so the fixture and the test cannot drift. It also records the SHA-256 of the model it used, and the tests fail with "fixtures were generated from a different model" if the loaded model differs. To adopt a newer upstream model on purpose, follow "Refreshing the upstream model" in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ```sh
 # Build NativeAOT CLI

@@ -1,3 +1,4 @@
+import hashlib
 import json
 import struct
 import sys
@@ -10,6 +11,7 @@ ROOT = Path(__file__).resolve().parent.parent
 CACT = ROOT / "ref/hf/needle3.cact"
 SPM = ROOT / "ref/hf/tokenizer/tokenizer.model"
 OUT = ROOT / "ref/golden"
+LOCK = ROOT / "tools/ref.lock"
 
 HEADER = "<48If"
 RECORD = "<BBHIIIIQQII"
@@ -29,6 +31,14 @@ TOOLS = [
      "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "Song or artist"}}, "required": ["query"]}},
 ]
 QUERIES = ["what's it like in Lagos right now?", "set a timer for 12 minutes and play some Miles Davis"]
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for block in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def prompt_of(query, tools):
@@ -375,7 +385,8 @@ def main():
         case["text"] = sp.Decode(generated)
         print(case["query"], "->", case["text"])
         results.append(case)
-    (OUT / "golden.json").write_text(json.dumps({"budget": budget, "cases": results, "probes": probe_cases}, ensure_ascii=False))
+    provenance = {"model_sha256": file_sha256(CACT), "ref_lock_sha256": file_sha256(LOCK)}
+    (OUT / "golden.json").write_text(json.dumps({"budget": budget, **provenance, "cases": results, "probes": probe_cases}, ensure_ascii=False))
 
 
 if __name__ == "__main__":
