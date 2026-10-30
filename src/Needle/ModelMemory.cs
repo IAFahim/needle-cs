@@ -119,7 +119,9 @@ internal sealed unsafe class ModelMemory : IDisposable
             var view = file.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
             byte* pointer = null;
             view.SafeMemoryMappedViewHandle.AcquirePointer(ref pointer);
-            return new ModelMemory(pointer + view.PointerOffset, (nuint)length, file, view);
+            var address = pointer + view.PointerOffset;
+            Paging.AdviseHugePages(address, (nuint)length);
+            return new ModelMemory(address, (nuint)length, file, view);
         }
         catch
         {

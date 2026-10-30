@@ -98,10 +98,19 @@ internal static unsafe class Mem
 
 internal static unsafe partial class Paging
 {
+    public const nuint HugePageBytes = 2u << 20;
+
+    public static readonly bool HugePagesEnabled = ParseHugePagesSetting(Environment.GetEnvironmentVariable("NEEDLE_HUGEPAGES"));
+
+    internal static bool ParseHugePagesSetting(string? value) => value is { Length: > 0 } && value != "0";
+
 #if NETSTANDARD2_1
     public static bool WillNeed(byte* address, nuint length) => false;
+
+    public static bool AdviseHugePages(byte* address, nuint length) => false;
 #else
     const int AdviceWillNeed = 3;
+    const int AdviceHugePage = 14;
 
     [LibraryImport("libc", EntryPoint = "madvise")]
     private static partial int Madvise(nint address, nuint length, int advice);
@@ -120,6 +129,21 @@ internal static unsafe partial class Paging
             return false;
         }
     }
+
+    public static bool AdviseHugePages(byte* address, nuint length)
+    {
+        if (!HugePagesEnabled || length == 0 || !OperatingSystem.IsLinux()) return false;
+        const nuint PageBytes = 4096;
+        var start = (nuint)address & ~(PageBytes - 1);
+        try
+        {
+            return Madvise((nint)start, length + ((nuint)address - start), AdviceHugePage) == 0;
+        }
+        catch (Exception e) when (e is DllNotFoundException || e is EntryPointNotFoundException)
+        {
+            return false;
+        }
+    }
 #endif
 }
 
@@ -131,7 +155,15 @@ internal unsafe struct Arena
 
     public Arena(nuint capacity)
     {
-        Base = (byte*)Mem.AlignedAlloc(capacity, 64);
+        if (Paging.HugePagesEnabled && capacity >= Paging.HugePageBytes)
+        {
+            Base = (byte*)Mem.AlignedAlloc(capacity, Paging.HugePageBytes);
+            Paging.AdviseHugePages(Base, capacity);
+        }
+        else
+        {
+            Base = (byte*)Mem.AlignedAlloc(capacity, 64);
+        }
         cursor = Base;
         end = Base + capacity;
     }

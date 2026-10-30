@@ -155,7 +155,7 @@ python3 tools/golden.py               # about 15 CPU minutes
 python3 tools/golden_confidence.py    # needs the output of golden.py; takes seconds
 python3 tools/golden_whistle.py       # Whistle stage goldens; soxr resamples the 48 kHz clips; takes seconds
 
-# 3. Run the 245 tests (under a minute)
+# 3. Run the 259 tests (under a minute)
 dotnet test tests/Needle.Tests -c Release
 NEEDLE_SCALAR=1 dotnet test tests/Needle.Tests -c Release
 ```
@@ -228,6 +228,12 @@ python3 tools/bench_ab.py --rounds 6 \
 ```
 
 `bench_ab.py` alternates A,B / B,A rounds, then reports the best of the per-round bests and the median of the per-round medians for both variants, with the percentage change. Expect about 15% noise on a shared machine; trust the best-of figures and repeat when A and B differ by less than the spread between rounds. `tools/native_bench.py --json` produces the same schema, so a native run can be passed as `--b` against a C# `--a` (its `threads` is `null`, which matches every thread count). The upstream C API reports tokens per second and no token counts or TTFT, so the native JSON carries `prefill_tps`, `decode_tps`, `decode_us_per_token` and a wall-clock `total_ms` around `needle_complete`; `bench-e2e` emits the same `prefill_tps` and `decode_tps` fields for a like-for-like comparison. The library spins its own worker threads and degrades badly on a loaded machine, so run it on an idle one.
+
+### Large pages (`NEEDLE_HUGEPAGES`)
+
+`NEEDLE_HUGEPAGES=1` is an opt-in Linux hint for weight and arena memory. When set, `Model.Open` advises `MADV_HUGEPAGE` on the mapped weights and every `Arena` of 2 MiB or more is 2 MiB-aligned and advised `MADV_HUGEPAGE`; smaller arenas keep the 64-byte alignment. Unset or `0` disables it with zero behavior change. Any other OS is a graceful no-op: Windows would need `VirtualAlloc` with `MEM_LARGE_PAGES` plus the `SeLockMemoryPrivilege` privilege, which is not implemented, and the flag is never consulted there.
+
+Measured on a loaded Linux box (transparent hugepages `always`, so anonymous memory already collapses without the flag): `Model.Open` time is unchanged (page-cache resident either way), and two interleaved 6-round A/B runs of `bench-e2e --threads 4` disagree on decode (best-of-bests -5.7% then +0.5%, medians +2.1% then -10.4%), i.e. inside round-to-round spread and short of the 3% bar in issue #36. `perf stat -e dTLB-load-misses` swings more run-to-run than off-vs-on. Verdict: keep the flag as a harmless opt-in (it may matter on `madvise`-mode kernels), default off, no further work until a reference-box measurement shows TLB pressure. Re-run the A/B above with `--b "env NEEDLE_HUGEPAGES=1 ..."` to re-check.
 
 ## Evaluating your tool set
 
