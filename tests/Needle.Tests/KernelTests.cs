@@ -570,3 +570,123 @@ public sealed unsafe class HadamardMlpTests : IDisposable
     }
 #endif
 }
+public sealed unsafe class FusedKernelTests
+{
+    static void Fill(float* x, int n, Random random, float magnitude)
+    {
+        for (var i = 0; i < n; i++) x[i] = ((float)random.NextDouble() - 0.5f) * magnitude;
+    }
+
+    static void ExpectBits(float* expected, float* actual, int n)
+    {
+        for (var i = 0; i < n; i++) Assert.Equal(expected[i], actual[i]);
+    }
+
+    [Theory]
+    [InlineData(768)]
+    [InlineData(3072)]
+    public void RmsFakeA8MatchesRmsThenFake(int n)
+    {
+        var random = new Random(13);
+        var x = stackalloc float[n];
+        var expected = stackalloc float[n];
+        var actual = stackalloc float[n];
+        Fill(x, n, random, 4f);
+        for (var i = 0; i < n; i++) expected[i] = actual[i] = x[i];
+        Ops.RmsUnit(expected, n, expected);
+        Quant.FakeA8(expected, n);
+        Ops.RmsFakeA8(actual, n, actual);
+        ExpectBits(expected, actual, n);
+    }
+
+    [Theory]
+    [InlineData(768)]
+    [InlineData(3072)]
+    public void CenteredRmsFakeA8MatchesNormThenFake(int n)
+    {
+        var random = new Random(17);
+        var x = stackalloc float[n];
+        var scale = stackalloc float[n];
+        var expected = stackalloc float[n];
+        var actual = stackalloc float[n];
+        Fill(x, n, random, 4f);
+        Fill(scale, n, random, 0.5f);
+        for (var i = 0; i < n; i++) expected[i] = actual[i] = x[i];
+        Ops.ZeroCenteredRms(expected, scale, n, expected);
+        Quant.FakeA8(expected, n);
+        Ops.CenteredRmsFakeA8(actual, scale, n, actual);
+        ExpectBits(expected, actual, n);
+    }
+
+    [Fact]
+    public void GateFakeA8MatchesSigmoidThenFake()
+    {
+        const int n = 768;
+        var random = new Random(19);
+        var x = stackalloc float[n];
+        var gate = stackalloc float[n];
+        var expected = stackalloc float[n];
+        var actual = stackalloc float[n];
+        Fill(x, n, random, 4f);
+        Fill(gate, n, random, 4f);
+        for (var i = 0; i < n; i++) expected[i] = actual[i] = x[i];
+        Ops.MultiplyBySigmoid(expected, gate, n);
+        Quant.FakeA8(expected, n);
+        for (var i = 0; i < n; i++) actual[i] = x[i];
+        Ops.GateFakeA8(actual, gate, n);
+        ExpectBits(expected, actual, n);
+    }
+
+    [Fact]
+    public void CombineDiff4MatchesSubtractThenCombine()
+    {
+        const int dim = 768;
+        var random = new Random(23);
+        var s = stackalloc float[4 * dim];
+        var x = stackalloc float[dim];
+        var u = stackalloc float[dim];
+        var expected = stackalloc float[dim];
+        var actual = stackalloc float[dim];
+        var y = stackalloc float[dim];
+        Fill(s, 4 * dim, random, 2f);
+        Fill(x, dim, random, 2f);
+        Fill(u, dim, random, 2f);
+        Ops.Subtract(x, u, dim, y);
+        Ops.Combine4(s, dim, 0.3f, -0.7f, 1.1f, 0.1f, y, 0.9f, expected);
+        Ops.CombineDiff4(s, dim, 0.3f, -0.7f, 1.1f, 0.1f, x, u, 0.9f, actual);
+        ExpectBits(expected, actual, dim);
+    }
+
+    [Fact]
+    public void PostNormAddMatchesNormThenAddScaled()
+    {
+        const int n = 768;
+        var random = new Random(29);
+        var residual = stackalloc float[n];
+        var x = stackalloc float[n];
+        var scale = stackalloc float[n];
+        var expected = stackalloc float[n];
+        var normalized = stackalloc float[n];
+        Fill(residual, n, random, 2f);
+        Fill(x, n, random, 4f);
+        Fill(scale, n, random, 0.5f);
+        for (var i = 0; i < n; i++) expected[i] = residual[i];
+        Ops.ZeroCenteredRms(x, scale, n, normalized);
+        Ops.AddScaled(expected, normalized, 0.8f, n);
+        Ops.PostNormAdd(residual, x, scale, 0.8f, n);
+        ExpectBits(expected, residual, n);
+    }
+
+    [Fact]
+    public void Sinkhorn4x4MatchesScalarNormalize()
+    {
+        var random = new Random(31);
+        var logits = stackalloc float[16];
+        var expected = stackalloc float[16];
+        var actual = stackalloc float[16];
+        for (var i = 0; i < 16; i++) logits[i] = ((float)random.NextDouble() - 0.5f) * 6f;
+        Sinkhorn.Normalize(logits, expected);
+        Ops.Sinkhorn4x4(logits, actual);
+        ExpectBits(expected, actual, 16);
+    }
+}

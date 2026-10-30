@@ -970,6 +970,131 @@ internal static unsafe class Neon
             AdvSimd.Store(residual + i, AdvSimd.FusedMultiplyAdd(
                 AdvSimd.LoadVector128(residual + i), s, AdvSimd.Multiply(AdvSimd.LoadVector128(product + i), AdvSimd.LoadVector128(d4 + i))));
     }
+    public static void Sinkhorn4x4(float* logits, float* result)
+    {
+        var centered = stackalloc float[4];
+        var sums = stackalloc float[4];
+        for (var r = 0; r < 4; r++)
+        {
+            var row = AdvSimd.LoadVector128(logits + r * 4);
+            var shift = Vector128.Create(AdvSimd.Arm64.MaxAcross(row).ToScalar());
+            AdvSimd.Store(centered, AdvSimd.Subtract(row, shift));
+            for (var c = 0; c < 4; c++) result[r * 4 + c] = MathF.Exp(centered[c]);
+        }
+        for (var iteration = 0; iteration < 20; iteration++)
+        {
+            NormRow(result);
+            NormRow(result + 4);
+            NormRow(result + 8);
+            NormRow(result + 12);
+            var a0 = AdvSimd.LoadVector128(result);
+            var a1 = AdvSimd.LoadVector128(result + 4);
+            var a2 = AdvSimd.LoadVector128(result + 8);
+            var a3 = AdvSimd.LoadVector128(result + 12);
+            AdvSimd.Store(sums, AdvSimd.Add(AdvSimd.Add(AdvSimd.Add(a0, a1), a2), a3));
+            if (sums[0] > 0f && sums[1] > 0f && sums[2] > 0f && sums[3] > 0f)
+            {
+                var total = AdvSimd.LoadVector128(sums);
+                AdvSimd.Store(result, AdvSimd.Arm64.Divide(a0, total));
+                AdvSimd.Store(result + 4, AdvSimd.Arm64.Divide(a1, total));
+                AdvSimd.Store(result + 8, AdvSimd.Arm64.Divide(a2, total));
+                AdvSimd.Store(result + 12, AdvSimd.Arm64.Divide(a3, total));
+            }
+            else
+            {
+                for (var c = 0; c < 4; c++)
+                {
+                    var sum = result[c] + result[4 + c] + result[8 + c] + result[12 + c];
+                    if (sum > 0f) for (var r = 0; r < 4; r++) result[r * 4 + c] /= sum;
+                }
+            }
+        }
+    }
+
+    static void NormRow(float* row)
+    {
+        var v = AdvSimd.LoadVector128(row);
+        var lanes = stackalloc float[4];
+        AdvSimd.Store(lanes, v);
+        AdvSimd.Store(row, AdvSimd.Arm64.Divide(v, Vector128.Create(lanes[0] + lanes[1] + lanes[2] + lanes[3])));
+    }
+
+
+    public static void RmsFakeA8(float* x, int n, float* destination)
+    {
+        var inverse = Vector128.Create(1f / MathF.Sqrt(SumOfSquares(x, n) / n + RmsEpsilon));
+        var peak = Vector128<float>.Zero;
+        for (var i = 0; i < n; i += 4)
+        {
+            var v = AdvSimd.Multiply(AdvSimd.LoadVector128(x + i), inverse);
+            AdvSimd.Store(destination + i, v);
+            peak = AdvSimd.Max(peak, AdvSimd.Abs(v));
+        }
+        FinishFakeA8(destination, n, AdvSimd.Arm64.MaxAcross(peak).ToScalar());
+    }
+
+    public static void CenteredRmsFakeA8(float* x, float* scale, int n, float* destination)
+    {
+        var inverse = Vector128.Create(1f / MathF.Sqrt(SumOfSquares(x, n) / n + RmsEpsilon));
+        var one = Vector128.Create(1f);
+        var peak = Vector128<float>.Zero;
+        for (var i = 0; i < n; i += 4)
+        {
+            var v = AdvSimd.Multiply(AdvSimd.Multiply(AdvSimd.Add(one, AdvSimd.LoadVector128(scale + i)), AdvSimd.LoadVector128(x + i)), inverse);
+            AdvSimd.Store(destination + i, v);
+            peak = AdvSimd.Max(peak, AdvSimd.Abs(v));
+        }
+        FinishFakeA8(destination, n, AdvSimd.Arm64.MaxAcross(peak).ToScalar());
+    }
+
+    public static void GateFakeA8(float* x, float* gate, int n)
+    {
+        var peak = Vector128<float>.Zero;
+        for (var i = 0; i < n; i += 4)
+        {
+            var v = AdvSimd.Multiply(AdvSimd.LoadVector128(x + i), Sigmoid(AdvSimd.LoadVector128(gate + i)));
+            AdvSimd.Store(x + i, v);
+            peak = AdvSimd.Max(peak, AdvSimd.Abs(v));
+        }
+        FinishFakeA8(x, n, AdvSimd.Arm64.MaxAcross(peak).ToScalar());
+    }
+
+    static void FinishFakeA8(float* x, int n, float peak)
+    {
+        var scale = peak > 0f ? peak / 127f : 1f;
+        RoundTrip(x, n, 1f / scale, scale);
+    }
+
+    public static void CombineDiff4(float* s, int dim, float w0, float w1, float w2, float w3, float* x, float* u, float post, float* destination)
+    {
+        var v0 = Vector128.Create(w0);
+        var v1 = Vector128.Create(w1);
+        var v2 = Vector128.Create(w2);
+        var v3 = Vector128.Create(w3);
+        var vp = Vector128.Create(post);
+        for (var c = 0; c < dim; c += 4)
+        {
+            var acc = AdvSimd.Multiply(vp, AdvSimd.Subtract(AdvSimd.LoadVector128(x + c), AdvSimd.LoadVector128(u + c)));
+            acc = AdvSimd.FusedMultiplyAdd(acc, v0, AdvSimd.LoadVector128(s + c));
+            acc = AdvSimd.FusedMultiplyAdd(acc, v1, AdvSimd.LoadVector128(s + dim + c));
+            acc = AdvSimd.FusedMultiplyAdd(acc, v2, AdvSimd.LoadVector128(s + 2 * dim + c));
+            acc = AdvSimd.FusedMultiplyAdd(acc, v3, AdvSimd.LoadVector128(s + 3 * dim + c));
+            AdvSimd.Store(destination + c, acc);
+        }
+    }
+
+    public static void PostNormAdd(float* residual, float* x, float* scale, float gate, int n)
+    {
+        var inverse = Vector128.Create(1f / MathF.Sqrt(SumOfSquares(x, n) / n + RmsEpsilon));
+        var one = Vector128.Create(1f);
+        var g = Vector128.Create(gate);
+        for (var i = 0; i < n; i += 4)
+            AdvSimd.Store(residual + i, AdvSimd.FusedMultiplyAdd(AdvSimd.LoadVector128(residual + i), g,
+                AdvSimd.Multiply(AdvSimd.Multiply(AdvSimd.Add(one, AdvSimd.LoadVector128(scale + i)), AdvSimd.LoadVector128(x + i)), inverse)));
+    }
+
+
+
 
     [SkipLocalsInit]
     public static void Kron(float* z, int activeRows, float* left, float* right, int rows, int cols, int resultRows, float* result)

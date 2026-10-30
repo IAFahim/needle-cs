@@ -45,6 +45,9 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
     sbyte* queryInt8, keyCache, valueCache;
     float* queryScale;
     int* engramRows;
+    TeamBarrier* barrier;
+    float* attnPartials;
+    int* attnArrivals;
 
     readonly float* state;
     readonly float* snapshot;
@@ -152,6 +155,9 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         queryInt8 = arena.Take<sbyte>((nuint)(chunk * qWidth));
         queryScale = arena.Take<float>((nuint)(chunk * g.Heads));
         engramRows = arena.Take<int>((nuint)(chunk * g.EngramTables));
+        barrier = arena.Take<TeamBarrier>(1);
+        attnPartials = arena.Take<float>((nuint)chunk * (nuint)g.KvHeads * 8 * Attention.PartialFloats);
+        attnArrivals = arena.Take<int>((nuint)chunk * (nuint)g.KvHeads);
         keyCache = arena.TakeUncleared<sbyte>((nuint)capacity * (nuint)g.Layers * (nuint)kWidth);
         valueCache = arena.TakeUncleared<sbyte>((nuint)capacity * (nuint)g.Layers * (nuint)vWidth);
         keyScale = arena.TakeUncleared<float>((nuint)capacity * (nuint)g.Layers * (nuint)g.KvHeads);
@@ -496,6 +502,483 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
     }
 
     void RunLayer(int l, int count, int position)
+    {
+        if (cross.Frames != 0) { RunLayerLegacy(l, count, position); return; }
+        RunLayerTeam(l, count, position);
+    }
+
+    unsafe struct LayerJob
+    {
+        public TeamBarrier* Barrier;
+        public TClock Clock;
+        public int Members, Layer, Lane, Count, Position, Capacity, HasEngram;
+        public Geometry Geometry;
+        public LayerWeights Weights;
+        public HyperConnections Hyper;
+        public EngramSite Engram;
+        public Activations StreamAct, DimAct;
+        public float* Stream;
+        public float* Next;
+        public float* Normed;
+        public float* Input;
+        public float* Residual;
+        public float* Quantized;
+        public float* QRaw;
+        public float* KRaw;
+        public float* VRaw;
+        public float* QConv;
+        public float* KConv;
+        public float* VConv;
+        public float* GateOut;
+        public float* AttnOut;
+        public float* AttnProj;
+        public float* EngramInput;
+        public float* EngramKey;
+        public float* EngramConv;
+        public float* EngramValueBuffer;
+        public float* QueryScale;
+        public float* KeyScale;
+        public float* ValueScale;
+        public float* RopeCos;
+        public float* RopeSin;
+        public float* ResidualMix;
+        public float* PostGate;
+        public float* PreOut;
+        public float* PostOut;
+        public float* ResOut;
+        public float* AttnPartials;
+        public float* QkvBase;
+        public float* EngramBase;
+        public float* QkvLive;
+        public float* EngramLive;
+        public sbyte* QueryInt8;
+        public sbyte* KeyCache;
+        public sbyte* ValueCache;
+        public int* EngramRows;
+        public int* AttnArrivals;
+        public MlpWeights* Mlp;
+    }
+
+    static void Shard(int tasks, int member, int members, out int first, out int count)
+    {
+        var per = (tasks + members - 1) / members;
+        first = Math.Min(member * per, tasks);
+        count = Math.Min(first + per, tasks) - first;
+    }
+
+    void RunLayerTeam(int l, int count, int position)
+    {
+        var site = g.SiteOf(l);
+        var job = new LayerJob
+        {
+            Barrier = barrier,
+            Clock = clock,
+            Members = pool.Members,
+            Layer = l,
+            Lane = l % Lanes,
+            Count = count,
+            Position = position,
+            Capacity = capacity,
+            HasEngram = site >= 0 ? 1 : 0,
+            Geometry = g,
+            Weights = model.Blocks[l],
+            Hyper = model.Hyper,
+            StreamAct = streamAct,
+            DimAct = dimAct,
+            Stream = stream,
+            Next = nextStream,
+            Normed = normalizedStream,
+            Input = input,
+            Residual = residual,
+            Quantized = quantizedInput,
+            QRaw = qRaw,
+            KRaw = kRaw,
+            VRaw = vRaw,
+            QConv = qConv,
+            KConv = kConv,
+            VConv = vConv,
+            GateOut = gateOut,
+            AttnOut = attnOut,
+            AttnProj = attnProj,
+            EngramInput = engramInput,
+            EngramKey = engramKey,
+            EngramConv = engramConv,
+            EngramValueBuffer = engramValueBuffer,
+            QueryScale = queryScale,
+            KeyScale = keyScale,
+            ValueScale = valueScale,
+            RopeCos = ropeCos,
+            RopeSin = ropeSin,
+            ResidualMix = residualMix,
+            PostGate = postGate,
+            PreOut = preOut,
+            PostOut = postOut,
+            ResOut = resOut,
+            AttnPartials = attnPartials,
+            AttnArrivals = attnArrivals,
+            QkvBase = (historyPending ? snapshot + (qkvHistory - state) : qkvHistory) + (long)l * historyPerLayer,
+            EngramBase = (historyPending ? snapshot + (engramHistory - state) : engramHistory) + (long)(site >= 0 ? site : 0) * EngramHistory * dim,
+            QkvLive = qkvHistory + (long)l * historyPerLayer,
+            EngramLive = engramHistory + (long)(site >= 0 ? site : 0) * EngramHistory * dim,
+            QueryInt8 = queryInt8,
+            KeyCache = keyCache,
+            ValueCache = valueCache,
+            EngramRows = engramRows,
+            Mlp = &model.Blocks[l].Mlp,
+        };
+        if (site >= 0) job.Engram = model.Sites[site];
+        clock.PoolRun();
+        pool.RunTeam(&ExecuteLayer, System.Runtime.CompilerServices.Unsafe.AsPointer(ref job), barrier);
+        var swap = stream;
+        stream = nextStream;
+        nextStream = swap;
+    }
+    static void ExecuteLayer(void* context, int member)
+    {
+        ref var job = ref System.Runtime.CompilerServices.Unsafe.AsRef<LayerJob>(context);
+        var members = job.Members;
+        HyperNorm(in job, member, members);
+        Pool.Barrier(job.Barrier);
+        HyperPhi(in job, member, members);
+        Pool.Barrier(job.Barrier);
+        HyperMix(in job, member, members);
+        if (job.HasEngram != 0)
+        {
+            EngramGather(in job, member, members);
+            Pool.Barrier(job.Barrier);
+            EngramMatMul(in job, member, members);
+            Pool.Barrier(job.Barrier);
+            EngramBlend(in job, member, members);
+            Pool.Barrier(job.Barrier);
+        }
+        if (member == 0) job.Clock.Lap(Stage.Engram);
+        AttentionPrepare(in job, member, members);
+        Pool.Barrier(job.Barrier);
+        AttentionQkvg(in job, member, members);
+        Pool.Barrier(job.Barrier);
+        TapsHistory(in job, member, members);
+        AttentionHeads(in job, member, members);
+        Pool.Barrier(job.Barrier);
+        AttentionCore(in job, member, members);
+        Pool.Barrier(job.Barrier);
+        AttentionGate(in job, member, members);
+        Pool.Barrier(job.Barrier);
+        AttentionOut(in job, member, members);
+        Pool.Barrier(job.Barrier);
+        PostNorm(in job, member, members);
+        Pool.Barrier(job.Barrier);
+        Mlp(in job, member, members);
+        Pool.Barrier(job.Barrier);
+        Combine(in job, member, members);
+    }
+
+    static void HyperNorm(in LayerJob job, int member, int members)
+    {
+        var streamWidth = Lanes * job.Geometry.Dim;
+        Shard(job.Count, member, members, out var first, out var count);
+        for (var t = first; t < first + count; t++)
+        {
+            Ops.RmsFakeA8(job.Stream + (long)t * streamWidth, streamWidth, job.Normed + (long)t * streamWidth);
+            var slice = job.StreamAct.Slice(t);
+            Quant.Prepare(job.Normed + (long)t * streamWidth, 1, streamWidth, 4, slice);
+        }
+        if (member == 0) job.Clock.Lap(Stage.HyperPrepare);
+    }
+
+    static void HyperPhi(in LayerJob job, int member, int members)
+    {
+        var batch = new MatMulBatch(job.StreamAct, job.Count);
+        var l = job.Layer;
+        batch.Add(job.Hyper.PhiPre.Slice(l * Lanes, Lanes), job.PreOut, Lanes);
+        batch.Add(job.Hyper.PhiPost.Slice(l * Lanes, Lanes), job.PostOut, Lanes);
+        batch.Add(job.Hyper.PhiRes.Slice(l * Lanes * Lanes, Lanes * Lanes), job.ResOut, Lanes * Lanes);
+        batch.Plan(members);
+        Shard(batch.TaskCount, member, members, out var first, out var count);
+        for (var i = first; i < first + count; i++) MatMulBatch.RunTask(&batch, i);
+        if (member == 0) job.Clock.Lap(Stage.HyperPhi);
+    }
+
+    static void HyperMix(in LayerJob job, int member, int members)
+    {
+        var dim = job.Geometry.Dim;
+        var lane = job.Lane;
+        var l = job.Layer;
+        var mixLogits = stackalloc float[Lanes * Lanes];
+        var hpre = stackalloc float[Lanes];
+        Shard(job.Count, member, members, out var first, out var count);
+        for (var t = first; t < first + count; t++)
+        {
+            var s = job.Stream + (long)t * Lanes * dim;
+            var u = job.Input + (long)t * dim;
+            for (var i = 0; i < Lanes; i++)
+            {
+                hpre[i] = Ops.Sigmoid(job.Hyper.APre[l] * job.PreOut[t * Lanes + i] + job.Hyper.BPre[l * Lanes + i] + (i == lane ? 4f : -4f));
+                job.PostGate[t * Lanes + i] = 2f * Ops.Sigmoid(job.Hyper.APost[l] * job.PostOut[t * Lanes + i] + job.Hyper.BPost[l * Lanes + i] + (i == lane ? 0f : -4f));
+            }
+            Ops.Mix4(s, dim, hpre[0], hpre[1], hpre[2], hpre[3], u);
+            for (var i = 0; i < Lanes * Lanes; i++) mixLogits[i] = job.Hyper.ARes[l] * job.ResOut[t * Lanes * Lanes + i] + job.Hyper.BRes[l * Lanes * Lanes + i];
+            Ops.Sinkhorn4x4(mixLogits, job.ResidualMix + (long)t * Lanes * Lanes);
+            Buffer.MemoryCopy(u, job.Residual + (long)t * dim, dim * 4, dim * 4);
+        }
+        if (member == 0) job.Clock.Lap(Stage.HyperMix);
+    }
+
+    static void EngramGather(in LayerJob job, int member, int members)
+    {
+        var dim = job.Geometry.Dim;
+        var tables = job.Geometry.EngramTables;
+        var sub = job.Geometry.EngramSub;
+        Shard(job.Count, member, members, out var first, out var count);
+        for (var t = first; t < first + count; t++)
+        {
+            var e = job.EngramInput + (long)t * dim;
+            for (var table = 0; table < tables; table++)
+            {
+                var row = job.EngramRows[t * tables + table];
+                if (row < 0) Ops.Zero(e + table * sub, sub);
+                else Quant.GatherRow(job.Engram.Tables, row, e + table * sub);
+            }
+            Quant.FakeA8(e, dim);
+            var slice = job.DimAct.Slice(t);
+            Quant.Prepare(e, 1, dim, 2, slice);
+        }
+        if (member == 0) Buffer.MemoryCopy(job.EngramBase, job.EngramValueBuffer, EngramHistory * dim * 4, EngramHistory * dim * 4);
+    }
+
+    static void EngramMatMul(in LayerJob job, int member, int members)
+    {
+        var batch = new MatMulBatch(job.DimAct, job.Count);
+        batch.Add(job.Engram.Key, job.EngramKey, job.Geometry.Dim);
+        batch.Add(job.Engram.Value, job.EngramValueBuffer + EngramHistory * job.Geometry.Dim, job.Geometry.Dim);
+        batch.Plan(members);
+        Shard(batch.TaskCount, member, members, out var first, out var count);
+        for (var i = first; i < first + count; i++) MatMulBatch.RunTask(&batch, i);
+    }
+
+    static void EngramBlend(in LayerJob job, int member, int members)
+    {
+        var dim = job.Geometry.Dim;
+        var unitA = stackalloc float[dim];
+        var unitB = stackalloc float[dim];
+        var inverseRootDim = 1f / MathF.Sqrt(dim);
+        Shard(job.Count, member, members, out var first, out var count);
+        for (var t = first; t < first + count; t++)
+        {
+            var o = job.EngramConv + (long)t * dim;
+            Ops.Zero(o, dim);
+            for (var j = 0; j < EngramTaps; j++)
+                Ops.MultiplyAccumulate(o, job.Engram.Taps + j * dim, job.EngramValueBuffer + (long)(EngramHistory + t - j * job.Geometry.EngramDilation) * dim, dim);
+        }
+        if (member == 0) Buffer.MemoryCopy(job.EngramValueBuffer + (long)job.Count * dim, job.EngramLive, EngramHistory * dim * 4, EngramHistory * dim * 4);
+        for (var t = first; t < first + count; t++)
+        {
+            var x = job.Input + (long)t * dim;
+            Ops.RmsUnit(x, dim, unitA);
+            Ops.RmsUnit(job.EngramKey + (long)t * dim, dim, unitB);
+            var alpha = Ops.Sigmoid(Ops.Dot(unitA, unitB, dim) * inverseRootDim);
+            Ops.AddScaled(job.Residual + (long)t * dim, job.EngramConv + (long)t * dim, alpha, dim);
+        }
+    }
+    static void AttentionPrepare(in LayerJob job, int member, int members)
+    {
+        var dim = job.Geometry.Dim;
+        Shard(job.Count, member, members, out var first, out var count);
+        for (var t = first; t < first + count; t++)
+        {
+            Ops.CenteredRmsFakeA8(job.Residual + (long)t * dim, job.Weights.NormIn, dim, job.Quantized + (long)t * dim);
+            var slice = job.DimAct.Slice(t);
+            Quant.Prepare(job.Quantized + (long)t * dim, 1, dim, 2, slice);
+        }
+        if (member == 0) job.Clock.Lap(Stage.AttentionPrep);
+    }
+
+    static void AttentionQkvg(in LayerJob job, int member, int members)
+    {
+        var qWidth = job.Geometry.QueryWidth;
+        var kWidth = job.Geometry.KeyWidth;
+        var vWidth = job.Geometry.ValueWidth;
+        var batch = new MatMulBatch(job.DimAct, job.Count);
+        batch.Add(job.Weights.Q, job.QRaw + (ConvTaps - 1) * qWidth, qWidth);
+        batch.Add(job.Weights.K, job.KRaw + (ConvTaps - 1) * kWidth, kWidth);
+        batch.Add(job.Weights.V, job.VRaw + (ConvTaps - 1) * vWidth, vWidth);
+        batch.Add(job.Weights.Gate, job.GateOut, job.Geometry.OutputWidth);
+        batch.Plan(members);
+        Shard(batch.TaskCount, member, members, out var first, out var count);
+        for (var i = first; i < first + count; i++) MatMulBatch.RunTask(&batch, i);
+        if (member == 0) job.Clock.Lap(Stage.AttentionQkvg);
+    }
+
+    static void TapsHistory(in LayerJob job, int member, int members)
+    {
+        var qWidth = job.Geometry.QueryWidth;
+        var kWidth = job.Geometry.KeyWidth;
+        var vWidth = job.Geometry.ValueWidth;
+        var qHistory = job.QkvBase;
+        var kHistory = qHistory + (ConvTaps - 1) * qWidth;
+        var vHistory = kHistory + (ConvTaps - 1) * kWidth;
+        var qLive = job.QkvLive;
+        var kLive = qLive + (ConvTaps - 1) * qWidth;
+        var vLive = kLive + (ConvTaps - 1) * kWidth;
+        if (member == 0)
+        {
+            LoadHistory(qHistory, job.QRaw, qWidth);
+            LoadHistory(kHistory, job.KRaw, kWidth);
+            LoadHistory(vHistory, job.VRaw, vWidth);
+        }
+        Pool.Barrier(job.Barrier);
+        Shard(job.Count, member, members, out var first, out var count);
+        for (var t = first; t < first + count; t++)
+        {
+            Ops.Taps3(job.Weights.QTaps, qWidth, job.QRaw + (long)(t + ConvTaps - 1) * qWidth, job.QConv + (long)t * qWidth);
+            Ops.Taps3(job.Weights.KTaps, kWidth, job.KRaw + (long)(t + ConvTaps - 1) * kWidth, job.KConv + (long)t * kWidth);
+            Ops.Taps3(job.Weights.VTaps, vWidth, job.VRaw + (long)(t + ConvTaps - 1) * vWidth, job.VConv + (long)t * vWidth);
+        }
+        Pool.Barrier(job.Barrier);
+        if (member == 0)
+        {
+            SaveHistory(qLive, job.QRaw, job.Count, qWidth);
+            SaveHistory(kLive, job.KRaw, job.Count, kWidth);
+            SaveHistory(vLive, job.VRaw, job.Count, vWidth);
+        }
+    }
+
+    static void AttentionHeads(in LayerJob job, int member, int members)
+    {
+        var heads = job.Geometry.Heads;
+        var kvHeads = job.Geometry.KvHeads;
+        var qkDim = job.Geometry.QkDim;
+        var vDim = job.Geometry.VDim;
+        var half = qkDim / 2;
+        var layerKeys = job.KeyCache + (long)job.Layer * job.Capacity * job.Geometry.KeyWidth;
+        var layerValues = job.ValueCache + (long)job.Layer * job.Capacity * job.Geometry.ValueWidth;
+        var layerKeyScales = job.KeyScale + (long)job.Layer * job.Capacity * kvHeads;
+        var layerValueScales = job.ValueScale + (long)job.Layer * job.Capacity * kvHeads;
+        Shard(job.Count * (heads + kvHeads), member, members, out var first, out var count);
+        for (var u = first; u < first + count; u++)
+        {
+            var t = u / (heads + kvHeads);
+            var h = u % (heads + kvHeads);
+            var p = job.Position + t;
+            var cos = job.RopeCos + (long)p * half;
+            var sin = job.RopeSin + (long)p * half;
+            if (h < heads)
+            {
+                var q = job.QConv + ((long)t * heads + h) * qkDim;
+                Ops.ZeroCenteredRms(q, job.Weights.QNorm, qkDim, q);
+                Ops.Rope(q, 1, qkDim, cos, sin);
+                job.QueryScale[(long)t * heads + h] = Quant.QuantizeInt8(q, qkDim, job.QueryInt8 + ((long)t * heads + h) * qkDim);
+            }
+            else
+            {
+                var k = h - heads;
+                var kv = job.KConv + ((long)t * kvHeads + k) * qkDim;
+                Ops.ZeroCenteredRms(kv, job.Weights.KNorm, qkDim, kv);
+                Ops.Rope(kv, 1, qkDim, cos, sin);
+                layerKeyScales[(long)p * kvHeads + k] = Quant.QuantizeInt8(kv, qkDim, layerKeys + ((long)p * kvHeads + k) * qkDim);
+                var v = job.VConv + ((long)t * kvHeads + k) * vDim;
+                layerValueScales[(long)p * kvHeads + k] = Quant.QuantizeInt8(v, vDim, layerValues + ((long)p * kvHeads + k) * vDim);
+            }
+        }
+        if (member == 0) job.Clock.Lap(Stage.AttentionPostProjection);
+    }
+
+    static void AttentionCore(in LayerJob job, int member, int members)
+    {
+        var kvHeads = job.Geometry.KvHeads;
+        var batch = new AttentionBatch
+        {
+            Queries = job.QueryInt8,
+            QueryScales = job.QueryScale,
+            Keys = job.KeyCache + (long)job.Layer * job.Capacity * job.Geometry.KeyWidth,
+            KeyScales = job.KeyScale + (long)job.Layer * job.Capacity * kvHeads,
+            Values = job.ValueCache + (long)job.Layer * job.Capacity * job.Geometry.ValueWidth,
+            ValueScales = job.ValueScale + (long)job.Layer * job.Capacity * kvHeads,
+            Output = job.AttnOut,
+            Heads = job.Geometry.Heads,
+            KvHeads = kvHeads,
+            QkDim = job.Geometry.QkDim,
+            VDim = job.Geometry.VDim,
+            Position = job.Position,
+            Window = job.Geometry.IsGlobal(job.Layer) ? 0 : job.Geometry.SlidingWindow,
+            Capacity = job.Capacity,
+        };
+        batch.Plan(members, job.Count, job.AttnPartials, job.AttnArrivals);
+        if (member == 0) for (var g = 0; g < job.Count * kvHeads; g++) job.AttnArrivals[g] = 0;
+        Pool.Barrier(job.Barrier);
+        Shard(batch.TeamTasks, member, members, out var first, out var count);
+        for (var i = first; i < first + count; i++) AttentionBatch.RunTask(&batch, i);
+        if (member == 0) job.Clock.Lap(Stage.AttentionCore);
+    }
+
+    static void AttentionGate(in LayerJob job, int member, int members)
+    {
+        var outWidth = job.Geometry.OutputWidth;
+        Shard(job.Count, member, members, out var first, out var count);
+        for (var t = first; t < first + count; t++)
+        {
+            Ops.GateFakeA8(job.AttnOut + (long)t * outWidth, job.GateOut + (long)t * outWidth, outWidth);
+            var slice = job.DimAct.Slice(t);
+            Quant.Prepare(job.AttnOut + (long)t * outWidth, 1, outWidth, 2, slice);
+        }
+        if (member == 0) job.Clock.Lap(Stage.AttentionGate);
+    }
+
+    static void AttentionOut(in LayerJob job, int member, int members)
+    {
+        var batch = new MatMulBatch(job.DimAct, job.Count);
+        batch.Add(job.Weights.Out, job.AttnProj, job.Geometry.Dim);
+        batch.Plan(members);
+        Shard(batch.TaskCount, member, members, out var first, out var count);
+        for (var i = first; i < first + count; i++) MatMulBatch.RunTask(&batch, i);
+        if (member == 0) job.Clock.Lap(Stage.AttentionOut);
+    }
+
+    static void PostNorm(in LayerJob job, int member, int members)
+    {
+        var dim = job.Geometry.Dim;
+        Shard(job.Count, member, members, out var first, out var count);
+        for (var t = first; t < first + count; t++)
+            Ops.PostNormAdd(job.Residual + (long)t * dim, job.AttnProj + (long)t * dim, job.Weights.PostNorm, job.Weights.AttnGate, dim);
+        if (member == 0) job.Clock.Lap(Stage.AttentionPostNorm);
+    }
+
+    static void Mlp(in LayerJob job, int member, int members)
+    {
+        var batch = new MlpBatch
+        {
+            Weights = job.Mlp,
+            PreNorm = job.Weights.PreHada,
+            PermA = job.Hyper.PermA,
+            PermB = job.Hyper.PermB,
+            Residual = job.Residual,
+            Dim = job.Geometry.Dim,
+            Rows = job.Geometry.HadaRows,
+            Cols = job.Geometry.HadaCols,
+            Scale = 1f,
+        };
+        Shard(job.Count, member, members, out var first, out var count);
+        for (var t = first; t < first + count; t++) MlpBatch.RunToken(&batch, t);
+        if (member == 0) job.Clock.Lap(Stage.Mlp);
+    }
+
+    static void Combine(in LayerJob job, int member, int members)
+    {
+        var dim = job.Geometry.Dim;
+        Shard(job.Count, member, members, out var first, out var count);
+        for (var t = first; t < first + count; t++)
+        {
+            var s = job.Stream + (long)t * Lanes * dim;
+            var n = job.Next + (long)t * Lanes * dim;
+            var x = job.Residual + (long)t * dim;
+            var u = job.Input + (long)t * dim;
+            var mix = job.ResidualMix + (long)t * Lanes * Lanes;
+            for (var i = 0; i < Lanes; i++)
+                Ops.CombineDiff4(s, dim, mix[i * 4], mix[i * 4 + 1], mix[i * 4 + 2], mix[i * 4 + 3], x, u, job.PostGate[t * Lanes + i], n + (long)i * dim);
+        }
+        if (member == 0) job.Clock.Lap(Stage.Combine);
+    }
+
+    void RunLayerLegacy(int l, int count, int position)
     {
         ref readonly var w = ref model.Blocks[l];
         ref readonly var hyper = ref model.Hyper;
