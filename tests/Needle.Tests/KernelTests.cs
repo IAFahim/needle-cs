@@ -335,12 +335,20 @@ public sealed unsafe class HadamardMlpTests : IDisposable
         var width = rows * cols;
         var weights = (float**)Mem.AllocZeroed(13 * (nuint)sizeof(float*));
         allocations.Add((nint)weights);
-        weights[0] = Allocate(width, random, 0.5f, 1f);
+        // MlpWeights order: D1(dim), D2/B2/D3(width), D4(dim), WxA(rows*rows), WxB(cols*cols), CondV(dim*8), CondU(8*width).
+        // Kron indexes left as i*rows+k and right as j*cols+c, so W factors MUST be rows*rows / cols*cols.
+        // Sizing them as rows*cols overreads the heap for non-square shapes (8x16 W*B needs 256 floats, not 128).
+        weights[0] = Allocate(dim, random, 0.5f, 1f);
         weights[1] = Allocate(width, random, 0.5f, 1f);
         weights[2] = Allocate(width, random, 0.2f);
         weights[3] = Allocate(width, random, 0.5f, 1f);
-        weights[4] = Allocate(width, random, 0.5f, 1f);
-        for (var i = 5; i < 11; i++) weights[i] = Allocate(width, random, 0.3f);
+        weights[4] = Allocate(dim, random, 0.5f, 1f);
+        weights[5] = Allocate(rows * rows, random, 0.3f);
+        weights[6] = Allocate(cols * cols, random, 0.3f);
+        weights[7] = Allocate(rows * rows, random, 0.3f);
+        weights[8] = Allocate(cols * cols, random, 0.3f);
+        weights[9] = Allocate(rows * rows, random, 0.3f);
+        weights[10] = Allocate(cols * cols, random, 0.3f);
         weights[11] = Allocate(dim * 8, random, 0.1f);
         weights[12] = Allocate(8 * width, random, 0.3f);
         var batch = (MlpBatch*)Mem.AllocZeroed((nuint)sizeof(MlpBatch));
@@ -452,6 +460,39 @@ public sealed unsafe class HadamardMlpTests : IDisposable
             }
         }
         finally { Mem.Free(scratch); }
+    }
+
+    [Fact]
+    public void NonSquareHadamardMatchesReferenceRepeatedly()
+    {
+        // Regression for #45: Batch() sized every Kron factor as rows*cols, so the only
+        // non-square shape (8x16) overread the W*B heap blocks by 128 floats and failed
+        // intermittently with NaN/Inf (~1-2/10 under load). Hammer the failing tuple plus
+        // a thread/token sweep and the mirrored rectangle (16x8, scalar Kron path).
+        foreach (var (dim, rows, cols) in new[] { (96, 8, 16), (48, 16, 8) })
+            foreach (var threads in new[] { 1, 2, 3, 4 })
+                foreach (var tokens in new[] { 1, 2 })
+                    for (var iter = 0; iter < 25; iter++)
+                    {
+                        var batch = Batch(dim, rows, cols, 0.5f, 1000 + iter);
+                        var initial = Initial(tokens * dim, 2000 + iter);
+                        var actual = Run(batch, initial, tokens, threads);
+                        var scratch = (float*)Mem.AllocZeroed((nuint)(tokens * dim) * sizeof(float));
+                        try
+                        {
+                            for (var t = 0; t < tokens; t++)
+                            {
+                                for (var i = 0; i < dim; i++) scratch[t * dim + i] = initial[t * dim + i];
+                                var expected = Reference(batch, scratch + t * dim);
+                                for (var i = 0; i < dim; i++)
+                                {
+                                    Assert.False(float.IsNaN(actual[t * dim + i]), $"NaN at dim={dim} rows={rows} cols={cols} threads={threads} tokens={tokens} iter={iter} index={i}");
+                                    Assert.InRange(actual[t * dim + i], expected[i] - 2e-4 * (1 + Math.Abs(expected[i])), expected[i] + 2e-4 * (1 + Math.Abs(expected[i])));
+                                }
+                            }
+                        }
+                        finally { Mem.Free(scratch); }
+                    }
     }
 
     [Theory]
