@@ -53,6 +53,13 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
     int* snapshotTokens;
     float* snapshotPoolMax, snapshotPoolSum, snapshotPoolAcc;
     bool historyPending, poolPending;
+    // Per-step speculative snapshot (issue #17): a full copy of the recurrent
+    // state plus Length from before a draft chunk. KV caches need no copy:
+    // they are indexed by absolute position, so a stale tail is simply
+    // overwritten by later feeds. Allocated once in the constructor; the
+    // speculative path only memcpys between these buffers (no allocation).
+    float* specSnapshot;
+    int specLength;
     float* qkvHistory, engramHistory;
     int* previousTokens;
     int markedLength;
@@ -137,6 +144,7 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         stateBytes = stateFloats * sizeof(float);
         state = arena.Take<float>(stateFloats);
         snapshot = arena.Take<float>(stateFloats);
+        specSnapshot = (float*)Mem.Alloc(stateBytes);
         qkvHistory = state;
         engramHistory = state + g.Layers * historyPerLayer;
         previousTokens = (int*)(engramHistory + g.SiteCount * EngramHistory * dim);
@@ -376,6 +384,26 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         historyPending = true;
         poolPending = poolRows > 0;
         Length = markedLength;
+    }
+
+    // Saves the recurrent state (conv/engram histories, previous tokens,
+    // confidence pooling) plus Length from before a speculative draft chunk.
+    // Must be called with a settled state (right after a feed, when
+    // historyPending/poolPending are false); RestoreSpec then reinstalls a
+    // self-consistent state, so the lazy flags stay clear.
+    internal void CheckpointSpec()
+    {
+        Buffer.MemoryCopy(state, specSnapshot, stateBytes, stateBytes);
+        specLength = Length;
+    }
+
+    // Drops a rejected draft tail: reinstalls the pre-chunk recurrent state
+    // and Length. KV caches are indexed by absolute position, so entries
+    // past the restored Length are simply overwritten by the next feed.
+    internal void RestoreSpec()
+    {
+        Buffer.MemoryCopy(specSnapshot, state, stateBytes, stateBytes);
+        Length = specLength;
     }
 
     public void Feed(ReadOnlySpan<int> tokens, bool computeLogits = true)
@@ -718,15 +746,26 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         }
     }
 
-    void ComputeLogits(int last)
+    void ComputeLogits(int last) => ComputeLogitsAt(last);
+
+    // Full-vocabulary logits for one row of the last forwarded chunk,
+    // written to the shared `logits` buffer. Lets prompt-lookup speculation
+    // (issue #17) verify each draft position from a single chunk pass: the
+    // stream rows persist until the next Forward overwrites them. Callers
+    // that need the last row afterwards use RefreshLastLogits.
+    internal void ComputeLogitsAt(int row)
     {
-        PrepareHead(last);
+        PrepareHead(row);
         var head = new MatMulBatch(headAct, 1);
         head.Add(model.Embedding, logits, model.Embedding.Rows);
         clock.PoolRun();
         MatMulBatch.Run(pool, &head);
         clock.Lap(Stage.Logits);
     }
+
+    // Recomputes full-vocabulary logits for the last row of the last
+    // forwarded chunk (per-row verification overwrites the shared buffer).
+    internal void RefreshLastLogits() => ComputeLogitsAt(lastForwardCount - 1);
 
     // Builds the quantized head input for one forwarded token. Shared by the
     // full head and LogitsForRows so both see the exact same normalization.
@@ -748,9 +787,18 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
     // the full head's bit-for-bit. `destination[0..count)` aligns with `rows`.
     // No pool work happens here, hence no clock.PoolRun; the logits stage is
     // still attributed through Lap.
-    internal void LogitsForRows(int* rows, int count, float* destination)
+    internal void LogitsForRows(int* rows, int count, float* destination) =>
+        LogitsForRowsAt(lastForwardCount - 1, rows, count, destination);
+
+    // Sparse-head read for one row of the last forwarded chunk. Same
+    // run-merging alignment as the full head, so values equal the full head
+    // bit-for-bit at every row; used to verify draft positions whose mask
+    // fits the sparse threshold. Like the full head it borrows the shared
+    // logits buffer as run scratch, so the last-row logits are recomputed
+    // afterwards (LogitsForRows or RefreshLastLogits).
+    internal void LogitsForRowsAt(int row, int* rows, int count, float* destination)
     {
-        PrepareHead(lastForwardCount - 1);
+        PrepareHead(row);
         var vocab = model.Embedding.Rows;
         var i = 0;
         while (i < count)
@@ -777,6 +825,7 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
     {
         if (ownsPool) pool.Dispose();
         arena.Free();
+        Mem.Free(specSnapshot);
     }
 }
 
