@@ -116,14 +116,24 @@ internal static unsafe class Gemv
     {
         if (UsePermute)
         {
-            if (w.Bits == 2) Rows<PermuteTwoBitPlanes>(w, a, token, y, rowStart, rowEnd);
-            else Rows<PermuteFourBitPlanes>(w, a, token, y, rowStart, rowEnd);
+            if (w.Bits == 2) RowsDot<PermuteTwoBitPlanes>(w, a, token, y, rowStart, rowEnd);
+            else RowsDot<PermuteFourBitPlanes>(w, a, token, y, rowStart, rowEnd);
         }
-        else if (w.Bits == 2) Rows<TwoBitPlanes>(w, a, token, y, rowStart, rowEnd);
-        else Rows<FourBitPlanes>(w, a, token, y, rowStart, rowEnd);
+        else if (w.Bits == 2) RowsDot<TwoBitPlanes>(w, a, token, y, rowStart, rowEnd);
+        else RowsDot<FourBitPlanes>(w, a, token, y, rowStart, rowEnd);
     }
 
-    static void Rows<TPlanes>(in Cq w, in Activations a, int token, float* y, int rowStart, int rowEnd) where TPlanes : struct, IPlaneLayout
+    static void RowsDot<TPlanes>(in Cq w, in Activations a, int token, float* y, int rowStart, int rowEnd) where TPlanes : struct, IPlaneLayout
+    {
+        if (Tiers.Active == CpuTier.AvxVnniInt8) Rows<TPlanes, VnniInt8Dot>(w, a, token, y, rowStart, rowEnd);
+        else if (Tiers.Active == CpuTier.Avx512Bw) Rows<TPlanes, BwDot>(w, a, token, y, rowStart, rowEnd);
+        else if (Tiers.Active == CpuTier.AvxVnni) Rows<TPlanes, VnniDot>(w, a, token, y, rowStart, rowEnd);
+        else Rows<TPlanes, Avx2Dot>(w, a, token, y, rowStart, rowEnd);
+    }
+
+    static void Rows<TPlanes, TDot>(in Cq w, in Activations a, int token, float* y, int rowStart, int rowEnd)
+        where TPlanes : struct, IPlaneLayout
+        where TDot : struct, IInt8Dot
     {
         var groups = w.Groups;
         var stride = a.Stride;
@@ -141,9 +151,9 @@ internal static unsafe class Gemv
         var convertibleRows = (long)w.Rows * groups < paddedGroups ? 0 : (int)(((long)w.Rows * groups - paddedGroups) / groups) + 1;
         var n = rowStart;
         for (; n + RowBlock <= rowEnd && n + RowBlock <= convertibleRows; n += RowBlock)
-            Block<TPlanes>(w.Indices + (long)n * rowBytes, rowBytes, w.Norms + (long)n * groups, groups, stride, tables, weightedScales, offsets, values, scaled, y + n);
+            Block<TPlanes, TDot>(w.Indices + (long)n * rowBytes, rowBytes, w.Norms + (long)n * groups, groups, stride, tables, weightedScales, offsets, values, scaled, y + n);
         for (; n < rowEnd; n++)
-            y[n] = Single<TPlanes>(w.Indices + (long)n * rowBytes, w.Norms + (long)n * groups, groups, stride, n < convertibleRows, tables, weightedScales, offsets, values, scaled);
+            y[n] = Single<TPlanes, TDot>(w.Indices + (long)n * rowBytes, w.Norms + (long)n * groups, groups, stride, n < convertibleRows, tables, weightedScales, offsets, values, scaled);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -176,26 +186,25 @@ internal static unsafe class Gemv
     static Vector256<float> UnbiasedHalfToSingle(Vector256<int> half) => Avx2.ShiftLeftLogical(half, 13).AsSingle();
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    static Vector256<int> Dot(Vector256<byte> p0, Vector256<byte> p1, Vector256<byte> p2, Vector256<byte> p3, Vector256<sbyte> x0, Vector256<sbyte> x1, Vector256<sbyte> x2, Vector256<sbyte> x3)
-    {
-        var sum = Quant.Accumulate(Vector256<int>.Zero, p0, x0);
-        sum = Quant.Accumulate(sum, p1, x1);
-        sum = Quant.Accumulate(sum, p2, x2);
-        return Quant.Accumulate(sum, p3, x3);
-    }
+    static Vector256<int> Dot<TDot>(Vector256<byte> p0, Vector256<byte> p1, Vector256<byte> p2, Vector256<byte> p3, Vector256<sbyte> x0, Vector256<sbyte> x1, Vector256<sbyte> x2, Vector256<sbyte> x3) where TDot : struct, IInt8Dot =>
+        TDot.Dot(p0, p1, p2, p3, x0, x1, x2, x3);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    static Vector256<int> Dot(Vector256<byte> p0, Vector256<byte> p1, Vector256<byte> p2, Vector256<byte> p3, sbyte* x) =>
-        Dot(p0, p1, p2, p3, Avx.LoadVector256(x), Avx.LoadVector256(x + 32), Avx.LoadVector256(x + 64), Avx.LoadVector256(x + 96));
+    static Vector256<int> Dot<TDot>(Vector256<byte> p0, Vector256<byte> p1, Vector256<byte> p2, Vector256<byte> p3, sbyte* x) where TDot : struct, IInt8Dot =>
+        Dot<TDot>(p0, p1, p2, p3, Avx.LoadVector256(x), Avx.LoadVector256(x + 32), Avx.LoadVector256(x + 64), Avx.LoadVector256(x + 96));
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    static Vector256<float> Group<TPlanes>(byte* packed, in PlaneTables tables, Vector256<sbyte> x0, Vector256<sbyte> x1, Vector256<sbyte> x2, Vector256<sbyte> x3, float* scale, Vector256<float> accumulator) where TPlanes : struct, IPlaneLayout
+    static Vector256<float> Group<TPlanes, TDot>(byte* packed, in PlaneTables tables, Vector256<sbyte> x0, Vector256<sbyte> x1, Vector256<sbyte> x2, Vector256<sbyte> x3, float* scale, Vector256<float> accumulator)
+        where TPlanes : struct, IPlaneLayout
+        where TDot : struct, IInt8Dot
     {
         TPlanes.Expand(packed, tables, out var p0, out var p1, out var p2, out var p3);
-        return Fma.MultiplyAdd(Avx.ConvertToVector256Single(Dot(p0, p1, p2, p3, x0, x1, x2, x3)), Avx.BroadcastScalarToVector256(scale), accumulator);
+        return Fma.MultiplyAdd(Avx.ConvertToVector256Single(Dot<TDot>(p0, p1, p2, p3, x0, x1, x2, x3)), Avx.BroadcastScalarToVector256(scale), accumulator);
     }
 
-    static void Block<TPlanes>(byte* packed, int rowBytes, ushort* norms, int groups, int stride, in PlaneTables tables, float* weightedScales, float* offsets, sbyte* values, float* scaled, float* y) where TPlanes : struct, IPlaneLayout
+    static void Block<TPlanes, TDot>(byte* packed, int rowBytes, ushort* norms, int groups, int stride, in PlaneTables tables, float* weightedScales, float* offsets, sbyte* values, float* scaled, float* y)
+        where TPlanes : struct, IPlaneLayout
+        where TDot : struct, IInt8Dot
     {
         var start0 = Corrections(norms, stride, weightedScales, offsets, scaled);
         var start1 = Corrections(norms + groups, stride, weightedScales, offsets, scaled + stride);
@@ -226,10 +235,10 @@ internal static unsafe class Gemv
             var x2 = Avx.LoadVector256(x + 64);
             var x3 = Avx.LoadVector256(x + 96);
             var offset = g * groupBytes;
-            accumulator0 = Group<TPlanes>(packed + offset, tables, x0, x1, x2, x3, scaled + g, accumulator0);
-            accumulator1 = Group<TPlanes>(row1 + offset, tables, x0, x1, x2, x3, scaled + stride + g, accumulator1);
-            accumulator2 = Group<TPlanes>(row2 + offset, tables, x0, x1, x2, x3, scaled + 2 * stride + g, accumulator2);
-            accumulator3 = Group<TPlanes>(row3 + offset, tables, x0, x1, x2, x3, scaled + 3 * stride + g, accumulator3);
+            accumulator0 = Group<TPlanes, TDot>(packed + offset, tables, x0, x1, x2, x3, scaled + g, accumulator0);
+            accumulator1 = Group<TPlanes, TDot>(row1 + offset, tables, x0, x1, x2, x3, scaled + stride + g, accumulator1);
+            accumulator2 = Group<TPlanes, TDot>(row2 + offset, tables, x0, x1, x2, x3, scaled + 2 * stride + g, accumulator2);
+            accumulator3 = Group<TPlanes, TDot>(row3 + offset, tables, x0, x1, x2, x3, scaled + 3 * stride + g, accumulator3);
         }
         var pairs01 = Avx.HorizontalAdd(accumulator0, accumulator1);
         var pairs23 = Avx.HorizontalAdd(accumulator2, accumulator3);
@@ -237,7 +246,9 @@ internal static unsafe class Gemv
         Sse.Store(y, Sse.Add(quads.GetLower(), quads.GetUpper()));
     }
 
-    static float Single<TPlanes>(byte* packed, ushort* norms, int groups, int stride, bool convertible, in PlaneTables tables, float* weightedScales, float* offsets, sbyte* values, float* scaled) where TPlanes : struct, IPlaneLayout
+    static float Single<TPlanes, TDot>(byte* packed, ushort* norms, int groups, int stride, bool convertible, in PlaneTables tables, float* weightedScales, float* offsets, sbyte* values, float* scaled)
+        where TPlanes : struct, IPlaneLayout
+        where TDot : struct, IInt8Dot
     {
         var accumulator = convertible
             ? Corrections(norms, stride, weightedScales, offsets, scaled)
@@ -246,7 +257,7 @@ internal static unsafe class Gemv
         for (var g = 0; g < groups; g++)
         {
             var x = values + g * Cq.GroupSize;
-            accumulator = Group<TPlanes>(packed + g * groupBytes, tables, Avx.LoadVector256(x), Avx.LoadVector256(x + 32), Avx.LoadVector256(x + 64), Avx.LoadVector256(x + 96), scaled + g, accumulator);
+            accumulator = Group<TPlanes, TDot>(packed + g * groupBytes, tables, Avx.LoadVector256(x), Avx.LoadVector256(x + 32), Avx.LoadVector256(x + 64), Avx.LoadVector256(x + 96), scaled + g, accumulator);
         }
         return Vector256.Sum(accumulator);
     }
@@ -255,25 +266,43 @@ internal static unsafe class Gemv
     {
         if (UsePermute)
         {
-            if (w.Bits == 2) Tile4<PermuteTwoBitPlanes>(w, a, token, y, ldy, rowStart, rowEnd);
-            else Tile4<PermuteFourBitPlanes>(w, a, token, y, ldy, rowStart, rowEnd);
+            if (w.Bits == 2) Tile4Dot<PermuteTwoBitPlanes>(w, a, token, y, ldy, rowStart, rowEnd);
+            else Tile4Dot<PermuteFourBitPlanes>(w, a, token, y, ldy, rowStart, rowEnd);
         }
-        else if (w.Bits == 2) Tile4<TwoBitPlanes>(w, a, token, y, ldy, rowStart, rowEnd);
-        else Tile4<FourBitPlanes>(w, a, token, y, ldy, rowStart, rowEnd);
+        else if (w.Bits == 2) Tile4Dot<TwoBitPlanes>(w, a, token, y, ldy, rowStart, rowEnd);
+        else Tile4Dot<FourBitPlanes>(w, a, token, y, ldy, rowStart, rowEnd);
+    }
+
+    static void Tile4Dot<TPlanes>(in Cq w, in Activations a, int token, float* y, int ldy, int rowStart, int rowEnd) where TPlanes : struct, IPlaneLayout
+    {
+        if (Tiers.Active == CpuTier.AvxVnniInt8) Tile4<TPlanes, VnniInt8Dot>(w, a, token, y, ldy, rowStart, rowEnd);
+        else if (Tiers.Active == CpuTier.Avx512Bw) Tile4<TPlanes, BwDot>(w, a, token, y, ldy, rowStart, rowEnd);
+        else if (Tiers.Active == CpuTier.AvxVnni) Tile4<TPlanes, VnniDot>(w, a, token, y, ldy, rowStart, rowEnd);
+        else Tile4<TPlanes, Avx2Dot>(w, a, token, y, ldy, rowStart, rowEnd);
     }
 
     public static void Tile2(in Cq w, in Activations a, int token, float* y, int ldy, int rowStart, int rowEnd)
     {
         if (UsePermute)
         {
-            if (w.Bits == 2) Tile2<PermuteTwoBitPlanes>(w, a, token, y, ldy, rowStart, rowEnd);
-            else Tile2<PermuteFourBitPlanes>(w, a, token, y, ldy, rowStart, rowEnd);
+            if (w.Bits == 2) Tile2Dot<PermuteTwoBitPlanes>(w, a, token, y, ldy, rowStart, rowEnd);
+            else Tile2Dot<PermuteFourBitPlanes>(w, a, token, y, ldy, rowStart, rowEnd);
         }
-        else if (w.Bits == 2) Tile2<TwoBitPlanes>(w, a, token, y, ldy, rowStart, rowEnd);
-        else Tile2<FourBitPlanes>(w, a, token, y, ldy, rowStart, rowEnd);
+        else if (w.Bits == 2) Tile2Dot<TwoBitPlanes>(w, a, token, y, ldy, rowStart, rowEnd);
+        else Tile2Dot<FourBitPlanes>(w, a, token, y, ldy, rowStart, rowEnd);
     }
 
-    static void Tile4<TPlanes>(in Cq w, in Activations a, int token, float* y, int ldy, int rowStart, int rowEnd) where TPlanes : struct, IPlaneLayout
+    static void Tile2Dot<TPlanes>(in Cq w, in Activations a, int token, float* y, int ldy, int rowStart, int rowEnd) where TPlanes : struct, IPlaneLayout
+    {
+        if (Tiers.Active == CpuTier.AvxVnniInt8) Tile2<TPlanes, VnniInt8Dot>(w, a, token, y, ldy, rowStart, rowEnd);
+        else if (Tiers.Active == CpuTier.Avx512Bw) Tile2<TPlanes, BwDot>(w, a, token, y, ldy, rowStart, rowEnd);
+        else if (Tiers.Active == CpuTier.AvxVnni) Tile2<TPlanes, VnniDot>(w, a, token, y, ldy, rowStart, rowEnd);
+        else Tile2<TPlanes, Avx2Dot>(w, a, token, y, ldy, rowStart, rowEnd);
+    }
+
+    static void Tile4<TPlanes, TDot>(in Cq w, in Activations a, int token, float* y, int ldy, int rowStart, int rowEnd)
+        where TPlanes : struct, IPlaneLayout
+        where TDot : struct, IInt8Dot
     {
         var groups = w.Groups;
         var stride = a.Stride;
@@ -295,12 +324,14 @@ internal static unsafe class Gemv
         var prefetchDistance = (long)PrefetchBlocks * 2 * rowBytes;
         var n = rowStart;
         for (; n + 2 <= rowEnd && n + 2 <= convertibleRows; n += 2)
-            Pair4<TPlanes>(w.Indices + (long)n * rowBytes, rowBytes, w.Norms + (long)n * groups, groups, stride, cols, tables, weightedScales, offsets, values, scaled, rowFactors, groupBytes, prefetchDistance, y + n, ldy);
+            Pair4<TPlanes, TDot>(w.Indices + (long)n * rowBytes, rowBytes, w.Norms + (long)n * groups, groups, stride, cols, tables, weightedScales, offsets, values, scaled, rowFactors, groupBytes, prefetchDistance, y + n, ldy);
         for (; n < rowEnd; n++)
-            Row4<TPlanes>(w.Indices + (long)n * rowBytes, w.Norms + (long)n * groups, n < convertibleRows, groups, stride, cols, tables, weightedScales, offsets, values, scaled, rowFactors, groupBytes, prefetchDistance, y + n, ldy);
+            Row4<TPlanes, TDot>(w.Indices + (long)n * rowBytes, w.Norms + (long)n * groups, n < convertibleRows, groups, stride, cols, tables, weightedScales, offsets, values, scaled, rowFactors, groupBytes, prefetchDistance, y + n, ldy);
     }
 
-    static void Tile2<TPlanes>(in Cq w, in Activations a, int token, float* y, int ldy, int rowStart, int rowEnd) where TPlanes : struct, IPlaneLayout
+    static void Tile2<TPlanes, TDot>(in Cq w, in Activations a, int token, float* y, int ldy, int rowStart, int rowEnd)
+        where TPlanes : struct, IPlaneLayout
+        where TDot : struct, IInt8Dot
     {
         const int Tokens = 2;
         var groups = w.Groups;
@@ -323,12 +354,14 @@ internal static unsafe class Gemv
         var prefetchDistance = (long)PrefetchBlocks * 2 * rowBytes;
         var n = rowStart;
         for (; n + 2 <= rowEnd && n + 2 <= convertibleRows; n += 2)
-            Pair2<TPlanes>(w.Indices + (long)n * rowBytes, rowBytes, w.Norms + (long)n * groups, groups, stride, cols, tables, weightedScales, offsets, values, scaled, rowFactors, groupBytes, prefetchDistance, y + n, ldy);
+            Pair2<TPlanes, TDot>(w.Indices + (long)n * rowBytes, rowBytes, w.Norms + (long)n * groups, groups, stride, cols, tables, weightedScales, offsets, values, scaled, rowFactors, groupBytes, prefetchDistance, y + n, ldy);
         for (; n < rowEnd; n++)
-            Row2<TPlanes>(w.Indices + (long)n * rowBytes, w.Norms + (long)n * groups, n < convertibleRows, groups, stride, cols, tables, weightedScales, offsets, values, scaled, rowFactors, groupBytes, prefetchDistance, y + n, ldy);
+            Row2<TPlanes, TDot>(w.Indices + (long)n * rowBytes, w.Norms + (long)n * groups, n < convertibleRows, groups, stride, cols, tables, weightedScales, offsets, values, scaled, rowFactors, groupBytes, prefetchDistance, y + n, ldy);
     }
 
-    static void Pair4<TPlanes>(byte* packed, int rowBytes, ushort* norms, int groups, int stride, int cols, in PlaneTables tables, float* weightedScales, float* offsets, sbyte* values, float* scaled, float* rowFactors, int groupBytes, long prefetchDistance, float* y, int ldy) where TPlanes : struct, IPlaneLayout
+    static void Pair4<TPlanes, TDot>(byte* packed, int rowBytes, ushort* norms, int groups, int stride, int cols, in PlaneTables tables, float* weightedScales, float* offsets, sbyte* values, float* scaled, float* rowFactors, int groupBytes, long prefetchDistance, float* y, int ldy)
+        where TPlanes : struct, IPlaneLayout
+        where TDot : struct, IInt8Dot
     {
         for (var v = 0; v < stride; v += HalvesPerVector)
         {
@@ -358,14 +391,14 @@ internal static unsafe class Gemv
             var x1 = x + cols;
             var x2 = x + 2 * cols;
             var x3 = x + 3 * cols;
-            accumulator00 = ApplyPlanes(p0, p1, p2, p3, x, scaled + g, accumulator00);
-            accumulator10 = ApplyPlanes(q0, q1, q2, q3, x, scaled + 4 * stride + g, accumulator10);
-            accumulator01 = ApplyPlanes(p0, p1, p2, p3, x1, scaled + stride + g, accumulator01);
-            accumulator11 = ApplyPlanes(q0, q1, q2, q3, x1, scaled + 5 * stride + g, accumulator11);
-            accumulator02 = ApplyPlanes(p0, p1, p2, p3, x2, scaled + 2 * stride + g, accumulator02);
-            accumulator12 = ApplyPlanes(q0, q1, q2, q3, x2, scaled + 6 * stride + g, accumulator12);
-            accumulator03 = ApplyPlanes(p0, p1, p2, p3, x3, scaled + 3 * stride + g, accumulator03);
-            accumulator13 = ApplyPlanes(q0, q1, q2, q3, x3, scaled + 7 * stride + g, accumulator13);
+            accumulator00 = ApplyPlanes<TDot>(p0, p1, p2, p3, x, scaled + g, accumulator00);
+            accumulator10 = ApplyPlanes<TDot>(q0, q1, q2, q3, x, scaled + 4 * stride + g, accumulator10);
+            accumulator01 = ApplyPlanes<TDot>(p0, p1, p2, p3, x1, scaled + stride + g, accumulator01);
+            accumulator11 = ApplyPlanes<TDot>(q0, q1, q2, q3, x1, scaled + 5 * stride + g, accumulator11);
+            accumulator02 = ApplyPlanes<TDot>(p0, p1, p2, p3, x2, scaled + 2 * stride + g, accumulator02);
+            accumulator12 = ApplyPlanes<TDot>(q0, q1, q2, q3, x2, scaled + 6 * stride + g, accumulator12);
+            accumulator03 = ApplyPlanes<TDot>(p0, p1, p2, p3, x3, scaled + 3 * stride + g, accumulator03);
+            accumulator13 = ApplyPlanes<TDot>(q0, q1, q2, q3, x3, scaled + 7 * stride + g, accumulator13);
         }
         var quads0 = Avx.HorizontalAdd(Avx.HorizontalAdd(accumulator00, accumulator01), Avx.HorizontalAdd(accumulator02, accumulator03));
         var sums0 = Sse.Add(quads0.GetLower(), quads0.GetUpper());
@@ -381,7 +414,9 @@ internal static unsafe class Gemv
         y[3 * ldy + 1] = Sse41.Extract(sums1, 3);
     }
 
-    static void Row4<TPlanes>(byte* packed, ushort* norms, bool convertible, int groups, int stride, int cols, in PlaneTables tables, float* weightedScales, float* offsets, sbyte* values, float* scaled, float* rowFactors, int groupBytes, long prefetchDistance, float* y, int ldy) where TPlanes : struct, IPlaneLayout
+    static void Row4<TPlanes, TDot>(byte* packed, ushort* norms, bool convertible, int groups, int stride, int cols, in PlaneTables tables, float* weightedScales, float* offsets, sbyte* values, float* scaled, float* rowFactors, int groupBytes, long prefetchDistance, float* y, int ldy)
+        where TPlanes : struct, IPlaneLayout
+        where TDot : struct, IInt8Dot
     {
         if (convertible)
             for (var v = 0; v < stride; v += HalvesPerVector) Avx.Store(rowFactors + v, UnbiasedHalfToSingle(Avx2.ConvertToVector256Int32(norms + v)));
@@ -396,10 +431,10 @@ internal static unsafe class Gemv
             if ((g * groupBytes & CacheLine - 1) == 0) Sse.Prefetch0(packed + g * groupBytes + prefetchDistance);
             TPlanes.Expand(packed + g * groupBytes, tables, out var p0, out var p1, out var p2, out var p3);
             var x = values + g * Cq.GroupSize;
-            accumulator0 = ApplyPlanes(p0, p1, p2, p3, x, scaled + g, accumulator0);
-            accumulator1 = ApplyPlanes(p0, p1, p2, p3, x + cols, scaled + stride + g, accumulator1);
-            accumulator2 = ApplyPlanes(p0, p1, p2, p3, x + 2 * cols, scaled + 2 * stride + g, accumulator2);
-            accumulator3 = ApplyPlanes(p0, p1, p2, p3, x + 3 * cols, scaled + 3 * stride + g, accumulator3);
+            accumulator0 = ApplyPlanes<TDot>(p0, p1, p2, p3, x, scaled + g, accumulator0);
+            accumulator1 = ApplyPlanes<TDot>(p0, p1, p2, p3, x + cols, scaled + stride + g, accumulator1);
+            accumulator2 = ApplyPlanes<TDot>(p0, p1, p2, p3, x + 2 * cols, scaled + 2 * stride + g, accumulator2);
+            accumulator3 = ApplyPlanes<TDot>(p0, p1, p2, p3, x + 3 * cols, scaled + 3 * stride + g, accumulator3);
         }
         var quads = Avx.HorizontalAdd(Avx.HorizontalAdd(accumulator0, accumulator1), Avx.HorizontalAdd(accumulator2, accumulator3));
         var sums = Sse.Add(quads.GetLower(), quads.GetUpper());
@@ -409,7 +444,9 @@ internal static unsafe class Gemv
         y[3 * ldy] = Sse41.Extract(sums, 3);
     }
 
-    static void Pair2<TPlanes>(byte* packed, int rowBytes, ushort* norms, int groups, int stride, int cols, in PlaneTables tables, float* weightedScales, float* offsets, sbyte* values, float* scaled, float* rowFactors, int groupBytes, long prefetchDistance, float* y, int ldy) where TPlanes : struct, IPlaneLayout
+    static void Pair2<TPlanes, TDot>(byte* packed, int rowBytes, ushort* norms, int groups, int stride, int cols, in PlaneTables tables, float* weightedScales, float* offsets, sbyte* values, float* scaled, float* rowFactors, int groupBytes, long prefetchDistance, float* y, int ldy)
+        where TPlanes : struct, IPlaneLayout
+        where TDot : struct, IInt8Dot
     {
         for (var v = 0; v < stride; v += HalvesPerVector)
         {
@@ -433,10 +470,10 @@ internal static unsafe class Gemv
             TPlanes.Expand(row1 + g * groupBytes, tables, out var q0, out var q1, out var q2, out var q3);
             var x = values + g * Cq.GroupSize;
             var x1 = x + cols;
-            accumulator00 = ApplyPlanes(p0, p1, p2, p3, x, scaled + g, accumulator00);
-            accumulator10 = ApplyPlanes(q0, q1, q2, q3, x, scaled + 2 * stride + g, accumulator10);
-            accumulator01 = ApplyPlanes(p0, p1, p2, p3, x1, scaled + stride + g, accumulator01);
-            accumulator11 = ApplyPlanes(q0, q1, q2, q3, x1, scaled + 3 * stride + g, accumulator11);
+            accumulator00 = ApplyPlanes<TDot>(p0, p1, p2, p3, x, scaled + g, accumulator00);
+            accumulator10 = ApplyPlanes<TDot>(q0, q1, q2, q3, x, scaled + 2 * stride + g, accumulator10);
+            accumulator01 = ApplyPlanes<TDot>(p0, p1, p2, p3, x1, scaled + stride + g, accumulator01);
+            accumulator11 = ApplyPlanes<TDot>(q0, q1, q2, q3, x1, scaled + 3 * stride + g, accumulator11);
         }
         y[0] = Vector256.Sum(accumulator00);
         y[ldy] = Vector256.Sum(accumulator01);
@@ -444,7 +481,9 @@ internal static unsafe class Gemv
         y[ldy + 1] = Vector256.Sum(accumulator11);
     }
 
-    static void Row2<TPlanes>(byte* packed, ushort* norms, bool convertible, int groups, int stride, int cols, in PlaneTables tables, float* weightedScales, float* offsets, sbyte* values, float* scaled, float* rowFactors, int groupBytes, long prefetchDistance, float* y, int ldy) where TPlanes : struct, IPlaneLayout
+    static void Row2<TPlanes, TDot>(byte* packed, ushort* norms, bool convertible, int groups, int stride, int cols, in PlaneTables tables, float* weightedScales, float* offsets, sbyte* values, float* scaled, float* rowFactors, int groupBytes, long prefetchDistance, float* y, int ldy)
+        where TPlanes : struct, IPlaneLayout
+        where TDot : struct, IInt8Dot
     {
         if (convertible)
             for (var v = 0; v < stride; v += HalvesPerVector) Avx.Store(rowFactors + v, UnbiasedHalfToSingle(Avx2.ConvertToVector256Int32(norms + v)));
@@ -457,16 +496,16 @@ internal static unsafe class Gemv
             if ((g * groupBytes & CacheLine - 1) == 0) Sse.Prefetch0(packed + g * groupBytes + prefetchDistance);
             TPlanes.Expand(packed + g * groupBytes, tables, out var p0, out var p1, out var p2, out var p3);
             var x = values + g * Cq.GroupSize;
-            accumulator0 = ApplyPlanes(p0, p1, p2, p3, x, scaled + g, accumulator0);
-            accumulator1 = ApplyPlanes(p0, p1, p2, p3, x + cols, scaled + stride + g, accumulator1);
+            accumulator0 = ApplyPlanes<TDot>(p0, p1, p2, p3, x, scaled + g, accumulator0);
+            accumulator1 = ApplyPlanes<TDot>(p0, p1, p2, p3, x + cols, scaled + stride + g, accumulator1);
         }
         y[0] = Vector256.Sum(accumulator0);
         y[ldy] = Vector256.Sum(accumulator1);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    static Vector256<float> ApplyPlanes(Vector256<byte> p0, Vector256<byte> p1, Vector256<byte> p2, Vector256<byte> p3, sbyte* x, float* scale, Vector256<float> accumulator) =>
-        Fma.MultiplyAdd(Avx.ConvertToVector256Single(Dot(p0, p1, p2, p3, x)), Avx.BroadcastScalarToVector256(scale), accumulator);
+    static Vector256<float> ApplyPlanes<TDot>(Vector256<byte> p0, Vector256<byte> p1, Vector256<byte> p2, Vector256<byte> p3, sbyte* x, float* scale, Vector256<float> accumulator) where TDot : struct, IInt8Dot =>
+        Fma.MultiplyAdd(Avx.ConvertToVector256Single(Dot<TDot>(p0, p1, p2, p3, x)), Avx.BroadcastScalarToVector256(scale), accumulator);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     static Vector256<float> TileCorrections(float* rowFactors, float* weightedScales, float* offsets, float* scaled, int stride)

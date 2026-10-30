@@ -1,29 +1,19 @@
 using System;
-#if NEEDLE_SIMD
-using System.Runtime.Intrinsics.X86;
-#endif
 
 namespace Needle;
 
 internal static class Simd
 {
 #if NEEDLE_SIMD
-    static bool forceScalar;
-
-    public static bool Avx => Avx2.IsSupported && Fma.IsSupported && Sse41.IsSupported;
+    public static bool Avx => Tiers.HasAvx;
 
     public static bool Neon => System.Runtime.Intrinsics.Arm.AdvSimd.IsSupported;
 
-    public static bool Enabled => !forceScalar && (Avx || Neon);
+    public static bool Enabled => Tiers.Active != CpuTier.Scalar;
 
-    public static bool UseAvx => !forceScalar && Avx;
+    public static bool UseAvx => Tiers.Active is CpuTier.Avx2 or CpuTier.AvxVnni or CpuTier.AvxVnniInt8 or CpuTier.Avx512Bw;
 
-    public static bool UseNeon => !forceScalar && Neon;
-
-#pragma warning disable CA2255
-    [System.Runtime.CompilerServices.ModuleInitializer]
-    internal static void ReadEnvironment() => forceScalar = Environment.GetEnvironmentVariable("NEEDLE_SCALAR") != null;
-#pragma warning restore CA2255
+    public static bool UseNeon => Tiers.Active is CpuTier.Neon or CpuTier.NeonDot;
 #else
     public const bool Enabled = false;
 #endif

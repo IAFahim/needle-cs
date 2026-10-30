@@ -281,9 +281,7 @@ internal static unsafe class Quant
 #if NEEDLE_SIMD
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static Vector256<int> Accumulate(Vector256<int> sum, Vector256<byte> weights, Vector256<sbyte> activations) =>
-        AvxVnni.IsSupported
-            ? AvxVnni.MultiplyWideningAndAdd(sum, weights, activations)
-            : Avx2.Add(sum, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(weights, activations), Vector256.Create((short)1)));
+        Tiers.Accumulate(sum, weights, activations);
 #endif
 
     public static void MatMul(in Cq w, in Activations a, int tokens, float* y, int ldy) =>

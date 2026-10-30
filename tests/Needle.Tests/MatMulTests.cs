@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 using Xunit;
 
 namespace Needle.Tests;
@@ -185,5 +187,109 @@ public sealed unsafe class MatMulTests : IDisposable
     public void Dispose()
     {
         foreach (var p in allocations) NativeMemory.AlignedFree((void*)p);
+    }
+}
+
+public sealed unsafe class Int8DotTierTests
+{
+    [Fact]
+    public void TierNamesParse()
+    {
+        Assert.True(Tiers.TryParseTier("scalar", out var scalar) && scalar == CpuTier.Scalar);
+        Assert.True(Tiers.TryParseTier("avx2", out var avx2) && avx2 == CpuTier.Avx2);
+        Assert.True(Tiers.TryParseTier("avxvnni", out var vnni) && vnni == CpuTier.AvxVnni);
+        Assert.True(Tiers.TryParseTier("AvxVnniInt8", out var vnni8) && vnni8 == CpuTier.AvxVnniInt8);
+        Assert.True(Tiers.TryParseTier("avx512", out var bw) && bw == CpuTier.Avx512Bw);
+        Assert.True(Tiers.TryParseTier("avx512bw", out var bw2) && bw2 == CpuTier.Avx512Bw);
+        Assert.True(Tiers.TryParseTier("neon", out var neon) && neon == CpuTier.Neon);
+        Assert.True(Tiers.TryParseTier("neondot", out var neonDot) && neonDot == CpuTier.NeonDot);
+        Assert.False(Tiers.TryParseTier("zen4", out _));
+        Assert.False(Tiers.TryParseTier("", out _));
+        Assert.False(Tiers.TryParseTier(null, out _));
+    }
+
+    [Fact]
+    public void ExecutableDotsMatchScalar()
+    {
+        if (!Avx2.IsSupported) return;
+        var random = new Random(21);
+        var p0 = stackalloc byte[32];
+        var p1 = stackalloc byte[32];
+        var p2 = stackalloc byte[32];
+        var p3 = stackalloc byte[32];
+        var x0 = stackalloc sbyte[32];
+        var x1 = stackalloc sbyte[32];
+        var x2 = stackalloc sbyte[32];
+        var x3 = stackalloc sbyte[32];
+        for (var i = 0; i < 32; i++)
+        {
+            p0[i] = (byte)random.Next(127);
+            p1[i] = (byte)random.Next(127);
+            p2[i] = (byte)random.Next(127);
+            p3[i] = (byte)random.Next(127);
+            x0[i] = (sbyte)random.Next(-128, 128);
+            x1[i] = (sbyte)random.Next(-128, 128);
+            x2[i] = (sbyte)random.Next(-128, 128);
+            x3[i] = (sbyte)random.Next(-128, 128);
+        }
+        var expected = ScalarDot(p0, p1, p2, p3, x0, x1, x2, x3);
+        var weights = (Avx.LoadVector256(p0), Avx.LoadVector256(p1), Avx.LoadVector256(p2), Avx.LoadVector256(p3));
+        var activations = (Avx.LoadVector256(x0), Avx.LoadVector256(x1), Avx.LoadVector256(x2), Avx.LoadVector256(x3));
+        Assert.Equal(expected, Vector256.Sum(Avx2Dot.Dot(weights.Item1, weights.Item2, weights.Item3, weights.Item4, activations.Item1, activations.Item2, activations.Item3, activations.Item4)));
+        if (AvxVnni.IsSupported)
+            Assert.Equal(expected, Vector256.Sum(VnniDot.Dot(weights.Item1, weights.Item2, weights.Item3, weights.Item4, activations.Item1, activations.Item2, activations.Item3, activations.Item4)));
+        if (AvxVnniInt8.IsSupported)
+            Assert.Equal(expected, Vector256.Sum(VnniInt8Dot.Dot(weights.Item1, weights.Item2, weights.Item3, weights.Item4, activations.Item1, activations.Item2, activations.Item3, activations.Item4)));
+        if (Avx512F.IsSupported && Avx512BW.IsSupported && Vector512.IsHardwareAccelerated)
+            Assert.Equal(expected, Vector256.Sum(BwDot.Dot(weights.Item1, weights.Item2, weights.Item3, weights.Item4, activations.Item1, activations.Item2, activations.Item3, activations.Item4)));
+    }
+
+    [Fact]
+    public void VnniInt8FormulationMatchesUnsigned()
+    {
+        var levels = stackalloc float[16];
+        for (var i = 0; i < 16; i++) levels[i] = (i - 7.5f) * 0.4f;
+        var book = stackalloc Codebook[1];
+        Codebook.Fill(book, levels, 16);
+        for (var i = 0; i < 32; i++) Assert.InRange(book->Bytes[i], 0, 126);
+        var random = new Random(22);
+        for (var trial = 0; trial < 64; trial++)
+        {
+            var weight = (byte)random.Next(127);
+            var activation = (sbyte)random.Next(-128, 128);
+            Assert.Equal((int)weight * activation, (int)(sbyte)weight * activation);
+        }
+    }
+
+    [Fact]
+    public void Bw512FormulationMatchesScalar()
+    {
+        var random = new Random(23);
+        var weights = stackalloc byte[128];
+        var activations = stackalloc sbyte[128];
+        for (var i = 0; i < 128; i++)
+        {
+            weights[i] = (byte)random.Next(127);
+            activations[i] = (sbyte)random.Next(-128, 128);
+        }
+        var expected = 0;
+        for (var i = 0; i < 128; i++) expected += weights[i] * activations[i];
+        var low = stackalloc int[32];
+        var high = stackalloc int[32];
+        for (var j = 0; j < 32; j++)
+        {
+            low[j] = weights[2 * j] * activations[2 * j] + weights[2 * j + 1] * activations[2 * j + 1];
+            high[j] = weights[64 + 2 * j] * activations[64 + 2 * j] + weights[64 + 2 * j + 1] * activations[64 + 2 * j + 1];
+        }
+        var total = 0;
+        for (var k = 0; k < 16; k++) total += low[2 * k] + low[2 * k + 1] + high[2 * k] + high[2 * k + 1];
+        Assert.Equal(expected, total);
+    }
+
+    static int ScalarDot(byte* p0, byte* p1, byte* p2, byte* p3, sbyte* x0, sbyte* x1, sbyte* x2, sbyte* x3)
+    {
+        var sum = 0;
+        for (var i = 0; i < 32; i++) sum += p0[i] * x0[i] + p1[i] * x1[i] + p2[i] * x2[i] + p3[i] * x3[i];
+        return sum;
     }
 }
