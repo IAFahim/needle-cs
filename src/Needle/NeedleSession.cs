@@ -21,15 +21,19 @@ public sealed class NeedleOptions
     public float RefuseBelow { get; init; } = 0.1f;
     public int RetrievalTopK { get; init; } = 5;
     /// <summary>
-    /// Jump-forward over grammar-forced spans (issue #16). After each
-    /// committed token, the unique forced byte continuation is tokenized
-    /// canonically (no dummy prefix) and fed as one batched chunk instead of
-    /// one decode step per token. The text is identical, but canonical
-    /// tokenization can differ from the model's own split, so token boundaries
-    /// may differ. Forced tokens contribute probability 1 to
-    /// <see cref="CallResult.DecodeConfidence"/>, which raises the mean in
-    /// exp(mean log p) relative to per-token decoding. Off by default until
-    /// the W28 accuracy gate shows no regression.
+    /// Lossless jump-forward over token-forced steps (issue #16). After each
+    /// committed call token, every follow-up token the grammar+trie allow
+    /// uniquely (allowed-mask popcount == 1) joins the fed chunk instead of
+    /// costing a decode pass. Each jumped token is what per-token greedy
+    /// would emit (argmax over one candidate is forced), so the chunk is the
+    /// per-token greedy sequence itself: calls, reasoning, responses and
+    /// decode-token counts are byte-identical either way. Jumped tokens
+    /// contribute probability 1 to <see cref="CallResult.DecodeConfidence"/>.
+    /// Off by default: the W16 identity gate proves byte-identical output on
+    /// every SessionCases step and game prompt, but no singleton mask occurs
+    /// on the current grammar/vocab (BPE offers several tokenizations at
+    /// every structural position), so jumping stays dormant with zero pass
+    /// reduction. Revisit if the grammar or vocabulary changes.
     /// </summary>
     public bool JumpForward { get; init; }
 
@@ -116,15 +120,11 @@ public sealed unsafe partial class NeedleSession : IDisposable
     // (Engine.LogitsForRows) instead of the full-vocabulary head; §5.3 tunes
     // it around 256 (76% of call steps allow <= 256 tokens).
     const int SparseHeadThreshold = 256;
-    // Jump-forward (issue #16) collects at most this many forced bytes per
-    // span. Structural spans (call heads, name suffixes, argument openers)
-    // are tens of bytes; longer runs simply continue on later macro-steps.
-    const int MaxForcedBytes = 256;
-    // Canonical tokens for a forced span: each token covers at least one
-    // escaped byte and escaping expands a byte at most 3x (space to U+2581),
-    // so 3x bytes plus the committed pick always fits. Proven above, so the
-    // span encoder below can never overrun its span.
-    const int MaxJumpChunk = 3 * MaxForcedBytes + 9;
+    // Jump-forward (issue #16) batches at most this many call tokens per
+    // engine pass (the committed pick plus token-forced followers). Forced
+    // runs are structural spans of tens of tokens; longer runs simply
+    // continue on later macro-steps.
+    const int MaxJumpChunk = 512;
     const int InputOverheadBytes = 128;
     const int TokenizerInputBytes = 1 << 16;
     const int EmbedderContext = 512;
@@ -510,7 +510,6 @@ public sealed unsafe partial class NeedleSession : IDisposable
         var logProbability = 0.0;
         var steps = 0;
         var buffer = stackalloc byte[256];
-        var forced = stackalloc byte[MaxForcedBytes];
         var chunkIds = stackalloc int[MaxJumpChunk];
         callTextLength = 0;
         LastCallPasses = 0;
@@ -525,7 +524,14 @@ public sealed unsafe partial class NeedleSession : IDisposable
             if (allowed == 0) return Abandon(ReplyStatus.Failed, FailureReason.GrammarDeadEnd, progress);
             int pick;
             float probability;
-            if (full) pick = ArgMaxWithProbability(mask, out probability);
+            if (jump && allowed == 1)
+            {
+                // No choice to sample: per-token greedy must emit this token
+                // (argmax over one candidate), so no logits are consulted.
+                pick = SoleAllowed(mask, maskWords, sparseRows);
+                probability = 1f;
+            }
+            else if (full) pick = ArgMaxWithProbability(mask, out probability);
             else pick = ArgMaxSparse(scratchLogits, sparseRows, allowed, out probability);
             if (pick < 0) return Abandon(ReplyStatus.Failed, FailureReason.GrammarDeadEnd, progress);
             if (steps == 0 && progress.FirstTokenTicks == 0) progress.FirstTokenTicks = Stopwatch.GetTimestamp() - progress.Started;
@@ -537,33 +543,50 @@ public sealed unsafe partial class NeedleSession : IDisposable
                 if (!Grammar.Advance(grammar.Program, cursor, buffer[b])) return Abandon(ReplyStatus.Failed, FailureReason.GrammarRejectedToken, progress);
                 callText[callTextLength++] = buffer[b];
             }
-            // Jump-forward (issue #16): after the committed token, the forced
-            // byte continuation (if any) is tokenized canonically and fed as
-            // one chunk with the pick. Forced tokens enter the decode mean
-            // with probability 1, so only the pick adds to logProbability
-            // below; the bytes are identical either way. MaxCallTokens counts
-            // tokens, not passes.
-            chunkIds[0] = pick;
-            var chunkCount = 1;
-            if (jump && !Grammar.Complete(state))
-            {
-                var forcedCount = Grammar.ForcedBytes(grammar.Program, cursor, new Span<byte>(forced, MaxForcedBytes));
-                if (forcedCount > 0)
-                {
-                    if (callTextLength + forcedCount > callText.Length) return Abandon(ReplyStatus.Failed, FailureReason.CallTextTooLong, progress);
-                    var encoded = tokenizer.Encode(new ReadOnlySpan<byte>(forced, forcedCount), new Span<int>(chunkIds + 1, MaxJumpChunk - 1), leadingSpace: false);
-                    if (encoded <= 0 || encoded > MaxJumpChunk - 1) return Abandon(ReplyStatus.Failed, FailureReason.GrammarRejectedToken, progress);
-                    for (var b = 0; b < forcedCount; b++) callText[callTextLength++] = forced[b];
-                    if (steps + chunkCount + encoded > options.MaxCallTokens) return Abandon(ReplyStatus.Failed, FailureReason.CallTokenBudgetExceeded, progress);
-                    chunkCount += encoded;
-                    steps += encoded;
-                    progress.DecodeTokens += encoded;
-                }
-            }
             logProbability += Math.Log(Math.Max(probability, 1e-9));
             steps++;
             progress.DecodeTokens++;
             if (!budget.IsUnlimited && FrameBudgetHit(progress, budget)) return Abandon(ReplyStatus.Failed, FailureReason.FrameBudgetExceeded, progress);
+            // Jump-forward (issue #16): while the grammar+trie allow exactly
+            // one token, per-token greedy would emit that token, so it joins
+            // the chunk instead of costing a decode pass. Each forced token
+            // enters the decode mean with probability 1 and counts toward
+            // MaxCallTokens exactly as a per-token step would. The chunk is
+            // the per-token greedy sequence itself: no canonical
+            // re-tokenization of byte spans, so free choices downstream see
+            // the identical token history.
+            chunkIds[0] = pick;
+            var chunkCount = 1;
+            var maskFresh = false;
+            if (jump && !Grammar.Complete(state))
+            {
+                while (chunkCount < MaxJumpChunk && !Grammar.Complete(state))
+                {
+                    if (CancelRequested) return Abandon(ReplyStatus.Cancelled, FailureReason.None, progress);
+                    if (steps >= options.MaxCallTokens) return Abandon(ReplyStatus.Failed, FailureReason.CallTokenBudgetExceeded, progress);
+                    // The next mask depends only on the committed tokens, so
+                    // it is current before the forward pass either way.
+                    trie.Allow(grammar.Program, state, mask);
+                    maskFresh = true;
+                    allowed = MaskCount(mask, maskWords);
+                    if (allowed != 1) break;
+                    var forced = SoleAllowed(mask, maskWords, sparseRows);
+                    var forcedLength = tokenizer.ConstraintBytes(forced, buffer);
+                    // A zero-byte sole token advances nothing; leave it for
+                    // the next macro-step to mirror per-token accounting.
+                    if (forcedLength <= 0) break;
+                    if (callTextLength + forcedLength > callText.Length) return Abandon(ReplyStatus.Failed, FailureReason.CallTextTooLong, progress);
+                    for (var b = 0; b < forcedLength; b++)
+                    {
+                        if (!Grammar.Advance(grammar.Program, cursor, buffer[b])) return Abandon(ReplyStatus.Failed, FailureReason.GrammarRejectedToken, progress);
+                        callText[callTextLength++] = buffer[b];
+                    }
+                    chunkIds[chunkCount++] = forced;
+                    steps++;
+                    progress.DecodeTokens++;
+                    if (!budget.IsUnlimited && FrameBudgetHit(progress, budget)) return Abandon(ReplyStatus.Failed, FailureReason.FrameBudgetExceeded, progress);
+                }
+            }
             if (jump && chunkCount > 1 && CancelRequested) return Abandon(ReplyStatus.Cancelled, FailureReason.None, progress);
             var chunk = new ReadOnlySpan<int>(chunkIds, chunkCount);
             if (Grammar.Complete(state))
@@ -571,11 +594,14 @@ public sealed unsafe partial class NeedleSession : IDisposable
                 if (!FeedCallChunk(chunk, computeLogits: false)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
                 break;
             }
-            // The next mask depends only on the chosen token, so compute it
+            // The next mask depends only on the chosen tokens, so compute it
             // before the forward pass (serial precompute; true overlap needs
             // pool support owned by the engine scheduler).
-            trie.Allow(grammar.Program, state, mask);
-            allowed = MaskCount(mask, maskWords);
+            if (!maskFresh)
+            {
+                trie.Allow(grammar.Program, state, mask);
+                allowed = MaskCount(mask, maskWords);
+            }
             if (allowed == 0) return Abandon(ReplyStatus.Failed, FailureReason.GrammarDeadEnd, progress);
             if (allowed <= SparseHeadThreshold)
             {
@@ -593,10 +619,9 @@ public sealed unsafe partial class NeedleSession : IDisposable
         if (!FeedCallChunk(callClosing, computeLogits: false)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
 
         var head = HeadProbability();
-        // Forced tokens jumped over above contribute probability 1, so the
-        // mean below mixes model probabilities (choice points) with ones
-        // (forced spans); this raises decode confidence relative to
-        // per-token decoding and is kept consistent with the W29 findings.
+        // Jumped forced tokens contribute probability 1, so the mean below
+        // mixes model probabilities (choice points) with ones (forced steps);
+        // with no forced steps this equals per-token decoding exactly.
         var decode = Math.Exp(logProbability / Math.Max(1, steps));
         var confidence = (float)Math.Min(head, decode);
         if (!CallRestorer.TryRestore(allTools.Aliases, new ReadOnlySpan<byte>(callText, 0, callTextLength), calls, keyScratch, callSpans, out var required, out restoredCallCount))
@@ -619,7 +644,6 @@ public sealed unsafe partial class NeedleSession : IDisposable
         var logProbability = 0.0;
         var steps = 0;
         var buffer = stackalloc byte[256];
-        var forced = stackalloc byte[MaxForcedBytes];
         var chunkIds = stackalloc int[MaxJumpChunk];
         var stored = 0;
         LastCallPasses = 0;
@@ -634,7 +658,14 @@ public sealed unsafe partial class NeedleSession : IDisposable
             if (allowed == 0) return Abandon(ReplyStatus.Failed, FailureReason.GrammarDeadEnd, progress);
             int pick;
             float probability;
-            if (full) pick = ArgMaxWithProbability(mask, out probability);
+            if (jump && allowed == 1)
+            {
+                // No choice to sample: per-token greedy must emit this token
+                // (argmax over one candidate), so no logits are consulted.
+                pick = SoleAllowed(mask, maskWords, sparseRows);
+                probability = 1f;
+            }
+            else if (full) pick = ArgMaxWithProbability(mask, out probability);
             else pick = ArgMaxSparse(scratchLogits, sparseRows, allowed, out probability);
             if (pick < 0) return Abandon(ReplyStatus.Failed, FailureReason.GrammarDeadEnd, progress);
             if (steps == 0 && progress.FirstTokenTicks == 0) progress.FirstTokenTicks = Stopwatch.GetTimestamp() - progress.Started;
@@ -645,31 +676,42 @@ public sealed unsafe partial class NeedleSession : IDisposable
                 if (!Grammar.Advance(grammar.Program, cursor, buffer[b], ref sink)) return Abandon(ReplyStatus.Failed, FailureReason.GrammarRejectedToken, progress);
                 if (sink.TryTakeCall(out var call) && stored < commands.Length) commands[stored++] = call;
             }
-            // Jump-forward (issue #16): same chunking as GenerateCalls. The
-            // sink overload of ForcedBytes fires every tool, property and
-            // value event in byte order, so the sink observes the identical
-            // sequence as per-byte decoding; completed calls are drained
-            // below before the chunk is fed.
-            chunkIds[0] = pick;
-            var chunkCount = 1;
-            if (jump && !Grammar.Complete(state))
-            {
-                var forcedCount = Grammar.ForcedBytes(grammar.Program, cursor, new Span<byte>(forced, MaxForcedBytes), ref sink);
-                if (forcedCount > 0)
-                {
-                    var encoded = tokenizer.Encode(new ReadOnlySpan<byte>(forced, forcedCount), new Span<int>(chunkIds + 1, MaxJumpChunk - 1), leadingSpace: false);
-                    if (encoded <= 0 || encoded > MaxJumpChunk - 1) return Abandon(ReplyStatus.Failed, FailureReason.GrammarRejectedToken, progress);
-                    if (steps + chunkCount + encoded > options.MaxCallTokens) return Abandon(ReplyStatus.Failed, FailureReason.CallTokenBudgetExceeded, progress);
-                    chunkCount += encoded;
-                    steps += encoded;
-                    progress.DecodeTokens += encoded;
-                    while (sink.TryTakeCall(out var forcedCall))
-                        if (stored < commands.Length) commands[stored++] = forcedCall;
-                }
-            }
             logProbability += Math.Log(Math.Max(probability, 1e-9));
             steps++;
             progress.DecodeTokens++;
+            // Jump-forward (issue #16): same token-forced extension as
+            // GenerateCalls. Each forced token advances through the sink
+            // overload, so the sink observes the identical event sequence as
+            // per-token decoding; completed calls are drained per token
+            // below before the chunk is fed.
+            chunkIds[0] = pick;
+            var chunkCount = 1;
+            var maskFresh = false;
+            if (jump && !Grammar.Complete(state))
+            {
+                while (chunkCount < MaxJumpChunk && !Grammar.Complete(state))
+                {
+                    if (CancelRequested) return Abandon(ReplyStatus.Cancelled, FailureReason.None, progress);
+                    if (steps >= options.MaxCallTokens) return Abandon(ReplyStatus.Failed, FailureReason.CallTokenBudgetExceeded, progress);
+                    trie.Allow(grammar.Program, state, mask);
+                    maskFresh = true;
+                    allowed = MaskCount(mask, maskWords);
+                    if (allowed != 1) break;
+                    var forced = SoleAllowed(mask, maskWords, sparseRows);
+                    var forcedLength = tokenizer.ConstraintBytes(forced, buffer);
+                    // A zero-byte sole token advances nothing; leave it for
+                    // the next macro-step to mirror per-token accounting.
+                    if (forcedLength <= 0) break;
+                    for (var b = 0; b < forcedLength; b++)
+                    {
+                        if (!Grammar.Advance(grammar.Program, cursor, buffer[b], ref sink)) return Abandon(ReplyStatus.Failed, FailureReason.GrammarRejectedToken, progress);
+                        if (sink.TryTakeCall(out var forcedCall) && stored < commands.Length) commands[stored++] = forcedCall;
+                    }
+                    chunkIds[chunkCount++] = forced;
+                    steps++;
+                    progress.DecodeTokens++;
+                }
+            }
             if (jump && chunkCount > 1 && CancelRequested) return Abandon(ReplyStatus.Cancelled, FailureReason.None, progress);
             var chunk = new ReadOnlySpan<int>(chunkIds, chunkCount);
             if (Grammar.Complete(state))
@@ -677,11 +719,14 @@ public sealed unsafe partial class NeedleSession : IDisposable
                 if (!FeedCallChunk(chunk, computeLogits: false)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
                 break;
             }
-            // The next mask depends only on the chosen token, so compute it
+            // The next mask depends only on the chosen tokens, so compute it
             // before the forward pass (serial precompute; true overlap needs
             // pool support owned by the engine scheduler).
-            trie.Allow(grammar.Program, state, mask);
-            allowed = MaskCount(mask, maskWords);
+            if (!maskFresh)
+            {
+                trie.Allow(grammar.Program, state, mask);
+                allowed = MaskCount(mask, maskWords);
+            }
             if (allowed == 0) return Abandon(ReplyStatus.Failed, FailureReason.GrammarDeadEnd, progress);
             if (allowed <= SparseHeadThreshold)
             {
@@ -699,7 +744,7 @@ public sealed unsafe partial class NeedleSession : IDisposable
         if (!FeedCallChunk(callClosing, computeLogits: false)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
 
         var head = HeadProbability();
-        // Forced tokens jumped over above contribute probability 1, matching
+        // Jumped forced tokens contribute probability 1, matching
         // GenerateCalls; see the note on the decode mean there.
         var decode = Math.Exp(logProbability / Math.Max(1, steps));
         var confidence = (float)Math.Min(head, decode);
@@ -822,6 +867,16 @@ public sealed unsafe partial class NeedleSession : IDisposable
             }
         }
         return count;
+    }
+
+    // Returns the single allowed token id; callers guarantee popcount == 1.
+    // Jump-forward (issue #16) uses this for token-forced steps: argmax over
+    // one candidate is forced, so per-token greedy must emit this token.
+    // `scratch` needs room for two ids (SparseHeadThreshold always qualifies).
+    static int SoleAllowed(uint* mask, int words, int* scratch)
+    {
+        ExtractIds(mask, words, scratch, 2);
+        return scratch[0];
     }
 
     // Argmax over a sparse head output: `values[0..count)` aligns with `rows`.
