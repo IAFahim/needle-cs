@@ -9,9 +9,5 @@
   "precompiledReferences": ["Needle.Inference.dll"],
   "autoReferenced": true,
   "defineConstraints": [],
-  "versionDefines": [
-    { "name": "com.unity.burst", "expression": "1.8.0", "define": "NEEDLE_BURST" },
-    { "name": "com.unity.entities", "expression": "1.0.0", "define": "NEEDLE_ENTITIES" }
-  ],
   "noEngineReferences": false
 }
