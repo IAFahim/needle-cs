@@ -1,9 +1,13 @@
 {
   "name": "com.needle.inference",
   "displayName": "Needle Inference",
-  "version": "0.1.0",
-  "unity": "2022.3",
-  "description": "On-device Needle 3 tool calling and Whistle speech-to-text, allocation-free after load. Kernels are plain pointer functions that Burst jobs can call.",
+  "version": "0.2.0",
+  "unity": "7000.0",
+  "description": "On-device Needle 3 tool calling and Whistle speech-to-text, allocation-free after load. Burst ISystem pumps an unmanaged request/reply channel; typed NPC commands come from the W10 source generator.",
   "keywords": ["inference", "burst", "ecs", "speech", "tool-calling"],
-  "dependencies": {}
+  "dependencies": {
+    "com.unity.burst": "1.8.31",
+    "com.unity.collections": "2.7.1",
+    "com.unity.entities": "1.5.0"
+  }
 }

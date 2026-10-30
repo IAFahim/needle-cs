@@ -270,7 +270,14 @@ public readonly unsafe struct NeedleChannel
 
     public bool TrySubmit(in ChannelRequest request, out ulong ticket)
     {
-        if (request.Utf8Length > ChannelLimits.QueryCapacity)
+        if (!TryEnqueueSilent(in request, out ticket)) return false;
+        SignalWake();
+        return true;
+    }
+
+    public bool TryEnqueueSilent(in ChannelRequest request, out ulong ticket)
+    {
+        if (request.Utf8Length < 0 || request.Utf8Length > ChannelLimits.QueryCapacity)
         {
             ticket = 0;
             return false;
@@ -281,9 +288,26 @@ public readonly unsafe struct NeedleChannel
             return false;
         }
         ticket = (ulong)position;
-        SignalWake();
         return true;
     }
+
+    public bool TrySubmitSilent(byte* utf8, int length, ChannelRequestKind kind, out ulong ticket)
+    {
+        if (length < 0 || length > ChannelLimits.QueryCapacity)
+        {
+            ticket = 0;
+            return false;
+        }
+        ChannelRequest request = default;
+        request.Kind = kind;
+        request.Utf8Length = length;
+        for (var i = 0; i < length; i++) request.Utf8[i] = utf8[i];
+        return TryEnqueueSilent(in request, out ticket);
+    }
+
+    public void Wake() => SignalWake();
+
+    public nint Identity => (nint)block;
 
     internal bool TryClaim(out ChannelRequest request, out ulong ticket)
     {

@@ -22,6 +22,7 @@ public sealed unsafe class NeedleHost : IDisposable
     NeedleSession? session;
     Thread? worker;
     NeedleChannel channel;
+    Runner runner = null!;
     byte* scratch;
     GCHandle self;
     long runningTicket = -1;
@@ -29,12 +30,22 @@ public sealed unsafe class NeedleHost : IDisposable
     int disposed;
     int stopping;
 
-    public NeedleChannel Start(in HostOptions options)
+    delegate Reply Runner(ref ChannelRequest request);
+
+    public NeedleChannel Start(in HostOptions options) => StartCore(in options, Run);
+
+    public NeedleChannel StartTyped<TSink, TCommand>(in HostOptions options)
+        where TSink : struct, Tools.ICallSink<TCommand>
+        where TCommand : unmanaged =>
+        StartCore(in options, RunTyped<TSink, TCommand>);
+
+    NeedleChannel StartCore(in HostOptions options, Runner run)
     {
         if (Interlocked.Exchange(ref started, 1) != 0 || Volatile.Read(ref disposed) != 0)
             throw new InvalidOperationException("NeedleHost was already started");
         try
         {
+            runner = run;
             var sessionOptions = options.Session ?? new NeedleOptions();
             policy = sessionOptions.ResolvedThreading;
             model = Model.Open(options.ModelPath);
@@ -80,7 +91,7 @@ public sealed unsafe class NeedleHost : IDisposable
         Volatile.Write(ref runningTicket, (long)ticket);
         ChannelReply reply = default;
         reply.Ticket = ticket;
-        reply.Reply = channel.IsCancelled(ticket) ? CancelledReply() : Run(ref request);
+        reply.Reply = channel.IsCancelled(ticket) ? CancelledReply() : runner(ref request);
         Volatile.Write(ref runningTicket, -1);
         new ReadOnlySpan<byte>(scratch, reply.Reply.Utf8Length)
             .CopyTo(Utf8.AsSpan(ref reply.Calls, reply.Reply.Utf8Length));
@@ -108,6 +119,26 @@ public sealed unsafe class NeedleHost : IDisposable
         return request.Kind == ChannelRequestKind.ToolResult
             ? session!.CompleteWithToolResult(payload, calls, reasoning, response)
             : session!.Complete(payload, calls, reasoning, response);
+    }
+
+    Reply RunTyped<TSink, TCommand>(ref ChannelRequest request)
+        where TSink : struct, Tools.ICallSink<TCommand>
+        where TCommand : unmanaged
+    {
+        var queryLength = Math.Min(request.Utf8Length, ChannelLimits.QueryCapacity);
+        var payload = Utf8.AsSpan(ref request.Utf8, queryLength);
+        var capacity = Math.Max(1, ChannelLimits.CallsCapacity / sizeof(TCommand));
+        var commands = new Span<TCommand>(scratch, capacity);
+        var reasoning = new Span<byte>(scratch + ChannelLimits.CallsCapacity, ChannelLimits.TextCapacity);
+        var response = new Span<byte>(scratch + ChannelLimits.CallsCapacity + ChannelLimits.TextCapacity, ChannelLimits.TextCapacity);
+        var sink = new TSink();
+        var reply = request.Kind == ChannelRequestKind.ToolResult
+            ? session!.CompleteWithToolResult(payload, commands, reasoning, response, ref sink)
+            : session!.Complete(payload, commands, reasoning, response, ref sink);
+        var stored = Math.Min(reply.CallCount, capacity);
+        return new Reply(reply.Status, reply.Failure, reply.Flags, reply.Confidence, reply.HeadConfidence,
+            reply.DecodeConfidence, stored, stored * sizeof(TCommand), reply.ReasoningLength, reply.ResponseLength,
+            reply.PromptTokens, reply.DecodeTokens, reply.PrefillTicks, reply.FirstTokenTicks, reply.ElapsedTicks);
     }
 
     static Reply CancelledReply() => new(
