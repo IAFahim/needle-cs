@@ -16,6 +16,7 @@ LOCK = ROOT / "tools/ref.lock"
 HEADER = "<48If"
 RECORD = "<BBHIIIIQQII"
 FP16, FP32, CQ, RAW = 1, 2, 3, 4
+END_OF_TEXT, IM_END = 1, 5
 DECODE_BUDGET = 40
 GROUP = 128
 M32 = 0xFFFFFFFF
@@ -377,7 +378,7 @@ def main():
         generated = []
         for _ in range(budget):
             nxt = int(model.forward(np.array(seq))[0].argmax())
-            if nxt == 1:
+            if nxt in (END_OF_TEXT, IM_END):
                 break
             seq.append(nxt)
             generated.append(nxt)
