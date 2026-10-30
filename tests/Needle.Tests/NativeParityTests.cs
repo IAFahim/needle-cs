@@ -249,20 +249,45 @@ public sealed class NativeParityTests : IDisposable
         T Proc<T>(string name) where T : Delegate =>
             Marshal.GetDelegateForFunctionPointer<T>(NativeLibrary.GetExport(handle, name));
 
+        // The upstream wheel only ships a manylinux x86-64 build, so on
+        // Windows, macOS, or arm64 there is deliberately nothing loadable and
+        // the parity tests skip via Ready(). TryLoad must therefore never
+        // throw for a platform-mismatched library (CI evidence: DllNotFound on
+        // macos-arm64/linux-arm64, BadImageFormat on windows-x64); only a
+        // genuinely broken linux-x64 setup should still surface.
+        static string NativeLibraryName() =>
+            RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "needle3.dll"
+            : RuntimeInformation.IsOSPlatform(OSPlatform.OSX) ? "libneedle3.dylib"
+            : "libneedle3.so";
+
         public static NativeEngine? TryLoad(string root)
         {
+            try
+            {
+                return Load(root);
+            }
+            catch (Exception ex) when (ex is DllNotFoundException or BadImageFormatException)
+            {
+                return null;
+            }
+        }
+
+        static NativeEngine? Load(string root)
+        {
+            var name = NativeLibraryName();
             var wheelDir = Path.Combine(root, "ref/hf/wheel");
-            string? library = File.Exists(Path.Combine(wheelDir, "libneedle3.so")) ? Path.Combine(wheelDir, "libneedle3.so") : null;
+            string? library = File.Exists(Path.Combine(wheelDir, name)) ? Path.Combine(wheelDir, name) : null;
             if (library == null)
             {
                 var wheel = Directory.Exists(wheelDir) ? Directory.GetFiles(wheelDir, "*.whl").FirstOrDefault() : null;
                 if (wheel == null) return null;
-                var target = Path.Combine(Path.GetTempPath(), "needle-cs-native", "libneedle3.so");
+                using var archive = ZipFile.OpenRead(wheel);
+                var entry = archive.Entries.FirstOrDefault(e => e.Name == name);
+                if (entry == null) return null;
+                var target = Path.Combine(Path.GetTempPath(), "needle-cs-native", name);
                 if (!File.Exists(target))
                 {
                     Directory.CreateDirectory(Path.GetDirectoryName(target)!);
-                    using var archive = ZipFile.OpenRead(wheel);
-                    var entry = archive.Entries.First(e => e.Name == "libneedle3.so");
                     entry.ExtractToFile(target);
                 }
                 library = target;

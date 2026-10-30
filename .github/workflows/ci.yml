@@ -92,6 +92,17 @@ jobs:
     runs-on: ${{ matrix.os }}
     continue-on-error: ${{ matrix.expected-fail }}
     timeout-minutes: 45
+    # Per-job policy for issue #32 (never a blanket flag). The linux legs are
+    # required-green: linux-x64 is the primary gate (suite + NEEDLE_SCALAR=1
+    # rerun + netstandard2.1 + NativeAOT publish/smoke) and linux-arm64 covers
+    # NeonTests natively plus the NEON widening fallback tier (NEEDLE_NODP=1).
+    # windows-x64 and macos-arm64 keep expected-fail until a re-run proves
+    # them green; their known failures are classified, not waived:
+    #  - native parity skips where the upstream wheel has no usable library
+    #    (wheel is manylinux x86-64 only; NativeParityTests.TryLoad returns
+    #    null and each test skips with a message instead of throwing);
+    #  - remaining red is engine/voice numerics under investigation in #32
+    #    (whisper transcripts, confidence head, whistle stage goldens).
     strategy:
       fail-fast: false
       matrix:

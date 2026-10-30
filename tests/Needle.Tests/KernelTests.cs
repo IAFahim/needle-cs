@@ -31,9 +31,14 @@ public sealed unsafe class KernelTests
         Assert.Equal(127, Math.Round(Math.Abs(x[0]) / scale));
     }
 
+    // Ops.Exp(Vector256) is the x86 AVX/FMA path (mirrors Neon.Exp on ARM,
+    // covered by NeonTests.ExpMatchesMathF). It faults on platforms without
+    // AVX, so gate on the same predicate the engine uses (CI evidence: run
+    // 41030471519 linux-arm64/macos-arm64 PlatformNotSupportedException).
     [Fact]
     public void ExpMatchesLibmWithinSingleRounding()
     {
+        if (!Simd.UseAvx) return;
         var input = stackalloc float[8];
         for (var i = 0; i < 8; i++) input[i] = -9f + 2.7f * i;
         var exp = Ops.Exp(System.Runtime.Intrinsics.X86.Avx.LoadVector256(input));

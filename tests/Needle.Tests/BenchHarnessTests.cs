@@ -34,7 +34,11 @@ public sealed class BenchHarnessTests : IDisposable
         Assert.Equal(BenchPrompts.Golden.Length, set.Prompts.Count);
         Assert.True(set.PrefixTokens > 0);
         Assert.True(set.SessionCtorMs > 0);
-        Assert.True(set.SessionCtorPrivateBytes > 0);
+        // Process.PrivateMemorySize64 reports 0 on macOS, so the ctor delta
+        // stays 0 there no matter how often we retry (CI evidence: run
+        // 41030471519 macos-arm64). Keep the signal where the OS provides it.
+        if (OperatingSystem.IsMacOS()) Assert.True(set.SessionCtorPrivateBytes >= 0);
+        else Assert.True(set.SessionCtorPrivateBytes > 0);
         foreach (var prompt in set.Prompts)
         {
             Assert.Equal(0, prompt.Failures);
