@@ -30,7 +30,7 @@ static int Usage()
     Console.Error.WriteLine("needle bench <needle3.cact> [--threads 4] [--json]");
     Console.Error.WriteLine("needle bench-e2e <needle3.cact> <tools.json> [--threads 1,2,4] [--reps N] [--sets golden|game|all] [--profile] [--json] [--max-managed-bytes N] [--max-native-allocs N]");
     Console.Error.WriteLine(Eval.Usage);
-    Console.Error.WriteLine("needle call <needle3.cact> <tools.json> <query>... ('tool:<json>' feeds a tool result)");
+    Console.Error.WriteLine("needle call <needle3.cact> <tools.json> [--no-date] [--no-retrieval] <query>... ('tool:<json>' feeds a tool result)");
     Console.Error.WriteLine("needle transcribe <whistle.cact> <clip.wav> [--language xx] [--words] [--keywords a,b] [--repeat n]");
     Console.Error.WriteLine("needle stream <whistle.cact> <clip.wav>");
     Console.Error.WriteLine("needle voice <needle3.cact> <whistle.cact> <tools.json> <clip.wav>");
@@ -115,13 +115,16 @@ static void CompareLayer(int layer, ReadOnlySpan<float> stream, string goldenDir
     Console.WriteLine($"layer {layer,2}: cosine={dot / Math.Sqrt(na * nb):F6} maxAbs={worst:F4} rms={Math.Sqrt(nb / (tokens * lanes * 768)):F3}");
 }
 
-static int Call(string modelPath, string toolsPath, string[] queries)
+static int Call(string modelPath, string toolsPath, string[] rest)
 {
     var threads = int.Parse(Environment.GetEnvironmentVariable("NEEDLE_THREADS") ?? Math.Clamp(Environment.ProcessorCount / 2, 1, 8).ToString());
     var system = Environment.GetEnvironmentVariable("NEEDLE_SYSTEM");
+    var autoDate = !rest.Contains("--no-date");
+    var topK = rest.Contains("--no-retrieval") ? int.MaxValue : 5;
+    var queries = rest.Where(q => q != "--no-date" && q != "--no-retrieval").ToArray();
     using var model = Model.Open(modelPath);
     var started = Stopwatch.GetTimestamp();
-    using var session = new NeedleSession(model, File.ReadAllText(toolsPath), new NeedleOptions { Threads = threads, System = system });
+    using var session = new NeedleSession(model, File.ReadAllText(toolsPath), new NeedleOptions { Threads = threads, System = system, AutoDate = autoDate, RetrievalTopK = topK });
     Console.Error.WriteLine($"ready in {(Stopwatch.GetTimestamp() - started) * 1000.0 / Stopwatch.Frequency:F1} ms, prefix {session.ContextUsed} tokens");
     foreach (var query in queries)
     {

@@ -205,11 +205,10 @@ public sealed unsafe partial class NeedleSession : IDisposable
         callSpans = new CallSpan[Math.Max(1, this.options.MaxCallTokens)];
         keyScratch = new byte[Math.Max(MinKeyScratchBytes, allTools.Aliases.LongestPropertyAlias + 2)];
         retrieval = allTools.Tools.Count > this.options.RetrievalTopK && model.Confidence != null;
-        var topK = Math.Max(0, this.options.RetrievalTopK);
         toolEmbeddings = retrieval ? new float[allTools.Tools.Count * embeddingWidth] : Array.Empty<float>();
         toolScores = retrieval ? new float[allTools.Tools.Count] : Array.Empty<float>();
-        chosenTools = new int[topK];
-        activeTools = new int[topK];
+        chosenTools = retrieval ? new int[Math.Max(0, this.options.RetrievalTopK)] : Array.Empty<int>();
+        activeTools = retrieval ? new int[Math.Max(0, this.options.RetrievalTopK)] : Array.Empty<int>();
         active = allTools;
         grammar = precompiled != null ? new Grammar(precompiled) : new Grammar(active.Tools);
         try
