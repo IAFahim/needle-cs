@@ -49,6 +49,7 @@ internal static unsafe class Ops
 #endif
         if (!Simd.Enabled) { Scalar.Silu(x, n); return; }
 #if NEEDLE_SIMD
+        if (Tiers.Active == CpuTier.Avx512Bw) { OpsAvx512.Silu(x, n); return; }
         for (var i = 0; i < n; i += 8)
         {
             var v = Avx.LoadVector256(x + i);
@@ -64,6 +65,7 @@ internal static unsafe class Ops
 #endif
         if (!Simd.Enabled) { Scalar.MultiplyBySigmoid(x, gate, n); return; }
 #if NEEDLE_SIMD
+        if (Tiers.Active == CpuTier.Avx512Bw) { OpsAvx512.MultiplyBySigmoid(x, gate, n); return; }
         for (var i = 0; i < n; i += 8)
             Avx.Store(x + i, Avx.Multiply(Avx.LoadVector256(x + i), Sigmoid(Avx.LoadVector256(gate + i))));
 #endif
@@ -76,6 +78,7 @@ internal static unsafe class Ops
 #endif
         if (!Simd.Enabled) return Scalar.SumOfSquares(x, n);
 #if NEEDLE_SIMD
+        if (Tiers.Active == CpuTier.Avx512Bw) return OpsAvx512.SumOfSquares(x, n);
         var s0 = Vector256<float>.Zero;
         var s1 = Vector256<float>.Zero;
         for (var i = 0; i < n; i += 16)
@@ -96,6 +99,7 @@ internal static unsafe class Ops
 #endif
         if (!Simd.Enabled) return Scalar.Dot(a, b, n);
 #if NEEDLE_SIMD
+        if (Tiers.Active == CpuTier.Avx512Bw) return OpsAvx512.Dot(a, b, n);
         var s0 = Vector256<float>.Zero;
         var s1 = Vector256<float>.Zero;
         for (var i = 0; i < n; i += 16)
@@ -116,6 +120,7 @@ internal static unsafe class Ops
 #endif
         if (!Simd.Enabled) { var scalarInverse = InverseRms(x, n); for (var i = 0; i < n; i++) destination[i] = x[i] * scalarInverse; return; }
 #if NEEDLE_SIMD
+        if (Tiers.Active == CpuTier.Avx512Bw) { OpsAvx512.RmsUnit(x, n, destination); return; }
         var inverse = Vector256.Create(InverseRms(x, n));
         for (var i = 0; i < n; i += 8) Avx.Store(destination + i, Avx.Multiply(Avx.LoadVector256(x + i), inverse));
 #endif
@@ -128,6 +133,7 @@ internal static unsafe class Ops
 #endif
         if (!Simd.Enabled) { var scalarInverse = InverseRms(x, n); for (var i = 0; i < n; i++) destination[i] = (1f + scale[i]) * x[i] * scalarInverse; return; }
 #if NEEDLE_SIMD
+        if (Tiers.Active == CpuTier.Avx512Bw) { OpsAvx512.ZeroCenteredRms(x, scale, n, destination); return; }
         var inverse = Vector256.Create(InverseRms(x, n));
         var one = Vector256.Create(1f);
         for (var i = 0; i < n; i += 8)
@@ -142,6 +148,7 @@ internal static unsafe class Ops
 #endif
         if (!Simd.Enabled) { Scalar.Softmax(s, n); return; }
 #if NEEDLE_SIMD
+        if (Tiers.Active == CpuTier.Avx512Bw) { OpsAvx512.Softmax(s, n); return; }
         var peak = float.NegativeInfinity;
         for (var i = 0; i < n; i++) peak = MathF.Max(peak, s[i]);
         var shift = Vector256.Create(peak);
@@ -198,6 +205,7 @@ internal static unsafe class Ops
 #endif
         if (!Simd.Enabled) { Scalar.Mix4(s, dim, w0, w1, w2, w3, destination); return; }
 #if NEEDLE_SIMD
+        if (Tiers.Active == CpuTier.Avx512Bw) { OpsAvx512.Mix4(s, dim, w0, w1, w2, w3, destination); return; }
         var v0 = Vector256.Create(w0);
         var v1 = Vector256.Create(w1);
         var v2 = Vector256.Create(w2);
@@ -220,6 +228,7 @@ internal static unsafe class Ops
 #endif
         if (!Simd.Enabled) { Scalar.Combine4(s, dim, w0, w1, w2, w3, y, post, destination); return; }
 #if NEEDLE_SIMD
+        if (Tiers.Active == CpuTier.Avx512Bw) { OpsAvx512.Combine4(s, dim, w0, w1, w2, w3, y, post, destination); return; }
         var v0 = Vector256.Create(w0);
         var v1 = Vector256.Create(w1);
         var v2 = Vector256.Create(w2);
@@ -244,6 +253,7 @@ internal static unsafe class Ops
 #endif
         if (!Simd.Enabled) { Scalar.Subtract(a, b, n, destination); return; }
 #if NEEDLE_SIMD
+        if (Tiers.Active == CpuTier.Avx512Bw) { OpsAvx512.Subtract(a, b, n, destination); return; }
         for (var i = 0; i < n; i += 8) Avx.Store(destination + i, Avx.Subtract(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
 #endif
     }
@@ -255,6 +265,7 @@ internal static unsafe class Ops
 #endif
         if (!Simd.Enabled) { Scalar.MultiplyAccumulate(destination, a, b, n); return; }
 #if NEEDLE_SIMD
+        if (Tiers.Active == CpuTier.Avx512Bw) { OpsAvx512.MultiplyAccumulate(destination, a, b, n); return; }
         for (var i = 0; i < n; i += 8)
             Avx.Store(destination + i, Fma.MultiplyAdd(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i), Avx.LoadVector256(destination + i)));
 #endif
@@ -267,6 +278,7 @@ internal static unsafe class Ops
 #endif
         if (!Simd.Enabled) { Scalar.ScaleAdd(destination, scale, x, xScale, n); return; }
 #if NEEDLE_SIMD
+        if (Tiers.Active == CpuTier.Avx512Bw) { OpsAvx512.ScaleAdd(destination, scale, x, xScale, n); return; }
         var s = Vector256.Create(scale);
         var xs = Vector256.Create(xScale);
         for (var i = 0; i < n; i += 8) Avx.Store(destination + i, Fma.MultiplyAdd(xs, Avx.LoadVector256(x + i), Avx.Multiply(s, Avx.LoadVector256(destination + i))));
@@ -280,6 +292,7 @@ internal static unsafe class Ops
 #endif
         if (!Simd.Enabled) { Scalar.AddScaled(destination, x, scale, n); return; }
 #if NEEDLE_SIMD
+        if (Tiers.Active == CpuTier.Avx512Bw) { OpsAvx512.AddScaled(destination, x, scale, n); return; }
         var s = Vector256.Create(scale);
         for (var i = 0; i < n; i += 8) Avx.Store(destination + i, Fma.MultiplyAdd(s, Avx.LoadVector256(x + i), Avx.LoadVector256(destination + i)));
 #endif
@@ -297,6 +310,7 @@ internal static unsafe class Ops
 #endif
         if (!Simd.Enabled) { Scalar.Glu(value, gate, destination, n); return; }
 #if NEEDLE_SIMD
+        if (Tiers.Active == CpuTier.Avx512Bw) { OpsAvx512.Glu(value, gate, destination, n); return; }
         for (var i = 0; i < n; i += 8)
             Avx.Store(destination + i, Avx.Multiply(Avx.LoadVector256(value + i), Sigmoid(Avx.LoadVector256(gate + i))));
 #endif
@@ -309,6 +323,7 @@ internal static unsafe class Ops
 #endif
         if (!Simd.Enabled) { Scalar.Taps3(taps, width, current, destination); return; }
 #if NEEDLE_SIMD
+        if (Tiers.Active == CpuTier.Avx512Bw) { OpsAvx512.Taps3(taps, width, current, destination); return; }
         for (var c = 0; c < width; c += 8)
         {
             var acc = Avx.Multiply(Avx.LoadVector256(taps + c), Avx.LoadVector256(current + c));

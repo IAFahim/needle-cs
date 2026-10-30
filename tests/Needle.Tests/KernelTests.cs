@@ -46,8 +46,42 @@ public sealed class BackendTests
     [Fact]
     public void ScalarBackendIsActiveWhenRequested()
     {
-        var requested = Environment.GetEnvironmentVariable("NEEDLE_SCALAR") != null;
+        var requested = Environment.GetEnvironmentVariable("NEEDLE_SCALAR") != null
+            || string.Equals(Environment.GetEnvironmentVariable("NEEDLE_TIER"), "scalar", StringComparison.OrdinalIgnoreCase);
         Assert.Equal(!requested, Simd.Enabled || !System.Runtime.Intrinsics.X86.Avx2.IsSupported);
+    }
+}
+
+public sealed class TierSelectionTests
+{
+    [Fact]
+    public void ActiveTierMatchesHardware()
+    {
+        var forcedScalar = Environment.GetEnvironmentVariable("NEEDLE_SCALAR") != null
+            || string.Equals(Environment.GetEnvironmentVariable("NEEDLE_TIER"), "scalar", StringComparison.OrdinalIgnoreCase);
+        if (forcedScalar) Assert.Equal(CpuTier.Scalar, Tiers.Active);
+        else if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported && !System.Runtime.Intrinsics.Arm.AdvSimd.IsSupported)
+            Assert.Equal(CpuTier.Scalar, Tiers.Active);
+        else Assert.NotEqual(CpuTier.Scalar, Tiers.Active);
+    }
+
+    [Fact]
+    public void ActiveTierIsExecutable()
+    {
+        switch (Tiers.Active)
+        {
+            case CpuTier.Scalar: break;
+            case CpuTier.Avx2: Assert.True(System.Runtime.Intrinsics.X86.Avx2.IsSupported); break;
+            case CpuTier.AvxVnni: Assert.True(System.Runtime.Intrinsics.X86.AvxVnni.IsSupported); break;
+            case CpuTier.AvxVnniInt8: Assert.True(System.Runtime.Intrinsics.X86.AvxVnniInt8.IsSupported); break;
+            case CpuTier.Avx512Bw:
+                Assert.True(System.Runtime.Intrinsics.X86.Avx512F.IsSupported);
+                Assert.True(System.Runtime.Intrinsics.X86.Avx512BW.IsSupported);
+                break;
+            case CpuTier.Neon:
+            case CpuTier.NeonDot: Assert.True(System.Runtime.Intrinsics.Arm.AdvSimd.IsSupported); break;
+            default: Assert.Fail("Unknown tier."); break;
+        }
     }
 }
 
