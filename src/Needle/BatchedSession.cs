@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading;
 
 namespace Needle;
 
@@ -117,6 +118,7 @@ public sealed unsafe class BatchedSession : IDisposable
     readonly int embeddingWidth;
     readonly Lane[] lanes;
     int laneCount;
+    internal long TurnGate;
 
     public BatchedSession(Model model, NeedleOptions? options = null, int maxSequences = 8)
     {
@@ -237,6 +239,7 @@ public sealed unsafe class BatchedSession : IDisposable
     {
         var started = Stopwatch.GetTimestamp();
         for (var i = 0; i < laneCount; i++) PrefillLane(i, inputs[i], toolResult, started);
+        Volatile.Write(ref TurnGate, Stopwatch.GetTimestamp());
         var tokens = stackalloc int[MaxLanes * MaxRunTokens];
         var slots = stackalloc int[MaxLanes * MaxRunTokens];
         var heads = stackalloc int[MaxLanes * MaxRunTokens];
