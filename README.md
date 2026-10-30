@@ -147,6 +147,8 @@ The 4-thread numbers include the faster Hadamard MLP (W12). The detailed profile
 
 The full parity suite (golden logits, greedy decode, tokenizer) passes on AVX2, NEON (both dot-product tiers, validated under qemu-aarch64), and scalar.
 
+ARM tiers: the NEON backend runs an SDOT (`Dp`) path where FEAT_DotProd exists and a widening fallback (`NEEDLE_NODP=1`) elsewhere; both tiers are validated under qemu-aarch64 (`NeonTests`, including a history-backed `Taps3` check matching production use). .NET 10 exposes `AdvSimd`/`Dp`/`Rdm` but no i8mm class (`SMMLA`/`USMMLA`/`USDOT`), so an i8mm tier is blocked on the runtime. `Sve`/`Sve2` exist but are experimental (`SYSLIB5003`) with no int8 matrix path, and 128-bit SVE2 is roughly NEON-width on target Android cores, so there is deliberately no SVE2 path.
+
 ## Build & Test
 
 Requirements: the [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0) (the 8.0 SDK fails with `NETSDK1045`), Python 3 with `numpy` and `sentencepiece`, and `curl`.

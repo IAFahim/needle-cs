@@ -319,8 +319,11 @@ public sealed unsafe class NeonTests
         AssertClose(actual, expected, 64, "Combine4");
 
         Fill(l, 256, 57);
-        Neon.Taps3(l, 64, r, actual);
-        Scalar.Taps3(l, 64, r, expected);
+        var history = stackalloc float[192];
+        Fill(history, 192, 57);
+        var current = history + 128;
+        Neon.Taps3(l, 64, current, actual);
+        Scalar.Taps3(l, 64, current, expected);
         AssertClose(actual, expected, 64, "Taps3");
 
         Fill(l, 256, 57);
