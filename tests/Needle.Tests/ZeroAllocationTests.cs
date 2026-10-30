@@ -33,7 +33,7 @@ internal static class AllocationProbe
         using var model = Model.Open(Assets.Model);
         var retrieval = mode == "retrieval";
         var tools = retrieval ? SessionCases.Catalog() : SessionCases.DefaultTools();
-        // The jumpforward mode decodes with forced-span chunking on the same
+        // The jumpforward mode decodes with token-forced chunking on the same
         // prompts: the chunk buffers are stack-owned, so the 0 B bar holds.
         using var session = new NeedleSession(model, tools, new NeedleOptions { Threads = threads, AutoDate = false, RetrievalTopK = 5, JumpForward = mode == "jumpforward" });
         var calls = new byte[4096];

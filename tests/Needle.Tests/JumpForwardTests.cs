@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Generic;
 using System.Text;
 using Needle.Cli;
 using Needle.Tools;
@@ -8,14 +7,16 @@ using Xunit.Abstractions;
 
 namespace Needle.Tests;
 
-// Issue #16: jump-forward over grammar-forced spans. The toggle under test
-// is NeedleOptions.JumpForward (off by default until the W28 accuracy gate).
-// Canonical chunk tokenization can split the same bytes differently from the
-// model's own split, so free choices downstream may flip (documented
-// divergences, gated by W28). What jump-forward guarantees — and what these
-// tests prove — is: forced bytes are byte-identical by construction, every
-// fed chunk token stays grammar-admissible, the typed sink observes the same
-// event sequence as per-byte decoding, and sequential engine passes drop.
+// Issue #16: lossless jump-forward over token-forced steps. A token may join
+// the fed chunk only when the grammar+trie allow exactly that one token at
+// the committed state (allowed-mask popcount == 1): per-token greedy would
+// emit it regardless of logits, so the chunk is the per-token greedy sequence
+// itself and free choices downstream see the identical token history. What
+// these tests prove is the losslessness (byte-identical calls/reasoning/
+// tokens/decode counts on every prompt), per-token probability-1 accounting,
+// and typed-sink event parity. Pass counts are reported per prompt with a
+// never-regress guard; on the current grammar/vocab no singleton mask occurs
+// so jumping stays dormant (default off), and these tests pin that behavior.
 public sealed class JumpForwardTests : IDisposable
 {
     readonly Model model;
@@ -69,11 +70,13 @@ public sealed class JumpForwardTests : IDisposable
         Assert.False(new NeedleOptions().JumpForward);
     }
 
-    // Returns true when both paths emitted identical text. Reduction is
-    // asserted only then: when the canonical split steers a free choice
-    // elsewhere the pass counts are not comparable, and the divergence is
-    // reported below for the W28 accuracy gate instead of asserted.
-    bool ReportPrompt(string label, string tools, string prompt, ref int totalTokens, ref int totalOff, ref int totalOn)
+    // Lossless jumping must reproduce the reference path exactly: the same
+    // status, calls, reasoning, response, and decode-token counts. Any
+    // divergence fails the test (it would mean the uniqueness criterion let
+    // a real choice slip into a chunk). Passes can only stay equal or drop:
+    // every macro-step feeds at least one token, so jumping never costs a
+    // sequential pass. Observed reduction is reported, not asserted.
+    void ReportPrompt(string label, string tools, string prompt, ref int totalTokens, ref int totalOff, ref int totalOn)
     {
         var options = new NeedleOptions { Threads = 4, AutoDate = false, System = "" };
         using var plain = new NeedleSession(model, tools, WithJump(options, false));
@@ -82,36 +85,27 @@ public sealed class JumpForwardTests : IDisposable
         var actual = RunStep(jumped, new SessionStep(StepKind.Query, prompt));
         var same = expected.Status == actual.Status && expected.Failure == actual.Failure &&
             expected.CallCount == actual.CallCount && expected.Calls == actual.Calls &&
-            expected.Reasoning == actual.Reasoning && expected.Response == actual.Response;
+            expected.Reasoning == actual.Reasoning && expected.Response == actual.Response &&
+            expected.PromptTokens == actual.PromptTokens && expected.DecodeTokens == actual.DecodeTokens;
         output.WriteLine($"{label}: tokens off={expected.DecodeTokens} on={actual.DecodeTokens}, passes off={expected.Passes} on={actual.Passes}, text={(same ? "identical" : "DIVERGED")}");
-        if (!same)
-        {
-            output.WriteLine($"  off: {expected.Status}/{expected.Failure} calls={expected.Calls}");
-            output.WriteLine($"  on:  {actual.Status}/{actual.Failure} calls={actual.Calls}");
-            return false;
-        }
-        // Identical text with at least one forced span jumped (every call
-        // opens with several) must take strictly fewer sequential passes.
-        Assert.True(actual.Passes < expected.Passes, $"{label}: passes {actual.Passes} >= {expected.Passes} without jumping");
+        Assert.True(same, $"{label}: jumped path diverged: off={expected.Status}/{expected.Failure} calls={expected.Calls} reasoning={expected.Reasoning} || on={actual.Status}/{actual.Failure} calls={actual.Calls} reasoning={actual.Reasoning}");
+        Assert.True(actual.Passes <= expected.Passes, $"{label}: passes {actual.Passes} > {expected.Passes} with jumping");
         totalTokens += expected.DecodeTokens;
         totalOff += expected.Passes;
         totalOn += actual.Passes;
-        return true;
     }
 
     [Fact]
-    public void JumpForwardReducesPassesOnGamePrompts()
+    public void JumpForwardMatchesReferenceOnGamePrompts()
     {
         var totalTokens = 0;
         var totalOff = 0;
         var totalOn = 0;
-        var agreed = 0;
         var tools = BenchPrompts.GameToolsJson;
         foreach (var prompt in BenchPrompts.Game)
-            if (ReportPrompt(prompt, tools, prompt, ref totalTokens, ref totalOff, ref totalOn)) agreed++;
-        output.WriteLine($"game prompts: {agreed}/{BenchPrompts.Game.Length} text-identical; {totalTokens} reference tokens in {totalOff} passes without jumping, {totalOn} with jumping");
-        Assert.True(agreed > 0, "no prompt agreed, nothing to compare");
-        Assert.True(totalOn < totalOff, $"expected fewer passes with jumping, got {totalOn} vs {totalOff}");
+            ReportPrompt(prompt, tools, prompt, ref totalTokens, ref totalOff, ref totalOn);
+        output.WriteLine($"game prompts: {BenchPrompts.Game.Length}/{BenchPrompts.Game.Length} text-identical; {totalTokens} reference tokens in {totalOff} passes without jumping, {totalOn} with jumping");
+        Assert.True(totalOn <= totalOff, $"jumping cost passes: {totalOn} vs {totalOff} without jumping");
     }
 
     static void AssertNpcEqual(NpcCommand expected, NpcCommand actual)
@@ -167,73 +161,6 @@ public sealed class JumpForwardTests : IDisposable
             AssertSameToggleAgreement("switch to wedge formation and follow the captain", jump);
             AssertSameToggleAgreement("form a circle", jump);
         }
-    }
-
-    [Fact]
-    public void JumpForwardChunkTokensStayGrammarAdmissible()
-    {
-        // Every token of a canonical forced-span chunk must advance the
-        // grammar from the span start and spell exactly the forced bytes:
-        // feeding the chunk cannot change the outcome versus per-byte steps.
-        using var tokenizer = new Tokenizer(model);
-        using var trie = new TokenTrie(tokenizer, model.VocabSize);
-        CheckChunks(tokenizer, trie, SessionCases.DefaultTools(), model.VocabSize);
-        CheckChunks(tokenizer, trie, BenchPrompts.GameToolsJson, model.VocabSize);
-    }
-
-    static unsafe void CheckChunks(Tokenizer tokenizer, TokenTrie trie, string toolsJson, int vocabSize)
-    {
-        using var grammar = new Grammar(new ToolSet(toolsJson).Tools);
-        var program = grammar.Program;
-        var random = new Random(7);
-        var mask = new uint[trie.Words];
-        var scratch = new byte[256];
-        var forced = new byte[256];
-        var ids = new int[776];
-        var decoded = new byte[1024];
-        var states = new List<GrammarState> { Grammar.Start(program) };
-        var walk = Grammar.Start(program);
-        for (var step = 0; step < 300 && !Grammar.Complete(walk); step++)
-        {
-            fixed (uint* m = mask) trie.Allow(program, walk, m);
-            var allowed = new List<int>();
-            for (var id = 0; id < vocabSize; id++) if ((mask[id / 32] >> (id % 32) & 1) != 0) allowed.Add(id);
-            if (allowed.Count == 0) break;
-            var pick = allowed[random.Next(allowed.Count)];
-            int length;
-            fixed (byte* p = scratch) length = tokenizer.ConstraintBytes(pick, p);
-            var ok = true;
-            for (var i = 0; i < length && ok; i++) ok = Grammar.Advance(program, &walk, scratch[i]);
-            if (!ok) break;
-            states.Add(walk);
-        }
-        var checkedSpans = 0;
-        foreach (var start in states)
-        {
-            var state = start;
-            int count;
-            fixed (byte* f = forced) count = Grammar.ForcedBytes(program, &state, new Span<byte>(f, forced.Length));
-            if (count == 0) continue;
-            checkedSpans++;
-            var span = forced.AsSpan(0, count);
-            var encoded = tokenizer.Encode(span, ids.AsSpan(), leadingSpace: false);
-            Assert.True(encoded > 0, "forced span encoded to no tokens");
-            var probe = start;
-            var at = 0;
-            for (var i = 0; i < encoded; i++)
-            {
-                int dlen;
-                fixed (byte* p = scratch) dlen = tokenizer.ConstraintBytes(ids[i], p);
-                Assert.True(dlen > 0, $"chunk token {ids[i]} has no bytes");
-                for (var b = 0; b < dlen; b++)
-                    Assert.True(Grammar.Advance(program, &probe, scratch[b]), $"chunk token {ids[i]} rejected at byte {b}");
-                scratch.AsSpan(0, dlen).CopyTo(decoded.AsSpan(at));
-                at += dlen;
-            }
-            Assert.True(new ReadOnlySpan<byte>(decoded, 0, at).SequenceEqual(span), "chunk bytes differ from the forced span");
-            Assert.Equal(Grammar.Complete(state), Grammar.Complete(probe));
-        }
-        Assert.True(checkedSpans > 0, "no forced spans sampled");
     }
 
     [Fact]
