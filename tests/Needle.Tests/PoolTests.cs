@@ -310,3 +310,74 @@ public sealed unsafe class PoolTests
         Assert.True(both.WithMaxTokensPerSlice(0).WithMaxMillisecondsPerSlice(0).IsUnlimited);
     }
 }
+
+public sealed unsafe class TeamBarrierTests
+{
+    const int Phases = 4;
+
+    struct TeamContext
+    {
+        public int* Seen;
+        public TeamBarrier* Barrier;
+        public int Members;
+    }
+
+    static void Rendezvous(void* context, int member)
+    {
+        var state = (TeamContext*)context;
+        for (var phase = 0; phase < Phases; phase++)
+        {
+            state->Seen[member * Phases + phase] = phase + 1;
+            Pool.Barrier(state->Barrier);
+            for (var m = 0; m < state->Members; m++)
+                if (state->Seen[m * Phases + phase] != phase + 1)
+                    state->Seen[member * Phases + phase] = -1;
+            Pool.Barrier(state->Barrier);
+        }
+    }
+
+    static void RecordMember(void* context, int member) => ((int*)context)[member] = Environment.CurrentManagedThreadId;
+
+    [Fact]
+    public void TeamDispatchRendezvousEveryMemberAtEveryBarrier()
+    {
+        using var pool = new Pool(4);
+        var members = pool.Members;
+        Assert.Equal(4, members);
+        var seen = stackalloc int[members * Phases];
+        var barrier = stackalloc TeamBarrier[1];
+        for (var round = 0; round < 50; round++)
+        {
+            for (var i = 0; i < members * Phases; i++) seen[i] = 0;
+            var context = new TeamContext { Seen = seen, Barrier = barrier, Members = members };
+            pool.RunTeam(&Rendezvous, &context, barrier);
+            for (var i = 0; i < members * Phases; i++) Assert.Equal((i % Phases) + 1, seen[i]);
+        }
+    }
+
+    [Fact]
+    public void PausedTeamRunsEveryMemberOnTheCaller()
+    {
+        using var pool = new Pool(4);
+        pool.Pause();
+        var members = pool.Members;
+        var ids = stackalloc int[members];
+        for (var i = 0; i < members; i++) ids[i] = 0;
+        var barrier = stackalloc TeamBarrier[1];
+        pool.RunTeam(&RecordMember, ids, barrier);
+        var caller = Environment.CurrentManagedThreadId;
+        for (var i = 0; i < members; i++) Assert.Equal(caller, ids[i]);
+        pool.Resume();
+    }
+
+    [Fact]
+    public void SingleThreadTeamRunsInlineWithoutWorkers()
+    {
+        using var pool = new Pool(1);
+        Assert.Equal(1, pool.Members);
+        var ran = 0;
+        var barrier = stackalloc TeamBarrier[1];
+        pool.RunTeam(&RecordMember, &ran, barrier);
+        Assert.Equal(Environment.CurrentManagedThreadId, ran);
+    }
+}

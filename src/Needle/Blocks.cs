@@ -631,39 +631,57 @@ internal unsafe struct AttentionBatch
     public int Heads, KvHeads, QkDim, VDim, Position, Window, Capacity, Frames;
     float* partials;
     int* arrivals;
-    int tileHeads, tilesPerGroup, chunks;
+    int tileHeads, tilesPerGroup, chunks, planGroups;
 
     public static void Run(Pool pool, AttentionBatch* batch, int tokens)
     {
-        var group = batch->Heads / batch->KvHeads;
-        batch->tilesPerGroup = (group + Attention.MaxTileHeads - 1) / Attention.MaxTileHeads;
-        batch->tileHeads = (group + batch->tilesPerGroup - 1) / batch->tilesPerGroup;
-        var groups = tokens * batch->KvHeads;
-        var splittable = Attention.CanSplitPositions && batch->tilesPerGroup == 1 && group > 1 && batch->Probabilities == null;
-        batch->chunks = splittable ? Math.Clamp((pool.Threads + groups - 1) / groups, 1, MaxChunks) : 1;
+        batch->Plan(pool.Threads, tokens, null, null);
         if (batch->chunks == 1)
         {
-            pool.Run(&Execute, batch, groups * batch->tilesPerGroup);
+            pool.Run(&Execute, batch, batch->TeamTasks);
             return;
         }
-        RunChunked(pool, batch, groups);
+        RunChunked(pool, batch);
+    }
+
+    public void Plan(int threads, int tokens, float* partials, int* arrivals)
+    {
+        var group = Heads / KvHeads;
+        tilesPerGroup = (group + Attention.MaxTileHeads - 1) / Attention.MaxTileHeads;
+        tileHeads = (group + tilesPerGroup - 1) / tilesPerGroup;
+        planGroups = tokens * KvHeads;
+        var splittable = Attention.CanSplitPositions && tilesPerGroup == 1 && group > 1 && Probabilities == null;
+        chunks = splittable ? Math.Clamp((threads + planGroups - 1) / planGroups, 1, MaxChunks) : 1;
+        if (chunks == 1) return;
+        this.partials = partials;
+        this.arrivals = arrivals;
+        for (var i = 0; i < planGroups; i++) arrivals[i] = 0;
+    }
+
+    public int TeamTasks => planGroups * (chunks == 1 ? tilesPerGroup : chunks);
+
+    public static void RunTask(AttentionBatch* batch, int task)
+    {
+        if (batch->chunks == 1) Execute(batch, task);
+        else ExecuteChunk(batch, task);
     }
 
     [SkipLocalsInit]
-    static void RunChunked(Pool pool, AttentionBatch* batch, int groups)
+    static void RunChunked(Pool pool, AttentionBatch* batch)
     {
-        var partials = stackalloc float[groups * batch->chunks * Attention.PartialFloats];
-        var arrivals = stackalloc int[groups];
-        for (var i = 0; i < groups; i++) arrivals[i] = 0;
-        batch->partials = partials;
-        batch->arrivals = arrivals;
-        pool.Run(&ExecuteChunk, batch, groups * batch->chunks);
+        var partials = stackalloc float[batch->planGroups * batch->chunks * Attention.PartialFloats];
+        var arrivals = stackalloc int[batch->planGroups];
+        batch->Plan(pool.Threads, batch->planGroups / batch->KvHeads, partials, arrivals);
+        pool.Run(&ExecuteChunk, batch, batch->TeamTasks);
     }
 
+    static void Execute(void* context, int task) => Execute((AttentionBatch*)context, task);
+
+    static void ExecuteChunk(void* context, int task) => ExecuteChunk((AttentionBatch*)context, task);
+
     [SkipLocalsInit]
-    static void Execute(void* context, int task)
+    static void Execute(AttentionBatch* b, int task)
     {
-        var b = (AttentionBatch*)context;
         var group = b->Heads / b->KvHeads;
         var token = task / (b->KvHeads * b->tilesPerGroup);
         var kv = task / b->tilesPerGroup % b->KvHeads;
@@ -678,9 +696,8 @@ internal unsafe struct AttentionBatch
     }
 
     [SkipLocalsInit]
-    static void ExecuteChunk(void* context, int task)
+    static void ExecuteChunk(AttentionBatch* b, int task)
     {
-        var b = (AttentionBatch*)context;
         var group = b->Heads / b->KvHeads;
         var chunk = task % b->chunks;
         var groupIndex = task / b->chunks;
@@ -740,13 +757,14 @@ internal unsafe struct MlpBatch
 
     public static void Run(Pool pool, MlpBatch* batch, int tokens) => pool.Run(&Execute, batch, tokens);
 
-    [System.Runtime.CompilerServices.SkipLocalsInit]
-    static void Execute(void* context, int token)
+    public static void RunToken(MlpBatch* batch, int token)
     {
-        var b = (MlpBatch*)context;
-        var scratch = stackalloc float[HadamardMlp.ScratchFloats(b->Dim, b->Width)];
-        HadamardMlp.Apply(b, b->Residual + (long)token * b->Dim, scratch);
+        var scratch = stackalloc float[HadamardMlp.ScratchFloats(batch->Dim, batch->Width)];
+        HadamardMlp.Apply(batch, batch->Residual + (long)token * batch->Dim, scratch);
     }
+
+    [System.Runtime.CompilerServices.SkipLocalsInit]
+    static void Execute(void* context, int token) => RunToken((MlpBatch*)context, token);
 }
 
 [System.Runtime.CompilerServices.SkipLocalsInit]

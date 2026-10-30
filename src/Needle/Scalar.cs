@@ -330,6 +330,86 @@ internal static unsafe class Scalar
         for (var i = 0; i < count; i++) residual[i] += scale * (product[i] * d4[i]);
     }
 
+    public static void Sinkhorn4x4(float* logits, float* result)
+    {
+        for (var r = 0; r < 4; r++)
+        {
+            var peak = MathF.Max(MathF.Max(logits[r * 4], logits[r * 4 + 1]), MathF.Max(logits[r * 4 + 2], logits[r * 4 + 3]));
+            for (var c = 0; c < 4; c++) result[r * 4 + c] = MathF.Exp(logits[r * 4 + c] - peak);
+        }
+        for (var iteration = 0; iteration < 20; iteration++)
+        {
+            for (var r = 0; r < 4; r++)
+            {
+                var sum = result[r * 4] + result[r * 4 + 1] + result[r * 4 + 2] + result[r * 4 + 3];
+                for (var c = 0; c < 4; c++) result[r * 4 + c] /= sum;
+            }
+            for (var c = 0; c < 4; c++)
+            {
+                var sum = result[c] + result[4 + c] + result[8 + c] + result[12 + c];
+                if (sum > 0f) for (var r = 0; r < 4; r++) result[r * 4 + c] /= sum;
+            }
+        }
+    }
+
+    public static void RmsFakeA8(float* x, int n, float* destination)
+    {
+        var sum = 0f;
+        for (var i = 0; i < n; i++) sum += x[i] * x[i];
+        var inverse = 1f / MathF.Sqrt(sum / n + 1e-6f);
+        var peak = 0f;
+        for (var i = 0; i < n; i++)
+        {
+            destination[i] = x[i] * inverse;
+            peak = MathF.Max(peak, MathF.Abs(destination[i]));
+        }
+        var scale = peak > 0f ? peak / 127f : 1f;
+        var round = 1f / scale;
+        for (var i = 0; i < n; i++) destination[i] = MathF.Min(MathF.Max(MathF.Round(destination[i] * round), -128f), 127f) * scale;
+    }
+
+    public static void CenteredRmsFakeA8(float* x, float* scale, int n, float* destination)
+    {
+        var sum = 0f;
+        for (var i = 0; i < n; i++) sum += x[i] * x[i];
+        var inverse = 1f / MathF.Sqrt(sum / n + 1e-6f);
+        var peak = 0f;
+        for (var i = 0; i < n; i++)
+        {
+            destination[i] = (1f + scale[i]) * x[i] * inverse;
+            peak = MathF.Max(peak, MathF.Abs(destination[i]));
+        }
+        var factor = peak > 0f ? peak / 127f : 1f;
+        var round = 1f / factor;
+        for (var i = 0; i < n; i++) destination[i] = MathF.Min(MathF.Max(MathF.Round(destination[i] * round), -128f), 127f) * factor;
+    }
+
+    public static void GateFakeA8(float* x, float* gate, int n)
+    {
+        var peak = 0f;
+        for (var i = 0; i < n; i++)
+        {
+            x[i] *= Sigmoid(gate[i]);
+            peak = MathF.Max(peak, MathF.Abs(x[i]));
+        }
+        var scale = peak > 0f ? peak / 127f : 1f;
+        var round = 1f / scale;
+        for (var i = 0; i < n; i++) x[i] = MathF.Min(MathF.Max(MathF.Round(x[i] * round), -128f), 127f) * scale;
+    }
+
+    public static void CombineDiff4(float* s, int dim, float w0, float w1, float w2, float w3, float* x, float* u, float post, float* destination)
+    {
+        for (var c = 0; c < dim; c++) destination[c] = post * (x[c] - u[c]) + w0 * s[c] + w1 * s[dim + c] + w2 * s[2 * dim + c] + w3 * s[3 * dim + c];
+    }
+
+    public static void PostNormAdd(float* residual, float* x, float* scale, float gate, int n)
+    {
+        var sum = 0f;
+        for (var i = 0; i < n; i++) sum += x[i] * x[i];
+        var inverse = 1f / MathF.Sqrt(sum / n + 1e-6f);
+        for (var i = 0; i < n; i++) residual[i] += gate * ((1f + scale[i]) * x[i] * inverse);
+    }
+
     [System.Runtime.CompilerServices.SkipLocalsInit]
     public static void Kron(float* z, int activeRows, float* left, float* right, int rows, int cols, int resultRows, float* result)
     {

@@ -52,7 +52,7 @@ public sealed class BenchHarnessTests : IDisposable
 
         var profile = Assert.IsType<ProfileResult>(run.Profile);
         var geometry = model.Geometry;
-        Assert.Equal((double)(geometry.Layers * 4 + geometry.SiteCount + 1), profile.PoolRunsPerToken);
+        Assert.Equal((double)(geometry.Layers + 1), profile.PoolRunsPerToken);
         Assert.Single(profile.Reps);
         for (var stage = 0; stage < StageProfile.StageCount; stage++) Assert.True(profile.DecodeStage(stage).IsFinite);
         Assert.True(profile.DecodeStage((int)Stage.Mlp).Best > 0);
