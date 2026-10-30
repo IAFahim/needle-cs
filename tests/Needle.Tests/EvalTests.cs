@@ -86,7 +86,7 @@ public sealed class EvalDatasetTests
         Assert.False(policy.AutoDate);
         Assert.Equal(32, policy.MaxReasoningTokens);
         Assert.Equal("defaults", EvalPolicies.Describe(defaults, defaults));
-        Assert.Equal("RefuseBelow=0.3 AutoDate=false MaxReasoningTokens=32", EvalPolicies.Describe(policy, defaults));
+        Assert.Equal("RefuseBelow=0.3 MaxReasoningTokens=32", EvalPolicies.Describe(policy, defaults));
         Assert.Throws<ArgumentException>(() => EvalPolicies.Apply(defaults, new[] { "JumpForward=true" }));
         Assert.Throws<ArgumentException>(() => EvalPolicies.Apply(defaults, new[] { "RefuseBelow=high" }));
     }

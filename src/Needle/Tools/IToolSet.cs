@@ -25,7 +25,7 @@ public static unsafe class ToolSession
             TTools.GrammarNodes, TTools.GrammarProperties, TTools.GrammarLiterals,
             TTools.GrammarUnions, TTools.GrammarTools, TTools.GrammarBytes,
             TTools.GrammarRoot, TTools.GrammarToolCount);
-        return new NeedleSession(model, Encoding.UTF8.GetString(TTools.Schema), program, options);
+        return new NeedleSession(model, Encoding.UTF8.GetString(TTools.Schema), program, default, options);
     }
 }
 #endif

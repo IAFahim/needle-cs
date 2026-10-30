@@ -16,7 +16,7 @@ public sealed class NeedleOptions
     public int MaxReasoningTokens { get; init; } = 96;
     public int MaxCallTokens { get; init; } = 384;
     public string? System { get; init; }
-    public bool AutoDate { get; init; } = true;
+    public bool AutoDate { get; init; }
     public float RefuseBelow { get; init; } = 0.1f;
     public int RetrievalTopK { get; init; } = 5;
 
@@ -162,18 +162,24 @@ public sealed unsafe partial class NeedleSession : IDisposable
     bool turnOne = true;
 
     public NeedleSession(Model model, string toolsJson, NeedleOptions? options = null)
-        : this(model, toolsJson, null, options)
+        : this(model, toolsJson, null, default, options)
     {
     }
 
-    internal NeedleSession(Model model, string toolsJson, GrammarProgram* precompiled, NeedleOptions? options)
+    public NeedleSession(Model model, string toolsJson, ReadOnlySpan<byte> primedPrefix, NeedleOptions? options = null)
+        : this(model, toolsJson, null, primedPrefix, options)
+    {
+    }
+
+    internal NeedleSession(Model model, string toolsJson, GrammarProgram* precompiled, ReadOnlySpan<byte> primedPrefix, NeedleOptions? options)
     {
         this.model = model;
         this.options = options ?? new NeedleOptions();
         allTools = new ToolSet(toolsJson);
         engine = new Engine(model, this.options.Context, 64, this.options.ResolvedThreading, null) { Pooling = true };
-        tokenizer = new Tokenizer(model, TokenizerInputBytes);
-        trie = new TokenTrie(tokenizer, model.VocabSize);
+        var vocabulary = model.GetVocabulary();
+        tokenizer = new Tokenizer(vocabulary, TokenizerInputBytes);
+        trie = new TokenTrie(vocabulary.Trie);
         system = BuildSystem(this.options);
         contextCapacity = Math.Min(this.options.Context, model.Geometry.MaxSeq);
         embedderCapacity = Math.Min(EmbedderContext, model.Geometry.MaxSeq);
@@ -185,7 +191,7 @@ public sealed unsafe partial class NeedleSession : IDisposable
         embeddingWidth = head != null ? head->Queries * model.Geometry.Dim : 0;
         pooled = (float*)Mem.AllocZeroed((nuint)Math.Max(1, embeddingWidth) * 4);
         confidenceScratch = head != null ? (float*)Mem.AllocZeroed((nuint)((model.Geometry.Layers + 1) * head->Probes * (model.Geometry.Dim + 1)) * 4) : null;
-        reasoningMask = BuildReasoningMask();
+        reasoningMask = CopySharedMask(vocabulary);
         decisionMask = CopyMask(reasoningMask, ToolCallStart, ImEnd, EndOfText);
         responseMask = CopyMask(reasoningMask, ImEnd, EndOfText);
         responseMask[ThinkEnd / 32] &= ~(1u << (ThinkEnd % 32));
@@ -206,8 +212,21 @@ public sealed unsafe partial class NeedleSession : IDisposable
         activeTools = new int[topK];
         active = allTools;
         grammar = precompiled != null ? new Grammar(precompiled) : new Grammar(active.Tools);
-        if (retrieval) IndexTools();
-        else Prime(active);
+        try
+        {
+            if (retrieval)
+            {
+                if (primedPrefix.Length > 0) throw new ArgumentException("a primed prefix cannot be combined with tool retrieval; raise RetrievalTopK or drop the prefix");
+                IndexTools();
+            }
+            else if (primedPrefix.Length > 0) ImportPrimedPrefix(primedPrefix);
+            else Prime(active);
+        }
+        catch
+        {
+            Dispose();
+            throw;
+        }
     }
 
     public int ContextUsed => engine.Length;
@@ -225,14 +244,6 @@ public sealed unsafe partial class NeedleSession : IDisposable
         return text.TrimStart().StartsWith('{') ? text : fact + "; " + text;
     }
 
-    uint* BuildReasoningMask()
-    {
-        var built = (uint*)Mem.AllocZeroed((nuint)maskWords * 4);
-        for (var id = 0; id < Math.Min(model.VocabSize, tokenizer.PieceCount); id++)
-            if (tokenizer.IsConstrainable(id)) built[id / 32] |= 1u << (id % 32);
-        built[ThinkEnd / 32] |= 1u << (ThinkEnd % 32);
-        return built;
-    }
 
     uint* CopyMask(uint* source, params int[] extraTokens)
     {
@@ -273,6 +284,68 @@ public sealed unsafe partial class NeedleSession : IDisposable
     {
         engine.Rewind();
         turnOne = true;
+    }
+
+    const int PrefixMagic = 0x3150444E;
+    const int PrefixVersion = 1;
+    const int PrefixHeaderInts = 10;
+
+    static uint PrefixHash(string text)
+    {
+        var hash = 2166136261u;
+        foreach (var b in Encoding.UTF8.GetBytes(text)) hash = (hash ^ b) * 16777619u;
+        return hash;
+    }
+
+    void WritePrefixHeader(Span<byte> destination)
+    {
+        var ints = MemoryMarshal.Cast<byte, int>(destination.Slice(0, PrefixHeaderInts * sizeof(int)));
+        ints[0] = PrefixMagic;
+        ints[1] = PrefixVersion;
+        ints[2] = model.Geometry.Dim;
+        ints[3] = model.Geometry.Layers;
+        ints[4] = model.VocabSize;
+        ints[5] = contextCapacity;
+        ints[6] = (int)PrefixHash(allTools.Render());
+        ints[7] = (int)PrefixHash(system);
+        ints[8] = engine.MarkedLength;
+    }
+
+    public byte[] ExportPrimedPrefix()
+    {
+        var bytes = new byte[PrefixHeaderInts * sizeof(int) + (int)engine.PrimedPrefixBytes];
+        WritePrefixHeader(bytes);
+        engine.ExportPrimedPrefix(bytes.AsSpan(PrefixHeaderInts * sizeof(int)));
+        return bytes;
+    }
+
+    void ImportPrimedPrefix(ReadOnlySpan<byte> primedPrefix)
+    {
+        if (primedPrefix.Length < PrefixHeaderInts * sizeof(int)) throw new ArgumentException("primed prefix is truncated");
+        var ints = MemoryMarshal.Cast<byte, int>(primedPrefix.Slice(0, PrefixHeaderInts * sizeof(int)));
+        if (ints[0] != PrefixMagic || ints[1] != PrefixVersion) throw new ArgumentException("primed prefix format is not recognized");
+        if (ints[2] != model.Geometry.Dim || ints[3] != model.Geometry.Layers || ints[4] != model.VocabSize ||
+            ints[5] != contextCapacity || ints[6] != (int)PrefixHash(allTools.Render()) || ints[7] != (int)PrefixHash(system))
+            throw new ArgumentException("primed prefix was created for a different model, tool set, system prompt or context");
+        engine.ImportPrimedPrefix(primedPrefix.Slice(PrefixHeaderInts * sizeof(int)));
+        turnOne = true;
+    }
+
+    bool warmed;
+
+    public void WarmUp()
+    {
+        if (warmed) return;
+        warmed = true;
+        _ = Complete("Warm up the engine with a short greeting.");
+        Reset();
+    }
+
+    uint* CopySharedMask(Vocabulary vocabulary)
+    {
+        var copy = (uint*)Mem.Alloc((nuint)maskWords * 4);
+        Buffer.MemoryCopy(vocabulary.ReasoningMask, copy, (nuint)maskWords * 4, (nuint)maskWords * 4);
+        return copy;
     }
 
     public Reply Complete(ReadOnlySpan<byte> utf8Query, Span<byte> utf8Calls) =>

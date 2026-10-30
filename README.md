@@ -189,6 +189,10 @@ dotnet build src/Needle -f netstandard2.1 -c Release
 
 Files inside an Android APK (StreamingAssets) cannot be memory-mapped. Either read them into a `byte[]` and call `Model.FromBytes`, stream them with `Model.FromStream`, or copy the file once to `persistentDataPath` and call `Model.Open` on that path. iOS can map the file from the bundle path directly.
 
+### First request in a player build
+
+Construct one `NeedleSession` during loading rather than on first input: the first constructor builds the shared per-model vocabulary and prefills the ~140-token tool prefix, while a session restored from an `ExportPrimedPrefix` blob constructs in a few milliseconds with under a megabyte of new commit, so ship the prefix blob or create it on first run and reuse it. Call `WarmUp()` on the loading thread to run every kernel and tier path once, then ship TieredPGO enabled (or NativeAOT/ReadyToRun) so the first real request pays no JIT cost; `bench-e2e` reports session constructor milliseconds and private bytes per set for tracking this budget.
+
 ## Benchmarking
 
 One harness covers end-to-end latency, the per-stage profile, kernels, allocations and the upstream native library. Build the CLI first (`dotnet publish src/Needle.Cli -c Release -o out/aot`).

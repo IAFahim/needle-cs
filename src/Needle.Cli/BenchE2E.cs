@@ -67,6 +67,8 @@ internal sealed class SetMeasurement
     public string Name = "";
     public int ToolCount;
     public int PrefixTokens;
+    public double SessionCtorMs;
+    public long SessionCtorPrivateBytes;
     public readonly List<PromptMeasurement> Prompts = new();
 
     public Spread Mean(Func<PromptMeasurement, Spread> select)
@@ -141,8 +143,12 @@ internal static class BenchE2E
     static SetMeasurement MeasureSet(Model model, PromptSet set, int threads, BenchE2EOptions options)
     {
         var sessionOptions = new NeedleOptions { Threads = threads, AutoDate = false, System = "", RetrievalTopK = 64 };
+        var privateBefore = PrivateBytes();
+        var started = Stopwatch.GetTimestamp();
         using var session = new NeedleSession(model, set.ToolsJson, sessionOptions);
-        var measurement = new SetMeasurement { Name = set.Name, ToolCount = new ToolSet(set.ToolsJson).Tools.Count, PrefixTokens = session.ContextUsed };
+        var measurement = new SetMeasurement { Name = set.Name, ToolCount = new ToolSet(set.ToolsJson).Tools.Count, PrefixTokens = session.ContextUsed,
+            SessionCtorMs = (Stopwatch.GetTimestamp() - started) * 1000.0 / Stopwatch.Frequency,
+            SessionCtorPrivateBytes = PrivateBytes() - privateBefore };
         foreach (var query in set.Queries) measurement.Prompts.Add(new PromptMeasurement { Query = query });
         for (var warm = 0; warm < options.Warmups; warm++)
             foreach (var query in set.Queries)
@@ -154,6 +160,12 @@ internal static class BenchE2E
             for (var i = 0; i < set.Queries.Length; i++)
                 Record(measurement.Prompts[i], session, set.Queries[i]);
         return measurement;
+    }
+
+    static long PrivateBytes()
+    {
+        using var process = Process.GetCurrentProcess();
+        return process.PrivateMemorySize64;
     }
 
     static void Record(PromptMeasurement prompt, NeedleSession session, string query)
@@ -212,7 +224,7 @@ internal static class BenchE2E
             foreach (var set in run.Sets)
             {
                 writer.WriteLine();
-                writer.WriteLine($"threads {run.Threads} | {set.Name} set | {set.ToolCount} tools | prefix {set.PrefixTokens} tokens");
+                writer.WriteLine($"threads {run.Threads} | {set.Name} set | {set.ToolCount} tools | prefix {set.PrefixTokens} tokens | ctor {set.SessionCtorMs:F1} ms (+{set.SessionCtorPrivateBytes / 1048576.0:F1} MB private)");
                 writer.WriteLine($"{"query",-48}{"ptok",5}{"dtok",5}{"prefill ms",16}{"decode us/tok",18}{"ttft ms",14}{"total ms",16}{"managed B",16}{"native alloc",14}");
                 writer.WriteLine($"{"",-58}{"best",8}{"med",8}{"best",9}{"med",9}{"best",7}{"med",7}{"best",8}{"med",8}{"best",8}{"med",8}{"med",14}");
                 foreach (var prompt in set.Prompts) WriteRow(writer, Row.Of(prompt));
@@ -275,6 +287,8 @@ internal static class BenchE2E
             .Field("name", set.Name)
             .Field("tools", set.ToolCount)
             .Field("prefix_tokens", set.PrefixTokens)
+            .Field("session_ctor_ms", set.SessionCtorMs)
+            .Field("session_ctor_private_bytes", set.SessionCtorPrivateBytes)
             .Key("prompts").BeginArray();
         foreach (var p in set.Prompts)
         {

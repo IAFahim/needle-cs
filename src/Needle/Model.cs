@@ -292,6 +292,17 @@ public sealed unsafe class Model : IDisposable
     readonly ModelMemory memory;
     Arena arena;
     int disposed;
+    Vocabulary? vocabulary;
+    readonly object vocabularyGate = new();
+
+    internal Vocabulary GetVocabulary()
+    {
+        lock (vocabularyGate)
+        {
+            vocabulary ??= new Vocabulary(this);
+            return vocabulary;
+        }
+    }
 
     Model(ModelMemory memory)
     {
@@ -424,7 +435,9 @@ public sealed unsafe class Model : IDisposable
     public void Dispose()
     {
         if (Interlocked.Exchange(ref disposed, 1) != 0) return;
-        memory.Dispose();
+        vocabulary?.Dispose();
+        vocabulary = null;
         arena.Free();
+        memory.Dispose();
     }
 }

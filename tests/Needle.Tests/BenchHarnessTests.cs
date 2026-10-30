@@ -29,6 +29,8 @@ public sealed class BenchHarnessTests : IDisposable
         var set = Assert.Single(run.Sets);
         Assert.Equal(BenchPrompts.Golden.Length, set.Prompts.Count);
         Assert.True(set.PrefixTokens > 0);
+        Assert.True(set.SessionCtorMs > 0);
+        Assert.True(set.SessionCtorPrivateBytes > 0);
         foreach (var prompt in set.Prompts)
         {
             Assert.Equal(0, prompt.Failures);
@@ -54,8 +56,11 @@ public sealed class BenchHarnessTests : IDisposable
         var first = root.GetProperty("runs")[0];
         Assert.Equal(1, first.GetProperty("threads").GetInt32());
         Assert.True(first.GetProperty("sets")[0].GetProperty("summary").GetProperty("total_ms").GetProperty("best").GetDouble() > 0);
+        Assert.True(first.GetProperty("sets")[0].GetProperty("session_ctor_ms").GetDouble() > 0);
+        Assert.True(first.GetProperty("sets")[0].GetProperty("session_ctor_private_bytes").GetInt64() > 0);
         Assert.True(first.GetProperty("profile").GetProperty("decode_us_per_token").GetProperty("best").GetDouble() > 0);
         Assert.Contains("mlp", BenchE2E.ToText(report));
+        Assert.Contains("ctor", BenchE2E.ToText(report));
         Assert.Empty(BenchE2E.Violations(report));
 
         report.Options = options with { MaxManagedBytes = 0 };

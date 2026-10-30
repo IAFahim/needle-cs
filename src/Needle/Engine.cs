@@ -289,6 +289,72 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         }
     }
 
+    internal int MarkedLength => markedLength;
+
+    internal long PrimedPrefixBytes =>
+        sizeof(int) + (long)stateBytes +
+        (long)g.Layers * markedLength * (kWidth + vWidth + 2L * g.KvHeads * sizeof(float));
+
+    internal void ExportPrimedPrefix(Span<byte> destination)
+    {
+        if (destination.Length < PrimedPrefixBytes) throw new ArgumentException("primed prefix buffer too small");
+        fixed (byte* dst = destination)
+        {
+            *(int*)dst = markedLength;
+            var at = dst + sizeof(int);
+            Buffer.MemoryCopy(snapshot, at, stateBytes, stateBytes);
+            at += stateBytes;
+            for (var l = 0; l < g.Layers; l++)
+            {
+                var keys = (long)markedLength * kWidth;
+                var values = (long)markedLength * vWidth;
+                var scales = (long)markedLength * g.KvHeads * sizeof(float);
+                Buffer.MemoryCopy(keyCache + (long)l * capacity * kWidth, at, keys, keys);
+                at += keys;
+                Buffer.MemoryCopy(valueCache + (long)l * capacity * vWidth, at, values, values);
+                at += values;
+                Buffer.MemoryCopy(keyScale + (long)l * capacity * g.KvHeads, at, scales, scales);
+                at += scales;
+                Buffer.MemoryCopy(valueScale + (long)l * capacity * g.KvHeads, at, scales, scales);
+                at += scales;
+            }
+        }
+    }
+
+    internal void ImportPrimedPrefix(ReadOnlySpan<byte> source)
+    {
+        fixed (byte* src = source)
+        {
+            var length = *(int*)src;
+            if (length < 0 || length > capacity) throw new ArgumentException("primed prefix length exceeds context capacity");
+            var expected = sizeof(int) + (long)stateBytes +
+                (long)g.Layers * length * (kWidth + vWidth + 2L * g.KvHeads * sizeof(float));
+            if (source.Length < expected) throw new ArgumentException("primed prefix is truncated");
+            var at = src + sizeof(int);
+            Buffer.MemoryCopy(at, state, stateBytes, stateBytes);
+            Buffer.MemoryCopy(at, snapshot, stateBytes, stateBytes);
+            at += stateBytes;
+            for (var l = 0; l < g.Layers; l++)
+            {
+                var keys = (long)length * kWidth;
+                var values = (long)length * vWidth;
+                var scales = (long)length * g.KvHeads * sizeof(float);
+                Buffer.MemoryCopy(at, keyCache + (long)l * capacity * kWidth, keys, keys);
+                at += keys;
+                Buffer.MemoryCopy(at, valueCache + (long)l * capacity * vWidth, values, values);
+                at += values;
+                Buffer.MemoryCopy(at, keyScale + (long)l * capacity * g.KvHeads, scales, scales);
+                at += scales;
+                Buffer.MemoryCopy(at, valueScale + (long)l * capacity * g.KvHeads, scales, scales);
+                at += scales;
+            }
+            Length = length;
+            markedLength = length;
+            historyPending = false;
+            poolPending = false;
+        }
+    }
+
     static void CopyPrefix<T>(T* from, T* to, long offset, long count) where T : unmanaged =>
         Buffer.MemoryCopy(from + offset, to + offset, count * sizeof(T), count * sizeof(T));
 

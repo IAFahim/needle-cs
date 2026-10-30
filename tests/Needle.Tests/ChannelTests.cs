@@ -101,7 +101,6 @@ public sealed class ChannelTests : IDisposable
         using var big = new DisposableChannel(NeedleChannel.Allocate(1024, 1024));
         var channel = big.Channel;
         Span<byte> payload = stackalloc byte[1];
-        var previous = ulong.MaxValue;
         for (var i = 0; i < 1_000; i++)
         {
             payload[0] = (byte)i;

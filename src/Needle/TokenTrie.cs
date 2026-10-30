@@ -23,6 +23,27 @@ internal sealed unsafe class TokenTrie : IDisposable
     readonly byte** specialBytes;
     readonly int* specialLength;
     byte* pool;
+    readonly bool shared;
+
+    internal TokenTrie(TokenTrie source)
+    {
+        shared = true;
+        vocab = source.vocab;
+        maskWords = source.maskWords;
+        walkStates = (GrammarState*)Mem.Alloc((nuint)(MaxTokenBytes + 1) * (nuint)sizeof(GrammarState));
+        edgeStart = source.edgeStart;
+        edgeCount = source.edgeCount;
+        edgeByte = source.edgeByte;
+        edgeNode = source.edgeNode;
+        tokenHead = source.tokenHead;
+        tokenNext = source.tokenNext;
+        safeMask = source.safeMask;
+        special = source.special;
+        specialCount = source.specialCount;
+        specialBytes = source.specialBytes;
+        specialLength = source.specialLength;
+        pool = source.pool;
+    }
 
     public int Words => maskWords;
 
@@ -160,6 +181,7 @@ internal sealed unsafe class TokenTrie : IDisposable
     public void Dispose()
     {
         Mem.Free(walkStates);
+        if (shared) return;
         Mem.Free(edgeStart);
         Mem.Free(edgeCount);
         Mem.Free(tokenHead);
