@@ -33,7 +33,9 @@ internal static class AllocationProbe
         using var model = Model.Open(Assets.Model);
         var retrieval = mode == "retrieval";
         var tools = retrieval ? SessionCases.Catalog() : SessionCases.DefaultTools();
-        using var session = new NeedleSession(model, tools, new NeedleOptions { Threads = threads, AutoDate = false, RetrievalTopK = 5 });
+        // The jumpforward mode decodes with forced-span chunking on the same
+        // prompts: the chunk buffers are stack-owned, so the 0 B bar holds.
+        using var session = new NeedleSession(model, tools, new NeedleOptions { Threads = threads, AutoDate = false, RetrievalTopK = 5, JumpForward = mode == "jumpforward" });
         var calls = new byte[4096];
         var reasoning = new byte[4096];
         var response = new byte[4096];
@@ -109,6 +111,18 @@ public sealed class ZeroAllocationTests
     public void HundredWarmSpanCallsAllocateNothingManagedOrNative(int threads)
     {
         var measurement = RunInQuietProcess("plain", threads);
+        Assert.Equal(0, measurement.Unexpected);
+        Assert.Equal(0, measurement.CallerThread);
+        Assert.Equal(0, measurement.WholeProcess);
+        if (measurement.NativeCounted) Assert.Equal(0, measurement.NativeCalls);
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(4)]
+    public void HundredWarmJumpForwardCallsAllocateNothingManagedOrNative(int threads)
+    {
+        var measurement = RunInQuietProcess("jumpforward", threads);
         Assert.Equal(0, measurement.Unexpected);
         Assert.Equal(0, measurement.CallerThread);
         Assert.Equal(0, measurement.WholeProcess);
