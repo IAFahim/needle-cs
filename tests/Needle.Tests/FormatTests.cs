@@ -38,13 +38,20 @@ public sealed class FormatTests
         return new LockFile(revisions, files);
     }
 
+    // fetch.sh runs under Git bash on Windows, where backslash separators in
+    // the script path ($0 dirname/cd) and in NEEDLE_REF_DIR/NEEDLE_REF_LOCK
+    // break file lookup, so hand bash forward-slash paths on every platform
+    // (no-op on Unix). CI evidence: run 41030471519 windows-x64, every
+    // fetch.sh invocation exited 1 with empty output.
+    static string ForBash(string path) => path.Replace(Path.DirectorySeparatorChar, '/');
+
     static ScriptResult RunFetch(string argument, string refDirectory, string lockPath)
     {
         var start = new ProcessStartInfo("bash") { RedirectStandardOutput = true, RedirectStandardError = true };
-        start.ArgumentList.Add(Path.Combine(Assets.Root, "tools/fetch.sh"));
+        start.ArgumentList.Add(ForBash(Path.Combine(Assets.Root, "tools/fetch.sh")));
         if (argument.Length > 0) start.ArgumentList.Add(argument);
-        start.Environment["NEEDLE_REF_DIR"] = refDirectory;
-        start.Environment["NEEDLE_REF_LOCK"] = lockPath;
+        start.Environment["NEEDLE_REF_DIR"] = ForBash(refDirectory);
+        start.Environment["NEEDLE_REF_LOCK"] = ForBash(lockPath);
         using var process = Process.Start(start)!;
         var errors = process.StandardError.ReadToEndAsync();
         var output = process.StandardOutput.ReadToEnd();

@@ -1,0 +1,5 @@
+# Windows checkouts must not CRLF-convert files that Git bash executes or
+# that bash tools parse field-wise (CI evidence: run 41030471519 windows-x64,
+# where every tools/fetch.sh invocation failed). See issue #32.
+*.sh text eol=lf
+tools/ref.lock text eol=lf
