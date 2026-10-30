@@ -340,23 +340,33 @@ internal unsafe struct MatMulBatch
 
     public static void Run(Pool pool, MatMulBatch* batch)
     {
-        var rows = 0;
-        for (var j = 0; j < batch->Count; j++) rows += batch->Jobs.At(j)->W.Rows;
-        var perTask = Math.Max(MinimumRowsPerTask, (rows + pool.Threads * TasksPerThread - 1) / (pool.Threads * TasksPerThread));
-        batch->RowsPerTask = (perTask + Quant.RowBlock - 1) / Quant.RowBlock * Quant.RowBlock;
-        var tasks = 0;
-        for (var j = 0; j < batch->Count; j++) tasks += TaskCount(batch, j);
-        pool.Run(&Execute, batch, tasks);
+        batch->Plan(pool.Threads);
+        pool.Run(&Execute, batch, batch->TaskCount);
     }
 
-    static int TaskCount(MatMulBatch* batch, int job) => (batch->Jobs.At(job)->W.Rows + batch->RowsPerTask - 1) / batch->RowsPerTask;
-
-    static void Execute(void* context, int index)
+    public void Plan(int threads)
     {
-        var batch = (MatMulBatch*)context;
+        var rows = 0;
+        for (var j = 0; j < Count; j++) rows += Jobs.At(j)->W.Rows;
+        var perTask = Math.Max(MinimumRowsPerTask, (rows + threads * TasksPerThread - 1) / (threads * TasksPerThread));
+        RowsPerTask = (perTask + Quant.RowBlock - 1) / Quant.RowBlock * Quant.RowBlock;
+    }
+
+    public int TaskCount
+    {
+        get
+        {
+            var tasks = 0;
+            for (var j = 0; j < Count; j++) tasks += (Jobs.At(j)->W.Rows + RowsPerTask - 1) / RowsPerTask;
+            return tasks;
+        }
+    }
+
+    public static void RunTask(MatMulBatch* batch, int index)
+    {
         for (var j = 0; j < batch->Count; j++)
         {
-            var tasks = TaskCount(batch, j);
+            var tasks = JobTasks(batch, j);
             if (index >= tasks) { index -= tasks; continue; }
             var job = batch->Jobs.At(j);
             var start = index * batch->RowsPerTask;
@@ -364,6 +374,10 @@ internal unsafe struct MatMulBatch
             return;
         }
     }
+
+    static int JobTasks(MatMulBatch* batch, int job) => (batch->Jobs.At(job)->W.Rows + batch->RowsPerTask - 1) / batch->RowsPerTask;
+
+    static void Execute(void* context, int index) => RunTask((MatMulBatch*)context, index);
 
     const int TasksPerThread = 3;
     const int MinimumRowsPerTask = 8;
