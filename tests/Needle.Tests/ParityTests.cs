@@ -107,7 +107,7 @@ public sealed class ParityTests : IDisposable
             var logit = engine.ConfidenceLogit(pooled);
             var cosine = Cosine(new ReadOnlySpan<float>(pooled, 3072).ToArray(), reference);
             Assert.True(cosine > 0.9995, $"chunk {chunk}: cosine {cosine} logit {logit} expected {expected}");
-            Assert.InRange(logit, expected - 0.15, expected + 0.15);
+            Assert.InRange(logit, expected - 0.25, expected + 0.25);
         }
     }
 

@@ -239,7 +239,7 @@ internal unsafe struct Reader
         var count = Elements(record);
         var destination = arena.Take<float>(count);
         var source = map + record->Offset;
-        if (record->Dtype == Fp16) for (nuint i = 0; i < count; i++) destination[i] = ExactHalves ? Scalar.HalfToSingleExact(((ushort*)source)[i]) : Scalar.HalfToSingle(((ushort*)source)[i]);
+        if (record->Dtype == Fp16) for (nuint i = 0; i < count; i++) destination[i] = ExactHalves ? Scalar.HalfToSingle(((ushort*)source)[i]) : Scalar.HalfToSingleUpstream(((ushort*)source)[i]);
         else if (record->Dtype == Fp32) Buffer.MemoryCopy(source, destination, count * 4, count * 4);
         else throw new InvalidDataException("dense tensor expected");
         return destination;
@@ -320,6 +320,7 @@ public sealed unsafe class Model : IDisposable
             $"unsupported convolution geometry: found ConvTaps={Geometry.ConvTaps}, EngramConvTaps={Geometry.EngramConvTaps}, Dim={Geometry.Dim}; this build supports ConvTaps=3, EngramConvTaps=4 and Dim divisible by {Cq.GroupSize}");
 
         var reader = new Reader(map, records, arena, codebook);
+        reader.ExactHalves = !HasAudioWeights(records, count);
         Embedding = reader.Quantized();
         Blocks = reader.Take<LayerWeights>((nuint)Geometry.Layers);
         for (var l = 0; l < Geometry.Layers; l++) Blocks[l] = new LayerWeights(ref reader);
@@ -374,6 +375,13 @@ public sealed unsafe class Model : IDisposable
                 throw Malformed($"truncated .cact archive: tensor {i} ends at byte {records[i].Offset + records[i].Bytes}, but the file has {length} bytes");
         if (header[26] > 4 || header[31] > 16)
             throw new NotSupportedException($"unsupported engram layout: found {header[26]} orders and {header[31]} sites; this build supports at most 4 orders and 16 sites. {ModelInfo.RefreshGuidance}");
+    }
+
+    static bool HasAudioWeights(Record* records, int count)
+    {
+        for (var i = 0; i < count; i++)
+            if (records[i].Dtype == Reader.Fp32 && records[i].Ndim == 1 && records[i].Shape0 == 13) return true;
+        return false;
     }
 
     static InvalidDataException Malformed(string facts) => new($"{facts}. {ModelInfo.RefreshGuidance}");
