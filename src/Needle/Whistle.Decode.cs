@@ -181,7 +181,7 @@ public sealed unsafe partial class Whistle
     }
 
     public int BeamWidth { get; set; } = 4;
-    public float BeamLengthPenalty { get; set; }
+    public float BeamLengthPenalty { get; set; } = 1f;
 
     Engine[]? beamEngines;
     float* beamScores;
