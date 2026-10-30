@@ -131,6 +131,22 @@ internal static unsafe class Neon
         for (; i2 < n; i2++) s[i2] /= total;
     }
 
+    // Probability of the best (maximum) entry: 1 / sum(exp(v - best)).
+    // Vectorized counterpart of Ops.BestProbability; only the best probability
+    // is produced, unlike Softmax which normalizes every entry.
+    public static float BestProbability(float* values, int count, float best)
+    {
+        var shift = Vector128.Create(best);
+        var sum = Vector128<float>.Zero;
+        var vectorEnd = count & ~3;
+        var i = 0;
+        for (; i < vectorEnd; i += 4)
+            sum = AdvSimd.Add(sum, Exp(AdvSimd.Subtract(AdvSimd.LoadVector128(values + i), shift)));
+        var total = HorizontalSum(sum);
+        for (; i < count; i++) total += MathF.Exp(values[i] - best);
+        return 1f / total;
+    }
+
     public static void Rope(float* x, int heads, int headDim, float* cos, float* sin)
     {
         var half = headDim / 2;

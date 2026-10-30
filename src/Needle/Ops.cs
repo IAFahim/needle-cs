@@ -340,4 +340,131 @@ internal static unsafe class Ops
         for (var i = 1; i < n; i++) if (x[i] > x[best]) best = i;
         return best;
     }
+
+    // Masked argmax over a bit mask of allowed ids (`words` 32-bit words, one
+    // bit per logit). Zero words are skipped; fully-set words reduce 8 logits
+    // at a time with AVX while sparse words visit only their set bits.
+    // Returns -1 when no bit is set. `length` bounds the logit array; padding
+    // bits past it are never set by our masks and are ignored defensively.
+    public static int ArgMaxMasked(float* x, uint* mask, int words, int length)
+    {
+#if NEEDLE_SIMD
+        if (!Simd.UseNeon && Simd.Enabled) return ArgMaxMaskedAvx(x, mask, words, length);
+#endif
+        return ArgMaxMaskedScalar(x, mask, words, length);
+    }
+
+    static int ArgMaxMaskedScalar(float* x, uint* mask, int words, int length)
+    {
+        var best = -1;
+        var peak = float.NegativeInfinity;
+        for (var w = 0; w < words; w++)
+        {
+            var bits = mask[w];
+            if (bits == 0) continue;
+            var bottom = w * 32;
+            if (bits == 0xFFFFFFFFu)
+            {
+                var top = bottom + 32 <= length ? bottom + 32 : length;
+                for (var id = bottom; id < top; id++)
+                {
+                    var value = x[id];
+                    if (value > peak) { peak = value; best = id; }
+                }
+                continue;
+            }
+            while (bits != 0)
+            {
+                var id = bottom + Bits.TrailingZeros(bits);
+                bits &= bits - 1;
+                if (id >= length) continue;
+                var value = x[id];
+                if (value > peak) { peak = value; best = id; }
+            }
+        }
+        return best;
+    }
+
+#if NEEDLE_SIMD
+    static int ArgMaxMaskedAvx(float* x, uint* mask, int words, int length)
+    {
+        var best = -1;
+        var peak = float.NegativeInfinity;
+        for (var w = 0; w < words; w++)
+        {
+            var bits = mask[w];
+            if (bits == 0) continue;
+            var bottom = w * 32;
+            if (bits == 0xFFFFFFFFu && bottom + 32 <= length)
+            {
+                for (var q = 0; q < 4; q++)
+                {
+                    var at = x + bottom + q * 8;
+                    var local = Max8(Avx.LoadVector256(at));
+                    if (local > peak)
+                    {
+                        peak = local;
+                        best = bottom + q * 8 + LaneOfMax(at, local);
+                    }
+                }
+                continue;
+            }
+            while (bits != 0)
+            {
+                var id = bottom + Bits.TrailingZeros(bits);
+                bits &= bits - 1;
+                if (id >= length) continue;
+                var value = x[id];
+                if (value > peak) { peak = value; best = id; }
+            }
+        }
+        return best;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    static float Max8(Vector256<float> v)
+    {
+        var halves = Sse.Max(v.GetLower(), v.GetUpper());
+        var pairs = Sse.Max(halves, Sse.Shuffle(halves, halves, 0x4E));
+        return Sse.Max(pairs, Sse.Shuffle(pairs, pairs, 0xB1)).ToScalar();
+    }
+
+    static int LaneOfMax(float* x, float peak)
+    {
+        for (var i = 0; i < 8; i++) if (x[i] == peak) return i;
+        return 0;
+    }
+#endif
+
+    // Probability of the best (maximum) entry: 1 / sum(exp(v - best)).
+    // The caller passes the maximum of `values[0..count)`; the exp-sum is
+    // vectorized and only the best probability is produced, unlike Softmax
+    // which normalizes every entry. `count` must be at least 1.
+    public static float BestProbability(float* values, int count, float best)
+    {
+#if NEEDLE_SIMD
+        if (Simd.UseNeon) return Neon.BestProbability(values, count, best);
+#endif
+        if (!Simd.Enabled) return ScalarBestProbability(values, count, best);
+#if NEEDLE_SIMD
+        var shift = Vector256.Create(best);
+        var sum = Vector256<float>.Zero;
+        var vectorEnd = count & ~7;
+        var i = 0;
+        for (; i < vectorEnd; i += 8)
+            sum = Avx.Add(sum, Exp(Avx.Subtract(Avx.LoadVector256(values + i), shift)));
+        var total = Vector256.Sum(sum);
+        for (; i < count; i++) total += MathF.Exp(values[i] - best);
+        return 1f / total;
+#else
+        return ScalarBestProbability(values, count, best);
+#endif
+    }
+
+    static float ScalarBestProbability(float* values, int count, float best)
+    {
+        var total = 0f;
+        for (var i = 0; i < count; i++) total += MathF.Exp(values[i] - best);
+        return 1f / total;
+    }
 }

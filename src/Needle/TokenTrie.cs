@@ -23,6 +23,14 @@ internal sealed unsafe class TokenTrie : IDisposable
     readonly byte** specialBytes;
     readonly int* specialLength;
     byte* pool;
+    // Direct-mapped memo of recent Allow masks keyed by grammar-state
+    // signature (program, depth, frames). The string fast path bypasses it.
+    const int MaskCacheSlots = 64;
+    readonly nuint* cacheProgram;
+    readonly ulong* cacheHash;
+    readonly int* cacheDepth;
+    readonly ulong* cacheFrames;
+    readonly uint* cacheMasks;
     readonly bool shared;
 
     internal TokenTrie(TokenTrie source)
@@ -43,6 +51,11 @@ internal sealed unsafe class TokenTrie : IDisposable
         specialBytes = source.specialBytes;
         specialLength = source.specialLength;
         pool = source.pool;
+        cacheProgram = (nuint*)Mem.AllocZeroed((nuint)MaskCacheSlots * (nuint)sizeof(nuint));
+        cacheHash = (ulong*)Mem.AllocZeroed((nuint)MaskCacheSlots * sizeof(ulong));
+        cacheDepth = (int*)Mem.AllocZeroed((nuint)MaskCacheSlots * 4);
+        cacheFrames = (ulong*)Mem.AllocZeroed((nuint)MaskCacheSlots * GrammarState.MaxDepth * 3 * sizeof(ulong));
+        cacheMasks = (uint*)Mem.AllocZeroed((nuint)MaskCacheSlots * (nuint)maskWords * 4);
     }
 
     public int Words => maskWords;
@@ -125,12 +138,20 @@ internal sealed unsafe class TokenTrie : IDisposable
             specialLength[i] = specialLengths[i];
             specialBytes[i] = pool + specialOffsets[i];
         }
+        cacheProgram = (nuint*)Mem.AllocZeroed((nuint)MaskCacheSlots * (nuint)sizeof(nuint));
+        cacheHash = (ulong*)Mem.AllocZeroed((nuint)MaskCacheSlots * sizeof(ulong));
+        cacheDepth = (int*)Mem.AllocZeroed((nuint)MaskCacheSlots * 4);
+        cacheFrames = (ulong*)Mem.AllocZeroed((nuint)MaskCacheSlots * GrammarState.MaxDepth * 3 * sizeof(ulong));
+        cacheMasks = (uint*)Mem.AllocZeroed((nuint)MaskCacheSlots * (nuint)maskWords * 4);
     }
 
     public void Allow(GrammarProgram* g, in GrammarState state, uint* mask)
     {
-        Mem.Clear(mask, (nuint)maskWords * 4);
-        if (state.Depth == 0) return;
+        if (state.Depth == 0)
+        {
+            Mem.Clear(mask, (nuint)maskWords * 4);
+            return;
+        }
         fixed (GrammarState* start = &state)
         {
             var top = start->Frames + start->Depth - 1;
@@ -148,8 +169,48 @@ internal sealed unsafe class TokenTrie : IDisposable
                 }
                 return;
             }
+            var hash = MaskSignature(g, start, out var depth);
+            var slot = (int)(hash & (ulong)(MaskCacheSlots - 1));
+            if (cacheProgram[slot] == (nuint)g && cacheDepth[slot] == depth && cacheHash[slot] == hash && FramesEqual(slot, start, depth))
+            {
+                var hit = cacheMasks + (long)slot * maskWords;
+                for (var i = 0; i < maskWords; i++) mask[i] = hit[i];
+                return;
+            }
+            Mem.Clear(mask, (nuint)maskWords * 4);
             Walk(g, start, mask);
+            cacheProgram[slot] = (nuint)g;
+            cacheDepth[slot] = depth;
+            cacheHash[slot] = hash;
+            var frames = (ulong*)start->Frames;
+            var storedFrames = cacheFrames + (long)slot * GrammarState.MaxDepth * 3;
+            for (var i = 0; i < depth * 3; i++) storedFrames[i] = frames[i];
+            var storedMask = cacheMasks + (long)slot * maskWords;
+            for (var i = 0; i < maskWords; i++) storedMask[i] = mask[i];
         }
+    }
+
+    // FNV-1a over the owning program, depth and every frame (node, phase, aux,
+    // aux2, candidate bits). The full stack is hashed: deeper frames decide
+    // what happens after the top frame completes, so a top-frame-only key
+    // would alias distinct masks.
+    static ulong MaskSignature(GrammarProgram* g, GrammarState* state, out int depth)
+    {
+        depth = state->Depth;
+        var hash = 1469598103934665603ul;
+        hash = (hash ^ (ulong)(nuint)g) * 1099511628211ul;
+        hash = (hash ^ (ulong)(uint)depth) * 1099511628211ul;
+        var frames = (ulong*)state->Frames;
+        for (var i = 0; i < depth * 3; i++) hash = (hash ^ frames[i]) * 1099511628211ul;
+        return hash;
+    }
+
+    bool FramesEqual(int slot, GrammarState* state, int depth)
+    {
+        var frames = (ulong*)state->Frames;
+        var stored = cacheFrames + (long)slot * GrammarState.MaxDepth * 3;
+        for (var i = 0; i < depth * 3; i++) if (stored[i] != frames[i]) return false;
+        return true;
     }
 
     void Walk(GrammarProgram* g, GrammarState* start, uint* mask)
@@ -183,6 +244,11 @@ internal sealed unsafe class TokenTrie : IDisposable
     public void Dispose()
     {
         Mem.Free(walkStates);
+        Mem.Free(cacheProgram);
+        Mem.Free(cacheHash);
+        Mem.Free(cacheDepth);
+        Mem.Free(cacheFrames);
+        Mem.Free(cacheMasks);
         if (shared) return;
         Mem.Free(edgeStart);
         Mem.Free(edgeCount);
