@@ -250,7 +250,7 @@ public sealed unsafe class BatchedDecodeTests : IDisposable
             using var batch = new BatchedSession(model, options, queries.Length);
             foreach (var _ in queries) batch.Open(tools);
             var task = Task.Run(() => batch.Complete(queries));
-            Thread.Sleep(100);
+            if (attempt > 0) Thread.Sleep(attempt * 5);
             batch.RequestCancel(3);
             var actual = task.Result;
             if (!actual[3].Success && actual[3].Error == "cancelled")
