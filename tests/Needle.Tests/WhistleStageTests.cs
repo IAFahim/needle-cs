@@ -71,6 +71,8 @@ public sealed class WhistleStageTests : IDisposable
     [Theory]
     [InlineData("record")]
     [InlineData("hotword")]
+    [InlineData("test")]
+    [InlineData("long25")]
     public void StagesMatchTheNumpyReference(string clip)
     {
         var directory = GoldenDirectory(clip);

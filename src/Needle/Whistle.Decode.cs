@@ -180,7 +180,7 @@ public sealed unsafe partial class Whistle
         return pass;
     }
 
-    public int BeamWidth { get; set; } = 4;
+    public int BeamWidth { get; set; } = 3;
     public float BeamLengthPenalty { get; set; } = 1f;
 
     Engine[]? beamEngines;

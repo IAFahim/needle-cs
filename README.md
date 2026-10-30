@@ -17,7 +17,7 @@ Early but usable for a showcase: everything below works on Linux x64 today and i
 | Threading | `ThreadPolicy` presets, the library never pins your calling thread, workers park when idle, `Pause`/`Resume` |
 | Speed | Faster than the upstream native engine on the reference VM (73-84 ms vs 95-129 ms per call, 4 threads). A further 3x is planned, see below |
 | Per-call allocations | About 6 KB of managed allocations per call today. Zero-allocation API and typed C# calls are planned |
-| Voice | Whistle transcription matches the upstream library on 2 of 4 test clips and is close on the others (details in issue #38). Beam search is on by default, `BeamWidth = 1` gives faster greedy decoding |
+| Voice | Whistle transcription matches the upstream library on record, test and hotword; long25 keeps the queen passage but differs by one short phrase (issue #38). Beam search is on by default (`BeamWidth = 3`), `BeamWidth = 1` gives faster greedy decoding |
 | Evaluating tool sets | `needle eval` with 208 game prompts, see below |
 | Unity | Sample package exists, the Entities `ISystem` version is planned |
 
@@ -148,10 +148,10 @@ NEEDLE_SCALAR=1 dotnet test tests/Needle.Tests -c Release
 
 The greedy decode budget is `DECODE_BUDGET` in `tools/golden.py` (`python3 tools/golden.py 64` overrides it). The script records the budget it used in `ref/golden/golden.json` and `ParityTests.GenerationMatchesReferenceGreedyDecode` decodes exactly that many tokens, so the fixture and the test cannot drift. It also records the SHA-256 of the model it used, and the tests fail with "fixtures were generated from a different model" if the loaded model differs. To adopt a newer upstream model on purpose, follow "Refreshing the upstream model" in [CONTRIBUTING.md](CONTRIBUTING.md).
 
-The Whistle stage goldens come from a second numpy reference, `tools/golden_whistle.py`. It reads `whistle.cact` and the clips in `ref/audio`, and writes the log-mel features, stem output, encoder layers, encoder output, cross-attention memory and the first decoder logits to `ref/golden/whistle/<clip>/`. `WhistleStageTests` compares the C# stages against them. It needs `pip install numpy sentencepiece soxr` (soxr resamples the 48 kHz clips) and takes seconds. Whistle decodes with beam search (width 4, mean log-probability), which is what the upstream library does.
+The Whistle stage goldens come from a second numpy reference, `tools/golden_whistle.py`. It reads `whistle.cact` and the clips in `ref/audio`, and writes the log-mel features, stem output, encoder layers, encoder output, cross-attention memory and the first decoder logits to `ref/golden/whistle/<clip>/`. `WhistleStageTests` compares the C# stages against them. It needs `pip install numpy sentencepiece soxr` (soxr resamples the 48 kHz clips) and takes seconds. Whistle decodes with beam search (width 3, mean log-probability), which matches the upstream library on all four clips.
 
 ```bash
-python3 tools/golden_whistle.py record hotword
+python3 tools/golden_whistle.py
 ```
 
 
