@@ -43,7 +43,7 @@ public sealed unsafe class BatchedSession : IDisposable
     static readonly Regex DateKey = new(@"\bdate\s*:", RegexOptions.IgnoreCase);
     static readonly Regex IsoStamp = new(@"\d{4}-\d{2}-\d{2}");
 
-    enum Phase : byte { Reasoning, ThinkHead, ThinkTail, Call, CallClosing, Respond, RespondClosing }
+    enum Phase : byte { Reasoning, ThinkTail, Call, CallClosingFeed, CallClosing, Respond, RespondClosing }
 
     enum Want : byte { None, Full, Sparse }
 
@@ -303,6 +303,9 @@ public sealed unsafe class BatchedSession : IDisposable
         lane.First = true;
         lane.Finished = false;
         System.Threading.Volatile.Write(ref lane.CancelRequested, 0);
+        // Every turn starts from the shared primed prefix with first-turn
+        // prompt heads: lanes are stateless across turns by design.
+        lane.TurnOne = true;
         engine.RewindSlot(lane.Slot);
         if (!toolResult && input.Length == 0) { FailLane(ref lane, ReplyStatus.Failed, FailureReason.EmptyInput); return; }
         if (input.Length > maxInputBytes) { FailLane(ref lane, ReplyStatus.Failed, FailureReason.InputTooLong); return; }
@@ -326,9 +329,9 @@ public sealed unsafe class BatchedSession : IDisposable
         switch (lane.Phase)
         {
             case Phase.Reasoning: AdvanceReason(ref lane); break;
-            case Phase.ThinkHead: AdvanceThinkHead(ref lane); break;
             case Phase.ThinkTail: AdvanceThinkTail(ref lane); break;
             case Phase.Call: AdvanceCall(ref lane); break;
+            case Phase.CallClosingFeed: AdvanceCallClosingFeed(ref lane); break;
             case Phase.CallClosing: FinishCall(ref lane); break;
             case Phase.Respond: AdvanceRespond(ref lane); break;
             case Phase.RespondClosing: FinishRespond(ref lane); break;
@@ -340,8 +343,8 @@ public sealed unsafe class BatchedSession : IDisposable
     {
         if (lane.Steps >= options.MaxReasoningTokens)
         {
-            SetPending(ref lane, ThinkEnd, Want.None);
-            lane.Phase = Phase.ThinkHead;
+            SetPending(ref lane, thinkEndForced, Want.Full);
+            lane.Phase = Phase.ThinkTail;
             return;
         }
         var next = ArgMax(reasoningMask, PickLogits(ref lane));
@@ -349,8 +352,8 @@ public sealed unsafe class BatchedSession : IDisposable
         if (lane.FirstTokenTicks == 0) lane.FirstTokenTicks = Stopwatch.GetTimestamp() - lane.Started;
         if (next == ThinkEnd)
         {
-            SetPending(ref lane, ThinkEnd, Want.None);
-            lane.Phase = Phase.ThinkHead;
+            SetPending(ref lane, thinkEndForced, Want.Full);
+            lane.Phase = Phase.ThinkTail;
             return;
         }
         AppendPiece(next, lane.ReasoningLength == 0, lane.Reasoning, ref lane.ReasoningLength, ref lane.Flags, ReplyFlags.ReasoningTruncated);
@@ -358,12 +361,6 @@ public sealed unsafe class BatchedSession : IDisposable
         lane.DecodeTokens++;
         if (FrameBudgetHit(ref lane)) return;
         SetPending(ref lane, next, Want.Full);
-    }
-
-    void AdvanceThinkHead(ref Lane lane)
-    {
-        SetPending(ref lane, thinkEndForced.AsSpan(1, 1), Want.Full);
-        lane.Phase = Phase.ThinkTail;
     }
 
     void AdvanceThinkTail(ref Lane lane)
@@ -426,8 +423,10 @@ public sealed unsafe class BatchedSession : IDisposable
         if (FrameBudgetHit(ref lane)) return;
         if (Grammar.Complete(lane.State))
         {
-            lane.Phase = Phase.CallClosing;
-            SetPending(ref lane, pick, callClosing, Want.None);
+            // The pick and the closing span are separate shared passes, like
+            // the reference path's two feeds, so pooling sees identical rows.
+            lane.Phase = Phase.CallClosingFeed;
+            SetPending(ref lane, pick, Want.None);
             return;
         }
         trie.Allow(lane.Grammar.Program, lane.State, lane.Mask);
@@ -465,6 +464,12 @@ public sealed unsafe class BatchedSession : IDisposable
         }
         lane.Current = next;
         SetPending(ref lane, next, Want.Full);
+    }
+
+    void AdvanceCallClosingFeed(ref Lane lane)
+    {
+        SetPending(ref lane, callClosing, Want.None);
+        lane.Phase = Phase.CallClosing;
     }
 
     void FinishCall(ref Lane lane)
@@ -527,21 +532,6 @@ public sealed unsafe class BatchedSession : IDisposable
     static void SetPending(ref Lane lane, int[] tokens, Want want)
     {
         tokens.CopyTo(lane.Pending, 0);
-        lane.PendingCount = tokens.Length;
-        lane.Want = want;
-    }
-
-    static void SetPending(ref Lane lane, int pick, int[] tail, Want want)
-    {
-        lane.Pending[0] = pick;
-        tail.CopyTo(lane.Pending, 1);
-        lane.PendingCount = 1 + tail.Length;
-        lane.Want = want;
-    }
-
-    static void SetPending(ref Lane lane, Span<int> tokens, Want want)
-    {
-        for (var i = 0; i < tokens.Length; i++) lane.Pending[i] = tokens[i];
         lane.PendingCount = tokens.Length;
         lane.Want = want;
     }
@@ -701,9 +691,9 @@ public sealed unsafe class BatchedSession : IDisposable
         return count;
     }
 
-    void AppendPiece(int token, bool first, byte[] destination, ref int length, ref ReplyFlags flags, ReplyFlags truncated)
+    void AppendPiece(int token, bool first, Span<byte> destination, ref int length, ref ReplyFlags flags, ReplyFlags truncated)
     {
-        if (destination.Length == 0) return;
+        if (destination.IsEmpty) return;
         Span<byte> piece = stackalloc byte[MaxPieceBytes];
         var count = tokenizer.Append(token, piece, first);
         var room = destination.Length - length;

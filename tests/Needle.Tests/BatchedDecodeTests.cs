@@ -170,7 +170,11 @@ public sealed unsafe class BatchedDecodeTests : IDisposable
     CallResult[] RunSequential(string tools, string[] queries, NeedleOptions options)
     {
         using var session = new NeedleSession(model, tools, options);
-        return queries.Select(q => session.Complete(q)).ToArray();
+        return queries.Select(q =>
+        {
+            session.Reset();
+            return session.Complete(q);
+        }).ToArray();
     }
 
     [Fact]
@@ -226,12 +230,12 @@ public sealed unsafe class BatchedDecodeTests : IDisposable
         var expected = RunSequential(tools, queries, options);
         using var batch = new BatchedSession(model, options, queries.Length);
         foreach (var _ in queries) batch.Open(tools);
+        // A pre-turn cancel is cleared at turn start, exactly like the
+        // single-sequence session clears RequestCancel on entry: the lane
+        // runs normally and identically.
         batch.RequestCancel(1);
         var actual = batch.Complete(queries);
-        Assert.False(actual[1].Success);
-        Assert.Equal("cancelled", actual[1].Error);
-        AssertSameCallResult("lane 0", expected[0], actual[0]);
-        AssertSameCallResult("lane 2", expected[2], actual[2]);
+        for (var i = 0; i < queries.Length; i++) AssertSameCallResult($"lane {i}", expected[i], actual[i]);
     }
 
     [Fact]
@@ -239,20 +243,20 @@ public sealed unsafe class BatchedDecodeTests : IDisposable
     {
         var options = Options(4);
         var tools = BenchPrompts.GameToolsJson;
-        var queries = new[] { "give 50 gold to Borin then move to 10, 20", "switch to wedge formation and follow the captain", "attack the watchtower near the river" };
+        var queries = BenchPrompts.Game;
         var expected = RunSequential(tools, queries, options);
         for (var attempt = 0; attempt < 8; attempt++)
         {
             using var batch = new BatchedSession(model, options, queries.Length);
             foreach (var _ in queries) batch.Open(tools);
             var task = Task.Run(() => batch.Complete(queries));
-            Thread.Sleep(20);
-            batch.RequestCancel(1);
+            Thread.Sleep(100);
+            batch.RequestCancel(3);
             var actual = task.Result;
-            if (!actual[1].Success && actual[1].Error == "cancelled")
+            if (!actual[3].Success && actual[3].Error == "cancelled")
             {
-                AssertSameCallResult("lane 0", expected[0], actual[0]);
-                AssertSameCallResult("lane 2", expected[2], actual[2]);
+                for (var i = 0; i < queries.Length; i++)
+                    if (i != 3) AssertSameCallResult($"lane {i}", expected[i], actual[i]);
                 output.WriteLine($"mid-flight cancel landed on attempt {attempt}");
                 return;
             }

@@ -107,7 +107,7 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         var kvScales = (nuint)capacity * (nuint)g.Layers * (nuint)g.KvHeads;
         var batchScratchFloats = (nuint)model.Embedding.Rows + (nuint)(ConvTaps * (qWidth + kWidth + vWidth)) + (nuint)((EngramHistory + 1) * dim);
         var extra = slots > 0
-            ? (nuint)slots * (2 * batchStateFloats * sizeof(float) + kvKeys + kvValues + 2 * kvScales * sizeof(float))
+            ? (nuint)slots * (2 * batchStateFloats * sizeof(float) + kvKeys + kvValues + 2 * kvScales * sizeof(float) + (nuint)dim * sizeof(float))
                 + (nuint)chunk * batchScratchFloats * sizeof(float)
             : 0;
         var kvBytes = (nuint)capacity * (nuint)g.Layers * (nuint)(kWidth + vWidth + 2 * g.KvHeads * sizeof(float));
@@ -184,6 +184,7 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
                 view.Values = arena.TakeUncleared<sbyte>((nuint)capacity * (nuint)g.Layers * (nuint)vWidth);
                 view.KeyScales = arena.TakeUncleared<float>((nuint)capacity * (nuint)g.Layers * (nuint)g.KvHeads);
                 view.ValueScales = arena.TakeUncleared<float>((nuint)capacity * (nuint)g.Layers * (nuint)g.KvHeads);
+                view.Cell = arena.Take<float>((nuint)dim);
                 ResetView(ref view);
             }
             batchLogits = arena.Take<float>((nuint)chunk * (nuint)model.Embedding.Rows);
@@ -806,6 +807,7 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         public sbyte* Values;
         public float* KeyScales;
         public float* ValueScales;
+        public float* Cell;
         public int Length;
         public int Marked;
         public bool HistPending;
@@ -1045,8 +1047,8 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
             var rk = rs;
             while (rk + 1 < count && rowSlots[rk + 1] == slot) rk++;
             ref var view = ref slotViews![slot];
-            var history = view.HistPending ? EngramOf(view.Snapshot) : EngramOf(view.State);
-            Buffer.MemoryCopy(history, stage + (long)rs * stride * dim, EngramHistory * dim * 4, EngramHistory * dim * 4);
+            var siteHistory = EngramOf(view.HistPending ? view.Snapshot : view.State) + (long)site * EngramHistory * dim;
+            Buffer.MemoryCopy(siteHistory, stage + (long)rs * stride * dim, EngramHistory * dim * 4, EngramHistory * dim * 4);
             rs = rk + 1;
         }
         var batch = new MatMulBatch(dimAct, count);
@@ -1069,7 +1071,7 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
                     Ops.MultiplyAccumulate(o, s.Taps + j * dim, cur + (long)(EngramHistory - j * g.EngramDilation) * dim, dim);
             }
             ref var view = ref slotViews![slot];
-            Buffer.MemoryCopy(stage + ((long)rk * stride + 1) * dim, EngramOf(view.State), EngramHistory * dim * 4, EngramHistory * dim * 4);
+            Buffer.MemoryCopy(stage + ((long)rk * stride + 1) * dim, EngramOf(view.State) + (long)site * EngramHistory * dim, EngramHistory * dim * 4, EngramHistory * dim * 4);
             rs = rk + 1;
         }
 
@@ -1139,19 +1141,24 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
             while (rk + 1 < count && rowSlots[rk + 1] == slot) rk++;
             ref var view = ref slotViews![slot];
             var live = QkvOf(view.State, l);
+            // Chained rows reuse the slot tail when the run head does; after
+            // a rewind that tail lives in the snapshot, like the run head.
+            var histBase = view.HistPending ? QkvOf(view.Snapshot, l) : live;
             var liveK = live + (ConvTaps - 1) * qWidth;
             var liveV = liveK + (ConvTaps - 1) * kWidth;
+            var histK = histBase + (ConvTaps - 1) * qWidth;
+            var histV = histK + (ConvTaps - 1) * kWidth;
             for (var t = rs; t <= rk; t++)
             {
                 if (t > rs)
                 {
-                    ChainTriple(batchQ, t, t - rs, live, qWidth);
-                    ChainTriple(batchK, t, t - rs, liveK, kWidth);
-                    ChainTriple(batchV, t, t - rs, liveV, vWidth);
+                    ChainTriple(batchQ, t, t - rs, histBase, qWidth);
+                    ChainTriple(batchK, t, t - rs, histK, kWidth);
+                    ChainTriple(batchV, t, t - rs, histV, vWidth);
                 }
-                Ops.Taps3(w.QTaps, qWidth, batchQ + (long)t * 3 * qWidth, qConv + (long)t * qWidth);
-                Ops.Taps3(w.KTaps, kWidth, batchK + (long)t * 3 * kWidth, kConv + (long)t * kWidth);
-                Ops.Taps3(w.VTaps, vWidth, batchV + (long)t * 3 * vWidth, vConv + (long)t * vWidth);
+                Ops.Taps3(w.QTaps, qWidth, batchQ + ((long)t * 3 + 2) * qWidth, qConv + (long)t * qWidth);
+                Ops.Taps3(w.KTaps, kWidth, batchK + ((long)t * 3 + 2) * kWidth, kConv + (long)t * kWidth);
+                Ops.Taps3(w.VTaps, vWidth, batchV + ((long)t * 3 + 2) * vWidth, vConv + (long)t * vWidth);
             }
             if (rk > rs)
             {
@@ -1233,39 +1240,61 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
 
     void PoolTokensBatch(int row, int* rowSlots, int count, bool initial)
     {
+        // The pooling cell carries the running mixture across rows and
+        // layers, so each slot run swaps in its own cell around the shared
+        // per-row updates below.
         var head = model.Confidence;
         var probes = head->Probes;
         var inverseRoot = 1f / MathF.Sqrt(dim);
-        for (var t = 0; t < count; t++)
+        for (var rs = 0; rs < count;)
         {
-            ref var view = ref slotViews![rowSlots[t]];
-            if ((t == 0 || rowSlots[t] != rowSlots[t - 1]) && view.PoolPending)
-                Buffer.MemoryCopy(PoolMaxOf(view.Snapshot), PoolMaxOf(view.State), poolBytes, poolBytes);
-            var s = stream + (long)t * streamWidth;
-            if (initial) Buffer.MemoryCopy(s, cell, dim * 4, dim * 4);
-            else Ops.Mix4(s, dim, 0.25f, 0.25f, 0.25f, 0.25f, cell);
+            var rk = rs;
+            while (rk + 1 < count && rowSlots[rk + 1] == rowSlots[rs]) rk++;
+            ref var view = ref slotViews![rowSlots[rs]];
+            Buffer.MemoryCopy(view.Cell, cell, dim * 4, dim * 4);
             var liveMax = PoolMaxOf(view.State);
             var liveSum = PoolSumOf(view.State);
             var liveAcc = PoolAccOf(view.State);
-            for (var p = 0; p < probes; p++)
+            var snapMax = PoolMaxOf(view.Snapshot);
+            var snapSum = PoolSumOf(view.Snapshot);
+            var snapAcc = PoolAccOf(view.Snapshot);
+            var restore = view.PoolPending;
+            for (var t = rs; t <= rk; t++)
             {
-                var index = row * probes + p;
-                var score = Ops.Dot(cell, head->ProbeVectors + (long)index * dim, dim) * inverseRoot;
-                var acc = liveAcc + (long)index * dim;
-                if (score > liveMax[index])
+                var s = stream + (long)t * streamWidth;
+                if (initial && t == rs) Buffer.MemoryCopy(s, cell, dim * 4, dim * 4);
+                else Ops.Mix4(s, dim, 0.25f, 0.25f, 0.25f, 0.25f, cell);
+                for (var p = 0; p < probes; p++)
                 {
-                    var rescale = MathF.Exp(liveMax[index] - score);
-                    liveSum[index] = liveSum[index] * rescale + 1f;
-                    Ops.ScaleAdd(acc, rescale, cell, 1f, dim);
-                    liveMax[index] = score;
-                }
-                else
-                {
-                    var weight = MathF.Exp(score - liveMax[index]);
-                    liveSum[index] += weight;
-                    Ops.AddScaled(acc, cell, weight, dim);
+                    var index = row * probes + p;
+                    // Lazy per-row restore from the slot snapshot, mirroring
+                    // the single-sequence path: each layer owns its rows, so
+                    // a whole-block copy here would wipe other layers.
+                    if (restore && t == rs)
+                    {
+                        liveMax[index] = snapMax[index];
+                        liveSum[index] = snapSum[index];
+                        Buffer.MemoryCopy(snapAcc + (long)index * dim, liveAcc + (long)index * dim, dim * 4, dim * 4);
+                    }
+                    var score = Ops.Dot(cell, head->ProbeVectors + (long)index * dim, dim) * inverseRoot;
+                    var acc = liveAcc + (long)index * dim;
+                    if (score > liveMax[index])
+                    {
+                        var rescale = MathF.Exp(liveMax[index] - score);
+                        liveSum[index] = liveSum[index] * rescale + 1f;
+                        Ops.ScaleAdd(acc, rescale, cell, 1f, dim);
+                        liveMax[index] = score;
+                    }
+                    else
+                    {
+                        var weight = MathF.Exp(score - liveMax[index]);
+                        liveSum[index] += weight;
+                        Ops.AddScaled(acc, cell, weight, dim);
+                    }
                 }
             }
+            Buffer.MemoryCopy(cell, view.Cell, dim * 4, dim * 4);
+            rs = rk + 1;
         }
     }
 

@@ -34,12 +34,13 @@ public sealed unsafe class BatchedEngine : IDisposable
 
     public int VocabSize => engine.Vocab;
 
+    public LayerObserver? Observer { get => engine.Observer; set => engine.Observer = value; }
+
     public int SlotLength(int slot) => engine.SlotLength(slot);
 
     public void ResetSlot(int slot) => engine.ResetSlot(slot);
 
     public void MarkSlot(int slot) => engine.MarkSlot(slot);
-
     public void RewindSlot(int slot) => engine.RewindSlot(slot);
 
     public void FeedSlot(int slot, ReadOnlySpan<int> tokens, bool computeLogits = true) =>
