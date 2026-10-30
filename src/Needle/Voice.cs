@@ -34,22 +34,36 @@ public sealed class VoiceSession : IDisposable
     {
         whistle = new Whistle(whistleModel, options?.ResolvedThreading ?? ThreadPolicy.Default);
         needle = new NeedleSession(needleModel, toolsJson, options);
-        vocabulary = EnumValues(new ToolSet(toolsJson));
+        vocabulary = EnumKeywords(toolsJson);
+    }
+
+    // Startup-only convenience: accepts the UTF-8 schema bytes (for example the bytes
+    // of a W10 generated tool set's Schema) and decodes them once here.
+    public VoiceSession(Model needleModel, Model whistleModel, ReadOnlySpan<byte> toolsJson, NeedleOptions? options = null)
+        : this(needleModel, whistleModel, System.Text.Encoding.UTF8.GetString(toolsJson), options)
+    {
     }
 
     public NeedleSession Needle => needle;
 
-    public VoiceResult Complete(ReadOnlySpan<float> pcm, string? language = null)
+    public SpeechSpan TranscribeSpan(ReadOnlySpan<float> pcm, Span<byte> utf8, Span<WordSlice> words, string? language = null) =>
+        whistle.TranscribeUtf8(pcm, utf8, words, language, vocabulary);
+
+    // Zero-allocation voice-to-call: span transcription with enum-literal keyword bias,
+    // then one span request through the session. Silence yields an EmptyInput reply.
+    public (Reply Reply, SpeechSpan Speech) CompleteSpan(ReadOnlySpan<float> pcm, Span<byte> calls, Span<byte> reasoning, Span<byte> response, Span<byte> transcriptUtf8, Span<WordSlice> transcriptWords, string? language = null)
     {
-        var speech = whistle.Transcribe(pcm, language, vocabulary);
-        var call = speech.Text.Length == 0
-            ? new CallResult { Reasoning = "no speech detected", Confidence = 0f }
-            : needle.Complete(speech.Text);
-        return new VoiceResult { Speech = speech, Call = call };
+        var speech = TranscribeSpan(pcm, transcriptUtf8, transcriptWords, language);
+        var reply = needle.Complete(transcriptUtf8.Slice(0, speech.Utf8Length), calls, reasoning, response);
+        return (reply, speech);
     }
+
+
+    internal static System.Collections.Generic.List<string> EnumKeywords(string toolsJson) => EnumValues(new ToolSet(toolsJson));
 
     static List<string> EnumValues(ToolSet tools)
     {
+
         var found = new List<string>();
         void Walk(JsonValue v)
         {

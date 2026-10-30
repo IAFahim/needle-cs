@@ -310,6 +310,11 @@ public sealed unsafe class Tokenizer : IDisposable
 
     static bool Before(in Merge a, in Merge b) => a.Score > b.Score || (a.Score == b.Score && a.Left < b.Left);
 
+    internal byte* PiecePointer(int id) => blob + pieceOffset[id];
+    internal int PieceByteLength(int id) => pieceLength[id];
+    internal static bool PieceStartsWord(byte* piece, int length) =>
+        length >= 3 && piece[0] == 0xE2 && piece[1] == 0x96 && piece[2] == 0x81;
+
     public int Append(int id, Span<byte> output, bool first)
     {
         if (pieceType[id] == ControlType || pieceType[id] == UnknownType) return 0;
