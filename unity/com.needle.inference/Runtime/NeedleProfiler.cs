@@ -1,7 +1,7 @@
 using System.Threading;
 using Unity.Profiling;
 
-namespace Needle.Unity
+namespace Needle
 {
     public static unsafe class NeedleProfiler
     {

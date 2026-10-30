@@ -193,6 +193,13 @@ Indicative numbers from the loaded 32-core dev box (JIT, avx2); latency is too n
 | Steam Deck, PS5, Xbox Series (Zen 2) | AVX2 | Avx2 | same as Zen 3 |
 | Apple Silicon, recent Android, Switch-class ARM | NEON, dotprod (i8mm on newer cores) | Neon SDOT | i8mm tier; verify per device |
 
+### 2.9 Unity W23 proofs (2026-10-30, in-Editor 7000.0.0a12, Linux x64)
+
+- **64-NPC load (LoadProof harness, 1.2 s cadence ≈ 50 asks/min/NPC, 120 warmup + 600 measured frames, two runs):** main-thread managed allocations in the per-frame NPC pump bracket: **0 bytes, 0 nonzero frames** both runs. 38–39 replies per run, 100% carrying dispatched tool calls (`MoveTo`/`GiveItem`); 64 asks pending at end (engine does ~1 reply/s on 2 threads vs ~53 asks/s offered — saturation is expected, the Unity side stays flat).
+- **Main-thread timing (PlayerLoop timestamp markers around `SimulationSystemGroup`, same runs):** 293.8 µs mean / 595.7 µs max with 64 asks pending; 210.4 µs / 711.9 µs max idle floor (load disabled, system skipped); incremental ≈ 84 µs. The ≤ 20 µs criterion is NOT met in this environment (Editor-debug codegen with safety checks, ~6 fps, inference workers saturating the 4-core box). Method notes: the headless Editor runs with the Unity Profiler disabled and `Profiler.enabled = true` throws NRE, so `Recorder`/`ProfilerRecorder` capture nothing; Entities 1.5 groups expose no `PlayerLoop` children, so no per-system split was obtainable — re-measure in a release player before treating 84 µs as real work.
+- **Voice end to end in PlayMode** (`whistle.cact` + `test.wav` from StreamingAssets, `PushToTalk` streaming + `Release`): full 41-word transcript, not truncated. 4-thread `Transcribe` matches upstream exactly ("creating a way of file", "Wi-Fi"); the sample default 1-thread lands on the known beam knife-edge ("grading away a file"). So the transcript is **thread-count-sensitive** — `ThreadCountDoesNotChangeTheTranscript` only pins `record.wav`, not the knife-edge clip; evidence for #38, not a W23 problem. The sample is unchanged (still 1 thread).
+- **Repro:** the harness lives in the test project only (`Assets/LoadProof/LoadProof.cs`, dormant `LoadProof` GameObject in `NeedleTest.unity`); rerun = enter PlayMode, read the `LOADPROOF` console line.
+
 ## 3. Engineering rules
 
 1. **No comments.** Names, types and data layout carry the meaning. A stranger should learn the domain, not the author's mood.
@@ -422,11 +429,12 @@ dotnet publish src/Needle.Cli -c Release -o out/aot
 
 1. **netstandard2.1.** Keep it compiling (scalar) until the Unity CoreCLR release is the minimum; decide in W25.
 2. **AOT platforms (consoles, iOS, IL2CPP).** Options are a NativeAOT C-ABI plugin, Burst kernels, or scalar. Prototype in W25.
-3. **Unity specifics to verify** before W23 (research was not completed in this pass):
-   - the CoreCLR release version and timeline;
-   - whether `System.Runtime.Intrinsics` is accelerated in CoreCLR players;
-   - `Interlocked`/`Volatile` support in Burst;
-   - the best Entities pattern for unmanaged singleton handles.
+3. **Unity specifics, verified in-Editor 2026-10-30 (Unity 7000.0.0a12 on Linux x64; Editor only, players unverified):**
+   - CoreCLR is the runtime: `FrameworkDescription` `.NET 10.0.10-dev`, `Environment.Version` 10.0.10. Per the Unity 7000 docs CoreCLR ships on Windows x86/x64/Arm64, macOS Arm64 and Linux x64 (and is the default there); every other platform is IL2CPP-only (W25).
+   - Intrinsics ARE accelerated in the CoreCLR Editor: `Vector.IsHardwareAccelerated=True`, `Avx2=True`, `AvxVnni=True`; `Avx512BW=False` on the measured box (the VM hides AVX-512; the reference box in §2.2 has it), `AdvSimd=False` (x86_64, as expected).
+   - `Interlocked`/`Volatile` in Burst: VERIFIED. `NeedleChannel` uses `Volatile.Read/Write` + `Interlocked.CompareExchange` and the Burst `NeedleSystem` calls `TrySubmitSilent`/`TryReceive` from Burst jobs; Burst 1.8.31 + Entities 1.5.0 compile the package with 0 errors and 0 Burst errors in our files, and 64-NPC round trips flow. Residual: 3 recurring Burst BC0102 internal errors in Entities' own `EntityCommandBufferPlayback.cs`/`EntityCommandBufferDebug.cs` (`DefaultInterpolatedStringHandler`) — a pre-existing Unity-alpha toolchain issue outside our call chain; the game runs.
+   - Singleton-handle pattern VERIFIED: blittable `NeedleChannelHandle` (`NeedleChannel` + `nint Identity`) as a singleton component, `RequireForUpdate`, rebind on `Identity` change after host restart. GOTCHA (fixed during the W23 proofs): no C# namespace may be named `X.Unity` in an assembly whose Entities source-generated code qualifies `Unity.*` — `Needle.Unity` (W24 profiler namespace plus the asmdef `rootNamespace`) hijacked `Unity.Entities` resolution in hand code and in the generated `NeedleSystem__JobEntity` wrapper (CS0234). Fix: profiler moved to `namespace Needle`, asmdef `rootNamespace` `Needle.Unity` → `Needle` (assembly name unchanged).
+   - Two one-line package compile fixes from the proofs: the missing `using Unity.Collections.LowLevel.Unsafe;` in `NeedleSystem.cs` (CS0246) and the `rootNamespace` above (CS0234).
 4. **Jump-forward and reasoning caps** change outputs. Default them on only after W28 passes.
 5. **AutoDate.** For games, default to off or a fixed caller-supplied date, so outputs are reproducible and primed prefixes stay valid (W09, W29).
 6. **Many NPCs.** Default to stateless commands plus batched decode (W26); per-NPC sessions are opt-in because of memory.
