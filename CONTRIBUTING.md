@@ -59,6 +59,30 @@ export PATH="$HOME/.dotnet:$PATH" DOTNET_CLI_TELEMETRY_OPTOUT=1
 tools/fetch.sh && pip install numpy sentencepiece && python3 tools/golden.py 40 && python3 tools/golden_confidence.py
 ```
 
+## Refreshing the upstream model
+
+Cactus Compute owns the model weights and the `.cact` format. `tools/ref.lock` pins every downloaded file by SHA-256 and size, and pins the Hugging Face commits of `Cactus-Compute/needle3` and `Cactus-Compute/whistle` and the `cactus-compute/cactus` commit that hosts the audio clips. `tools/fetch.sh` downloads exactly those revisions and fails with "upstream changed" when a file does not match its pin. Nothing changes silently.
+
+Everyday commands:
+
+```bash
+tools/fetch.sh
+tools/fetch.sh --verify
+```
+
+`tools/fetch.sh` skips files that already match the lock, so it is safe to rerun. `--verify` downloads nothing and checks the files already in `ref/` (the test suite runs it).
+
+Refresh procedure, only when you deliberately adopt a new upstream model:
+
+1. Run `tools/fetch.sh --update-lock`. It resolves the newest upstream revisions, downloads those files into `ref/`, and rewrites `tools/ref.lock`. Read the diff of the lock: it shows which files and revisions changed.
+2. Run `python3 tools/golden.py 40` and `python3 tools/golden_confidence.py`. `golden.json` records the model SHA-256 and the lock SHA-256, and the tests refuse fixtures generated from a different model ("fixtures were generated from a different model; regenerate with tools/golden.py"). An old `golden.json` without the field is accepted, so regenerate it once.
+3. Run `dotnet test tests/Needle.Tests -c Release` and `NEEDLE_SCALAR=1 dotnet test tests/Needle.Tests -c Release`. A new format variant fails at load with a message naming the found and the supported values (`ModelInfo` in `src/Needle/ModelInfo.cs`, `Model.Info` for the loaded model). Extend `Model` only after reading what changed upstream. `FormatTests` pins the expected `ModelInfo` of the current model, so update those numbers on purpose.
+4. Rerun the W02 benchmarks (`needle bench-e2e`, `tools/native_bench.py`) on the reference machine and record before and after numbers.
+5. Run the evaluation suite and the parity checks: `needle eval ref/hf/needle3.cact tests/eval` with a baseline from the old model (`--baseline`, `--max-drop`) for W28, and the upstream native comparison for W29.
+6. Update the numbers in `plan.md` section 2 and the model facts in the README, then commit `tools/ref.lock` together with the code and test changes.
+
+`ref/` stays git-ignored. Never commit the lock-listed files themselves.
+
 ## Pull request checklist
 
 From `plan.md` section 8 and section 7.
