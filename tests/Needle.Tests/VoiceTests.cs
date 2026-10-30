@@ -227,6 +227,20 @@ public sealed class VoiceTests : IDisposable
     }
 
     [Fact]
+    public void VoiceSessionManagedCompleteMatchesSpanPath()
+    {
+        Assets.Require();
+        using var needle = Model.Open(Assets.Model);
+        using var voice = new VoiceSession(needle, model, File.ReadAllText(Assets.Tools), new NeedleOptions { Threads = 2, AutoDate = false });
+        var result = voice.Complete(Clip("record.wav"));
+        Assert.Contains("speed of sound", result.Speech.Text);
+        Assert.True(result.Call.Success);
+        var silent = voice.Complete(new float[Wav.SampleRate]);
+        Assert.Equal("", silent.Speech.Text);
+        Assert.Equal(0f, silent.Call.Confidence);
+    }
+
+    [Fact]
     public void VoiceToTypedCommandEndToEnd()
     {
         Assets.Require();
