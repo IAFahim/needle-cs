@@ -100,6 +100,10 @@ public sealed unsafe partial class NeedleSession : IDisposable
 {
     const int ImStart = 4, ImEnd = 5, ThinkStart = 6, ThinkEnd = 7, ToolCallStart = 10, ToolCallEnd = 11, EndOfText = 1;
     const int MaxPieceBytes = 64;
+    // Call steps with at most this many allowed tokens use the sparse head
+    // (Engine.LogitsForRows) instead of the full-vocabulary head; §5.3 tunes
+    // it around 256 (76% of call steps allow <= 256 tokens).
+    const int SparseHeadThreshold = 256;
     const int InputOverheadBytes = 128;
     const int TokenizerInputBytes = 1 << 16;
     const int EmbedderContext = 512;
@@ -132,6 +136,8 @@ public sealed unsafe partial class NeedleSession : IDisposable
     readonly uint* reasoningMask;
     readonly uint* decisionMask;
     readonly uint* responseMask;
+    // Allowed ids for the current sparse-head step (SparseHeadThreshold ints).
+    readonly int* sparseRows;
     readonly uint* mask;
     readonly float* scratchLogits;
     readonly float* pooled;
@@ -188,6 +194,7 @@ public sealed unsafe partial class NeedleSession : IDisposable
         maskWords = trie.Words;
         mask = (uint*)Mem.AllocZeroed((nuint)maskWords * 4);
         scratchLogits = (float*)Mem.Alloc((nuint)model.VocabSize * 4);
+        sparseRows = (int*)Mem.Alloc((nuint)SparseHeadThreshold * 4);
         var head = model.Confidence;
         embeddingWidth = head != null ? head->Queries * model.Geometry.Dim : 0;
         pooled = (float*)Mem.AllocZeroed((nuint)Math.Max(1, embeddingWidth) * 4);
@@ -474,12 +481,19 @@ public sealed unsafe partial class NeedleSession : IDisposable
         var steps = 0;
         var buffer = stackalloc byte[256];
         callTextLength = 0;
+        // The prompt/decision feeds left full logits ready for the first mask.
+        trie.Allow(grammar.Program, state, mask);
+        var allowed = MaskCount(mask, maskWords);
+        var full = true;
         while (!Grammar.Complete(state))
         {
             if (CancelRequested) return Abandon(ReplyStatus.Cancelled, FailureReason.None, progress);
             if (steps >= options.MaxCallTokens) return Abandon(ReplyStatus.Failed, FailureReason.CallTokenBudgetExceeded, progress);
-            trie.Allow(grammar.Program, state, mask);
-            var pick = ArgMaxWithProbability(mask, out var probability);
+            if (allowed == 0) return Abandon(ReplyStatus.Failed, FailureReason.GrammarDeadEnd, progress);
+            int pick;
+            float probability;
+            if (full) pick = ArgMaxWithProbability(mask, out probability);
+            else pick = ArgMaxSparse(scratchLogits, sparseRows, allowed, out probability);
             if (pick < 0) return Abandon(ReplyStatus.Failed, FailureReason.GrammarDeadEnd, progress);
             if (steps == 0 && progress.FirstTokenTicks == 0) progress.FirstTokenTicks = Stopwatch.GetTimestamp() - progress.Started;
             var length = tokenizer.ConstraintBytes(pick, buffer);
@@ -494,7 +508,29 @@ public sealed unsafe partial class NeedleSession : IDisposable
             steps++;
             progress.DecodeTokens++;
             if (!budget.IsUnlimited && FrameBudgetHit(progress, budget)) return Abandon(ReplyStatus.Failed, FailureReason.FrameBudgetExceeded, progress);
-            if (!TryFeed(pick, computeLogits: !Grammar.Complete(state))) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
+            if (Grammar.Complete(state))
+            {
+                if (!TryFeed(pick, computeLogits: false)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
+                break;
+            }
+            // The next mask depends only on the chosen token, so compute it
+            // before the forward pass (serial precompute; true overlap needs
+            // pool support owned by the engine scheduler).
+            trie.Allow(grammar.Program, state, mask);
+            allowed = MaskCount(mask, maskWords);
+            if (allowed == 0) return Abandon(ReplyStatus.Failed, FailureReason.GrammarDeadEnd, progress);
+            if (allowed <= SparseHeadThreshold)
+            {
+                ExtractIds(mask, maskWords, sparseRows, SparseHeadThreshold);
+                if (!TryFeed(pick, computeLogits: false)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
+                engine.LogitsForRows(sparseRows, allowed, scratchLogits);
+                full = false;
+            }
+            else
+            {
+                if (!TryFeed(pick, computeLogits: true)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
+                full = true;
+            }
         }
         if (!TryFeed(callClosing, computeLogits: false)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
 
@@ -521,12 +557,19 @@ public sealed unsafe partial class NeedleSession : IDisposable
         var steps = 0;
         var buffer = stackalloc byte[256];
         var stored = 0;
+        // The prompt/decision feeds left full logits ready for the first mask.
+        trie.Allow(grammar.Program, state, mask);
+        var allowed = MaskCount(mask, maskWords);
+        var full = true;
         while (!Grammar.Complete(state))
         {
             if (CancelRequested) return Abandon(ReplyStatus.Cancelled, FailureReason.None, progress);
             if (steps >= options.MaxCallTokens) return Abandon(ReplyStatus.Failed, FailureReason.CallTokenBudgetExceeded, progress);
-            trie.Allow(grammar.Program, state, mask);
-            var pick = ArgMaxWithProbability(mask, out var probability);
+            if (allowed == 0) return Abandon(ReplyStatus.Failed, FailureReason.GrammarDeadEnd, progress);
+            int pick;
+            float probability;
+            if (full) pick = ArgMaxWithProbability(mask, out probability);
+            else pick = ArgMaxSparse(scratchLogits, sparseRows, allowed, out probability);
             if (pick < 0) return Abandon(ReplyStatus.Failed, FailureReason.GrammarDeadEnd, progress);
             if (steps == 0 && progress.FirstTokenTicks == 0) progress.FirstTokenTicks = Stopwatch.GetTimestamp() - progress.Started;
             var length = tokenizer.ConstraintBytes(pick, buffer);
@@ -539,7 +582,29 @@ public sealed unsafe partial class NeedleSession : IDisposable
             logProbability += Math.Log(Math.Max(probability, 1e-9));
             steps++;
             progress.DecodeTokens++;
-            if (!TryFeed(pick, computeLogits: !Grammar.Complete(state))) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
+            if (Grammar.Complete(state))
+            {
+                if (!TryFeed(pick, computeLogits: false)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
+                break;
+            }
+            // The next mask depends only on the chosen token, so compute it
+            // before the forward pass (serial precompute; true overlap needs
+            // pool support owned by the engine scheduler).
+            trie.Allow(grammar.Program, state, mask);
+            allowed = MaskCount(mask, maskWords);
+            if (allowed == 0) return Abandon(ReplyStatus.Failed, FailureReason.GrammarDeadEnd, progress);
+            if (allowed <= SparseHeadThreshold)
+            {
+                ExtractIds(mask, maskWords, sparseRows, SparseHeadThreshold);
+                if (!TryFeed(pick, computeLogits: false)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
+                engine.LogitsForRows(sparseRows, allowed, scratchLogits);
+                full = false;
+            }
+            else
+            {
+                if (!TryFeed(pick, computeLogits: true)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
+                full = true;
+            }
         }
         if (!TryFeed(callClosing, computeLogits: false)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
 
@@ -629,22 +694,47 @@ public sealed unsafe partial class NeedleSession : IDisposable
     int ArgMax(uint* allowed)
     {
         fixed (float* logits = engine.Logits)
+            return Ops.ArgMaxMasked(logits, allowed, maskWords, model.VocabSize);
+    }
+
+    static int MaskCount(uint* mask, int words)
+    {
+        var total = 0;
+        for (var w = 0; w < words; w++) total += System.Numerics.BitOperations.PopCount(mask[w]);
+        return total;
+    }
+
+    // Extracts allowed ids ascending into `rows`, stopping at `limit`.
+    // Callers compare MaskCount first when they need the exact count.
+    static int ExtractIds(uint* mask, int words, int* rows, int limit)
+    {
+        var count = 0;
+        for (var w = 0; w < words && count < limit; w++)
         {
-            var best = -1;
-            var peak = float.NegativeInfinity;
-            for (var word = 0; word < maskWords; word++)
+            var bits = mask[w];
+            while (bits != 0 && count < limit)
             {
-                var bits = allowed[word];
-                while (bits != 0)
-                {
-                    var id = word * 32 + Bits.TrailingZeros(bits);
-                    bits &= bits - 1;
-                    var value = logits[id];
-                    if (value > peak) { peak = value; best = id; }
-                }
+                rows[count++] = w * 32 + Bits.TrailingZeros(bits);
+                bits &= bits - 1;
             }
-            return best;
         }
+        return count;
+    }
+
+    // Argmax over a sparse head output: `values[0..count)` aligns with `rows`.
+    // The best probability comes from a log-sum-exp over the allowed set only,
+    // never from a full-vocabulary softmax.
+    static int ArgMaxSparse(float* values, int* rows, int count, out float probability)
+    {
+        var best = -1;
+        var peak = float.NegativeInfinity;
+        for (var i = 0; i < count; i++)
+        {
+            var value = values[i];
+            if (value > peak) { peak = value; best = rows[i]; }
+        }
+        probability = best < 0 ? 0f : Ops.BestProbability(values, count, peak);
+        return best;
     }
 
     int ArgMaxWithProbability(uint* allowed, out float probability)
@@ -652,7 +742,6 @@ public sealed unsafe partial class NeedleSession : IDisposable
         fixed (float* logits = engine.Logits)
         {
             var best = -1;
-            var bestSlot = 0;
             var count = 0;
             var peak = float.NegativeInfinity;
             for (var word = 0; word < maskWords; word++)
@@ -663,9 +752,8 @@ public sealed unsafe partial class NeedleSession : IDisposable
                     var id = word * 32 + Bits.TrailingZeros(bits);
                     bits &= bits - 1;
                     var value = logits[id];
-                    scratchLogits[count] = value;
-                    if (value > peak) { peak = value; best = id; bestSlot = count; }
-                    count++;
+                    scratchLogits[count++] = value;
+                    if (value > peak) { peak = value; best = id; }
                 }
             }
             if (best < 0)
@@ -673,8 +761,7 @@ public sealed unsafe partial class NeedleSession : IDisposable
                 probability = 0f;
                 return -1;
             }
-            Ops.Softmax(scratchLogits, count);
-            probability = scratchLogits[bestSlot];
+            probability = Ops.BestProbability(scratchLogits, count, peak);
             return best;
         }
     }
@@ -789,6 +876,7 @@ public sealed unsafe partial class NeedleSession : IDisposable
         Mem.Free(decisionMask);
         Mem.Free(responseMask);
         Mem.Free(scratchLogits);
+        Mem.Free(sparseRows);
         Mem.Free(pooled);
         if (confidenceScratch != null) Mem.Free(confidenceScratch);
     }

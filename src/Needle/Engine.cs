@@ -56,6 +56,8 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
     float* qkvHistory, engramHistory;
     int* previousTokens;
     int markedLength;
+    // Token count of the last Forward chunk; the sparse head reads that row.
+    int lastForwardCount;
     float* poolMax, poolSum, poolAcc, cell;
     bool pooling;
     CrossMemory cross;
@@ -398,6 +400,7 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
 
     void Forward(int* tokens, int count, int position, bool wantLogits)
     {
+        lastForwardCount = count;
         clock.Begin();
         for (var t = 0; t < count; t++)
         {
@@ -717,6 +720,18 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
 
     void ComputeLogits(int last)
     {
+        PrepareHead(last);
+        var head = new MatMulBatch(headAct, 1);
+        head.Add(model.Embedding, logits, model.Embedding.Rows);
+        clock.PoolRun();
+        MatMulBatch.Run(pool, &head);
+        clock.Lap(Stage.Logits);
+    }
+
+    // Builds the quantized head input for one forwarded token. Shared by the
+    // full head and LogitsForRows so both see the exact same normalization.
+    void PrepareHead(int last)
+    {
         var s = stream + (long)last * streamWidth;
         var mean = scratch;
         for (var c = 0; c < dim; c++) mean[c] = 0.25f * (s[c] + s[dim + c] + s[2 * dim + c] + s[3 * dim + c]);
@@ -724,11 +739,32 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         Ops.ZeroCenteredRms(mean, model.FinalNorm, dim, normalized);
         Quant.FakeA8(normalized, dim);
         Quant.Prepare(normalized, 1, dim, 4, headAct);
-        var head = new MatMulBatch(headAct, 1);
-        head.Add(model.Embedding, logits, model.Embedding.Rows);
-        clock.PoolRun();
-        MatMulBatch.Run(pool, &head);
-        clock.Lap(Stage.Logits);
+    }
+
+    // Logits for an explicit row subset of the embedding head, read from the
+    // last forwarded token. Ascending `rows` (mask-extraction order) lets
+    // contiguous ids merge into runs; each run is extended to a multiple of 4
+    // to match the full head's AVX block alignment, so gathered values equal
+    // the full head's bit-for-bit. `destination[0..count)` aligns with `rows`.
+    // No pool work happens here, hence no clock.PoolRun; the logits stage is
+    // still attributed through Lap.
+    internal void LogitsForRows(int* rows, int count, float* destination)
+    {
+        PrepareHead(lastForwardCount - 1);
+        var vocab = model.Embedding.Rows;
+        var i = 0;
+        while (i < count)
+        {
+            var start = rows[i];
+            var end = start + 1;
+            i++;
+            while (i < count && rows[i] == end) { end++; i++; }
+            var alignedStart = start & ~3;
+            var alignedEnd = (end + 3) & ~3;
+            if (alignedEnd > vocab) alignedEnd = vocab;
+            Quant.MatMulRows(model.Embedding, headAct, 1, logits, vocab, alignedStart, alignedEnd);
+        }
+        for (var k = 0; k < count; k++) destination[k] = logits[rows[k]];
     }
 
     internal Pool SharedPool => pool;
