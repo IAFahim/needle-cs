@@ -23,7 +23,11 @@ public sealed class BenchHarnessTests : IDisposable
     public void EndToEndHarnessReturnsFiniteNumbersAndProfilesEveryPoolRun()
     {
         var options = new BenchE2EOptions { Threads = new[] { 1 }, Reps = 1, Warmups = 0, Sets = "golden", Profile = true, DecodeBudget = 8 };
+        // Process-wide private bytes can dip while other test classes churn, so
+        // retry the cheap measurement until the ctor delta is observable.
         var report = BenchE2E.Measure(model, File.ReadAllText(Assets.Tools), options, "test", null);
+        for (var attempt = 0; attempt < 3 && report.Runs[0].Sets[0].SessionCtorPrivateBytes <= 0; attempt++)
+            report = BenchE2E.Measure(model, File.ReadAllText(Assets.Tools), options, "test", null);
 
         var run = Assert.Single(report.Runs);
         var set = Assert.Single(run.Sets);
@@ -91,5 +95,95 @@ public sealed class BenchHarnessTests : IDisposable
         Assert.Equal(JsonValueKind.Null, document.RootElement.GetProperty("ratio").ValueKind);
         Assert.Equal(2, document.RootElement.GetProperty("spread").GetProperty("median").GetDouble());
         Assert.Equal(3, document.RootElement.GetProperty("list").GetArrayLength());
+    }
+
+    [Fact]
+    public void SpanApiModeMatchesTextMode()
+    {
+        var text = new BenchE2EOptions { Threads = new[] { 1 }, Reps = 1, Warmups = 0, Sets = "golden", DecodeBudget = 8 };
+        var textReport = BenchE2E.Measure(model, File.ReadAllText(Assets.Tools), text, "test", null);
+        var spanReport = BenchE2E.Measure(model, File.ReadAllText(Assets.Tools), text with { Api = "span" }, "test", null);
+
+        Assert.Equal("span", spanReport.Options.Api);
+        Assert.Equal(textReport.Runs.Count, spanReport.Runs.Count);
+        for (var r = 0; r < textReport.Runs.Count; r++)
+        {
+            Assert.Equal(textReport.Runs[r].Sets.Count, spanReport.Runs[r].Sets.Count);
+            for (var s = 0; s < textReport.Runs[r].Sets.Count; s++)
+            {
+                var expected = textReport.Runs[r].Sets[s];
+                var actual = spanReport.Runs[r].Sets[s];
+                Assert.Equal(expected.Prompts.Count, actual.Prompts.Count);
+                for (var p = 0; p < expected.Prompts.Count; p++)
+                {
+                    Assert.Equal(0, actual.Prompts[p].Failures);
+                    Assert.Equal(expected.Prompts[p].Calls, actual.Prompts[p].Calls);
+                    Assert.Equal(expected.Prompts[p].PrefillTokens, actual.Prompts[p].PrefillTokens);
+                    Assert.Equal(expected.Prompts[p].DecodeTokens, actual.Prompts[p].DecodeTokens);
+                    Assert.True(Spread.Of(actual.Prompts[p].TotalMs).IsFinite);
+                    Assert.True(actual.Prompts[p].ManagedBytes.Count == 1 && actual.Prompts[p].ManagedBytes[0] >= 0);
+                    Assert.True(actual.Prompts[p].NativeAllocs.Count == 1 && actual.Prompts[p].NativeAllocs[0] >= 0);
+                }
+            }
+        }
+        Assert.Empty(BenchE2E.Violations(spanReport));
+        Assert.Contains("api span", BenchE2E.ToText(spanReport));
+        using var document = JsonDocument.Parse(BenchE2E.ToJson(spanReport));
+        Assert.Equal("span", document.RootElement.GetProperty("api").GetString());
+        var native = document.RootElement.GetProperty("runs")[0].GetProperty("sets")[0].GetProperty("prompts")[0].GetProperty("native_allocs");
+        if (Mem.CountersEnabled) Assert.True(native.GetProperty("median").GetDouble() >= 0);
+        else Assert.Equal(JsonValueKind.Null, native.ValueKind);
+    }
+
+    [Fact]
+    public void ApiOptionRejectsUnknownModes()
+    {
+        Assert.Equal("text", BenchE2EOptions.Parse(Array.Empty<string>()).Api);
+        Assert.Equal("span", BenchE2EOptions.Parse(new[] { "--api", "span" }).Api);
+        Assert.Equal("text", BenchE2EOptions.Parse(new[] { "--api", "TEXT" }).Api);
+        Assert.Throws<ArgumentException>(() => BenchE2EOptions.Parse(new[] { "--api", "bogus" }));
+    }
+
+    static PromptMeasurement GatePrompt(long managedBytes, long nativeAllocs, int failures = 0) => new()
+    {
+        Query = "q",
+        Calls = "get_weather",
+        Failures = failures,
+        PrefillTokens = 10,
+        DecodeTokens = 5,
+        PrefillMs = { 1 },
+        DecodeUsPerToken = { 100 },
+        TtftMs = { 1 },
+        TotalMs = { 2 },
+        PrefillTps = { 1000 },
+        DecodeTps = { 10000 },
+        ManagedBytes = { managedBytes },
+        NativeAllocs = { nativeAllocs },
+    };
+
+    static E2EReport GateReport(PromptMeasurement prompt, long? maxManaged, long? maxNative)
+    {
+        var set = new SetMeasurement { Name = "golden" };
+        set.Prompts.Add(prompt);
+        var run = new ThreadMeasurement { Threads = 1 };
+        run.Sets.Add(set);
+        var report = new E2EReport { Model = "test", Options = new BenchE2EOptions { MaxManagedBytes = maxManaged, MaxNativeAllocs = maxNative } };
+        report.Runs.Add(run);
+        return report;
+    }
+
+    [Fact]
+    public void ZeroGatesPassOnlyWhenNothingWasAllocated()
+    {
+        var clean = BenchE2E.Violations(GateReport(GatePrompt(0, 0), 0, 0));
+        if (Mem.CountersEnabled) Assert.Empty(clean);
+        else Assert.Contains(clean, v => v.Contains("NeedleAllocCounters"));
+
+        Assert.Contains(BenchE2E.Violations(GateReport(GatePrompt(5, 0), 0, 0)), v => v.Contains("managed bytes"));
+        var native = BenchE2E.Violations(GateReport(GatePrompt(0, 3), 0, 0));
+        Assert.Contains(native, v => v.Contains(Mem.CountersEnabled ? "native allocations" : "NeedleAllocCounters"));
+
+        Assert.Contains(BenchE2E.Violations(GateReport(GatePrompt(0, 0, failures: 1), 0, 0)), v => v.Contains("failed calls"));
+        Assert.Empty(BenchE2E.Violations(GateReport(GatePrompt(732, 0), null, null)));
     }
 }

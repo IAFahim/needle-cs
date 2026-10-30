@@ -8,7 +8,7 @@ Reads `.cact` model files directly in place with AVX2, ARM64 NEON (SDOT with a w
 
 ## Status
 
-Early but usable for a showcase: everything below works on Linux x64 today and is covered by 260 passing tests (Linux x64, AVX2 and scalar).
+Early but usable for a showcase: everything below works on Linux x64 today and is covered by 267 passing tests (Linux x64, AVX2 and scalar).
 
 | Area | State |
 |---|---|

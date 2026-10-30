@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Text;
 using Needle;
 
 namespace Needle.Cli;
@@ -16,6 +17,7 @@ internal sealed record BenchE2EOptions
     public bool Json { get; init; }
     public bool Profile { get; init; }
     public int DecodeBudget { get; init; } = 40;
+    public string Api { get; init; } = "text";
     public long? MaxManagedBytes { get; init; }
     public long? MaxNativeAllocs { get; init; }
 
@@ -32,6 +34,7 @@ internal sealed record BenchE2EOptions
                 "--warmup" => options with { Warmups = int.Parse(Next()) },
                 "--sets" => options with { Sets = Next() },
                 "--decode-budget" => options with { DecodeBudget = int.Parse(Next()) },
+                "--api" => options with { Api = Next().ToLowerInvariant() },
                 "--max-managed-bytes" => options with { MaxManagedBytes = long.Parse(Next()) },
                 "--max-native-allocs" => options with { MaxNativeAllocs = long.Parse(Next()) },
                 "--json" => options with { Json = true },
@@ -41,6 +44,7 @@ internal sealed record BenchE2EOptions
         }
         if (options.Threads.Length == 0 || options.Threads.Any(t => t < 1)) throw new ArgumentException("--threads needs positive integers");
         if (options.Reps < 1) throw new ArgumentException("--reps must be at least 1");
+        if (options.Api is not ("text" or "span")) throw new ArgumentException("--api needs span or text");
         return options;
     }
 }
@@ -150,6 +154,7 @@ internal static class BenchE2E
             SessionCtorMs = (Stopwatch.GetTimestamp() - started) * 1000.0 / Stopwatch.Frequency,
             SessionCtorPrivateBytes = PrivateBytes() - privateBefore };
         foreach (var query in set.Queries) measurement.Prompts.Add(new PromptMeasurement { Query = query });
+        if (options.Api == "span") return MeasureSetSpan(set, options, session, measurement);
         for (var warm = 0; warm < options.Warmups; warm++)
             foreach (var query in set.Queries)
             {
@@ -159,6 +164,32 @@ internal static class BenchE2E
         for (var rep = 0; rep < options.Reps; rep++)
             for (var i = 0; i < set.Queries.Length; i++)
                 Record(measurement.Prompts[i], session, set.Queries[i]);
+        return measurement;
+    }
+
+    // Zero-allocation API path: queries are encoded once and the same scratch
+    // buffers serve every rep, so --max-managed-bytes 0 --max-native-allocs 0
+    // gates the session itself instead of the string wrapper.
+    const int SpanCallsBytes = 65536;
+    const int SpanReasoningBytes = 8192;
+    const int SpanResponseBytes = 32768;
+
+    static SetMeasurement MeasureSetSpan(PromptSet set, BenchE2EOptions options, NeedleSession session, SetMeasurement measurement)
+    {
+        var encoded = new byte[set.Queries.Length][];
+        for (var i = 0; i < encoded.Length; i++) encoded[i] = Encoding.UTF8.GetBytes(set.Queries[i]);
+        var calls = new byte[SpanCallsBytes];
+        var reasoning = new byte[SpanReasoningBytes];
+        var response = new byte[SpanResponseBytes];
+        for (var warm = 0; warm < options.Warmups; warm++)
+            for (var i = 0; i < encoded.Length; i++)
+            {
+                session.Reset();
+                session.Complete(encoded[i], calls, reasoning, response);
+            }
+        for (var rep = 0; rep < options.Reps; rep++)
+            for (var i = 0; i < encoded.Length; i++)
+                RecordSpan(measurement.Prompts[i], session, encoded[i], calls, reasoning, response);
         return measurement;
     }
 
@@ -194,6 +225,51 @@ internal static class BenchE2E
         prompt.NativeAllocs.Add(nativeAllocs);
     }
 
+    static void RecordSpan(PromptMeasurement prompt, NeedleSession session, byte[] query, byte[] calls, byte[] reasoning, byte[] response)
+    {
+        session.Reset();
+        var managedBefore = GC.GetTotalAllocatedBytes(true);
+        var nativeBefore = Mem.Allocations;
+        var reply = session.Complete(query, calls, reasoning, response);
+        var nativeAllocs = Mem.Allocations - nativeBefore;
+        var managedBytes = GC.GetTotalAllocatedBytes(true) - managedBefore;
+        var ticksPerSecond = (double)Stopwatch.Frequency;
+        var prefillTps = reply.PromptTokens / Math.Max(1e-9, reply.PrefillTicks / ticksPerSecond);
+        var decodeTps = reply.DecodeTokens / Math.Max(1e-9, (reply.ElapsedTicks - reply.PrefillTicks) / ticksPerSecond);
+        if (reply.Status is not (ReplyStatus.Called or ReplyStatus.Responded or ReplyStatus.Refused) || decodeTps <= 0)
+        {
+            prompt.Failures++;
+            return;
+        }
+        // Display decoding happens outside the measured region.
+        prompt.Calls = reply.HasCalls ? CallNames(calls, reply.Utf8Length) : "respond";
+        prompt.PrefillTokens = reply.PromptTokens;
+        prompt.DecodeTokens = reply.DecodeTokens;
+        prompt.PrefillMs.Add(reply.PromptTokens / prefillTps * 1000.0);
+        prompt.DecodeUsPerToken.Add(1e6 / decodeTps);
+        prompt.TtftMs.Add(reply.FirstTokenTicks * 1000.0 / ticksPerSecond);
+        prompt.TotalMs.Add(reply.ElapsedTicks * 1000.0 / ticksPerSecond);
+        prompt.PrefillTps.Add(prefillTps);
+        prompt.DecodeTps.Add(decodeTps);
+        prompt.ManagedBytes.Add(managedBytes);
+        prompt.NativeAllocs.Add(nativeAllocs);
+    }
+
+    static string CallNames(byte[] calls, int length)
+    {
+        try
+        {
+            var names = new List<string>();
+            foreach (var call in JsonValue.Parse(Encoding.UTF8.GetString(calls, 0, length)).Items)
+                names.Add(call.GetString("name") ?? "?");
+            return names.Count > 0 ? string.Join(",", names) : "calls";
+        }
+        catch (Exception e) when (e is ArgumentException or FormatException or InvalidOperationException)
+        {
+            return "calls";
+        }
+    }
+
     public static List<string> Violations(E2EReport report)
     {
         var violations = new List<string>();
@@ -218,7 +294,7 @@ internal static class BenchE2E
     public static string ToText(E2EReport report)
     {
         var writer = new StringWriter();
-        writer.WriteLine($"bench-e2e {report.Model} | {BenchMachine.Describe()} | reps {report.Options.Reps}");
+        writer.WriteLine($"bench-e2e {report.Model} | {BenchMachine.Describe()} | api {report.Options.Api} | reps {report.Options.Reps}");
         foreach (var run in report.Runs)
         {
             foreach (var set in run.Sets)
@@ -263,6 +339,7 @@ internal static class BenchE2E
             .Field("schema", "needle.bench-e2e/1")
             .Field("engine", "csharp")
             .Field("model", report.Model)
+            .Field("api", report.Options.Api)
             .Field("reps", report.Options.Reps);
         BenchMachine.Write(json);
         json.Key("runs").BeginArray();
