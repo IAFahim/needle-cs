@@ -12,6 +12,7 @@ public sealed class NeedleOptions
 {
     public int Threads { get; init; } = 1;
     public ThreadPolicy? Threading { get; init; }
+    public FrameBudget FrameBudget { get; init; }
     public int Context { get; init; } = 2048;
     public int MaxReasoningTokens { get; init; } = 96;
     public int MaxCallTokens { get; init; } = 384;
@@ -394,6 +395,7 @@ public sealed unsafe partial class NeedleSession : IDisposable
 
     Reply Generate(ref TurnProgress progress, Span<byte> calls, Span<byte> reasoning, Span<byte> response)
     {
+        var budget = options.FrameBudget;
         var firstPiece = true;
         for (var i = 0; i < options.MaxReasoningTokens; i++)
         {
@@ -406,6 +408,7 @@ public sealed unsafe partial class NeedleSession : IDisposable
             firstPiece = false;
             if (!TryFeed(next)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
             progress.DecodeTokens++;
+            if (!budget.IsUnlimited && FrameBudgetHit(progress, budget)) return Abandon(ReplyStatus.Failed, FailureReason.FrameBudgetExceeded, progress);
         }
         if (!TryFeed(thinkEndForced)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
         var decision = ArgMax(decisionMask);
@@ -417,6 +420,7 @@ public sealed unsafe partial class NeedleSession : IDisposable
 
     Reply GenerateCalls(ref TurnProgress progress, Span<byte> calls)
     {
+        var budget = options.FrameBudget;
         var state = Grammar.Start(grammar.Program);
         var logProbability = 0.0;
         var steps = 0;
@@ -441,6 +445,7 @@ public sealed unsafe partial class NeedleSession : IDisposable
             logProbability += Math.Log(Math.Max(probability, 1e-9));
             steps++;
             progress.DecodeTokens++;
+            if (!budget.IsUnlimited && FrameBudgetHit(progress, budget)) return Abandon(ReplyStatus.Failed, FailureReason.FrameBudgetExceeded, progress);
             if (!TryFeed(pick, computeLogits: !Grammar.Complete(state))) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
         }
         if (!TryFeed(callClosing, computeLogits: false)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
@@ -460,12 +465,14 @@ public sealed unsafe partial class NeedleSession : IDisposable
     Reply Respond(int first, ref TurnProgress progress, Span<byte> response)
     {
         var next = first;
+        var budget = options.FrameBudget;
         for (var i = 0; i < options.MaxCallTokens && next != ImEnd && next != EndOfText; i++)
         {
             if (CancelRequested) return Abandon(ReplyStatus.Cancelled, FailureReason.None, progress);
             AppendPiece(next, i == 0, response, ref progress.ResponseLength, ref progress.Flags, ReplyFlags.ResponseTruncated);
             if (!TryFeed(next)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
             progress.DecodeTokens++;
+            if (!budget.IsUnlimited && FrameBudgetHit(progress, budget)) return Abandon(ReplyStatus.Failed, FailureReason.FrameBudgetExceeded, progress);
             next = ArgMax(responseMask);
             if (next < 0) return Abandon(ReplyStatus.Failed, FailureReason.GrammarDeadEnd, progress);
         }
@@ -476,6 +483,13 @@ public sealed unsafe partial class NeedleSession : IDisposable
     }
 
     bool CancelRequested => System.Threading.Volatile.Read(ref cancelRequested) != 0;
+
+    static bool FrameBudgetHit(in TurnProgress progress, in FrameBudget budget)
+    {
+        if (budget.MaxTokensPerSlice > 0 && progress.DecodeTokens >= budget.MaxTokensPerSlice) return true;
+        if (budget.MaxMillisecondsPerSlice <= 0) return false;
+        return (Stopwatch.GetTimestamp() - progress.Started) * 1000.0 / Stopwatch.Frequency >= budget.MaxMillisecondsPerSlice;
+    }
 
     double HeadProbability() =>
         confidenceScratch == null ? 1.0 : 1.0 / (1.0 + Math.Exp(-engine.ConfidenceLogit(pooled, confidenceScratch)));

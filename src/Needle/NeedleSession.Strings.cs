@@ -123,6 +123,7 @@ public sealed unsafe partial class NeedleSession
         FailureReason.CallsBufferTooSmall => "the calls buffer is too small",
         FailureReason.MalformedCalls => "the generated calls are not valid JSON",
         FailureReason.ToolContextFailed => "the tool context could not be built",
+        FailureReason.FrameBudgetExceeded => "the frame budget ran out",
         _ => "the turn failed",
     };
 }

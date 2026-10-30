@@ -73,3 +73,20 @@ public readonly struct ThreadPolicy
         return new ThreadPolicy(Threads, SpinMicroseconds, Priority, CorePlacement.Explicit, Caller, mask);
     }
 }
+
+public readonly struct FrameBudget
+{
+    public int MaxTokensPerSlice { get; }
+    public double MaxMillisecondsPerSlice { get; }
+    public bool IsUnlimited => MaxTokensPerSlice <= 0 && MaxMillisecondsPerSlice <= 0;
+    public static FrameBudget Unlimited => default;
+    public FrameBudget(int maxTokensPerSlice, double maxMillisecondsPerSlice)
+    {
+        MaxTokensPerSlice = Math.Max(0, maxTokensPerSlice);
+        MaxMillisecondsPerSlice = Math.Max(0, maxMillisecondsPerSlice);
+    }
+    public static FrameBudget FromTokens(int maxTokensPerSlice) => new(maxTokensPerSlice, 0);
+    public static FrameBudget FromMilliseconds(double maxMillisecondsPerSlice) => new(0, maxMillisecondsPerSlice);
+    public FrameBudget WithMaxTokensPerSlice(int maxTokensPerSlice) => new(maxTokensPerSlice, MaxMillisecondsPerSlice);
+    public FrameBudget WithMaxMillisecondsPerSlice(double maxMillisecondsPerSlice) => new(MaxTokensPerSlice, maxMillisecondsPerSlice);
+}

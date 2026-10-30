@@ -282,4 +282,31 @@ public sealed unsafe class PoolTests
         Assert.Equal(5400u, Topology.PerformanceFloor(new uint[] { 3800, 3800, 5400, 5400 }));
         Assert.Equal(800u, Topology.PerformanceFloor(new uint[] { 400, 800, 1024 }));
     }
+
+    [Fact]
+    public void SpinBudgetsStayAtTheirMeasuredDefaults()
+    {
+        Assert.Equal(300, ThreadPolicy.DefaultSpinMicroseconds);
+        Assert.Equal(50, ThreadPolicy.GameSpinMicroseconds);
+        Assert.Equal(ThreadPolicy.DefaultSpinMicroseconds, ThreadPolicy.Default.SpinMicroseconds);
+        Assert.Equal(ThreadPolicy.GameSpinMicroseconds, ThreadPolicy.Game.SpinMicroseconds);
+    }
+
+    [Fact]
+    public void FrameBudgetsDefaultToUnlimitedAndClampNegativeInputs()
+    {
+        Assert.True(default(FrameBudget).IsUnlimited);
+        Assert.True(FrameBudget.Unlimited.IsUnlimited);
+        Assert.True(new NeedleOptions().FrameBudget.IsUnlimited);
+        Assert.True(new FrameBudget(-3, -1.5).IsUnlimited);
+        var tokens = FrameBudget.FromTokens(8);
+        Assert.Equal(8, tokens.MaxTokensPerSlice);
+        Assert.Equal(0, tokens.MaxMillisecondsPerSlice);
+        Assert.False(tokens.IsUnlimited);
+        var both = FrameBudget.FromMilliseconds(2.5).WithMaxTokensPerSlice(8);
+        Assert.Equal(8, both.MaxTokensPerSlice);
+        Assert.Equal(2.5, both.MaxMillisecondsPerSlice);
+        Assert.False(both.IsUnlimited);
+        Assert.True(both.WithMaxTokensPerSlice(0).WithMaxMillisecondsPerSlice(0).IsUnlimited);
+    }
 }

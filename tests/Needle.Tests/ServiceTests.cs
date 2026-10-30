@@ -20,6 +20,17 @@ public sealed class ServiceTests
     }
 
     [Fact]
+    public async Task TinyFrameBudgetRefusesTheCallThroughTheService()
+    {
+        Assets.Require();
+        using var service = new NeedleService();
+        await service.Start(Assets.Model, File.ReadAllText(Assets.Tools), new NeedleOptions { Threads = 2, FrameBudget = FrameBudget.FromTokens(2) });
+        var result = await service.Complete("what's it like in Lagos right now?");
+        Assert.False(result.Success);
+        Assert.Equal("the frame budget ran out", result.Error);
+    }
+
+    [Fact]
     public async Task SpeechServiceTranscribes()
     {
         var path = Path.Combine(Assets.Root, "ref/hf/whistle/whistle.cact");
