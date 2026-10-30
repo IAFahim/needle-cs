@@ -8,7 +8,7 @@ Reads `.cact` model files directly in place with AVX2, ARM64 NEON (SDOT with a w
 
 ## Status
 
-Early but usable for a showcase: everything below works on Linux x64 today and is covered by 85 passing tests (Linux x64, AVX2 and scalar).
+Early but usable for a showcase: everything below works on Linux x64 today and is covered by 216 passing tests (Linux x64, AVX2 and scalar).
 
 | Area | State |
 |---|---|
@@ -17,6 +17,8 @@ Early but usable for a showcase: everything below works on Linux x64 today and i
 | Threading | `ThreadPolicy` presets, the library never pins your calling thread, workers park when idle, `Pause`/`Resume` |
 | Speed | Faster than the upstream native engine on the reference VM (73-84 ms vs 95-129 ms per call, 4 threads). A further 3x is planned, see below |
 | Per-call allocations | About 6 KB of managed allocations per call today. Zero-allocation API and typed C# calls are planned |
+| Voice | Whistle transcription matches the upstream library on 2 of 4 test clips and is close on the others (details in issue #38). Beam search is on by default, `BeamWidth = 1` gives faster greedy decoding |
+| Evaluating tool sets | `needle eval` with 208 game prompts, see below |
 | Unity | Sample package exists, the Entities `ISystem` version is planned |
 
 The roadmap lives in [plan.md](plan.md), and every work item is a GitHub issue. Start at the tracking issue [#31](https://github.com/IAFahim/needle-cs/issues/31).
