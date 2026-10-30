@@ -23,6 +23,7 @@ internal static class Emitter
         EmitKindEnum(builder, model, indent);
         foreach (var tool in model.Tools) EmitArgsStruct(builder, model, tool, indent);
         EmitCommandStruct(builder, model, indent);
+        EmitSink(builder, model, indent);
         EmitCommandsClass(builder, model, indent);
         if (implementToolSet) EmitToolSetAdapter(builder, model, indent);
         if (!model.GlobalNamespace) builder.Append("}\n");
@@ -76,6 +77,176 @@ internal static class Emitter
             builder.Append(indent).Append("    public ").Append(tool.Name).Append("Args ").Append(tool.Name).Append(";\n");
         builder.Append(indent).Append("}\n\n");
     }
+
+    static string SinkName(ToolSetModel model) => model.CommandName.EndsWith("Command", StringComparison.Ordinal)
+        ? model.CommandName.Substring(0, model.CommandName.Length - "Command".Length) + "Sink"
+        : model.CommandName + "Sink";
+
+    static void EmitSink(StringBuilder builder, ToolSetModel model, string indent)
+    {
+        var sink = SinkName(model);
+        builder.Append(indent).Append("public struct ").Append(sink).Append(" : global::Needle.Tools.ICallSink<").Append(model.CommandName).Append(">\n");
+        builder.Append(indent).Append("{\n");
+        builder.Append(indent).Append("    public ").Append(model.CommandName).Append(" Command;\n");
+        builder.Append(indent).Append("    public int CallCount { get; private set; }\n");
+        builder.Append(indent).Append("    int _tool;\n");
+        builder.Append(indent).Append("    int _property;\n");
+        builder.Append(indent).Append("    global::Needle.Tools.Utf8Text64 _number;\n");
+        builder.Append(indent).Append("    bool _numberOverflow;\n");
+        builder.Append(indent).Append("    int _scalar;\n");
+        builder.Append(indent).Append("    bool _ready;\n");
+        builder.Append(indent).Append("    bool _textOverflow;\n");
+        builder.Append(indent).Append("    int _textPending;\n\n");
+        builder.Append(indent).Append("    public bool TryTakeCall(out ").Append(model.CommandName).Append(" command)\n");
+        builder.Append(indent).Append("    {\n");
+        builder.Append(indent).Append("        if (!_ready) { command = default; return false; }\n");
+        builder.Append(indent).Append("        _ready = false;\n");
+        builder.Append(indent).Append("        command = Command;\n");
+        builder.Append(indent).Append("        return true;\n");
+        builder.Append(indent).Append("    }\n\n");
+        builder.Append(indent).Append("    public void ToolSelected(int tool)\n");
+        builder.Append(indent).Append("    {\n");
+        builder.Append(indent).Append("        Command = default;\n");
+        builder.Append(indent).Append("        _tool = tool;\n");
+        builder.Append(indent).Append("        _property = -1;\n");
+        builder.Append(indent).Append("        _number.Length = 0;\n");
+        builder.Append(indent).Append("        _numberOverflow = false;\n");
+        builder.Append(indent).Append("        _scalar = 0;\n");
+        builder.Append(indent).Append("        _ready = false;\n");
+        builder.Append(indent).Append("        _textOverflow = false;\n");
+        builder.Append(indent).Append("        _textPending = 0;\n");
+        builder.Append(indent).Append("        if ((uint)tool < ").Append(model.Tools.Length).Append("u)\n");
+        builder.Append(indent).Append("            Command.Kind = (").Append(model.CommandName).Append("Kind)(tool + 1);\n");
+        builder.Append(indent).Append("    }\n\n");
+        builder.Append(indent).Append("    public void PropertySelected(int property)\n");
+        builder.Append(indent).Append("    {\n");
+        builder.Append(indent).Append("        _property = property;\n");
+        builder.Append(indent).Append("        _number.Length = 0;\n");
+        builder.Append(indent).Append("        _numberOverflow = false;\n");
+        builder.Append(indent).Append("        _scalar = 0;\n");
+        builder.Append(indent).Append("        _textOverflow = false;\n");
+        builder.Append(indent).Append("        _textPending = 0;\n");
+        builder.Append(indent).Append("    }\n\n");
+        builder.Append(indent).Append("    public void StringByte(byte value)\n");
+        builder.Append(indent).Append("    {\n");
+        builder.Append(indent).Append("        switch (_tool)\n");
+        builder.Append(indent).Append("        {\n");
+        for (var t = 0; t < model.Tools.Length; t++)
+        {
+            var tool = model.Tools[t];
+            var texts = new List<int>();
+            for (var p = 0; p < tool.Args.Length; p++) if (tool.Args[p].Type == ArgType.Text) texts.Add(p);
+            if (texts.Count == 0) continue;
+            builder.Append(indent).Append("            case ").Append(t).Append(":\n");
+            builder.Append(indent).Append("                switch (_property)\n");
+            builder.Append(indent).Append("                {\n");
+            foreach (var p in texts)
+                builder.Append(indent).Append("                    case ").Append(p).Append(":\n")
+                    .Append(indent).Append("                        AppendText(ref Command.").Append(tool.Name).Append('.').Append(Pascal(tool.Args[p].Name)).Append(", value);\n")
+                    .Append(indent).Append("                        break;\n");
+            builder.Append(indent).Append("                }\n");
+            builder.Append(indent).Append("                break;\n");
+        }
+        builder.Append(indent).Append("        }\n");
+        builder.Append(indent).Append("    }\n\n");
+        builder.Append(indent).Append("    public void NumberByte(byte value)\n");
+        builder.Append(indent).Append("    {\n");
+        builder.Append(indent).Append("        if (_number.Length < global::Needle.Tools.Utf8Text64.Capacity) _number.Buffer[_number.Length++] = value;\n");
+        builder.Append(indent).Append("        else _numberOverflow = true;\n");
+        builder.Append(indent).Append("    }\n\n");
+        builder.Append(indent).Append("    public void EnumSelected(int literal) { _scalar = literal; }\n\n");
+        builder.Append(indent).Append("    public void BoolSelected(bool value) { _scalar = value ? 1 : 0; }\n\n");
+        builder.Append(indent).Append("    public void NullSelected() { }\n\n");
+        builder.Append(indent).Append("    public void ValueCompleted()\n");
+        builder.Append(indent).Append("    {\n");
+        builder.Append(indent).Append("        switch (_tool)\n");
+        builder.Append(indent).Append("        {\n");
+        for (var t = 0; t < model.Tools.Length; t++)
+        {
+            var tool = model.Tools[t];
+            if (tool.Args.Length == 0) continue;
+            builder.Append(indent).Append("            case ").Append(t).Append(":\n");
+            builder.Append(indent).Append("                switch (_property)\n");
+            builder.Append(indent).Append("                {\n");
+            for (var p = 0; p < tool.Args.Length; p++) EmitSinkCommit(builder, model, indent, tool, t, p);
+            builder.Append(indent).Append("                }\n");
+            builder.Append(indent).Append("                break;\n");
+        }
+        builder.Append(indent).Append("        }\n");
+        builder.Append(indent).Append("    }\n\n");
+        builder.Append(indent).Append("    public void CallCompleted()\n");
+        builder.Append(indent).Append("    {\n");
+        builder.Append(indent).Append("        _ready = true;\n");
+        builder.Append(indent).Append("        CallCount++;\n");
+        builder.Append(indent).Append("    }\n\n");
+        var capacities = new SortedSet<int>();
+        foreach (var tool in model.Tools)
+            foreach (var arg in tool.Args)
+                if (arg.Type == ArgType.Text) capacities.Add(arg.FixedText ? arg.TextCapacity : 128);
+        foreach (var capacity in capacities)
+        {
+            builder.Append(indent).Append("    void AppendText(ref global::Needle.Tools.Utf8Text").Append(capacity).Append(" slot, byte value)\n");
+            builder.Append(indent).Append("    {\n");
+            builder.Append(indent).Append("        if (slot.Length >= global::Needle.Tools.Utf8Text").Append(capacity).Append(".Capacity) { _textOverflow = true; return; }\n");
+            builder.Append(indent).Append("        if (value < 0x80) _textPending = 0;\n");
+            builder.Append(indent).Append("        else if (value < 0xC0) { if (_textPending > 0) _textPending--; }\n");
+            builder.Append(indent).Append("        else if (value < 0xE0) _textPending = 1;\n");
+            builder.Append(indent).Append("        else if (value < 0xF0) _textPending = 2;\n");
+            builder.Append(indent).Append("        else _textPending = 3;\n");
+            builder.Append(indent).Append("        slot.Buffer[slot.Length++] = value;\n");
+            builder.Append(indent).Append("    }\n\n");
+        }
+        builder.Append(indent).Append("}\n\n");
+    }
+
+    static void EmitSinkCommit(StringBuilder builder, ToolSetModel model, string indent, ToolEntry tool, int t, int p)
+    {
+        var arg = tool.Args[p];
+        var target = $"Command.{tool.Name}.{Pascal(arg.Name)}";
+        var bit = "0x" + (1u << p) + "u";
+        builder.Append(indent).Append("                    case ").Append(p).Append(":\n");
+        builder.Append(indent).Append("                    {\n");
+        switch (arg.Type)
+        {
+            case ArgType.Text:
+                builder.Append(indent).Append("                        if (_textOverflow && _textPending > 0)\n");
+                builder.Append(indent).Append("                        {\n");
+                builder.Append(indent).Append("                            var buffer = ").Append(target).Append(".Buffer;\n");
+                builder.Append(indent).Append("                            var length = ").Append(target).Append(".Length;\n");
+                builder.Append(indent).Append("                            while (length > 0 && (buffer[length - 1] & 0xC0) == 0x80) length--;\n");
+                builder.Append(indent).Append("                            if (length > 0 && buffer[length - 1] >= 0x80) length--;\n");
+                builder.Append(indent).Append("                            ").Append(target).Append(".Length = length;\n");
+                builder.Append(indent).Append("                        }\n");
+                builder.Append(indent).Append("                        Command.Presence |= ").Append(bit).Append(";\n");
+                break;
+            case ArgType.Int:
+            case ArgType.Long:
+            case ArgType.Float:
+            case ArgType.Double:
+                var parse = arg.Type == ArgType.Int ? "int" : arg.Type == ArgType.Long ? "long" : arg.Type == ArgType.Float ? "float" : "double";
+                builder.Append(indent).Append("                        if (!_numberOverflow && System.Buffers.Text.Utf8Parser.TryParse(_number.Span, out ").Append(parse).Append(" number").Append(t).Append('_').Append(p).Append(", out int used").Append(t).Append('_').Append(p).Append(") && used").Append(t).Append('_').Append(p).Append(" == _number.Length)\n");
+                builder.Append(indent).Append("                        {\n");
+                builder.Append(indent).Append("                            ").Append(target).Append(" = number").Append(t).Append('_').Append(p).Append(";\n");
+                builder.Append(indent).Append("                            Command.Presence |= ").Append(bit).Append(";\n");
+                builder.Append(indent).Append("                        }\n");
+                break;
+            case ArgType.Bool:
+                builder.Append(indent).Append("                        ").Append(target).Append(" = _scalar != 0;\n");
+                builder.Append(indent).Append("                        Command.Presence |= ").Append(bit).Append(";\n");
+                break;
+            default:
+                builder.Append(indent).Append("                        switch (_scalar)\n");
+                builder.Append(indent).Append("                        {\n");
+                for (var i = 0; i < arg.EnumLiterals.Length; i++)
+                    builder.Append(indent).Append("                            case ").Append(i).Append(": ").Append(target).Append(" = ").Append(arg.EnumTypeName).Append('.').Append(arg.EnumMembers[i]).Append("; break;\n");
+                builder.Append(indent).Append("                        }\n");
+                builder.Append(indent).Append("                        Command.Presence |= ").Append(bit).Append(";\n");
+                break;
+        }
+        builder.Append(indent).Append("                        break;\n");
+        builder.Append(indent).Append("                    }\n");
+    }
+
 
     static void EmitCommandsClass(StringBuilder builder, ToolSetModel model, string indent)
     {

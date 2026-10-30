@@ -360,6 +360,26 @@ public sealed unsafe partial class NeedleSession : IDisposable
     public Reply CompleteWithToolResult(ReadOnlySpan<byte> utf8Json, Span<byte> utf8Calls, Span<byte> utf8Reasoning, Span<byte> utf8Response) =>
         Run(utf8Json, true, utf8Calls, utf8Reasoning, utf8Response);
 
+    public Reply Complete<TSink, TCommand>(ReadOnlySpan<byte> utf8Query, Span<TCommand> commands, ref TSink sink)
+        where TSink : struct, Tools.ICallSink<TCommand>
+        where TCommand : struct =>
+        RunTyped(utf8Query, false, commands, default, default, ref sink);
+
+    public Reply Complete<TSink, TCommand>(ReadOnlySpan<byte> utf8Query, Span<TCommand> commands, Span<byte> utf8Reasoning, Span<byte> utf8Response, ref TSink sink)
+        where TSink : struct, Tools.ICallSink<TCommand>
+        where TCommand : struct =>
+        RunTyped(utf8Query, false, commands, utf8Reasoning, utf8Response, ref sink);
+
+    public Reply CompleteWithToolResult<TSink, TCommand>(ReadOnlySpan<byte> utf8Json, Span<TCommand> commands, ref TSink sink)
+        where TSink : struct, Tools.ICallSink<TCommand>
+        where TCommand : struct =>
+        RunTyped(utf8Json, true, commands, default, default, ref sink);
+
+    public Reply CompleteWithToolResult<TSink, TCommand>(ReadOnlySpan<byte> utf8Json, Span<TCommand> commands, Span<byte> utf8Reasoning, Span<byte> utf8Response, ref TSink sink)
+        where TSink : struct, Tools.ICallSink<TCommand>
+        where TCommand : struct =>
+        RunTyped(utf8Json, true, commands, utf8Reasoning, utf8Response, ref sink);
+
     Reply Run(ReadOnlySpan<byte> input, bool toolResult, Span<byte> calls, Span<byte> reasoning, Span<byte> response)
     {
         var progress = new TurnProgress { Started = Stopwatch.GetTimestamp() };
@@ -379,6 +399,26 @@ public sealed unsafe partial class NeedleSession : IDisposable
         return Generate(ref progress, calls, reasoning, response);
     }
 
+    Reply RunTyped<TSink, TCommand>(ReadOnlySpan<byte> input, bool toolResult, Span<TCommand> commands, Span<byte> reasoning, Span<byte> response, ref TSink sink)
+        where TSink : struct, Tools.ICallSink<TCommand>
+        where TCommand : struct
+    {
+        var progress = new TurnProgress { Started = Stopwatch.GetTimestamp() };
+        System.Threading.Volatile.Write(ref cancelRequested, 0);
+        if (!toolResult && input.Length == 0) return Failed(FailureReason.EmptyInput, progress);
+        if (input.Length > maxInputBytes) return Failed(FailureReason.InputTooLong, progress);
+        if (retrieval) return Failed(FailureReason.ToolContextFailed, progress);
+        progress.PromptTokens = EncodePrompt(input, toolResult);
+        if (engine.Length + progress.PromptTokens > contextCapacity) return Failed(FailureReason.ContextExhausted, progress);
+        turnOne = false;
+        engine.Feed(new ReadOnlySpan<int>(promptIds, 0, progress.PromptTokens));
+        progress.PrefillTicks = Stopwatch.GetTimestamp() - progress.Started;
+        var interrupted = Reason(ref progress, reasoning, response, out _);
+        if (interrupted.HasValue) return interrupted.Value;
+        if (!TryFeed(ToolCallStart)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
+        return GenerateCallsTyped(ref progress, commands, ref sink);
+    }
+
     int EncodePrompt(ReadOnlySpan<byte> input, bool toolResult)
     {
         var head = toolResult ? ToolResultHead : turnOne ? FirstQueryHead : LaterQueryHead;
@@ -394,6 +434,15 @@ public sealed unsafe partial class NeedleSession : IDisposable
 
     Reply Generate(ref TurnProgress progress, Span<byte> calls, Span<byte> reasoning, Span<byte> response)
     {
+        var interrupted = Reason(ref progress, reasoning, response, out _);
+        if (interrupted.HasValue) return interrupted.Value;
+        if (!TryFeed(ToolCallStart)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
+        return GenerateCalls(ref progress, calls);
+    }
+
+    Reply? Reason(ref TurnProgress progress, Span<byte> reasoning, Span<byte> response, out int decision)
+    {
+        decision = ToolCallStart;
         var firstPiece = true;
         for (var i = 0; i < options.MaxReasoningTokens; i++)
         {
@@ -408,11 +457,10 @@ public sealed unsafe partial class NeedleSession : IDisposable
             progress.DecodeTokens++;
         }
         if (!TryFeed(thinkEndForced)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
-        var decision = ArgMax(decisionMask);
+        decision = ArgMax(decisionMask);
         if (decision < 0) return Abandon(ReplyStatus.Failed, FailureReason.GrammarDeadEnd, progress);
         if (decision != ToolCallStart) return Respond(decision, ref progress, response);
-        if (!TryFeed(ToolCallStart)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
-        return GenerateCalls(ref progress, calls);
+        return null;
     }
 
     Reply GenerateCalls(ref TurnProgress progress, Span<byte> calls)
@@ -454,6 +502,53 @@ public sealed unsafe partial class NeedleSession : IDisposable
         var status = required > calls.Length ? ReplyStatus.Failed : refused ? ReplyStatus.Refused : ReplyStatus.Called;
         var failure = required > calls.Length ? FailureReason.CallsBufferTooSmall : FailureReason.None;
         return new Reply(status, failure, progress.Flags, confidence, (float)head, (float)decode, restoredCallCount, required,
+            progress.ReasoningLength, 0, progress.PromptTokens, progress.DecodeTokens, progress.PrefillTicks, progress.FirstTokenTicks, Stopwatch.GetTimestamp() - progress.Started);
+    }
+
+    Reply GenerateCallsTyped<TSink, TCommand>(ref TurnProgress progress, Span<TCommand> commands, ref TSink sink)
+        where TSink : struct, Tools.ICallSink<TCommand>
+        where TCommand : struct
+    {
+        var startCount = sink.CallCount;
+        sink.TryTakeCall(out _);
+        var state = Grammar.Start(grammar.Program);
+        var logProbability = 0.0;
+        var steps = 0;
+        var buffer = stackalloc byte[256];
+        var stored = 0;
+        while (!Grammar.Complete(state))
+        {
+            if (CancelRequested) return Abandon(ReplyStatus.Cancelled, FailureReason.None, progress);
+            if (steps >= options.MaxCallTokens) return Abandon(ReplyStatus.Failed, FailureReason.CallTokenBudgetExceeded, progress);
+            trie.Allow(grammar.Program, state, mask);
+            var pick = ArgMaxWithProbability(mask, out var probability);
+            if (pick < 0) return Abandon(ReplyStatus.Failed, FailureReason.GrammarDeadEnd, progress);
+            if (steps == 0 && progress.FirstTokenTicks == 0) progress.FirstTokenTicks = Stopwatch.GetTimestamp() - progress.Started;
+            var length = tokenizer.ConstraintBytes(pick, buffer);
+            var cursor = &state;
+            for (var b = 0; b < length; b++)
+            {
+                if (!Grammar.Advance(grammar.Program, cursor, buffer[b], ref sink)) return Abandon(ReplyStatus.Failed, FailureReason.GrammarRejectedToken, progress);
+                if (sink.TryTakeCall(out var call) && stored < commands.Length) commands[stored++] = call;
+            }
+            logProbability += Math.Log(Math.Max(probability, 1e-9));
+            steps++;
+            progress.DecodeTokens++;
+            if (!TryFeed(pick, computeLogits: !Grammar.Complete(state))) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
+        }
+        if (!TryFeed(callClosing, computeLogits: false)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
+
+        var head = HeadProbability();
+        var decode = Math.Exp(logProbability / Math.Max(1, steps));
+        var confidence = (float)Math.Min(head, decode);
+        var total = sink.CallCount - startCount;
+        restoredCallCount = total;
+        if (total > stored)
+            return new Reply(ReplyStatus.Failed, FailureReason.CallsBufferTooSmall, progress.Flags, confidence, (float)head, (float)decode, total, 0,
+                progress.ReasoningLength, 0, progress.PromptTokens, progress.DecodeTokens, progress.PrefillTicks, progress.FirstTokenTicks, Stopwatch.GetTimestamp() - progress.Started);
+        var refused = confidence < options.RefuseBelow;
+        var status = refused ? ReplyStatus.Refused : ReplyStatus.Called;
+        return new Reply(status, FailureReason.None, progress.Flags, confidence, (float)head, (float)decode, stored, 0,
             progress.ReasoningLength, 0, progress.PromptTokens, progress.DecodeTokens, progress.PrefillTicks, progress.FirstTokenTicks, Stopwatch.GetTimestamp() - progress.Started);
     }
 

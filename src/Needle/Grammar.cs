@@ -270,10 +270,16 @@ internal sealed unsafe class Grammar : IDisposable
 
     public static bool Advance(GrammarProgram* g, GrammarState* s, byte c)
     {
+        var sink = new Tools.NoSink();
+        return Advance(g, s, c, ref sink);
+    }
+
+    public static bool Advance<TSink>(GrammarProgram* g, GrammarState* s, byte c, ref TSink sink) where TSink : struct, Tools.IGrammarSink
+    {
         for (var guard = 0; guard < 12; guard++)
         {
             if (s->Depth == 0) return false;
-            var result = Step(g, s, s->Frames + s->Depth - 1, c);
+            var result = Step(g, s, s->Frames + s->Depth - 1, c, ref sink);
             if (result != Reprocess) return result == Consumed;
         }
         return false;
@@ -285,21 +291,21 @@ internal sealed unsafe class Grammar : IDisposable
         return result;
     }
 
-    static int Step(GrammarProgram* g, GrammarState* s, Frame* f, byte c)
+    static int Step<TSink>(GrammarProgram* g, GrammarState* s, Frame* f, byte c, ref TSink sink) where TSink : struct, Tools.IGrammarSink
     {
         var n = g->Nodes + f->Node * Kind.Fields;
         switch (n[0])
         {
             case Kind.Root: return StepRoot(g, s, f, c);
-            case Kind.Call: return StepCall(g, s, f, c);
-            case Kind.Obj: return n[4] != 0 ? StepFreeObject(s, f, c) : StepObject(g, s, f, n, c);
+            case Kind.Call: return StepCall(g, s, f, c, ref sink);
+            case Kind.Obj: return n[4] != 0 ? StepFreeObject(s, f, c) : StepObject(g, s, f, n, c, ref sink);
             case Kind.Arr: return StepArray(s, f, n, c);
-            case Kind.Str: return StepString(f, n, s, c);
+            case Kind.Str: return StepString(f, n, s, c, ref sink);
             case Kind.Int:
-            case Kind.Num: return StepNumber(s, f, n[0] == Kind.Num, c);
-            case Kind.Bool: return StepBool(s, f, c);
-            case Kind.Null: return StepLiteral(s, f, "null"u8, c);
-            case Kind.Enum: return StepEnum(g, s, f, n, c);
+            case Kind.Num: return StepNumber(s, f, n[0] == Kind.Num, c, ref sink);
+            case Kind.Bool: return StepBool(s, f, c, ref sink);
+            case Kind.Null: return StepNull(s, f, c, ref sink);
+            case Kind.Enum: return StepEnum(g, s, f, n, c, ref sink);
             case Kind.Union: return StepUnion(g, s, f, n, c);
             case Kind.Any: return StepAny(s, f, c);
             default: return Reject;
@@ -328,7 +334,7 @@ internal sealed unsafe class Grammar : IDisposable
         }
     }
 
-    static int StepCall(GrammarProgram* g, GrammarState* s, Frame* f, byte c)
+    static int StepCall<TSink>(GrammarProgram* g, GrammarState* s, Frame* f, byte c, ref TSink sink) where TSink : struct, Tools.IGrammarSink
     {
         var root = g->Nodes + g->Root * Kind.Fields;
         switch (f->Phase)
@@ -343,7 +349,7 @@ internal sealed unsafe class Grammar : IDisposable
                 if (c == '"')
                 {
                     for (var t = 0; t < g->ToolCount; t++)
-                        if ((f->Bits >> t & 1) != 0 && g->Tools[(root[2] + t) * 4 + 1] == f->Aux) { f->Aux2 = t; f->Phase = 2; f->Aux = 0; return Consumed; }
+                        if ((f->Bits >> t & 1) != 0 && g->Tools[(root[2] + t) * 4 + 1] == f->Aux) { f->Aux2 = t; f->Phase = 2; f->Aux = 0; sink.ToolSelected(t); return Consumed; }
                     return Reject;
                 }
                 for (var t = 0; t < g->ToolCount; t++)
@@ -366,13 +372,15 @@ internal sealed unsafe class Grammar : IDisposable
                 }
                 return Consumed;
             default:
-                return c == '}' ? Pop(s, Consumed) : Reject;
+                if (c != '}') return Reject;
+                sink.CallCompleted();
+                return Pop(s, Consumed);
         }
     }
 
     static ulong ToolMask(GrammarProgram* g) => g->ToolCount >= 64 ? ulong.MaxValue : (1UL << g->ToolCount) - 1;
 
-    static int StepObject(GrammarProgram* g, GrammarState* s, Frame* f, int* n, byte c)
+    static int StepObject<TSink>(GrammarProgram* g, GrammarState* s, Frame* f, int* n, byte c, ref TSink sink) where TSink : struct, Tools.IGrammarSink
     {
         var count = n[1];
         var all = count >= 32 ? 0xFFFFFFFFUL : (1UL << count) - 1;
@@ -404,6 +412,7 @@ internal sealed unsafe class Grammar : IDisposable
                             f->Aux2 |= 1 << p;
                             f->Aux = p;
                             f->Phase = 3;
+                            sink.PropertySelected(p);
                             return Consumed;
                         }
                     return Reject;
@@ -482,7 +491,7 @@ internal sealed unsafe class Grammar : IDisposable
         }
     }
 
-    static int StepString(Frame* f, int* n, GrammarState* s, byte c)
+    static int StepString<TSink>(Frame* f, int* n, GrammarState* s, byte c, ref TSink sink) where TSink : struct, Tools.IGrammarSink
     {
         var max = n[1];
         switch (f->Phase)
@@ -492,7 +501,12 @@ internal sealed unsafe class Grammar : IDisposable
                 f->Phase = 1;
                 return Consumed;
             case 1:
-                if (c == '"') return f->Aux >= n[2] ? Pop(s, Consumed) : Reject;
+                if (c == '"')
+                {
+                    if (f->Aux < n[2]) return Reject;
+                    sink.ValueCompleted();
+                    return Pop(s, Consumed);
+                }
                 if (c == '\\')
                 {
                     if (max >= 0 && f->Aux >= max) return Reject;
@@ -505,17 +519,29 @@ internal sealed unsafe class Grammar : IDisposable
                     if (max >= 0 && f->Aux >= max) return Reject;
                     f->Aux++;
                 }
+                sink.StringByte(c);
                 return Consumed;
             case 2:
-                if (c == 'u') { f->Phase = 3; f->Aux2 = 0; return Consumed; }
+                if (c == 'u') { f->Phase = 3; f->Aux2 = 0; f->Bits = 0; return Consumed; }
                 if (c != '"' && c != '\\' && c != '/' && c != 'b' && c != 'f' && c != 'n' && c != 'r' && c != 't') return Reject;
                 f->Aux++;
                 f->Phase = 1;
+                sink.StringByte(c switch
+                {
+                    (byte)'b' => (byte)'\b',
+                    (byte)'f' => (byte)'\f',
+                    (byte)'n' => (byte)'\n',
+                    (byte)'r' => (byte)'\r',
+                    (byte)'t' => (byte)'\t',
+                    _ => c,
+                });
                 return Consumed;
             default:
                 if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) return Reject;
+                f->Bits = f->Bits * 16 + HexValue(c);
                 if (++f->Aux2 == 4)
                 {
+                    EmitUnit((int)f->Bits, ref sink);
                     f->Aux++;
                     f->Phase = 1;
                 }
@@ -523,47 +549,81 @@ internal sealed unsafe class Grammar : IDisposable
         }
     }
 
-    static int StepNumber(GrammarState* s, Frame* f, bool real, byte c)
+    static ulong HexValue(byte c) => c <= '9' ? (ulong)(c - '0') : (ulong)((c & 0xDF) - 'A' + 10);
+
+    static void EmitUnit<TSink>(int unit, ref TSink sink) where TSink : struct, Tools.IGrammarSink
+    {
+        if (unit < 0x80) sink.StringByte((byte)unit);
+        else if (unit < 0x800)
+        {
+            sink.StringByte((byte)(0xC0 | (unit >> 6)));
+            sink.StringByte((byte)(0x80 | (unit & 0x3F)));
+        }
+        else if (unit is >= 0xD800 and <= 0xDFFF)
+        {
+            sink.StringByte(0xEF);
+            sink.StringByte(0xBF);
+            sink.StringByte(0xBD);
+        }
+        else
+        {
+            sink.StringByte((byte)(0xE0 | (unit >> 12)));
+            sink.StringByte((byte)(0x80 | ((unit >> 6) & 0x3F)));
+            sink.StringByte((byte)(0x80 | (unit & 0x3F)));
+        }
+    }
+
+    static int StepNumber<TSink>(GrammarState* s, Frame* f, bool real, byte c, ref TSink sink) where TSink : struct, Tools.IGrammarSink
     {
         var digit = c >= '0' && c <= '9';
         switch (f->Phase)
         {
             case 0:
-                if (c == '-') { f->Phase = 1; return Consumed; }
-                if (c == '0') { f->Phase = 2; return Consumed; }
-                if (digit) { f->Phase = 3; return Consumed; }
+                if (c == '-') { f->Phase = 1; sink.NumberByte(c); return Consumed; }
+                if (c == '0') { f->Phase = 2; sink.NumberByte(c); return Consumed; }
+                if (digit) { f->Phase = 3; sink.NumberByte(c); return Consumed; }
                 return Reject;
             case 1:
-                if (c == '0') { f->Phase = 2; return Consumed; }
-                if (digit) { f->Phase = 3; return Consumed; }
+                if (c == '0') { f->Phase = 2; sink.NumberByte(c); return Consumed; }
+                if (digit) { f->Phase = 3; sink.NumberByte(c); return Consumed; }
                 return Reject;
             case 2:
             case 3:
-                if (f->Phase == 3 && digit) return Consumed;
-                if (real && c == '.') { f->Phase = 4; return Consumed; }
-                if (real && (c == 'e' || c == 'E')) { f->Phase = 6; return Consumed; }
+                if (f->Phase == 3 && digit) { sink.NumberByte(c); return Consumed; }
+                if (real && c == '.') { f->Phase = 4; sink.NumberByte(c); return Consumed; }
+                if (real && (c == 'e' || c == 'E')) { f->Phase = 6; sink.NumberByte(c); return Consumed; }
+                sink.ValueCompleted();
                 return Pop(s, Reprocess);
             case 4:
                 if (!digit) return Reject;
                 f->Phase = 5;
+                sink.NumberByte(c);
                 return Consumed;
             case 5:
-                if (digit) return Consumed;
-                if (c == 'e' || c == 'E') { f->Phase = 6; return Consumed; }
+                if (digit) { sink.NumberByte(c); return Consumed; }
+                if (c == 'e' || c == 'E') { f->Phase = 6; sink.NumberByte(c); return Consumed; }
+                sink.ValueCompleted();
                 return Pop(s, Reprocess);
             case 6:
-                if (c == '+' || c == '-') { f->Phase = 7; return Consumed; }
+                if (c == '+' || c == '-') { f->Phase = 7; sink.NumberByte(c); return Consumed; }
                 goto case 7;
             case 7:
                 if (!digit) return Reject;
                 f->Phase = 8;
+                sink.NumberByte(c);
                 return Consumed;
             default:
-                return digit ? Consumed : Pop(s, Reprocess);
+                if (!digit)
+                {
+                    sink.ValueCompleted();
+                    return Pop(s, Reprocess);
+                }
+                sink.NumberByte(c);
+                return Consumed;
         }
     }
 
-    static int StepBool(GrammarState* s, Frame* f, byte c)
+    static int StepBool<TSink>(GrammarState* s, Frame* f, byte c, ref TSink sink) where TSink : struct, Tools.IGrammarSink
     {
         if (f->Phase == 0)
         {
@@ -571,17 +631,25 @@ internal sealed unsafe class Grammar : IDisposable
             if (c == 'f') { f->Aux2 = 1; f->Aux = 1; f->Phase = 1; return Consumed; }
             return Reject;
         }
-        return StepLiteral(s, f, f->Aux2 == 0 ? "true"u8 : "false"u8, c);
+        var word = f->Aux2 == 0 ? "true"u8 : "false"u8;
+        if (c != word[f->Aux]) return Reject;
+        if (++f->Aux != word.Length) return Consumed;
+        sink.BoolSelected(f->Aux2 == 0);
+        sink.ValueCompleted();
+        return Pop(s, Consumed);
     }
 
-    static int StepLiteral(GrammarState* s, Frame* f, ReadOnlySpan<byte> word, byte c)
+    static int StepNull<TSink>(GrammarState* s, Frame* f, byte c, ref TSink sink) where TSink : struct, Tools.IGrammarSink
     {
         if (f->Phase == 0) f->Phase = 1;
-        if (c != word[f->Aux]) return Reject;
-        return ++f->Aux == word.Length ? Pop(s, Consumed) : Consumed;
+        if (c != "null"u8[f->Aux]) return Reject;
+        if (++f->Aux != 4) return Consumed;
+        sink.NullSelected();
+        sink.ValueCompleted();
+        return Pop(s, Consumed);
     }
 
-    static int StepEnum(GrammarProgram* g, GrammarState* s, Frame* f, int* n, byte c)
+    static int StepEnum<TSink>(GrammarProgram* g, GrammarState* s, Frame* f, int* n, byte c, ref TSink sink) where TSink : struct, Tools.IGrammarSink
     {
         if (f->Phase == 0)
         {
@@ -591,25 +659,35 @@ internal sealed unsafe class Grammar : IDisposable
         }
         var candidates = 0UL;
         var complete = false;
+        var completed = 0;
         for (var i = 0; i < n[1]; i++)
         {
             if ((f->Bits >> i & 1) == 0) continue;
             var literal = g->Literals + (n[2] + i) * 2;
-            if (literal[1] == f->Aux) complete = true;
+            if (literal[1] == f->Aux) { complete = true; completed = i; }
             else if (g->Bytes[literal[0] + f->Aux] == c) candidates |= 1UL << i;
         }
-        if (candidates == 0) return complete ? Pop(s, Reprocess) : Reject;
+        if (candidates == 0)
+        {
+            if (!complete) return Reject;
+            sink.EnumSelected(completed);
+            sink.ValueCompleted();
+            return Pop(s, Reprocess);
+        }
         f->Bits = candidates;
         f->Aux++;
         var longer = false;
-        var exact = false;
+        var exact = -1;
         for (var i = 0; i < n[1]; i++)
         {
             if ((candidates >> i & 1) == 0) continue;
             var length = g->Literals[(n[2] + i) * 2 + 1];
-            if (length == f->Aux) exact = true; else longer = true;
+            if (length == f->Aux) exact = i; else longer = true;
         }
-        return exact && !longer ? Pop(s, Consumed) : Consumed;
+        if (exact < 0 || longer) return Consumed;
+        sink.EnumSelected(exact);
+        sink.ValueCompleted();
+        return Pop(s, Consumed);
     }
 
     static int StepUnion(GrammarProgram* g, GrammarState* s, Frame* f, int* n, byte c)
