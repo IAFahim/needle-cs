@@ -10,7 +10,16 @@ internal static class Bits
     };
 
     public static int TrailingZeros(uint value) => DeBruijn[(uint)((value & (uint)-(int)value) * 0x077CB531u) >> 27];
+
+    public static int PopCount(uint value)
+    {
+        value -= (value >> 1) & 0x55555555u;
+        value = (value & 0x33333333u) + ((value >> 2) & 0x33333333u);
+        return (int)(((value + (value >> 4)) & 0x0F0F0F0Fu) * 0x01010101u >> 24);
+    }
 #else
     public static int TrailingZeros(uint value) => System.Numerics.BitOperations.TrailingZeroCount(value);
+
+    public static int PopCount(uint value) => System.Numerics.BitOperations.PopCount(value);
 #endif
 }

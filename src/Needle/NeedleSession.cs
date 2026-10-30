@@ -700,7 +700,7 @@ public sealed unsafe partial class NeedleSession : IDisposable
     static int MaskCount(uint* mask, int words)
     {
         var total = 0;
-        for (var w = 0; w < words; w++) total += System.Numerics.BitOperations.PopCount(mask[w]);
+        for (var w = 0; w < words; w++) total += Bits.PopCount(mask[w]);
         return total;
     }
 
