@@ -101,7 +101,12 @@ internal sealed unsafe class Grammar : IDisposable
         for (var i = 0; i < bytes.Count; i++) Program->Bytes[i] = bytes[i];
         Program->Root = root;
         Program->ToolCount = toolSchemas.Count;
+        TableLengths = (nodes.Count, properties.Count, literals.Count, unions.Count, tools.Count, bytes.Count);
     }
+
+    internal readonly (int Nodes, int Properties, int Literals, int Unions, int Tools, int Bytes) TableLengths;
+
+    internal Grammar(GrammarProgram* adopted) => Program = adopted;
 
     static int* Copy(List<int> list)
     {

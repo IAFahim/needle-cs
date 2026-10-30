@@ -162,6 +162,11 @@ public sealed unsafe partial class NeedleSession : IDisposable
     bool turnOne = true;
 
     public NeedleSession(Model model, string toolsJson, NeedleOptions? options = null)
+        : this(model, toolsJson, null, options)
+    {
+    }
+
+    internal NeedleSession(Model model, string toolsJson, GrammarProgram* precompiled, NeedleOptions? options)
     {
         this.model = model;
         this.options = options ?? new NeedleOptions();
@@ -200,7 +205,7 @@ public sealed unsafe partial class NeedleSession : IDisposable
         chosenTools = new int[topK];
         activeTools = new int[topK];
         active = allTools;
-        grammar = new Grammar(active.Tools);
+        grammar = precompiled != null ? new Grammar(precompiled) : new Grammar(active.Tools);
         if (retrieval) IndexTools();
         else Prime(active);
     }
