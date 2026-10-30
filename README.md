@@ -48,6 +48,20 @@ These steps need no golden fixtures. Only `dotnet test` does.
 - **Whistle Speech-to-Text:** 16 kHz WAV resampling, language detection/forcing, keyword biasing, DTW word timestamps, long-audio windowing, streaming, and direct audio-to-tool-call (`VoiceSession`).
 - **Portable & Embeddable:** Full scalar fallback for platforms without SIMD, `Model.FromBytes` for platforms without `mmap`, dedicated-thread `Task` wrappers (`NeedleService`, `SpeechService`), and automatic placement of worker threads on the fastest physical cores (Linux; `NEEDLE_PIN=0` disables, `NEEDLE_NODP=1` forces the NEON widening-fallback tier).
 
+### Unmanaged channel (game thread → worker, Burst-callable)
+
+`NeedleChannel` is two lock-free MPMC rings over unmanaged memory (blittable UTF-8 payloads, monotonic tickets, per-ticket cancellation). `NeedleHost` owns the model/session on its own worker thread; submit/receive are pointer math plus `Interlocked`/`Volatile` — no managed calls, no allocation — so Burst-compiled game code can hand off work without touching the managed API:
+
+```csharp
+using var host = new NeedleHost();
+var channel = host.Start(new HostOptions { ModelPath = "needle3.cact", ToolsJson = tools });
+channel.TrySubmitQuery("set a timer for 12 minutes"u8, out var ticket);
+// later, e.g. next frame:
+if (channel.TryReceive(out var reply) && reply.Ticket == ticket)
+    Handle(reply); // reply.Calls / reply.Response are fixed-size UTF-8 buffers
+host.Cancel(ticket); // cooperative cancellation per ticket
+```
+
 ## Quick Start
 
 ### Minimal Example

@@ -84,6 +84,7 @@ internal static unsafe class BenchKernels
                 Add(Prepare(cols, bits, tokens));
         Add(Mlp(model));
         Add(SinkhornNormalize());
+        Add(ChannelRoundTrip());
         foreach (var row in Vocabulary(model.VocabSize)) Add(row);
         foreach (var row in TrieAllow(model)) Add(row);
         foreach (var threads in options.PoolThreads)
@@ -240,6 +241,29 @@ internal static unsafe class BenchKernels
     {
         var spread = BenchTiming.NanosecondsPerCall(() => pool.Run(&EmptyTask, null, tasks), rounds: 9, roundMilliseconds: 6);
         return new KernelRow("pool_run_barrier", $"{tasks} empty tasks", 1, pool.Threads, spread, 0, 0);
+    }
+
+    static KernelRow ChannelRoundTrip()
+    {
+        var channel = NeedleChannel.Allocate(64, 64);
+        try
+        {
+            byte[] payload = { 1, 2, 3 };
+            var spread = BenchTiming.NanosecondsPerCall(() =>
+            {
+                channel.TrySubmitQuery(payload, out _);
+                channel.TryClaim(out var request, out var ticket);
+                ChannelReply reply = default;
+                reply.Ticket = ticket;
+                channel.TryPublishReply(in reply);
+                channel.TryReceive(out _);
+            }, rounds: 9, roundMilliseconds: 6);
+            return new KernelRow("channel_roundtrip", "submit+claim+publish+receive", 1, 1, spread, 0, 0);
+        }
+        finally
+        {
+            channel.Free();
+        }
     }
 
     static void EmptyTask(void* context, int index)
