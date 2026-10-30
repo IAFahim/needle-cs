@@ -297,7 +297,8 @@ internal static unsafe class Quant
         if (!Simd.Enabled) { Scalar.MatMulRows(w, a, tokens, y, ldy, rowStart, rowEnd); return; }
 #if NEEDLE_SIMD
         var tiledTokens = tokens & ~(TokenTile - 1);
-        for (var t = 0; t < tiledTokens; t += TokenTile) Gemv.Tile(w, a, t, y + (long)t * ldy, ldy, rowStart, rowEnd);
+        for (var t = 0; t < tiledTokens; t += TokenTile) Gemv.Tile4(w, a, t, y + (long)t * ldy, ldy, rowStart, rowEnd);
+        if (tokens - tiledTokens >= 2) { Gemv.Tile2(w, a, tiledTokens, y + (long)tiledTokens * ldy, ldy, rowStart, rowEnd); tiledTokens += 2; }
         for (var t = tiledTokens; t < tokens; t++) Gemv.Rows(w, a, t, y + (long)t * ldy, rowStart, rowEnd);
 #endif
     }
