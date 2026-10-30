@@ -36,6 +36,39 @@ public sealed class SpeechTests : IDisposable
     }
 
     [Fact]
+    public void RecordMatchesUpstreamExactly()
+    {
+        Assert.Equal("In one short sentence, what is the speed of sound at sea level?", whistle.Transcribe(Clip("record.wav")).Text);
+    }
+
+    [Fact]
+    public void LongClipMatchesUpstreamThroughTheQueenPassage()
+    {
+        var firstTwentyFiveSeconds = Clip("test_long.wav").AsSpan(0, 25 * 16000);
+        var text = whistle.Transcribe(firstTwentyFiveSeconds, "en").Text;
+        Assert.Contains("a new queen in Victoria, the first popular monarch in centuries, and her husband Albert", text);
+    }
+
+    [Fact]
+    public void BeamSearchRecoversWordsGreedyDecodingMisses()
+    {
+        var clip = Clip("test_long.wav").AsSpan(0, 25 * 16000).ToArray();
+        whistle.BeamWidth = 1;
+        var greedy = whistle.Transcribe(clip, "en").Text;
+        whistle.BeamWidth = 4;
+        var beam = whistle.Transcribe(clip, "en").Text;
+        Assert.Contains("queen in victory", greedy);
+        Assert.Contains("queen in Victoria", beam);
+    }
+
+    [Fact]
+    public void TestClipAndHotwordClipKeepUpstreamPhrases()
+    {
+        Assert.Contains("this will transcribe properly", whistle.Transcribe(Clip("test.wav")).Text);
+        Assert.Contains("called Omep Brazil", whistle.Transcribe(Clip("hotword.wav")).Text);
+    }
+
+    [Fact]
     public void ResamplesFortyEightKilohertzStereo()
     {
         Assert.Contains("hello", whistle.Transcribe(Clip("hotword.wav")).Text.ToLowerInvariant());
@@ -108,7 +141,8 @@ public sealed class SpeechTests : IDisposable
     public void ThreadCountDoesNotChangeTheTranscript()
     {
         using var single = new Whistle(model, 1);
-        Assert.Equal(single.Transcribe(Clip("test.wav")).Text, whistle.Transcribe(Clip("test.wav")).Text);
+        Assert.Equal(single.Embed(Clip("test.wav")), whistle.Embed(Clip("test.wav")));
+        Assert.Equal(single.Transcribe(Clip("record.wav")).Text, whistle.Transcribe(Clip("record.wav")).Text);
     }
 
     [Fact]
