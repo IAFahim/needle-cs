@@ -21,7 +21,7 @@ public sealed unsafe class NeedleHost : IDisposable
     Model? model;
     NeedleSession? session;
     Thread? worker;
-    NeedleChannel channel;
+    Runner runner = Run;
     byte* scratch;
     GCHandle self;
     long runningTicket = -1;
@@ -29,8 +29,16 @@ public sealed unsafe class NeedleHost : IDisposable
     int disposed;
     int stopping;
 
-    public NeedleChannel Start(in HostOptions options)
-    {
+    public NeedleChannel Start(in HostOptions options) => StartCore(in options, Run);
+
+    public NeedleChannel StartTyped<TSink, TCommand>(in HostOptions options)
+        where TSink : struct, Tools.ICallSink<TCommand>
+        where TCommand : unmanaged =>
+        StartCore(in options, RunTyped<TSink, TCommand>);
+
+    delegate Reply Runner(ref ChannelRequest request);
+
+    NeedleChannel StartCore(in HostOptions options, Runner runner)
         if (Interlocked.Exchange(ref started, 1) != 0 || Volatile.Read(ref disposed) != 0)
             throw new InvalidOperationException("NeedleHost was already started");
         try
