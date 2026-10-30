@@ -218,6 +218,8 @@ internal unsafe struct Reader
         Codebook.Fill(book4, codebook + 12, 16);
     }
 
+    public bool ExactHalves;
+
     public Arena Arena => arena;
 
     public float* Rows(Cq tensor)
@@ -237,7 +239,7 @@ internal unsafe struct Reader
         var count = Elements(record);
         var destination = arena.Take<float>(count);
         var source = map + record->Offset;
-        if (record->Dtype == Fp16) for (nuint i = 0; i < count; i++) destination[i] = Scalar.HalfToSingle(((ushort*)source)[i]);
+        if (record->Dtype == Fp16) for (nuint i = 0; i < count; i++) destination[i] = ExactHalves ? Scalar.HalfToSingleExact(((ushort*)source)[i]) : Scalar.HalfToSingle(((ushort*)source)[i]);
         else if (record->Dtype == Fp32) Buffer.MemoryCopy(source, destination, count * 4, count * 4);
         else throw new InvalidDataException("dense tensor expected");
         return destination;
@@ -326,6 +328,7 @@ public sealed unsafe class Model : IDisposable
         if (reader.Next->Dtype == Reader.Fp32 && reader.Next->Ndim == 1 && reader.Next->Shape0 == 13)
         {
             Audio = reader.Take<AudioWeights>(1);
+            reader.ExactHalves = true;
             *Audio = new AudioWeights(ref reader, Geometry.Layers, Geometry.HadaN);
         }
         else if (reader.Next != tail)
