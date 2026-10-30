@@ -1,7 +1,7 @@
 {
   "name": "Needle.Unity",
   "rootNamespace": "Needle.Unity",
-  "references": ["Unity.Burst", "Unity.Collections", "Unity.Jobs", "Unity.Entities"],
+  "references": ["Unity.Burst", "Unity.Collections", "Unity.Jobs", "Unity.Entities", "Unity.Profiling.Core"],
   "includePlatforms": [],
   "excludePlatforms": [],
   "allowUnsafeCode": true,
