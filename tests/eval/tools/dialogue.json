@@ -1,0 +1,6 @@
+[{"name":"say","description":"Say a line of dialogue out loud.","parameters":{"type":"object","properties":{"text":{"type":"string","description":"What to say"}},"required":["text"]}},
+{"name":"whisper","description":"Whisper a private line to one character.","parameters":{"type":"object","properties":{"target":{"type":"string","description":"Who hears it"},"text":{"type":"string","description":"What to whisper"}},"required":["target","text"]}},
+{"name":"ask_about","description":"Ask a character about a topic.","parameters":{"type":"object","properties":{"npc":{"type":"string","description":"Who to ask"},"topic":{"type":"string","description":"What to ask about"}},"required":["npc","topic"]}},
+{"name":"end_conversation","description":"Leave the current conversation.","parameters":{"type":"object","properties":{}}},
+{"name":"choose_option","description":"Pick a numbered dialogue option.","parameters":{"type":"object","properties":{"number":{"type":"integer","description":"Option number starting at 1"}},"required":["number"]}},
+{"name":"emote","description":"Play a gesture animation.","parameters":{"type":"object","properties":{"emotion":{"type":"string","enum":["wave","bow","laugh","cry","dance","shrug"]}},"required":["emotion"]}}]
