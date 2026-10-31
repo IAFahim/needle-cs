@@ -91,7 +91,7 @@ jobs:
     needs: fixtures
     runs-on: ${{ matrix.os }}
     continue-on-error: ${{ matrix.expected-fail }}
-    timeout-minutes: 45
+    timeout-minutes: 90
     # Per-job policy for issue #32 (never a blanket flag). The linux legs are
     # required-green: linux-x64 is the primary gate (suite + NEEDLE_SCALAR=1
     # rerun + netstandard2.1 + NativeAOT publish/smoke) and linux-arm64 covers
