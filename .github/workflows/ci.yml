@@ -220,10 +220,10 @@ jobs:
 
       - name: Log host SIMD capabilities
         run: |
-          grep -o 'avx512[a-z0-9]*\|avx2\|vnni\|fma' /proc/cpuinfo 2>/dev/null | sort -u || sysctl -a 2>/dev/null | grep -i 'machdep.cpu.features' || echo NO_CPUINFO
+          grep -o 'avx512[a-z0-9]*\|avx2\|vnni\|fma' /proc/cpuinfo 2>/dev/null | sort -u || lscpu 2>/dev/null | grep -i 'flags\|arch' || sysctl -a 2>/dev/null | grep -iE 'machdep.cpu.features|hw.optional.arm' || echo NO_CPUINFO
 
       - name: Hang watchdog (stacks + per-thread CPU before the blame fuse)
-        if: matrix.shard != 'unit' && (matrix.name == 'linux-x64' || matrix.name == 'linux-arm64')
+        if: matrix.shard != 'unit' && (startsWith(matrix.name, 'linux-x64') || matrix.name == 'linux-arm64')
         run: |
           dotnet tool install dotnet-stack --tool-path "$RUNNER_TEMP/diag"
           mkdir -p hang-snapshots
