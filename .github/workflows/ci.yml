@@ -128,6 +128,14 @@ jobs:
             netstandard: true
             neon: false
             shard: heavy
+          - name: linux-x64-noavx512
+            os: ubuntu-latest
+            expected-fail: true
+            scalar: false
+            netstandard: false
+            neon: false
+            shard: core
+            noavx512: true
           - name: linux-arm64
             os: ubuntu-24.04-arm
             expected-fail: false
@@ -209,6 +217,23 @@ jobs:
           name: ref-fixtures
           path: ref
 
+
+      - name: Log host SIMD capabilities
+        run: |
+          grep -o 'avx512[a-z0-9]*\|avx2\|vnni\|fma' /proc/cpuinfo 2>/dev/null | sort -u || sysctl -a 2>/dev/null | grep -i 'machdep.cpu.features' || echo NO_CPUINFO
+
+      - name: Hang watchdog (stacks + per-thread CPU before the blame fuse)
+        if: matrix.shard != 'unit' && (matrix.name == 'linux-x64' || matrix.name == 'linux-arm64')
+        run: |
+          dotnet tool install dotnet-stack --tool-path "$RUNNER_TEMP/diag"
+          mkdir -p hang-snapshots
+          ( sleep 1200
+            for pid in $(pgrep -f testhost); do
+              "$RUNNER_TEMP/diag/dotnet-stack" report -p "$pid" > "hang-snapshots/$pid-a.txt" 2>&1
+              top -H -b -n1 -p "$pid" > "hang-snapshots/$pid-top.txt" 2>&1
+              sleep 15
+              "$RUNNER_TEMP/diag/dotnet-stack" report -p "$pid" > "hang-snapshots/$pid-b.txt" 2>&1
+            done ) &
       - name: Select shard filter
         run: |
           case "${{ matrix.shard }}" in
@@ -216,11 +241,12 @@ jobs:
             core) echo 'FILTER=FullyQualifiedName~ChannelTests|FullyQualifiedName~ChunkParityTests|FullyQualifiedName~EvalTests|FullyQualifiedName~HugePagesTests|FullyQualifiedName~JumpForwardTests|FullyQualifiedName~LoadingTests|FullyQualifiedName~MaskedDecodingTests|FullyQualifiedName~NativeParityTests|FullyQualifiedName~ParityTests|FullyQualifiedName~RewindTests|FullyQualifiedName~ServiceTests|FullyQualifiedName~SessionStartupTests|FullyQualifiedName~SessionTests|FullyQualifiedName~SpanApiTests|FullyQualifiedName~SpeculativeTests|FullyQualifiedName~ToolGenSessionTests|FullyQualifiedName~TypedHostTests|FullyQualifiedName~TypedSinkTests' >> $GITHUB_ENV ;;
             heavy) echo 'FILTER=FullyQualifiedName~BatchedDecodeTests|FullyQualifiedName~BenchHarnessTests|FullyQualifiedName~SpeechTests|FullyQualifiedName~VoiceTests|FullyQualifiedName~WhistleStageTests|FullyQualifiedName~ZeroAllocationTests' >> $GITHUB_ENV ;;
           esac
+          if [ "${{ matrix.noavx512 }}" = "true" ]; then echo 'DOTNET_EnableAVX512F=0' >> $GITHUB_ENV; fi
 
       - name: Run shard tests (Release)
         run: |
           BLAME=""
-          if [ "${{ matrix.shard }}" != "unit" ]; then BLAME="--blame-hang --blame-hang-timeout 1500s --blame-hang-dump-type mini"; fi
+          if [ "${{ matrix.shard }}" != "unit" ]; then BLAME="--blame-hang --blame-hang-timeout 1500s --blame-hang-dump-type full"; fi
           dotnet test tests/Needle.Tests -c Release --filter "$FILTER" --logger "console;verbosity=normal" $BLAME
 
       - name: Upload hang dumps and blame sequence
@@ -231,6 +257,7 @@ jobs:
           path: |
             **/TestResults/**/*.dmp
             **/TestResults/**/Sequence_*.xml
+            hang-snapshots/
           compression-level: 1
 
       - name: Run shard tests on the scalar backend (NEEDLE_SCALAR=1)
