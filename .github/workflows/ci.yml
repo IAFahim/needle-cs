@@ -223,6 +223,16 @@ jobs:
           if [ "${{ matrix.shard }}" != "unit" ]; then BLAME="--blame-hang --blame-hang-timeout 1500s --blame-hang-dump-type mini"; fi
           dotnet test tests/Needle.Tests -c Release --filter "$FILTER" --logger "console;verbosity=normal" $BLAME
 
+      - name: Upload hang dumps and blame sequence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hang-dumps-${{ matrix.name }}-${{ matrix.shard }}
+          path: |
+            **/TestResults/**/*.dmp
+            **/TestResults/**/Sequence_*.xml
+          compression-level: 1
+
       - name: Run shard tests on the scalar backend (NEEDLE_SCALAR=1)
         if: matrix.scalar
         env:
