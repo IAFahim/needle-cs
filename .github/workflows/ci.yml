@@ -106,7 +106,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [unit, core, heavy]
         include:
           - name: linux-x64
             os: ubuntu-latest
@@ -114,24 +113,84 @@ jobs:
             scalar: true
             netstandard: true
             neon: false
+            shard: unit
+          - name: linux-x64
+            os: ubuntu-latest
+            expected-fail: false
+            scalar: true
+            netstandard: true
+            neon: false
+            shard: core
+          - name: linux-x64
+            os: ubuntu-latest
+            expected-fail: false
+            scalar: true
+            netstandard: true
+            neon: false
+            shard: heavy
           - name: linux-arm64
             os: ubuntu-24.04-arm
             expected-fail: false
             scalar: false
             netstandard: false
             neon: true
+            shard: unit
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+            expected-fail: false
+            scalar: false
+            netstandard: false
+            neon: true
+            shard: core
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+            expected-fail: false
+            scalar: false
+            netstandard: false
+            neon: true
+            shard: heavy
           - name: windows-x64
             os: windows-latest
             expected-fail: true
             scalar: false
             netstandard: false
             neon: false
+            shard: unit
+          - name: windows-x64
+            os: windows-latest
+            expected-fail: true
+            scalar: false
+            netstandard: false
+            neon: false
+            shard: core
+          - name: windows-x64
+            os: windows-latest
+            expected-fail: true
+            scalar: false
+            netstandard: false
+            neon: false
+            shard: heavy
           - name: macos-arm64
             os: macos-14
             expected-fail: true
             scalar: false
             netstandard: false
             neon: false
+            shard: unit
+          - name: macos-arm64
+            os: macos-14
+            expected-fail: true
+            scalar: false
+            netstandard: false
+            neon: false
+            shard: core
+          - name: macos-arm64
+            os: macos-14
+            expected-fail: true
+            scalar: false
+            netstandard: false
+            neon: false
+            shard: heavy
     defaults:
       run:
         shell: bash
