@@ -218,7 +218,10 @@ jobs:
           esac
 
       - name: Run shard tests (Release)
-        run: dotnet test tests/Needle.Tests -c Release --filter "$FILTER" --logger "console;verbosity=normal"
+        run: |
+          BLAME=""
+          if [ "${{ matrix.shard }}" != "unit" ]; then BLAME="--blame-hang --blame-hang-timeout 1500s --blame-hang-dump-type mini"; fi
+          dotnet test tests/Needle.Tests -c Release --filter "$FILTER" --logger "console;verbosity=normal" $BLAME
 
       - name: Run shard tests on the scalar backend (NEEDLE_SCALAR=1)
         if: matrix.scalar
