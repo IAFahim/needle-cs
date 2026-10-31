@@ -117,41 +117,43 @@ public sealed unsafe partial class Whistle
         if (Encode(pcm) == 0) return pass;
         BuildCrossMemory();
         pass.EncodeMs = (Stopwatch.GetTimestamp() - started) * 1000.0 / Stopwatch.Frequency;
+        return DecodeMemory(pass, started, language, keywords, align);
+    }
 
-        decoder.Reset();
-        decoder.Alignment = null;
-        if (align)
-        {
-            Mem.Clear(alignment, (nuint)g.MaxSeq * (nuint)maxFrames * 4);
-            decoder.Alignment = alignment;
-            decoder.AlignmentFromLayer = g.Layers / 2;
-        }
+    internal string TranscribeEmbedding(ReadOnlySpan<float> embedding, string? language)
+    {
+        EnsureDecoderBuffers();
+        frames = embedding.Length / dim;
+        embedding.CopyTo(new Span<float>(encoderOutput, embedding.Length));
+        BuildCrossMemory();
+        return DecodeMemory(new Pass(), Stopwatch.GetTimestamp(), language, null, false).Text;
+    }
+
+    Pass DecodeMemory(Pass pass, long started, string? language, IReadOnlyList<string>? keywords, bool align)
+    {
+        Prime(language, align, pass);
         var one = stackalloc int[1];
-        one[0] = Bos;
-        decoder.Feed(new ReadOnlySpan<int>(one, 1));
         var logits = decoder.Logits;
-        int tag;
-        if (language != null) tag = textVocab + Array.IndexOf(languages, language);
-        else
-        {
-            tag = textVocab;
-            for (var i = 1; i < languages.Length; i++) if (logits[textVocab + i] > logits[tag]) tag = textVocab + i;
-        }
-        pass.Language = languages[tag - textVocab];
-        one[0] = tag;
-        decoder.Feed(new ReadOnlySpan<int>(one, 1));
 
         var firstToken = Stopwatch.GetTimestamp();
         var decodeStart = firstToken;
         var steps = 0;
-        for (var step = 0; step < g.MaxSeq - 3; step++)
+        var forced = BeamWidth > 1 ? BeamSearch(keywords) : null;
+        if (forced != null && !align)
+        {
+            pass.Tokens.AddRange(forced);
+            pass.TtftMs = (Stopwatch.GetTimestamp() - started) * 1000.0 / Stopwatch.Frequency;
+            steps = forced.Count;
+        }
+        for (var step = 0; step < g.MaxSeq - 3 && (forced == null || align); step++)
         {
             logits = decoder.Logits;
             for (var i = 0; i < textVocab; i++) scores[i] = logits[i];
             scores[0] = scores[2] = scores[3] = -1e30f;
-            ApplyKeywordBias(keywords, pass.Tokens);
+            ApplyKeywordBias(keywords, pass.Tokens, scores);
             var best = 0;
             for (var i = 1; i < textVocab; i++) if (scores[i] > scores[best]) best = i;
+            if (forced != null) best = step < forced.Count ? forced[step] : Eos;
             if (step == 0) pass.TtftMs = (Stopwatch.GetTimestamp() - started) * 1000.0 / Stopwatch.Frequency;
             if (align)
             {
@@ -178,6 +180,158 @@ public sealed unsafe partial class Whistle
         return pass;
     }
 
+    public int BeamWidth { get; set; } = 3;
+    public float BeamLengthPenalty { get; set; } = 1f;
+
+    Engine[]? beamEngines;
+    float* beamScores;
+
+    void EnsureBeams(int width)
+    {
+        if (beamEngines != null && beamEngines.Length == 2 * width) return;
+        DisposeBeams();
+        beamEngines = new Engine[2 * width];
+        for (var i = 0; i < beamEngines.Length; i++) beamEngines[i] = new Engine(model, g.MaxSeq, 64, policy, pool);
+        beamScores = (float*)Mem.Alloc((nuint)(width * textVocab) * 4);
+    }
+
+    void DisposeBeams()
+    {
+        if (beamEngines != null) foreach (var engine in beamEngines) engine.Dispose();
+        if (beamScores != null) Mem.Free(beamScores);
+        beamEngines = null;
+        beamScores = null;
+    }
+
+    float Normalized(float score, int length) => BeamLengthPenalty == 0f ? score : score / MathF.Pow(length, BeamLengthPenalty);
+
+    List<int> BeamSearch(IReadOnlyList<string>? keywords)
+    {
+        var width = BeamWidth;
+        EnsureBeams(width);
+        foreach (var engine in beamEngines!) engine.Attach(memory);
+        var live = beamEngines.AsSpan(0, width).ToArray();
+        var next = beamEngines.AsSpan(width, width).ToArray();
+        var liveTokens = new List<int>[width];
+        var liveScores = new float[width];
+        liveTokens[0] = new List<int>();
+        live[0].CopyFrom(decoder);
+        var liveCount = 1;
+        var finished = new List<(float Score, List<int> Tokens)>();
+        var candidates = new List<(float Score, int Parent, int Token)>();
+        var parents = new int[width];
+        var picks = new int[width];
+        var pickScores = new float[width];
+        var one = stackalloc int[1];
+        for (var step = 0; step < g.MaxSeq - 4; step++)
+        {
+            candidates.Clear();
+            for (var i = 0; i < liveCount; i++)
+            {
+                var row = beamScores + (long)i * textVocab;
+                var logits = live[i].Logits;
+                for (var v = 0; v < textVocab; v++) row[v] = logits[v];
+                row[0] = row[2] = row[3] = -1e30f;
+                ApplyKeywordBias(keywords, liveTokens[i], row);
+                LogSoftmax(row, textVocab);
+                for (var k = 0; k < width; k++)
+                {
+                    var best = 0;
+                    for (var v = 1; v < textVocab; v++) if (row[v] > row[best]) best = v;
+                    candidates.Add((liveScores[i] + row[best], i, best));
+                    row[best] = float.NegativeInfinity;
+                }
+            }
+            candidates.Sort((a, b) => b.Score.CompareTo(a.Score));
+            var kept = 0;
+            foreach (var c in candidates)
+            {
+                if (c.Token == Eos) finished.Add((c.Score, liveTokens[c.Parent]));
+                else
+                {
+                    parents[kept] = c.Parent;
+                    picks[kept] = c.Token;
+                    pickScores[kept] = c.Score;
+                    kept++;
+                }
+                if (kept >= width) break;
+            }
+            if (kept == 0) break;
+            if (finished.Count >= width)
+            {
+                var bestFinished = float.NegativeInfinity;
+                foreach (var f in finished) bestFinished = MathF.Max(bestFinished, Normalized(f.Score, f.Tokens.Count + 1));
+                var bestLive = float.NegativeInfinity;
+                for (var j = 0; j < kept; j++) bestLive = MathF.Max(bestLive, Normalized(pickScores[j], liveTokens[parents[j]].Count + 1));
+                if (bestFinished >= bestLive) break;
+            }
+            var nextTokens = new List<int>[width];
+            for (var j = 0; j < kept; j++)
+            {
+                next[j].CopyFrom(live[parents[j]]);
+                one[0] = picks[j];
+                next[j].Feed(new ReadOnlySpan<int>(one, 1));
+                nextTokens[j] = new List<int>(liveTokens[parents[j]]) { picks[j] };
+                liveScores[j] = pickScores[j];
+            }
+            (live, next) = (next, live);
+            liveTokens = nextTokens;
+            liveCount = kept;
+        }
+        var winner = default(List<int>);
+        var winnerScore = float.NegativeInfinity;
+        foreach (var f in finished)
+        {
+            var score = Normalized(f.Score, f.Tokens.Count + 1);
+            if (score > winnerScore) { winnerScore = score; winner = f.Tokens; }
+        }
+        if (winner != null) return winner;
+        for (var j = 0; j < liveCount; j++)
+        {
+            var score = Normalized(liveScores[j], liveTokens[j].Count);
+            if (score > winnerScore) { winnerScore = score; winner = liveTokens[j]; }
+        }
+        return winner ?? new List<int>();
+    }
+
+    static void LogSoftmax(float* x, int n)
+    {
+        var peak = float.NegativeInfinity;
+        for (var i = 0; i < n; i++) peak = MathF.Max(peak, x[i]);
+        double sum = 0;
+        for (var i = 0; i < n; i++) sum += Math.Exp(x[i] - peak);
+        var shift = peak + (float)Math.Log(sum);
+        for (var i = 0; i < n; i++) x[i] -= shift;
+    }
+
+    void Prime(string? language, bool align, Pass pass)
+    {
+        decoder.Reset();
+        decoder.Alignment = null;
+        if (align)
+        {
+            Mem.Clear(alignment, (nuint)g.MaxSeq * (nuint)maxFrames * 4);
+            decoder.Alignment = alignment;
+            decoder.AlignmentFromLayer = g.Layers / 2;
+        }
+        var one = stackalloc int[1];
+        one[0] = Bos;
+        decoder.Feed(new ReadOnlySpan<int>(one, 1));
+        var logits = decoder.Logits;
+        Observer?.Invoke("logits_bos", logits);
+        int tag;
+        if (language != null) tag = textVocab + Array.IndexOf(languages, language);
+        else
+        {
+            tag = textVocab;
+            for (var i = 1; i < languages.Length; i++) if (logits[textVocab + i] > logits[tag]) tag = textVocab + i;
+        }
+        pass.Language = languages[tag - textVocab];
+        one[0] = tag;
+        decoder.Feed(new ReadOnlySpan<int>(one, 1));
+        Observer?.Invoke("logits_tag", decoder.Logits);
+    }
+
     string WordSoFar(List<int> generated)
     {
         var pieces = Pieces();
@@ -191,7 +345,7 @@ public sealed unsafe partial class Whistle
         return word.ToString();
     }
 
-    void ApplyKeywordBias(IReadOnlyList<string>? keywords, List<int> generated)
+    void ApplyKeywordBias(IReadOnlyList<string>? keywords, List<int> generated, float* target)
     {
         if (keywords == null || keywords.Count == 0) return;
         var pieces = Pieces();
@@ -212,7 +366,7 @@ public sealed unsafe partial class Whistle
                 if (text.Length == 0 || (current.Length == 0 && text.Length < 2 && remaining.Length > 1) || text.Length > remaining.Length) continue;
                 if (!remaining.StartsWith(text, StringComparison.OrdinalIgnoreCase)) continue;
                 var exact = remaining.StartsWith(text, StringComparison.Ordinal);
-                scores[id] += bias * (exact ? 1f : 0.5f) * (text.Length == remaining.Length ? 1.3f : 1f);
+                target[id] += bias * (exact ? 1f : 0.5f) * (text.Length == remaining.Length ? 1.3f : 1f);
             }
         }
     }

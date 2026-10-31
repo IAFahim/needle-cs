@@ -11,13 +11,54 @@ namespace Needle;
 public sealed class NeedleOptions
 {
     public int Threads { get; init; } = 1;
+    public ThreadPolicy? Threading { get; init; }
+    public FrameBudget FrameBudget { get; init; }
     public int Context { get; init; } = 2048;
     public int MaxReasoningTokens { get; init; } = 96;
     public int MaxCallTokens { get; init; } = 384;
     public string? System { get; init; }
-    public bool AutoDate { get; init; } = true;
+    public bool AutoDate { get; init; }
     public float RefuseBelow { get; init; } = 0.1f;
     public int RetrievalTopK { get; init; } = 5;
+    /// <summary>
+    /// Lossless jump-forward over token-forced steps (issue #16). After each
+    /// committed call token, every follow-up token the grammar+trie allow
+    /// uniquely (allowed-mask popcount == 1) joins the fed chunk instead of
+    /// costing a decode pass. Each jumped token is what per-token greedy
+    /// would emit (argmax over one candidate is forced), so the chunk is the
+    /// per-token greedy sequence itself: calls, reasoning, responses and
+    /// decode-token counts are byte-identical either way. Jumped tokens
+    /// contribute probability 1 to <see cref="CallResult.DecodeConfidence"/>.
+    /// Off by default: the W16 identity gate proves byte-identical output on
+    /// every SessionCases step and game prompt, but no singleton mask occurs
+    /// on the current grammar/vocab (BPE offers several tokenizations at
+    /// every structural position), so jumping stays dormant with zero pass
+    /// reduction. Revisit if the grammar or vocabulary changes.
+    /// </summary>
+    public bool JumpForward { get; init; }
+
+    /// <summary>
+    /// Lossless prompt-lookup speculative decoding (issue #17). At each
+    /// call-decode step, up to four draft continuations are proposed by
+    /// matching the recent token suffix against the prompt and output token
+    /// history, fed as one chunk, and verified against the model: the
+    /// longest prefix whose masked argmax equals the proposal is accepted,
+    /// plus one freshly-picked correction token. Engine state past the
+    /// accepted prefix is rewound (Engine.CheckpointSpec/RestoreSpec) and
+    /// the accepted prefix re-fed, so the committed token/state history is
+    /// exactly what per-token greedy would produce: calls, reasoning,
+    /// responses, confidences and decode-token counts are byte-identical
+    /// either way; only the sequential pass count changes. Typed sinks
+    /// observe events for accepted tokens only (drafts advance a scratch
+    /// grammar copy). Off by default: the W17 identity gate proves
+    /// byte-identical output (single-threaded), but a T=1+k chunk pass costs
+    /// ~2x a T=1 pass until W20 lands, and multi-threaded chunk feeds drift
+    /// from sequential singles (engine chunk/sequential inequivalence,
+    /// W13/W20), so wall-clock only wins once small-T GEMM does.
+    /// </summary>
+    public bool PromptLookup { get; init; }
+
+    internal ThreadPolicy ResolvedThreading => Threading ?? ThreadPolicy.Default.WithThreads(Threads);
 }
 
 public sealed record FunctionCall(string Name, string ArgumentsJson);
@@ -92,11 +133,43 @@ public static class Extraction
     }
 }
 
-public sealed unsafe class NeedleSession : IDisposable
+public sealed unsafe partial class NeedleSession : IDisposable
 {
-    const int ImStart = 4, ImEnd = 5, ThinkStart = 6, ThinkEnd = 7, ToolCallStart = 10, ToolCallEnd = 11;
+    const int ImStart = 4, ImEnd = 5, ThinkStart = 6, ThinkEnd = 7, ToolCallStart = 10, ToolCallEnd = 11, EndOfText = 1;
+    const int MaxPieceBytes = 64;
+    // Call steps with at most this many allowed tokens use the sparse head
+    // (Engine.LogitsForRows) instead of the full-vocabulary head; §5.3 tunes
+    // it around 256 (76% of call steps allow <= 256 tokens).
+    const int SparseHeadThreshold = 256;
+    // Jump-forward (issue #16) batches at most this many call tokens per
+    // engine pass (the committed pick plus token-forced followers). Forced
+    // runs are structural spans of tens of tokens; longer runs simply
+    // continue on later macro-steps.
+    const int MaxJumpChunk = 512;
+    // Prompt-lookup speculation (issue #17) proposes at most this many draft
+    // tokens per call-decode step (k=4, the simulated -36% point). The fed
+    // chunk is the pick plus drafts, so T=k+1.
+    const int MaxDraftTokens = 4;
+    const int InputOverheadBytes = 128;
+    const int TokenizerInputBytes = 1 << 16;
+    const int EmbedderContext = 512;
+    const int MinKeyScratchBytes = 64;
+
     static readonly Regex DateKey = new(@"\bdate\s*:", RegexOptions.IgnoreCase);
     static readonly Regex IsoStamp = new(@"\d{4}-\d{2}-\d{2}");
+
+    static ReadOnlySpan<byte> ToolResultHead => "<|im_start|>tool\n<tool_result>"u8;
+    static ReadOnlySpan<byte> ToolResultTail => "</tool_result><|im_end|>\n<|im_start|>assistant\n"u8;
+    static ReadOnlySpan<byte> FirstQueryHead => "\n"u8;
+    static ReadOnlySpan<byte> LaterQueryHead => "<|im_start|>user\n"u8;
+    static ReadOnlySpan<byte> QueryTail => "<|im_end|>\n<|im_start|>assistant\n"u8;
+
+    struct TurnProgress
+    {
+        public long Started, PrefillTicks, FirstTokenTicks;
+        public int PromptTokens, DecodeTokens, ReasoningLength, ResponseLength;
+        public ReplyFlags Flags;
+    }
 
     readonly Model model;
     readonly NeedleOptions options;
@@ -105,49 +178,135 @@ public sealed unsafe class NeedleSession : IDisposable
     readonly Tokenizer tokenizer;
     readonly TokenTrie trie;
     readonly string system;
-    readonly uint[] reasoningMask;
-    readonly uint[] decisionMask;
-    readonly uint[] responseMask;
+    readonly int maskWords;
+    readonly uint* reasoningMask;
+    readonly uint* decisionMask;
+    readonly uint* responseMask;
+    // Allowed ids for the current sparse-head step (SparseHeadThreshold ints).
+    readonly int* sparseRows;
     readonly uint* mask;
     readonly float* scratchLogits;
     readonly float* pooled;
+    readonly float* confidenceScratch;
+    readonly int embeddingWidth;
+    readonly int contextCapacity;
+    readonly int embedderCapacity;
+    readonly int maxInputBytes;
+    readonly byte[] inputBuffer;
+    readonly int[] promptIds;
+    readonly int[] thinkEndForced;
+    readonly int[] callClosing;
+    readonly int[] responseClosing;
+    readonly byte[] callText;
+    readonly byte[] keyScratch;
+    readonly CallSpan[] callSpans;
     readonly bool retrieval;
-    readonly List<float[]> toolEmbeddings = new();
+    readonly float[] toolEmbeddings;
+    readonly float[] toolScores;
+    readonly int[] chosenTools;
+    readonly int[] activeTools;
+    int activeToolCount = -1;
+    int callTextLength;
+    int restoredCallCount;
+    int cancelRequested;
     Engine? embedder;
     ToolSet active;
     Grammar grammar;
     bool turnOne = true;
-    string primedRender = "";
+    // Prompt-lookup history (issue #17): primed-prefix, prompt and committed
+    // output token ids for the n-gram proposer, append-only across turns
+    // (Reset truncates back to the primed length). Ctor-sized; the
+    // speculative path only appends and scans (no allocation).
+    readonly int[] specHistory;
+    // One allowed-mask per draft position, recorded at proposal time and
+    // reused for verification (avoids recomputing Allow after the feed).
+    readonly uint* specMasks;
+    int specHistoryLength;
+    int specPrimedLength;
 
     public NeedleSession(Model model, string toolsJson, NeedleOptions? options = null)
+        : this(model, toolsJson, null, default, options)
+    {
+    }
+
+    public NeedleSession(Model model, string toolsJson, ReadOnlySpan<byte> primedPrefix, NeedleOptions? options = null)
+        : this(model, toolsJson, null, primedPrefix, options)
+    {
+    }
+
+    internal NeedleSession(Model model, string toolsJson, GrammarProgram* precompiled, ReadOnlySpan<byte> primedPrefix, NeedleOptions? options)
     {
         this.model = model;
         this.options = options ?? new NeedleOptions();
         allTools = new ToolSet(toolsJson);
-        engine = new Engine(model, this.options.Context, 64, this.options.Threads) { Pooling = true };
-        tokenizer = new Tokenizer(model, 1 << 16);
-        trie = new TokenTrie(tokenizer, model.VocabSize);
+        engine = new Engine(model, this.options.Context, 64, this.options.ResolvedThreading, null) { Pooling = true };
+        var vocabulary = model.GetVocabulary();
+        tokenizer = new Tokenizer(vocabulary, TokenizerInputBytes);
+        trie = new TokenTrie(vocabulary.Trie);
         system = BuildSystem(this.options);
-        mask = (uint*)Mem.AllocZeroed((nuint)trie.Words * 4);
+        contextCapacity = Math.Min(this.options.Context, model.Geometry.MaxSeq);
+        embedderCapacity = Math.Min(EmbedderContext, model.Geometry.MaxSeq);
+        maxInputBytes = Math.Max(1, Math.Min(TokenizerInputBytes - InputOverheadBytes, this.options.Context * 16));
+        maskWords = trie.Words;
+        mask = (uint*)Mem.AllocZeroed((nuint)maskWords * 4);
         scratchLogits = (float*)Mem.Alloc((nuint)model.VocabSize * 4);
-        pooled = (float*)Mem.AllocZeroed((nuint)(4 * model.Geometry.Dim * 4));
-        reasoningMask = new uint[trie.Words];
-        for (var id = 0; id < Math.Min(model.VocabSize, tokenizer.PieceCount); id++)
-            if (tokenizer.IsConstrainable(id)) reasoningMask[id / 32] |= 1u << (id % 32);
-        reasoningMask[ThinkEnd / 32] |= 1u << (ThinkEnd % 32);
-        decisionMask = (uint[])reasoningMask.Clone();
-        responseMask = (uint[])reasoningMask.Clone();
-        foreach (var id in new[] { ToolCallStart, ImEnd, 1 }) decisionMask[id / 32] |= 1u << (id % 32);
-        foreach (var id in new[] { ImEnd, 1 }) responseMask[id / 32] |= 1u << (id % 32);
+        sparseRows = (int*)Mem.Alloc((nuint)SparseHeadThreshold * 4);
+        var head = model.Confidence;
+        embeddingWidth = head != null ? head->Queries * model.Geometry.Dim : 0;
+        pooled = (float*)Mem.AllocZeroed((nuint)Math.Max(1, embeddingWidth) * 4);
+        confidenceScratch = head != null ? (float*)Mem.AllocZeroed((nuint)((model.Geometry.Layers + 1) * head->Probes * (model.Geometry.Dim + 1)) * 4) : null;
+        reasoningMask = CopySharedMask(vocabulary);
+        decisionMask = CopyMask(reasoningMask, ToolCallStart, ImEnd, EndOfText);
+        responseMask = CopyMask(reasoningMask, ImEnd, EndOfText);
         responseMask[ThinkEnd / 32] &= ~(1u << (ThinkEnd % 32));
+        var newline = Tokens("\n", false);
+        thinkEndForced = Concatenate(new[] { ThinkEnd }, newline);
+        callClosing = Concatenate(new[] { ToolCallEnd, ImEnd }, newline);
+        responseClosing = Concatenate(new[] { ImEnd }, newline);
+        inputBuffer = new byte[maxInputBytes + InputOverheadBytes];
+        promptIds = new int[3 * (maxInputBytes + InputOverheadBytes) + 16];
+        specHistory = new int[contextCapacity];
+        specMasks = (uint*)Mem.Alloc((nuint)(MaxDraftTokens * maskWords) * 4);
+        callText = new byte[Math.Max(1, this.options.MaxCallTokens) * MaxPieceBytes];
+        callSpans = new CallSpan[Math.Max(1, this.options.MaxCallTokens)];
+        keyScratch = new byte[Math.Max(MinKeyScratchBytes, allTools.Aliases.LongestPropertyAlias + 2)];
         retrieval = allTools.Tools.Count > this.options.RetrievalTopK && model.Confidence != null;
+        toolEmbeddings = retrieval ? new float[allTools.Tools.Count * embeddingWidth] : Array.Empty<float>();
+        toolScores = retrieval ? new float[allTools.Tools.Count] : Array.Empty<float>();
+        chosenTools = retrieval ? new int[Math.Max(0, this.options.RetrievalTopK)] : Array.Empty<int>();
+        activeTools = retrieval ? new int[Math.Max(0, this.options.RetrievalTopK)] : Array.Empty<int>();
         active = allTools;
-        grammar = new Grammar(active.Tools);
-        if (retrieval) IndexTools();
-        else Prime(active);
+        grammar = precompiled != null ? new Grammar(precompiled) : new Grammar(active.Tools);
+        try
+        {
+            if (retrieval)
+            {
+                if (primedPrefix.Length > 0) throw new ArgumentException("a primed prefix cannot be combined with tool retrieval; raise RetrievalTopK or drop the prefix");
+                IndexTools();
+            }
+            else if (primedPrefix.Length > 0) ImportPrimedPrefix(primedPrefix);
+            else Prime(active);
+        }
+        catch
+        {
+            Dispose();
+            throw;
+        }
     }
 
     public int ContextUsed => engine.Length;
+
+    public int MaxInputBytes => maxInputBytes;
+
+    /// <summary>
+    /// Sequential engine passes used by the last call-decoding section
+    /// (GenerateCalls/GenerateCallsTyped). Without jump-forward this equals
+    /// the decoded call tokens; with it, one pass can cover the committed
+    /// token plus a whole forced span. Test-only gauge for issue #16.
+    /// </summary>
+    internal int LastCallPasses { get; private set; }
+
+    public void RequestCancel() => System.Threading.Volatile.Write(ref cancelRequested, 1);
 
     static string BuildSystem(NeedleOptions o)
     {
@@ -158,10 +317,27 @@ public sealed unsafe class NeedleSession : IDisposable
         return text.TrimStart().StartsWith('{') ? text : fact + "; " + text;
     }
 
+
+    uint* CopyMask(uint* source, params int[] extraTokens)
+    {
+        var copy = (uint*)Mem.Alloc((nuint)maskWords * 4);
+        new ReadOnlySpan<uint>(source, maskWords).CopyTo(new Span<uint>(copy, maskWords));
+        foreach (var id in extraTokens) copy[id / 32] |= 1u << (id % 32);
+        return copy;
+    }
+
+    static int[] Concatenate(int[] head, int[] tail)
+    {
+        var joined = new int[head.Length + tail.Length];
+        head.CopyTo(joined, 0);
+        tail.CopyTo(joined, head.Length);
+        return joined;
+    }
+
     int[] Tokens(string text, bool leadingSpace)
     {
         var bytes = Encoding.UTF8.GetBytes(text);
-        var ids = new int[bytes.Length + 8];
+        var ids = new int[bytes.Length * 3 + 8];
         var count = tokenizer.Encode(bytes, ids, leadingSpace);
         return ids[..count];
     }
@@ -174,241 +350,978 @@ public sealed unsafe class NeedleSession : IDisposable
         engine.Reset();
         engine.Feed(ids.ToArray(), computeLogits: false);
         engine.Mark();
+        // The primed tool-schema tokens seed the prompt-lookup history: tool
+        // names and argument keys are copied from this span most often.
+        var primed = Math.Min(ids.Count, specHistory.Length);
+        for (var i = 0; i < primed; i++) specHistory[i] = ids[i];
+        specPrimedLength = primed;
+        specHistoryLength = primed;
         turnOne = true;
-        primedRender = tools.Render();
     }
 
     public void Reset()
     {
         engine.Rewind();
         turnOne = true;
+        specHistoryLength = specPrimedLength;
     }
 
-    public CallResult Complete(string query) => Turn(query, null);
+    const int PrefixMagic = 0x3150444E;
+    const int PrefixVersion = 1;
+    const int PrefixHeaderInts = 10;
 
-    public CallResult CompleteWithToolResult(string resultJson) => Turn(null, resultJson);
-
-    CallResult Turn(string? query, string? toolResult)
+    static uint PrefixHash(string text)
     {
-        var started = Stopwatch.GetTimestamp();
-        try
-        {
-            if (retrieval && query != null) SelectTools(query);
-            var prompt = new List<int>();
-            if (toolResult != null)
-                prompt.AddRange(Tokens("<|im_start|>tool\n<tool_result>" + toolResult + "</tool_result><|im_end|>\n<|im_start|>assistant\n", false));
-            else if (turnOne)
-                prompt.AddRange(Tokens("\n" + query + "<|im_end|>\n<|im_start|>assistant\n", false));
-            else
-                prompt.AddRange(Tokens("<|im_start|>user\n" + query + "<|im_end|>\n<|im_start|>assistant\n", false));
-            prompt.Add(ThinkStart);
-            turnOne = false;
-            engine.Feed(prompt.ToArray());
-            var prefilled = Stopwatch.GetTimestamp();
-            return Generate(started, prefilled, prompt.Count);
-        }
-        catch (Exception e) when (e is InvalidOperationException or FormatException or ArgumentException)
-        {
-            return new CallResult { Success = false, Error = e.Message };
-        }
+        var hash = 2166136261u;
+        foreach (var b in Encoding.UTF8.GetBytes(text)) hash = (hash ^ b) * 16777619u;
+        return hash;
     }
 
-    CallResult Generate(long started, long prefilled, int promptTokens)
+    void WritePrefixHeader(Span<byte> destination)
     {
-        var reasoning = new List<byte>();
-        var piece = new byte[64];
-        var first = true;
-        var decoded = 0;
-        var ttft = 0.0;
+        var ints = MemoryMarshal.Cast<byte, int>(destination.Slice(0, PrefixHeaderInts * sizeof(int)));
+        ints[0] = PrefixMagic;
+        ints[1] = PrefixVersion;
+        ints[2] = model.Geometry.Dim;
+        ints[3] = model.Geometry.Layers;
+        ints[4] = model.VocabSize;
+        ints[5] = contextCapacity;
+        ints[6] = (int)PrefixHash(allTools.Render());
+        ints[7] = (int)PrefixHash(system);
+        ints[8] = engine.MarkedLength;
+    }
+
+    public byte[] ExportPrimedPrefix()
+    {
+        var bytes = new byte[PrefixHeaderInts * sizeof(int) + (int)engine.PrimedPrefixBytes];
+        WritePrefixHeader(bytes);
+        engine.ExportPrimedPrefix(bytes.AsSpan(PrefixHeaderInts * sizeof(int)));
+        return bytes;
+    }
+
+    void ImportPrimedPrefix(ReadOnlySpan<byte> primedPrefix)
+    {
+        if (primedPrefix.Length < PrefixHeaderInts * sizeof(int)) throw new ArgumentException("primed prefix is truncated");
+        var ints = MemoryMarshal.Cast<byte, int>(primedPrefix.Slice(0, PrefixHeaderInts * sizeof(int)));
+        if (ints[0] != PrefixMagic || ints[1] != PrefixVersion) throw new ArgumentException("primed prefix format is not recognized");
+        if (ints[2] != model.Geometry.Dim || ints[3] != model.Geometry.Layers || ints[4] != model.VocabSize ||
+            ints[5] != contextCapacity || ints[6] != (int)PrefixHash(allTools.Render()) || ints[7] != (int)PrefixHash(system))
+            throw new ArgumentException("primed prefix was created for a different model, tool set, system prompt or context");
+        engine.ImportPrimedPrefix(primedPrefix.Slice(PrefixHeaderInts * sizeof(int)));
+        turnOne = true;
+        // Imported bytes carry no token ids, so lookups use the prompt and
+        // output tokens only until the next Prime.
+        specPrimedLength = 0;
+        specHistoryLength = 0;
+    }
+
+    bool warmed;
+
+    public void WarmUp()
+    {
+        if (warmed) return;
+        warmed = true;
+        _ = Complete("Warm up the engine with a short greeting.");
+        Reset();
+    }
+
+    uint* CopySharedMask(Vocabulary vocabulary)
+    {
+        var copy = (uint*)Mem.Alloc((nuint)maskWords * 4);
+        Buffer.MemoryCopy(vocabulary.ReasoningMask, copy, (nuint)maskWords * 4, (nuint)maskWords * 4);
+        return copy;
+    }
+
+    public Reply Complete(ReadOnlySpan<byte> utf8Query, Span<byte> utf8Calls) =>
+        Run(utf8Query, false, utf8Calls, default, default);
+
+    public Reply Complete(ReadOnlySpan<byte> utf8Query, Span<byte> utf8Calls, Span<byte> utf8Reasoning, Span<byte> utf8Response) =>
+        Run(utf8Query, false, utf8Calls, utf8Reasoning, utf8Response);
+
+    public Reply CompleteWithToolResult(ReadOnlySpan<byte> utf8Json, Span<byte> utf8Calls) =>
+        Run(utf8Json, true, utf8Calls, default, default);
+
+    public Reply CompleteWithToolResult(ReadOnlySpan<byte> utf8Json, Span<byte> utf8Calls, Span<byte> utf8Reasoning, Span<byte> utf8Response) =>
+        Run(utf8Json, true, utf8Calls, utf8Reasoning, utf8Response);
+
+    public Reply Complete<TSink, TCommand>(ReadOnlySpan<byte> utf8Query, Span<TCommand> commands, ref TSink sink)
+        where TSink : struct, Tools.ICallSink<TCommand>
+        where TCommand : struct =>
+        RunTyped(utf8Query, false, commands, default, default, ref sink);
+
+    public Reply Complete<TSink, TCommand>(ReadOnlySpan<byte> utf8Query, Span<TCommand> commands, Span<byte> utf8Reasoning, Span<byte> utf8Response, ref TSink sink)
+        where TSink : struct, Tools.ICallSink<TCommand>
+        where TCommand : struct =>
+        RunTyped(utf8Query, false, commands, utf8Reasoning, utf8Response, ref sink);
+
+    public Reply CompleteWithToolResult<TSink, TCommand>(ReadOnlySpan<byte> utf8Json, Span<TCommand> commands, ref TSink sink)
+        where TSink : struct, Tools.ICallSink<TCommand>
+        where TCommand : struct =>
+        RunTyped(utf8Json, true, commands, default, default, ref sink);
+
+    public Reply CompleteWithToolResult<TSink, TCommand>(ReadOnlySpan<byte> utf8Json, Span<TCommand> commands, Span<byte> utf8Reasoning, Span<byte> utf8Response, ref TSink sink)
+        where TSink : struct, Tools.ICallSink<TCommand>
+        where TCommand : struct =>
+        RunTyped(utf8Json, true, commands, utf8Reasoning, utf8Response, ref sink);
+
+    Reply Run(ReadOnlySpan<byte> input, bool toolResult, Span<byte> calls, Span<byte> reasoning, Span<byte> response)
+    {
+        var progress = new TurnProgress { Started = Stopwatch.GetTimestamp() };
+        System.Threading.Volatile.Write(ref cancelRequested, 0);
+        if (!toolResult && input.Length == 0) return Failed(FailureReason.EmptyInput, progress);
+        if (input.Length > maxInputBytes) return Failed(FailureReason.InputTooLong, progress);
+        if (retrieval && !toolResult)
+        {
+            var selection = SelectTools(input);
+            if (selection != FailureReason.None) return Failed(selection, progress);
+        }
+        progress.PromptTokens = EncodePrompt(input, toolResult);
+        if (engine.Length + progress.PromptTokens > contextCapacity) return Failed(FailureReason.ContextExhausted, progress);
+        turnOne = false;
+        engine.Feed(new ReadOnlySpan<int>(promptIds, 0, progress.PromptTokens));
+        RecordSpecHistory(new ReadOnlySpan<int>(promptIds, 0, progress.PromptTokens));
+        progress.PrefillTicks = Stopwatch.GetTimestamp() - progress.Started;
+        return Generate(ref progress, calls, reasoning, response);
+    }
+
+    Reply RunTyped<TSink, TCommand>(ReadOnlySpan<byte> input, bool toolResult, Span<TCommand> commands, Span<byte> reasoning, Span<byte> response, ref TSink sink)
+        where TSink : struct, Tools.ICallSink<TCommand>
+        where TCommand : struct
+    {
+        var progress = new TurnProgress { Started = Stopwatch.GetTimestamp() };
+        System.Threading.Volatile.Write(ref cancelRequested, 0);
+        if (!toolResult && input.Length == 0) return Failed(FailureReason.EmptyInput, progress);
+        if (input.Length > maxInputBytes) return Failed(FailureReason.InputTooLong, progress);
+        if (retrieval) return Failed(FailureReason.ToolContextFailed, progress);
+        progress.PromptTokens = EncodePrompt(input, toolResult);
+        if (engine.Length + progress.PromptTokens > contextCapacity) return Failed(FailureReason.ContextExhausted, progress);
+        turnOne = false;
+        engine.Feed(new ReadOnlySpan<int>(promptIds, 0, progress.PromptTokens));
+        RecordSpecHistory(new ReadOnlySpan<int>(promptIds, 0, progress.PromptTokens));
+        progress.PrefillTicks = Stopwatch.GetTimestamp() - progress.Started;
+        var interrupted = Reason(ref progress, reasoning, response, out _);
+        if (interrupted.HasValue) return interrupted.Value;
+        if (!TryFeed(ToolCallStart)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
+        RecordSpecHistory(ToolCallStart);
+        return GenerateCallsTyped(ref progress, commands, ref sink);
+    }
+
+    int EncodePrompt(ReadOnlySpan<byte> input, bool toolResult)
+    {
+        var head = toolResult ? ToolResultHead : turnOne ? FirstQueryHead : LaterQueryHead;
+        var tail = toolResult ? ToolResultTail : QueryTail;
+        var text = new Span<byte>(inputBuffer);
+        head.CopyTo(text);
+        input.CopyTo(text[head.Length..]);
+        tail.CopyTo(text[(head.Length + input.Length)..]);
+        var count = tokenizer.Encode(text[..(head.Length + input.Length + tail.Length)], promptIds, false);
+        promptIds[count] = ThinkStart;
+        return count + 1;
+    }
+
+    Reply Generate(ref TurnProgress progress, Span<byte> calls, Span<byte> reasoning, Span<byte> response)
+    {
+        var budget = options.FrameBudget;
+        var interrupted = Reason(ref progress, reasoning, response, out _);
+        if (interrupted.HasValue) return interrupted.Value;
+        if (!TryFeed(ToolCallStart)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
+        RecordSpecHistory(ToolCallStart);
+        return GenerateCalls(ref progress, calls);
+    }
+
+    Reply? Reason(ref TurnProgress progress, Span<byte> reasoning, Span<byte> response, out int decision)
+    {
+        decision = ToolCallStart;
+        var budget = options.FrameBudget;
+        var firstPiece = true;
         for (var i = 0; i < options.MaxReasoningTokens; i++)
         {
-            var next = ArgMaxMasked(reasoningMask, out _);
-            if (i == 0) ttft = Elapsed(started, Stopwatch.GetTimestamp());
+            if (CancelRequested) return Abandon(ReplyStatus.Cancelled, FailureReason.None, progress);
+            var next = ArgMax(reasoningMask);
+            if (next < 0) return Abandon(ReplyStatus.Failed, FailureReason.GrammarDeadEnd, progress);
+            if (i == 0) progress.FirstTokenTicks = Stopwatch.GetTimestamp() - progress.Started;
             if (next == ThinkEnd) break;
-            reasoning.AddRange(piece.AsSpan(0, tokenizer.Append(next, piece, first)).ToArray());
-            first = false;
-            Feed(next);
-            decoded++;
+            AppendPiece(next, firstPiece, reasoning, ref progress.ReasoningLength, ref progress.Flags, ReplyFlags.ReasoningTruncated);
+            firstPiece = false;
+            if (!TryFeed(next)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
+            RecordSpecHistory(next);
+            progress.DecodeTokens++;
+            if (!budget.IsUnlimited && FrameBudgetHit(progress, budget)) return Abandon(ReplyStatus.Failed, FailureReason.FrameBudgetExceeded, progress);
         }
-        var forced = new List<int> { ThinkEnd };
-        forced.AddRange(Tokens("\n", false));
-        engine.Feed(forced.ToArray());
-        var decision = ArgMaxMasked(decisionMask, out _);
-        if (decision != ToolCallStart) return Respond(decision, reasoning, started, prefilled, promptTokens, decoded, ttft);
-        Feed(ToolCallStart);
+        if (!TryFeed(thinkEndForced)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
+        for (var f = 0; f < thinkEndForced.Length; f++) RecordSpecHistory(thinkEndForced[f]);
+        decision = ArgMax(decisionMask);
+        if (decision < 0) return Abandon(ReplyStatus.Failed, FailureReason.GrammarDeadEnd, progress);
+        if (decision != ToolCallStart) return Respond(decision, ref progress, response);
+        return null;
+    }
 
+    Reply GenerateCalls(ref TurnProgress progress, Span<byte> calls)
+    {
+        var budget = options.FrameBudget;
+        var jump = options.JumpForward;
         var state = Grammar.Start(grammar.Program);
-        var text = new List<byte>();
         var logProbability = 0.0;
         var steps = 0;
         var buffer = stackalloc byte[256];
+        var chunkIds = stackalloc int[MaxJumpChunk];
+        var draftAllowed = stackalloc int[MaxDraftTokens];
+        var draftProbs = stackalloc float[MaxDraftTokens];
+        callTextLength = 0;
+        LastCallPasses = 0;
+        // The prompt/decision feeds left full logits ready for the first mask.
+        trie.Allow(grammar.Program, state, mask);
+        var allowed = MaskCount(mask, maskWords);
+        var full = true;
         while (!Grammar.Complete(state))
         {
-            if (steps >= options.MaxCallTokens) return new CallResult { Success = false, Error = "call exceeded the token budget", Reasoning = Encoding.UTF8.GetString(reasoning.ToArray()) };
-            trie.Allow(grammar.Program, state, mask);
-            var pick = ArgMaxMasked(mask, out var probability);
-            if (steps == 0 && ttft == 0) ttft = Elapsed(started, Stopwatch.GetTimestamp());
+            if (CancelRequested) return Abandon(ReplyStatus.Cancelled, FailureReason.None, progress);
+            if (steps >= options.MaxCallTokens) return Abandon(ReplyStatus.Failed, FailureReason.CallTokenBudgetExceeded, progress);
+            if (allowed == 0) return Abandon(ReplyStatus.Failed, FailureReason.GrammarDeadEnd, progress);
+            int pick;
+            float probability;
+            if (jump && allowed == 1)
+            {
+                // No choice to sample: per-token greedy must emit this token
+                // (argmax over one candidate), so no logits are consulted.
+                pick = SoleAllowed(mask, maskWords, sparseRows);
+                probability = 1f;
+            }
+            else if (full) pick = ArgMaxWithProbability(mask, out probability);
+            else pick = ArgMaxSparse(scratchLogits, sparseRows, allowed, out probability);
+            if (pick < 0) return Abandon(ReplyStatus.Failed, FailureReason.GrammarDeadEnd, progress);
+            if (steps == 0 && progress.FirstTokenTicks == 0) progress.FirstTokenTicks = Stopwatch.GetTimestamp() - progress.Started;
+            var length = tokenizer.ConstraintBytes(pick, buffer);
+            if (callTextLength + length > callText.Length) return Abandon(ReplyStatus.Failed, FailureReason.CallTextTooLong, progress);
+            var cursor = &state;
+            for (var b = 0; b < length; b++)
+            {
+                if (!Grammar.Advance(grammar.Program, cursor, buffer[b])) return Abandon(ReplyStatus.Failed, FailureReason.GrammarRejectedToken, progress);
+                callText[callTextLength++] = buffer[b];
+            }
+            logProbability += Math.Log(Math.Max(probability, 1e-9));
+            steps++;
+            progress.DecodeTokens++;
+            if (!budget.IsUnlimited && FrameBudgetHit(progress, budget)) return Abandon(ReplyStatus.Failed, FailureReason.FrameBudgetExceeded, progress);
+            RecordSpecHistory(pick);
+            // Jump-forward (issue #16): while the grammar+trie allow exactly
+            // one token, per-token greedy would emit that token, so it joins
+            // the chunk instead of costing a decode pass. Each forced token
+            // enters the decode mean with probability 1 and counts toward
+            // MaxCallTokens exactly as a per-token step would. The chunk is
+            // the per-token greedy sequence itself: no canonical
+            // re-tokenization of byte spans, so free choices downstream see
+            // the identical token history.
+            chunkIds[0] = pick;
+            var chunkCount = 1;
+            var maskFresh = false;
+            if (jump && !Grammar.Complete(state))
+            {
+                while (chunkCount < MaxJumpChunk && !Grammar.Complete(state))
+                {
+                    if (CancelRequested) return Abandon(ReplyStatus.Cancelled, FailureReason.None, progress);
+                    if (steps >= options.MaxCallTokens) return Abandon(ReplyStatus.Failed, FailureReason.CallTokenBudgetExceeded, progress);
+                    // The next mask depends only on the committed tokens, so
+                    // it is current before the forward pass either way.
+                    trie.Allow(grammar.Program, state, mask);
+                    maskFresh = true;
+                    allowed = MaskCount(mask, maskWords);
+                    if (allowed != 1) break;
+                    var forced = SoleAllowed(mask, maskWords, sparseRows);
+                    var forcedLength = tokenizer.ConstraintBytes(forced, buffer);
+                    // A zero-byte sole token advances nothing; leave it for
+                    // the next macro-step to mirror per-token accounting.
+                    if (forcedLength <= 0) break;
+                    if (callTextLength + forcedLength > callText.Length) return Abandon(ReplyStatus.Failed, FailureReason.CallTextTooLong, progress);
+                    for (var b = 0; b < forcedLength; b++)
+                    {
+                        if (!Grammar.Advance(grammar.Program, cursor, buffer[b])) return Abandon(ReplyStatus.Failed, FailureReason.GrammarRejectedToken, progress);
+                        callText[callTextLength++] = buffer[b];
+                    }
+                    chunkIds[chunkCount++] = forced;
+                    steps++;
+                    progress.DecodeTokens++;
+                    RecordSpecHistory(forced);
+                    if (!budget.IsUnlimited && FrameBudgetHit(progress, budget)) return Abandon(ReplyStatus.Failed, FailureReason.FrameBudgetExceeded, progress);
+                }
+            }
+            if (jump && chunkCount > 1 && CancelRequested) return Abandon(ReplyStatus.Cancelled, FailureReason.None, progress);
+            // Prompt-lookup speculation (issue #17): propose draft continuations
+            // from the token history, feed pick+drafts as one chunk, and keep
+            // the longest verified prefix. Only runs on single-token chunks
+            // (a jump-forced run owns its chunk) and only when a draft was
+            // actually proposed, so non-matching steps cost nothing extra.
+            var draftStart = chunkCount;
+            var specFed = false;
+            if (options.PromptLookup && chunkCount == 1 && !Grammar.Complete(state))
+            {
+                var scratchState = state;
+                var drafts = ProposeDrafts(&scratchState, chunkIds, chunkCount, draftAllowed, steps, buffer);
+                if (drafts > 0)
+                {
+                    if (CancelRequested) return Abandon(ReplyStatus.Cancelled, FailureReason.None, progress);
+                    engine.CheckpointSpec();
+                    chunkCount += drafts;
+                    if (!FeedCallChunk(new ReadOnlySpan<int>(chunkIds, chunkCount), computeLogits: false)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
+                    var accepted = VerifyDrafts(chunkIds, draftStart, drafts, draftAllowed, draftProbs);
+                    if (accepted < drafts) engine.RestoreSpec();
+                    // Committing advances the real grammar state exactly as
+                    // per-token greedy would (verified tokens equal the masked
+                    // argmax at their positions), with per-token history,
+                    // probability, step, token-count and budget accounting.
+                    for (var j = 0; j < accepted; j++)
+                    {
+                        var draft = chunkIds[draftStart + j];
+                        var draftLength = tokenizer.ConstraintBytes(draft, buffer);
+                        if (callTextLength + draftLength > callText.Length) return Abandon(ReplyStatus.Failed, FailureReason.CallTextTooLong, progress);
+                        var draftCursor = &state;
+                        for (var b = 0; b < draftLength; b++)
+                        {
+                            if (!Grammar.Advance(grammar.Program, draftCursor, buffer[b])) return Abandon(ReplyStatus.Failed, FailureReason.GrammarRejectedToken, progress);
+                            callText[callTextLength++] = buffer[b];
+                        }
+                        RecordSpecHistory(draft);
+                        logProbability += Math.Log(Math.Max(draftProbs[j], 1e-9));
+                        steps++;
+                        progress.DecodeTokens++;
+                        if (!budget.IsUnlimited && FrameBudgetHit(progress, budget)) return Abandon(ReplyStatus.Failed, FailureReason.FrameBudgetExceeded, progress);
+                    }
+                    chunkCount = draftStart + accepted;
+                    specFed = accepted == drafts;
+                    // Committed drafts advanced the grammar state past the
+                    // jump block's precomputed mask, so the tail recomputes.
+                    if (accepted > 0) maskFresh = false;
+                }
+            }
+            var chunk = new ReadOnlySpan<int>(chunkIds, chunkCount);
+            if (Grammar.Complete(state))
+            {
+                // A fully-accepted draft chunk is already fed; a partial one
+                // was rewound, so the accepted prefix still needs its pass.
+                if (!specFed && !FeedCallChunk(chunk, computeLogits: false)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
+                break;
+            }
+            // The next mask depends only on the chosen tokens, so compute it
+            // before the forward pass (serial precompute; true overlap needs
+            // pool support owned by the engine scheduler).
+            if (!maskFresh)
+            {
+                trie.Allow(grammar.Program, state, mask);
+                allowed = MaskCount(mask, maskWords);
+            }
+            if (allowed == 0) return Abandon(ReplyStatus.Failed, FailureReason.GrammarDeadEnd, progress);
+            if (allowed <= SparseHeadThreshold)
+            {
+                ExtractIds(mask, maskWords, sparseRows, SparseHeadThreshold);
+                if (!specFed && !FeedCallChunk(chunk, computeLogits: false)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
+                engine.LogitsForRows(sparseRows, allowed, scratchLogits);
+                full = false;
+            }
+            else
+            {
+                if (specFed) engine.RefreshLastLogits();
+                else if (!FeedCallChunk(chunk, computeLogits: true)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
+                full = true;
+            }
+        }
+        if (!FeedCallChunk(callClosing, computeLogits: false)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
+        for (var c = 0; c < callClosing.Length; c++) RecordSpecHistory(callClosing[c]);
+
+        var head = HeadProbability();
+        // Jumped forced tokens contribute probability 1, so the mean below
+        // mixes model probabilities (choice points) with ones (forced steps);
+        // with no forced steps this equals per-token decoding exactly.
+        var decode = Math.Exp(logProbability / Math.Max(1, steps));
+        var confidence = (float)Math.Min(head, decode);
+        if (!CallRestorer.TryRestore(allTools.Aliases, new ReadOnlySpan<byte>(callText, 0, callTextLength), calls, keyScratch, callSpans, out var required, out restoredCallCount))
+            return Failed(FailureReason.MalformedCalls, progress);
+        var refused = confidence < options.RefuseBelow;
+        var status = required > calls.Length ? ReplyStatus.Failed : refused ? ReplyStatus.Refused : ReplyStatus.Called;
+        var failure = required > calls.Length ? FailureReason.CallsBufferTooSmall : FailureReason.None;
+        return new Reply(status, failure, progress.Flags, confidence, (float)head, (float)decode, restoredCallCount, required,
+            progress.ReasoningLength, 0, progress.PromptTokens, progress.DecodeTokens, progress.PrefillTicks, progress.FirstTokenTicks, Stopwatch.GetTimestamp() - progress.Started);
+    }
+
+    Reply GenerateCallsTyped<TSink, TCommand>(ref TurnProgress progress, Span<TCommand> commands, ref TSink sink)
+        where TSink : struct, Tools.ICallSink<TCommand>
+        where TCommand : struct
+    {
+        var startCount = sink.CallCount;
+        sink.TryTakeCall(out _);
+        var jump = options.JumpForward;
+        var state = Grammar.Start(grammar.Program);
+        var logProbability = 0.0;
+        var steps = 0;
+        var buffer = stackalloc byte[256];
+        var chunkIds = stackalloc int[MaxJumpChunk];
+        var draftAllowed = stackalloc int[MaxDraftTokens];
+        var draftProbs = stackalloc float[MaxDraftTokens];
+        var stored = 0;
+        LastCallPasses = 0;
+        // The prompt/decision feeds left full logits ready for the first mask.
+        trie.Allow(grammar.Program, state, mask);
+        var allowed = MaskCount(mask, maskWords);
+        var full = true;
+        while (!Grammar.Complete(state))
+        {
+            if (CancelRequested) return Abandon(ReplyStatus.Cancelled, FailureReason.None, progress);
+            if (steps >= options.MaxCallTokens) return Abandon(ReplyStatus.Failed, FailureReason.CallTokenBudgetExceeded, progress);
+            if (allowed == 0) return Abandon(ReplyStatus.Failed, FailureReason.GrammarDeadEnd, progress);
+            int pick;
+            float probability;
+            if (jump && allowed == 1)
+            {
+                // No choice to sample: per-token greedy must emit this token
+                // (argmax over one candidate), so no logits are consulted.
+                pick = SoleAllowed(mask, maskWords, sparseRows);
+                probability = 1f;
+            }
+            else if (full) pick = ArgMaxWithProbability(mask, out probability);
+            else pick = ArgMaxSparse(scratchLogits, sparseRows, allowed, out probability);
+            if (pick < 0) return Abandon(ReplyStatus.Failed, FailureReason.GrammarDeadEnd, progress);
+            if (steps == 0 && progress.FirstTokenTicks == 0) progress.FirstTokenTicks = Stopwatch.GetTimestamp() - progress.Started;
             var length = tokenizer.ConstraintBytes(pick, buffer);
             var cursor = &state;
             for (var b = 0; b < length; b++)
-                if (!Grammar.Advance(grammar.Program, cursor, buffer[b])) return new CallResult { Success = false, Error = "grammar rejected an allowed token" };
-            for (var b = 0; b < length; b++) text.Add(buffer[b]);
+            {
+                if (!Grammar.Advance(grammar.Program, cursor, buffer[b], ref sink)) return Abandon(ReplyStatus.Failed, FailureReason.GrammarRejectedToken, progress);
+                if (sink.TryTakeCall(out var call) && stored < commands.Length) commands[stored++] = call;
+            }
             logProbability += Math.Log(Math.Max(probability, 1e-9));
             steps++;
-            decoded++;
-            Feed(pick, computeLogits: !Grammar.Complete(state));
+            progress.DecodeTokens++;
+            RecordSpecHistory(pick);
+            // Jump-forward (issue #16): same token-forced extension as
+            // GenerateCalls. Each forced token advances through the sink
+            // overload, so the sink observes the identical event sequence as
+            // per-token decoding; completed calls are drained per token
+            // below before the chunk is fed.
+            chunkIds[0] = pick;
+            var chunkCount = 1;
+            var maskFresh = false;
+            if (jump && !Grammar.Complete(state))
+            {
+                while (chunkCount < MaxJumpChunk && !Grammar.Complete(state))
+                {
+                    if (CancelRequested) return Abandon(ReplyStatus.Cancelled, FailureReason.None, progress);
+                    if (steps >= options.MaxCallTokens) return Abandon(ReplyStatus.Failed, FailureReason.CallTokenBudgetExceeded, progress);
+                    trie.Allow(grammar.Program, state, mask);
+                    maskFresh = true;
+                    allowed = MaskCount(mask, maskWords);
+                    if (allowed != 1) break;
+                    var forced = SoleAllowed(mask, maskWords, sparseRows);
+                    var forcedLength = tokenizer.ConstraintBytes(forced, buffer);
+                    // A zero-byte sole token advances nothing; leave it for
+                    // the next macro-step to mirror per-token accounting.
+                    if (forcedLength <= 0) break;
+                    for (var b = 0; b < forcedLength; b++)
+                    {
+                        if (!Grammar.Advance(grammar.Program, cursor, buffer[b], ref sink)) return Abandon(ReplyStatus.Failed, FailureReason.GrammarRejectedToken, progress);
+                        if (sink.TryTakeCall(out var forcedCall) && stored < commands.Length) commands[stored++] = forcedCall;
+                    }
+                    chunkIds[chunkCount++] = forced;
+                    steps++;
+                    progress.DecodeTokens++;
+                    RecordSpecHistory(forced);
+                }
+            }
+            if (jump && chunkCount > 1 && CancelRequested) return Abandon(ReplyStatus.Cancelled, FailureReason.None, progress);
+            // Prompt-lookup speculation (issue #17): same propose/feed/verify
+            // as GenerateCalls. Drafts advance only a scratch grammar copy,
+            // so the sink observes events for accepted tokens only, in commit
+            // order, exactly as per-token decoding would emit them.
+            var draftStart = chunkCount;
+            var specFed = false;
+            if (options.PromptLookup && chunkCount == 1 && !Grammar.Complete(state))
+            {
+                var scratchState = state;
+                var drafts = ProposeDrafts(&scratchState, chunkIds, chunkCount, draftAllowed, steps, buffer);
+                if (drafts > 0)
+                {
+                    if (CancelRequested) return Abandon(ReplyStatus.Cancelled, FailureReason.None, progress);
+                    engine.CheckpointSpec();
+                    chunkCount += drafts;
+                    if (!FeedCallChunk(new ReadOnlySpan<int>(chunkIds, chunkCount), computeLogits: false)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
+                    var accepted = VerifyDrafts(chunkIds, draftStart, drafts, draftAllowed, draftProbs);
+                    if (accepted < drafts) engine.RestoreSpec();
+                    for (var j = 0; j < accepted; j++)
+                    {
+                        var draft = chunkIds[draftStart + j];
+                        var draftLength = tokenizer.ConstraintBytes(draft, buffer);
+                        var draftCursor = &state;
+                        for (var b = 0; b < draftLength; b++)
+                        {
+                            if (!Grammar.Advance(grammar.Program, draftCursor, buffer[b], ref sink)) return Abandon(ReplyStatus.Failed, FailureReason.GrammarRejectedToken, progress);
+                            if (sink.TryTakeCall(out var draftCall) && stored < commands.Length) commands[stored++] = draftCall;
+                        }
+                        RecordSpecHistory(draft);
+                        logProbability += Math.Log(Math.Max(draftProbs[j], 1e-9));
+                        steps++;
+                        progress.DecodeTokens++;
+                    }
+                    chunkCount = draftStart + accepted;
+                    specFed = accepted == drafts;
+                    // Committed drafts advanced the grammar state past the
+                    // jump block's precomputed mask, so the tail recomputes.
+                    if (accepted > 0) maskFresh = false;
+                }
+            }
+            var chunk = new ReadOnlySpan<int>(chunkIds, chunkCount);
+            if (Grammar.Complete(state))
+            {
+                // A fully-accepted draft chunk is already fed; a partial one
+                // was rewound, so the accepted prefix still needs its pass.
+                if (!specFed && !FeedCallChunk(chunk, computeLogits: false)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
+                break;
+            }
+            // The next mask depends only on the chosen tokens, so compute it
+            // before the forward pass (serial precompute; true overlap needs
+            // pool support owned by the engine scheduler).
+            if (!maskFresh)
+            {
+                trie.Allow(grammar.Program, state, mask);
+                allowed = MaskCount(mask, maskWords);
+            }
+            if (allowed == 0) return Abandon(ReplyStatus.Failed, FailureReason.GrammarDeadEnd, progress);
+            if (allowed <= SparseHeadThreshold)
+            {
+                ExtractIds(mask, maskWords, sparseRows, SparseHeadThreshold);
+                if (!specFed && !FeedCallChunk(chunk, computeLogits: false)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
+                engine.LogitsForRows(sparseRows, allowed, scratchLogits);
+                full = false;
+            }
+            else
+            {
+                if (specFed) engine.RefreshLastLogits();
+                else if (!FeedCallChunk(chunk, computeLogits: true)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
+                full = true;
+            }
         }
-        var closing = new List<int> { ToolCallEnd, ImEnd };
-        closing.AddRange(Tokens("\n", false));
-        engine.Feed(closing.ToArray(), computeLogits: false);
+        if (!FeedCallChunk(callClosing, computeLogits: false)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
+        for (var c = 0; c < callClosing.Length; c++) RecordSpecHistory(callClosing[c]);
 
-        var head = 1.0 / (1.0 + Math.Exp(-engine.ConfidenceLogit(pooled)));
+        var head = HeadProbability();
+        // Jumped forced tokens contribute probability 1, matching
+        // GenerateCalls; see the note on the decode mean there.
         var decode = Math.Exp(logProbability / Math.Max(1, steps));
         var confidence = (float)Math.Min(head, decode);
-        var calls = ParseCalls(Encoding.UTF8.GetString(text.ToArray()));
-        var done = Stopwatch.GetTimestamp();
+        var total = sink.CallCount - startCount;
+        restoredCallCount = total;
+        if (total > stored)
+            return new Reply(ReplyStatus.Failed, FailureReason.CallsBufferTooSmall, progress.Flags, confidence, (float)head, (float)decode, total, 0,
+                progress.ReasoningLength, 0, progress.PromptTokens, progress.DecodeTokens, progress.PrefillTicks, progress.FirstTokenTicks, Stopwatch.GetTimestamp() - progress.Started);
         var refused = confidence < options.RefuseBelow;
-        return new CallResult
-        {
-            FunctionCalls = refused ? Array.Empty<FunctionCall>() : calls,
-            SuppressedCalls = refused ? calls : Array.Empty<FunctionCall>(),
-            Reasoning = Encoding.UTF8.GetString(reasoning.ToArray()).Trim(),
-            Confidence = confidence,
-            HeadConfidence = (float)head,
-            DecodeConfidence = (float)decode,
-            PrefillTokens = promptTokens,
-            DecodeTokens = decoded,
-            TimeToFirstTokenMs = ttft,
-            PrefillTps = promptTokens / Math.Max(1e-9, (prefilled - started) / (double)Stopwatch.Frequency),
-            DecodeTps = decoded / Math.Max(1e-9, (done - prefilled) / (double)Stopwatch.Frequency),
-            TotalMs = Elapsed(started, done),
-        };
+        var status = refused ? ReplyStatus.Refused : ReplyStatus.Called;
+        return new Reply(status, FailureReason.None, progress.Flags, confidence, (float)head, (float)decode, stored, 0,
+            progress.ReasoningLength, 0, progress.PromptTokens, progress.DecodeTokens, progress.PrefillTicks, progress.FirstTokenTicks, Stopwatch.GetTimestamp() - progress.Started);
     }
 
-    void Feed(int token, bool computeLogits = true)
+    Reply Respond(int first, ref TurnProgress progress, Span<byte> response)
+    {
+        var next = first;
+        var budget = options.FrameBudget;
+        for (var i = 0; i < options.MaxCallTokens && next != ImEnd && next != EndOfText; i++)
+        {
+            if (CancelRequested) return Abandon(ReplyStatus.Cancelled, FailureReason.None, progress);
+            AppendPiece(next, i == 0, response, ref progress.ResponseLength, ref progress.Flags, ReplyFlags.ResponseTruncated);
+            if (!TryFeed(next)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
+            progress.DecodeTokens++;
+            if (!budget.IsUnlimited && FrameBudgetHit(progress, budget)) return Abandon(ReplyStatus.Failed, FailureReason.FrameBudgetExceeded, progress);
+            next = ArgMax(responseMask);
+            if (next < 0) return Abandon(ReplyStatus.Failed, FailureReason.GrammarDeadEnd, progress);
+        }
+        if (!TryFeed(responseClosing, computeLogits: false)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
+        var confidence = (float)HeadProbability();
+        return new Reply(ReplyStatus.Responded, FailureReason.None, progress.Flags, confidence, confidence, float.NaN, 0, 0,
+            progress.ReasoningLength, progress.ResponseLength, progress.PromptTokens, progress.DecodeTokens, progress.PrefillTicks, progress.FirstTokenTicks, Stopwatch.GetTimestamp() - progress.Started);
+    }
+
+    bool CancelRequested => System.Threading.Volatile.Read(ref cancelRequested) != 0;
+
+    static bool FrameBudgetHit(in TurnProgress progress, in FrameBudget budget)
+    {
+        if (budget.MaxTokensPerSlice > 0 && progress.DecodeTokens >= budget.MaxTokensPerSlice) return true;
+        if (budget.MaxMillisecondsPerSlice <= 0) return false;
+        return (Stopwatch.GetTimestamp() - progress.Started) * 1000.0 / Stopwatch.Frequency >= budget.MaxMillisecondsPerSlice;
+    }
+
+    double HeadProbability() =>
+        confidenceScratch == null ? 1.0 : 1.0 / (1.0 + Math.Exp(-engine.ConfidenceLogit(pooled, confidenceScratch)));
+
+    Reply Failed(FailureReason reason, in TurnProgress progress) =>
+        new(ReplyStatus.Failed, reason, progress.Flags, float.NaN, float.NaN, float.NaN, 0, 0,
+            progress.ReasoningLength, progress.ResponseLength, progress.PromptTokens, progress.DecodeTokens, progress.PrefillTicks, progress.FirstTokenTicks, Stopwatch.GetTimestamp() - progress.Started);
+
+    Reply Abandon(ReplyStatus status, FailureReason reason, in TurnProgress progress)
+    {
+        Reset();
+        var reply = Failed(reason, progress);
+        return status == ReplyStatus.Cancelled ? reply with { Status = ReplyStatus.Cancelled } : reply;
+    }
+
+    bool TryFeed(ReadOnlySpan<int> tokens, bool computeLogits = true)
+    {
+        if (engine.Length + tokens.Length > contextCapacity) return false;
+        engine.Feed(tokens, computeLogits);
+        return true;
+    }
+
+    // Call-decode feed that also counts sequential engine passes for
+    // LastCallPasses (issue #16 gauge). Zero allocation: the chunk is a
+    // caller-owned span, usually stack.
+    bool FeedCallChunk(ReadOnlySpan<int> tokens, bool computeLogits)
+    {
+        if (engine.Length + tokens.Length > contextCapacity) return false;
+        engine.Feed(tokens, computeLogits);
+        LastCallPasses++;
+        return true;
+    }
+
+    bool TryFeed(int token, bool computeLogits = true)
     {
         var one = stackalloc int[1];
         one[0] = token;
-        engine.Feed(new ReadOnlySpan<int>(one, 1), computeLogits);
+        return TryFeed(new ReadOnlySpan<int>(one, 1), computeLogits);
     }
 
-    CallResult Respond(int first, List<byte> reasoning, long started, long prefilled, int promptTokens, int decoded, double ttft)
+    void AppendPiece(int token, bool first, Span<byte> destination, ref int length, ref ReplyFlags flags, ReplyFlags truncated)
     {
-        var text = new List<byte>();
-        var piece = new byte[64];
-        var next = first;
-        for (var i = 0; i < options.MaxCallTokens && next != ImEnd && next != 1; i++)
+        if (destination.IsEmpty) return;
+        Span<byte> piece = stackalloc byte[MaxPieceBytes];
+        var count = tokenizer.Append(token, piece, first);
+        var room = destination.Length - length;
+        if (count > room) flags |= truncated;
+        var written = Math.Min(count, room);
+        piece[..written].CopyTo(destination[length..]);
+        length += written;
+    }
+
+    int ArgMax(uint* allowed)
+    {
+        fixed (float* logits = engine.Logits)
+            return Ops.ArgMaxMasked(logits, allowed, maskWords, model.VocabSize);
+    }
+
+    static int MaskCount(uint* mask, int words)
+    {
+        var total = 0;
+        for (var w = 0; w < words; w++) total += Bits.PopCount(mask[w]);
+        return total;
+    }
+
+    // Extracts allowed ids ascending into `rows`, stopping at `limit`.
+    // Callers compare MaskCount first when they need the exact count.
+    static int ExtractIds(uint* mask, int words, int* rows, int limit)
+    {
+        var count = 0;
+        for (var w = 0; w < words && count < limit; w++)
         {
-            text.AddRange(piece.AsSpan(0, tokenizer.Append(next, piece, i == 0)).ToArray());
-            Feed(next);
-            decoded++;
-            next = ArgMaxMasked(responseMask, out _);
+            var bits = mask[w];
+            while (bits != 0 && count < limit)
+            {
+                rows[count++] = w * 32 + Bits.TrailingZeros(bits);
+                bits &= bits - 1;
+            }
         }
-        var closing = new List<int> { ImEnd };
-        closing.AddRange(Tokens("\n", false));
-        engine.Feed(closing.ToArray(), computeLogits: false);
-        var done = Stopwatch.GetTimestamp();
-        return new CallResult
-        {
-            Reasoning = Encoding.UTF8.GetString(reasoning.ToArray()).Trim(),
-            Response = Encoding.UTF8.GetString(text.ToArray()).Trim(),
-            Confidence = (float)(1.0 / (1.0 + Math.Exp(-engine.ConfidenceLogit(pooled)))),
-            PrefillTokens = promptTokens,
-            DecodeTokens = decoded,
-            TimeToFirstTokenMs = ttft,
-            PrefillTps = promptTokens / Math.Max(1e-9, (prefilled - started) / (double)Stopwatch.Frequency),
-            DecodeTps = decoded / Math.Max(1e-9, (done - prefilled) / (double)Stopwatch.Frequency),
-            TotalMs = Elapsed(started, done),
-        };
+        return count;
     }
 
-    static double Elapsed(long from, long to) => (to - from) * 1000.0 / Stopwatch.Frequency;
-
-    int ArgMaxMasked(ReadOnlySpan<uint> allowed, out float probability)
+    // Returns the single allowed token id; callers guarantee popcount == 1.
+    // Jump-forward (issue #16) uses this for token-forced steps: argmax over
+    // one candidate is forced, so per-token greedy must emit this token.
+    // `scratch` needs room for two ids (SparseHeadThreshold always qualifies).
+    static int SoleAllowed(uint* mask, int words, int* scratch)
     {
-        fixed (uint* m = allowed) return ArgMaxMasked(m, out probability);
+        ExtractIds(mask, words, scratch, 2);
+        return scratch[0];
     }
 
-    int ArgMaxMasked(uint* allowed, out float probability)
+    // Argmax over a sparse head output: `values[0..count)` aligns with `rows`.
+    // The best probability comes from a log-sum-exp over the allowed set only,
+    // never from a full-vocabulary softmax.
+    static int ArgMaxSparse(float* values, int* rows, int count, out float probability)
     {
-        var logits = engine.Logits;
-        var vocab = model.VocabSize;
         var best = -1;
         var peak = float.NegativeInfinity;
-        for (var id = 0; id < vocab; id++)
+        for (var i = 0; i < count; i++)
         {
-            var open = (allowed[id / 32] >> (id % 32) & 1) != 0;
-            scratchLogits[id] = open ? logits[id] : -1e30f;
-            if (open && logits[id] > peak) { peak = logits[id]; best = id; }
+            var value = values[i];
+            if (value > peak) { peak = value; best = rows[i]; }
         }
-        if (best < 0) throw new InvalidOperationException("the grammar left no allowed token");
-        Ops.Softmax(scratchLogits, vocab);
-        probability = scratchLogits[best];
+        probability = best < 0 ? 0f : Ops.BestProbability(values, count, peak);
         return best;
     }
 
-    IReadOnlyList<FunctionCall> ParseCalls(string json)
+    int ArgMaxWithProbability(uint* allowed, out float probability)
     {
-        var parsed = JsonValue.Parse(json);
-        var calls = new List<FunctionCall>();
-        foreach (var call in parsed.Items)
+        fixed (float* logits = engine.Logits)
         {
-            var alias = call.GetString("name")!;
-            var arguments = call.Get("arguments") ?? JsonValue.Object(Array.Empty<KeyValuePair<string, JsonValue>>());
-            calls.Add(new FunctionCall(active.OriginalName(alias), Restore(arguments, alias).ToString()));
+            var best = -1;
+            var count = 0;
+            var peak = float.NegativeInfinity;
+            for (var word = 0; word < maskWords; word++)
+            {
+                var bits = allowed[word];
+                while (bits != 0)
+                {
+                    var id = word * 32 + Bits.TrailingZeros(bits);
+                    bits &= bits - 1;
+                    var value = logits[id];
+                    scratchLogits[count++] = value;
+                    if (value > peak) { peak = value; best = id; }
+                }
+            }
+            if (best < 0)
+            {
+                probability = 0f;
+                return -1;
+            }
+            probability = Ops.BestProbability(scratchLogits, count, peak);
+            return best;
         }
-        return calls;
     }
 
-    JsonValue Restore(JsonValue value, string tool) => value.Kind switch
+    // Appends committed token ids to the prompt-lookup history (issue #17).
+    // The buffer is ctor-sized and append-only across turns; when full,
+    // recording silently stops and lookups degrade to the recorded prefix.
+    // No allocation: plain array writes.
+    void RecordSpecHistory(int id)
     {
-        JsonKind.Object => JsonValue.Object(value.Members.ConvertAll(m => new KeyValuePair<string, JsonValue>(active.OriginalProperty(tool, m.Key), Restore(m.Value, tool)))),
-        JsonKind.Array => JsonValue.Array(value.Items.ConvertAll(i => Restore(i, tool))),
-        _ => value,
-    };
+        if (specHistoryLength < specHistory.Length) specHistory[specHistoryLength++] = id;
+    }
+
+    void RecordSpecHistory(ReadOnlySpan<int> ids)
+    {
+        var room = specHistory.Length - specHistoryLength;
+        var count = Math.Min(room, ids.Length);
+        for (var i = 0; i < count; i++) specHistory[specHistoryLength++] = ids[i];
+    }
+
+    // Most-recent occurrence of suffix[0..n) in the committed history;
+    // returns the token that followed it, or -1 when the suffix never
+    // occurred with a successor. Linear scan, no allocation.
+    int LookupDraft(int* suffix, int n)
+    {
+        if (n <= 0) return -1;
+        for (var p = specHistoryLength - n - 1; p >= 0; p--)
+        {
+            var match = true;
+            for (var i = 0; i < n; i++)
+                if (specHistory[p + i] != suffix[i]) { match = false; break; }
+            if (match) return specHistory[p + n];
+        }
+        return -1;
+    }
+
+    // Proposes up to MaxDraftTokens continuations by prompt lookup (issue
+    // #17). `scratch` starts as the post-pick grammar state and advances
+    // past each draft (the real state is untouched until commit); each draft
+    // position's mask is recorded in specMasks and its popcount in
+    // draftAllowed. Appends drafts to chunkIds[chunkCount..] and returns the
+    // draft count. Stops at the first position with no legal prediction, so
+    // every returned draft is grammar-legal by construction.
+    int ProposeDrafts(GrammarState* scratch, int* chunkIds, int chunkCount, int* draftAllowed, int steps, byte* bytes)
+    {
+        var suffix = stackalloc int[3];
+        var suffixCount = 0;
+        for (var i = Math.Max(0, specHistoryLength - 3); i < specHistoryLength; i++) suffix[suffixCount++] = specHistory[i];
+        var drafts = 0;
+        while (drafts < MaxDraftTokens && steps + drafts + 1 <= options.MaxCallTokens &&
+            engine.Length + chunkCount + drafts + 1 <= contextCapacity)
+        {
+            trie.Allow(grammar.Program, *scratch, mask);
+            var allowed = MaskCount(mask, maskWords);
+            if (allowed == 0) break;
+            var draft = -1;
+            for (var n = Math.Min(3, suffixCount); n >= 1; n--)
+            {
+                var candidate = LookupDraft(suffix + suffixCount - n, n);
+                if (candidate < 0) continue;
+                // Grammar-legal only: illegal predictions stop the draft run
+                // (verification would reject them anyway).
+                var word = candidate / 32;
+                if (word < maskWords && (mask[word] & (1u << (candidate % 32))) != 0) { draft = candidate; break; }
+            }
+            if (draft < 0) break;
+            var length = tokenizer.ConstraintBytes(draft, bytes);
+            // A zero-byte token advances nothing; leave it out exactly like
+            // the jump-forward path leaves zero-byte forced tokens out.
+            if (length <= 0) break;
+            var cursor = scratch;
+            var ok = true;
+            for (var b = 0; b < length; b++)
+                if (!Grammar.Advance(grammar.Program, cursor, bytes[b])) { ok = false; break; }
+            if (!ok) break;
+            var slot = specMasks + (long)drafts * maskWords;
+            for (var w = 0; w < maskWords; w++) slot[w] = mask[w];
+            draftAllowed[drafts] = allowed;
+            chunkIds[chunkCount + drafts] = draft;
+            drafts++;
+            if (suffixCount < 3) suffix[suffixCount++] = draft;
+            else { suffix[0] = suffix[1]; suffix[1] = suffix[2]; suffix[2] = draft; }
+        }
+        return drafts;
+    }
+
+    // Verifies drafts against the fed chunk (issue #17): draft j lives at
+    // chunk index draftStart + j and is predicted by the head at row
+    // draftStart + j - 1 under its recorded mask. Returns the accepted
+    // prefix length; probs[0..accepted) holds each accepted draft's masked
+    // probability for the decode mean. The shared logits buffer is clobbered
+    // and must be recomputed for the last row afterwards.
+    int VerifyDrafts(int* chunkIds, int draftStart, int draftCount, int* draftAllowed, float* probs)
+    {
+        for (var j = 0; j < draftCount; j++)
+        {
+            var draft = chunkIds[draftStart + j];
+            var row = draftStart + j - 1;
+            var slot = specMasks + (long)j * maskWords;
+            var allowed = draftAllowed[j];
+            int pick;
+            float probability;
+            if (allowed <= SparseHeadThreshold)
+            {
+                ExtractIds(slot, maskWords, sparseRows, SparseHeadThreshold);
+                engine.LogitsForRowsAt(row, sparseRows, allowed, scratchLogits);
+                pick = ArgMaxSparse(scratchLogits, sparseRows, allowed, out probability);
+            }
+            else
+            {
+                engine.ComputeLogitsAt(row);
+                pick = ArgMaxMaskedWithProbability(slot, out probability);
+            }
+            if (pick != draft) return j;
+            probs[j] = probability;
+        }
+        return draftCount;
+    }
+
+    int ArgMaxMaskedWithProbability(uint* allowed, out float probability)
+    {
+        fixed (float* logits = engine.Logits)
+        {
+            var best = -1;
+            var count = 0;
+            var peak = float.NegativeInfinity;
+            for (var word = 0; word < maskWords; word++)
+            {
+                var bits = allowed[word];
+                while (bits != 0)
+                {
+                    var id = word * 32 + Bits.TrailingZeros(bits);
+                    bits &= bits - 1;
+                    var value = logits[id];
+                    scratchLogits[count++] = value;
+                    if (value > peak) { peak = value; best = id; }
+                }
+            }
+            if (best < 0)
+            {
+                probability = 0f;
+                return -1;
+            }
+            probability = Ops.BestProbability(scratchLogits, count, peak);
+            return best;
+        }
+    }
 
     public float[] Embed(string text)
     {
-        embedder ??= new Engine(model, 512, 64, options.Threads) { Pooling = true };
-        var ids = new List<int> { tokenizer.BeginId };
-        ids.AddRange(Tokens(text, true));
-        embedder.Reset();
-        embedder.Feed(ids.ToArray(), computeLogits: false);
-        var width = model.Confidence->Queries * model.Geometry.Dim;
-        var vector = (float*)Mem.AllocZeroed((nuint)width * 4);
-        embedder.ConfidenceLogit(vector);
-        var norm = MathF.Sqrt(Ops.SumOfSquares(vector, width)) + 1e-12f;
-        var result = new float[width];
-        for (var i = 0; i < width; i++) result[i] = vector[i] / norm;
-        Mem.Free(vector);
+        EnsureEmbedder();
+        var ids = new int[Encoding.UTF8.GetByteCount(text) * 3 + 9];
+        ids[0] = tokenizer.BeginId;
+        var count = 1 + tokenizer.Encode(Encoding.UTF8.GetBytes(text), ids.AsSpan(1), true);
+        if (EmbedTokens(new ReadOnlySpan<int>(ids, 0, count)) != FailureReason.None) throw new InvalidOperationException("context capacity exceeded");
+        var result = new float[embeddingWidth];
+        new ReadOnlySpan<float>(pooled, embeddingWidth).CopyTo(result);
         return result;
+    }
+
+    void EnsureEmbedder()
+    {
+        if (model.Confidence == null) throw new InvalidOperationException("the model has no confidence head");
+        embedder ??= new Engine(model, EmbedderContext, 64, options.ResolvedThreading, engine.SharedPool) { Pooling = true };
+    }
+
+    FailureReason EmbedTokens(ReadOnlySpan<int> ids)
+    {
+        if (ids.Length > embedderCapacity) return FailureReason.ContextExhausted;
+        embedder!.Reset();
+        embedder.Feed(ids, computeLogits: false);
+        embedder.ConfidenceLogit(pooled, confidenceScratch);
+        var norm = MathF.Sqrt(Ops.SumOfSquares(pooled, embeddingWidth)) + 1e-12f;
+        for (var i = 0; i < embeddingWidth; i++) pooled[i] /= norm;
+        return FailureReason.None;
+    }
+
+    FailureReason EmbedQuery(ReadOnlySpan<byte> query)
+    {
+        promptIds[0] = tokenizer.BeginId;
+        var count = 1 + tokenizer.Encode(query, new Span<int>(promptIds, 1, promptIds.Length - 1), true);
+        return EmbedTokens(new ReadOnlySpan<int>(promptIds, 0, count));
     }
 
     void IndexTools()
     {
-        foreach (var tool in allTools.Tools) toolEmbeddings.Add(Embed(tool.ToString()));
+        EnsureEmbedder();
+        for (var t = 0; t < allTools.Tools.Count; t++)
+            Embed(allTools.Tools[t].ToString()).CopyTo(toolEmbeddings, t * embeddingWidth);
     }
 
-    void SelectTools(string query)
+    FailureReason SelectTools(ReadOnlySpan<byte> query)
     {
-        var q = Embed(query);
-        var scored = new List<(float Score, int Index)>();
-        for (var i = 0; i < toolEmbeddings.Count; i++)
+        var embedded = EmbedQuery(query);
+        if (embedded != FailureReason.None) return embedded;
+        var toolCount = allTools.Tools.Count;
+        for (var t = 0; t < toolCount; t++)
         {
             var dot = 0f;
-            for (var j = 0; j < q.Length; j++) dot += q[j] * toolEmbeddings[i][j];
-            scored.Add((dot, i));
+            var row = t * embeddingWidth;
+            for (var j = 0; j < embeddingWidth; j++) dot += pooled[j] * toolEmbeddings[row + j];
+            toolScores[t] = dot;
         }
-        scored.Sort((a, b) => b.Score.CompareTo(a.Score));
-        var chosen = scored.GetRange(0, options.RetrievalTopK).ConvertAll(s => s.Index);
-        chosen.Sort();
-        var subset = allTools.Subset(chosen);
-        if (subset.Render() == primedRender) return;
-        active = subset;
-        grammar.Dispose();
-        grammar = new Grammar(active.Tools);
-        Prime(active);
+        for (var k = 0; k < chosenTools.Length; k++)
+        {
+            var best = -1;
+            for (var t = 0; t < toolCount; t++)
+                if (!IsChosen(t, k) && (best < 0 || toolScores[t] > toolScores[best])) best = t;
+            chosenTools[k] = best;
+        }
+        Array.Sort(chosenTools);
+        if (activeToolCount == chosenTools.Length && chosenTools.AsSpan().SequenceEqual(activeTools)) return FailureReason.None;
+        return RestrictTools();
     }
+
+    bool IsChosen(int tool, int chosenCount)
+    {
+        for (var k = 0; k < chosenCount; k++) if (chosenTools[k] == tool) return true;
+        return false;
+    }
+
+    FailureReason RestrictTools()
+    {
+        try
+        {
+            activeToolCount = -1;
+            var subset = allTools.Subset(chosenTools);
+            var rebuilt = new Grammar(subset.Tools);
+            grammar.Dispose();
+            grammar = rebuilt;
+            active = subset;
+            Prime(active);
+            chosenTools.CopyTo(activeTools, 0);
+            activeToolCount = chosenTools.Length;
+            return FailureReason.None;
+        }
+        catch (Exception e) when (e is InvalidOperationException or FormatException or ArgumentException)
+        {
+            return FailureReason.ToolContextFailed;
+        }
+    }
+
+    public void Pause() => engine.Pause();
+
+    public void Resume() => engine.Resume();
 
     public void Dispose()
     {
@@ -418,7 +1331,13 @@ public sealed unsafe class NeedleSession : IDisposable
         trie.Dispose();
         grammar.Dispose();
         Mem.Free(mask);
+        Mem.Free(reasoningMask);
+        Mem.Free(decisionMask);
+        Mem.Free(responseMask);
         Mem.Free(scratchLogits);
+        Mem.Free(sparseRows);
+        Mem.Free(specMasks);
         Mem.Free(pooled);
+        if (confidenceScratch != null) Mem.Free(confidenceScratch);
     }
 }

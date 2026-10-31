@@ -1,0 +1,8 @@
+[{"name":"move_to","description":"Move the selected units to a map position.","parameters":{"type":"object","properties":{"x":{"type":"number","description":"Map x coordinate"},"y":{"type":"number","description":"Map y coordinate"}},"required":["x","y"]}},
+{"name":"attack","description":"Attack an enemy unit or building.","parameters":{"type":"object","properties":{"target":{"type":"string","description":"Name of the enemy or building"}},"required":["target"]}},
+{"name":"set_formation","description":"Change the squad formation.","parameters":{"type":"object","properties":{"formation":{"type":"string","enum":["line","wedge","circle","column"]}},"required":["formation"]}},
+{"name":"follow","description":"Follow a friendly character.","parameters":{"type":"object","properties":{"target":{"type":"string","description":"Who to follow"}},"required":["target"]}},
+{"name":"stop","description":"Stop all current actions.","parameters":{"type":"object","properties":{}}},
+{"name":"build","description":"Order workers to construct a building.","parameters":{"type":"object","properties":{"structure":{"type":"string","enum":["barracks","farm","tower","wall","mine"]},"x":{"type":"integer","description":"Map x coordinate"},"y":{"type":"integer","description":"Map y coordinate"}},"required":["structure","x","y"]}},
+{"name":"gather","description":"Send workers to collect a resource.","parameters":{"type":"object","properties":{"resource":{"type":"string","enum":["wood","gold","stone","food"]}},"required":["resource"]}},
+{"name":"set_stance","description":"Set how the squad reacts to enemies.","parameters":{"type":"object","properties":{"stance":{"type":"string","enum":["aggressive","defensive","passive"]}},"required":["stance"]}}]

@@ -1,7 +1,7 @@
 {
   "name": "Needle.Unity",
-  "rootNamespace": "Needle.Unity",
-  "references": ["Unity.Burst", "Unity.Collections", "Unity.Jobs", "Unity.Entities"],
+  "rootNamespace": "Needle",
+  "references": ["Unity.Burst", "Unity.Collections", "Unity.Jobs", "Unity.Entities", "Unity.Profiling.Core"],
   "includePlatforms": [],
   "excludePlatforms": [],
   "allowUnsafeCode": true,
@@ -9,9 +9,5 @@
   "precompiledReferences": ["Needle.Inference.dll"],
   "autoReferenced": true,
   "defineConstraints": [],
-  "versionDefines": [
-    { "name": "com.unity.burst", "expression": "1.8.0", "define": "NEEDLE_BURST" },
-    { "name": "com.unity.entities", "expression": "1.0.0", "define": "NEEDLE_ENTITIES" }
-  ],
   "noEngineReferences": false
 }

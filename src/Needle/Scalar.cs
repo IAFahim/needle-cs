@@ -1,29 +1,19 @@
 using System;
-#if NEEDLE_SIMD
-using System.Runtime.Intrinsics.X86;
-#endif
 
 namespace Needle;
 
 internal static class Simd
 {
 #if NEEDLE_SIMD
-    static bool forceScalar;
-
-    public static bool Avx => Avx2.IsSupported && Fma.IsSupported && Sse41.IsSupported;
+    public static bool Avx => Tiers.HasAvx;
 
     public static bool Neon => System.Runtime.Intrinsics.Arm.AdvSimd.IsSupported;
 
-    public static bool Enabled => !forceScalar && (Avx || Neon);
+    public static bool Enabled => Tiers.Active != CpuTier.Scalar;
 
-    public static bool UseAvx => !forceScalar && Avx;
+    public static bool UseAvx => Tiers.Active is CpuTier.Avx2 or CpuTier.AvxVnni or CpuTier.AvxVnniInt8 or CpuTier.Avx512Bw;
 
-    public static bool UseNeon => !forceScalar && Neon;
-
-#pragma warning disable CA2255
-    [System.Runtime.CompilerServices.ModuleInitializer]
-    internal static void ReadEnvironment() => forceScalar = Environment.GetEnvironmentVariable("NEEDLE_SCALAR") != null;
-#pragma warning restore CA2255
+    public static bool UseNeon => Tiers.Active is CpuTier.Neon or CpuTier.NeonDot;
 #else
     public const bool Enabled = false;
 #endif
@@ -92,10 +82,19 @@ internal static unsafe class Scalar
                     }
     }
 
+    public static float HalfToSingleUpstream(ushort half)
+    {
+        var magnitude = half & 0x7FFF;
+        if (magnitude == 0) return 0f;
+        var bits = ((uint)magnitude << 13) + 0x38000000u | (uint)(half & 0x8000) << 16;
+        return *(float*)&bits;
+    }
+
     public static float HalfToSingle(ushort half)
     {
         var magnitude = half & 0x7FFF;
         if (magnitude == 0) return 0f;
+        if (magnitude < 0x0400) return (half & 0x8000) != 0 ? -magnitude * 5.9604645e-8f : magnitude * 5.9604645e-8f;
         var bits = ((uint)magnitude << 13) + 0x38000000u | (uint)(half & 0x8000) << 16;
         return *(float*)&bits;
     }
@@ -284,9 +283,17 @@ internal static unsafe class Scalar
         }
     }
 
-    public static void Condition(float* condV, float* condU, float* input, int dim, int width, float* condition)
+    public static void AttentionTile(in AttentionTile tile)
     {
-        var weights = stackalloc float[8];
+        for (var h = 0; h < tile.Heads; h++)
+            AttentionHead(
+                tile.Queries + h * 48, tile.QueryScales[h], tile.Keys, tile.KeyScales, tile.Values, tile.ValueScales,
+                tile.KeyStride, tile.ValueStride, tile.ScaleStride, tile.First, tile.First + tile.Count - 1, tile.Scores,
+                tile.Output + h * 64, tile.Probabilities == null ? null : tile.Probabilities + h * tile.ProbabilityStride);
+    }
+
+    public static void ConditionWeights(float* condV, float* input, int dim, float* weights)
+    {
         for (var j = 0; j < 8; j++)
         {
             var sum = 0f;
@@ -294,35 +301,133 @@ internal static unsafe class Scalar
             weights[j] = sum;
         }
         Softmax(weights, 8);
+    }
+
+    public static void ScaleInput(float* input, float* d1, int dim, int padded, float* destination)
+    {
+        for (var i = 0; i < dim; i++) destination[i] = input[i] * d1[i];
+        for (var i = dim; i < padded; i++) destination[i] = 0f;
+    }
+
+    public static void PermuteModulateActivate(int* permutation, float* source, float* d2, float* weights, float* condU, float* b2, int width, float* destination)
+    {
         for (var n = 0; n < width; n++)
         {
-            var sum = 1f;
-            for (var j = 0; j < 8; j++) sum += weights[j] * condU[j * width + n];
-            condition[n] = sum;
+            var condition = 1f;
+            for (var j = 0; j < 8; j++) condition += weights[j] * condU[j * width + n];
+            var v = d2[n] * condition * source[permutation[n]] + b2[n];
+            destination[n] = v * Sigmoid(v);
         }
     }
 
-    public static void ModulateActivate(float* d2, float* condition, float* a, float* b2, int width)
+    public static void PermuteScale(int* permutation, float* source, float* scale, int width, float* destination)
     {
-        for (var i = 0; i < width; i++) a[i] = d2[i] * condition[i] * a[i] + b2[i];
+        for (var n = 0; n < width; n++) destination[n] = source[permutation[n]] * scale[n];
     }
 
-    public static void Kron(float* z, float* left, float* right, int rows, int cols, float* result)
+    public static void AccumulateOutput(float* residual, float* product, float* d4, float scale, int count)
     {
-        var scratch = stackalloc float[rows * cols];
-        for (var k = 0; k < rows; k++)
-            for (var c = 0; c < cols; c++)
+        for (var i = 0; i < count; i++) residual[i] += scale * (product[i] * d4[i]);
+    }
+
+    public static void Sinkhorn4x4(float* logits, float* result)
+    {
+        for (var r = 0; r < 4; r++)
+        {
+            var peak = MathF.Max(MathF.Max(logits[r * 4], logits[r * 4 + 1]), MathF.Max(logits[r * 4 + 2], logits[r * 4 + 3]));
+            for (var c = 0; c < 4; c++) result[r * 4 + c] = MathF.Exp(logits[r * 4 + c] - peak);
+        }
+        for (var iteration = 0; iteration < 20; iteration++)
+        {
+            for (var r = 0; r < 4; r++)
             {
-                var sum = 0f;
-                for (var i = 0; i < rows; i++) sum += left[i * rows + k] * z[i * cols + c];
-                scratch[k * cols + c] = sum;
+                var sum = result[r * 4] + result[r * 4 + 1] + result[r * 4 + 2] + result[r * 4 + 3];
+                for (var c = 0; c < 4; c++) result[r * 4 + c] /= sum;
             }
-        for (var k = 0; k < rows; k++)
+            for (var c = 0; c < 4; c++)
+            {
+                var sum = result[c] + result[4 + c] + result[8 + c] + result[12 + c];
+                if (sum > 0f) for (var r = 0; r < 4; r++) result[r * 4 + c] /= sum;
+            }
+        }
+    }
+
+    public static void RmsFakeA8(float* x, int n, float* destination)
+    {
+        var sum = 0f;
+        for (var i = 0; i < n; i++) sum += x[i] * x[i];
+        var inverse = 1f / MathF.Sqrt(sum / n + 1e-6f);
+        var peak = 0f;
+        for (var i = 0; i < n; i++)
+        {
+            destination[i] = x[i] * inverse;
+            peak = MathF.Max(peak, MathF.Abs(destination[i]));
+        }
+        var scale = peak > 0f ? peak / 127f : 1f;
+        var round = 1f / scale;
+        for (var i = 0; i < n; i++) destination[i] = MathF.Min(MathF.Max(MathF.Round(destination[i] * round), -128f), 127f) * scale;
+    }
+
+    public static void CenteredRmsFakeA8(float* x, float* scale, int n, float* destination)
+    {
+        var sum = 0f;
+        for (var i = 0; i < n; i++) sum += x[i] * x[i];
+        var inverse = 1f / MathF.Sqrt(sum / n + 1e-6f);
+        var peak = 0f;
+        for (var i = 0; i < n; i++)
+        {
+            destination[i] = (1f + scale[i]) * x[i] * inverse;
+            peak = MathF.Max(peak, MathF.Abs(destination[i]));
+        }
+        var factor = peak > 0f ? peak / 127f : 1f;
+        var round = 1f / factor;
+        for (var i = 0; i < n; i++) destination[i] = MathF.Min(MathF.Max(MathF.Round(destination[i] * round), -128f), 127f) * factor;
+    }
+
+    public static void GateFakeA8(float* x, float* gate, int n)
+    {
+        var peak = 0f;
+        for (var i = 0; i < n; i++)
+        {
+            x[i] *= Sigmoid(gate[i]);
+            peak = MathF.Max(peak, MathF.Abs(x[i]));
+        }
+        var scale = peak > 0f ? peak / 127f : 1f;
+        var round = 1f / scale;
+        for (var i = 0; i < n; i++) x[i] = MathF.Min(MathF.Max(MathF.Round(x[i] * round), -128f), 127f) * scale;
+    }
+
+    public static void CombineDiff4(float* s, int dim, float w0, float w1, float w2, float w3, float* x, float* u, float post, float* destination)
+    {
+        for (var c = 0; c < dim; c++) destination[c] = post * (x[c] - u[c]) + w0 * s[c] + w1 * s[dim + c] + w2 * s[2 * dim + c] + w3 * s[3 * dim + c];
+    }
+
+    public static void PostNormAdd(float* residual, float* x, float* scale, float gate, int n)
+    {
+        var sum = 0f;
+        for (var i = 0; i < n; i++) sum += x[i] * x[i];
+        var inverse = 1f / MathF.Sqrt(sum / n + 1e-6f);
+        for (var i = 0; i < n; i++) residual[i] += gate * ((1f + scale[i]) * x[i] * inverse);
+    }
+
+    [System.Runtime.CompilerServices.SkipLocalsInit]
+    public static void Kron(float* z, int activeRows, float* left, float* right, int rows, int cols, int resultRows, float* result)
+    {
+        var scratch = stackalloc float[cols];
+        for (var k = 0; k < resultRows; k++)
+        {
             for (var c = 0; c < cols; c++)
             {
                 var sum = 0f;
-                for (var j = 0; j < cols; j++) sum += scratch[k * cols + j] * right[j * cols + c];
+                for (var i = 0; i < activeRows; i++) sum += left[i * rows + k] * z[i * cols + c];
+                scratch[c] = sum;
+            }
+            for (var c = 0; c < cols; c++)
+            {
+                var sum = 0f;
+                for (var j = 0; j < cols; j++) sum += scratch[j] * right[j * cols + c];
                 result[k * cols + c] = sum;
             }
+        }
     }
 }
