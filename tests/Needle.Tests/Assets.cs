@@ -46,6 +46,11 @@ internal static class Assets
             : $"fixtures were generated from a different model; regenerate with tools/golden.py (golden.json records model SHA-256 {expected}, {Model} has {loadedModelSha256}; see CONTRIBUTING.md, section \"Refreshing the upstream model\")";
     }
 
+    // Team barriers busy-wait and need every member scheduled at once, so a test that asks for more
+    // threads than the machine has (8 on a 2-core CI runner) takes minutes to hours per forward
+    // pass. Tests that compare against tolerance-based goldens cap their request with this.
+    public static int ThreadsFor(int wanted) => Math.Max(1, Math.Min(wanted, Environment.ProcessorCount));
+
     public static int GoldenBudget(JsonElement golden) =>
         golden.TryGetProperty("budget", out var budget)
             ? budget.GetInt32()

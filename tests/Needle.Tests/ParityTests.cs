@@ -50,7 +50,7 @@ public sealed class ParityTests : IDisposable
         var expected = MemoryMarshal.Cast<byte, float>(File.ReadAllBytes(Path.Combine(Assets.Golden, "case0/logits.bin"))).ToArray();
         foreach (var (chunk, threads) in new[] { (256, 1), (64, 1), (7, 1), (64, 8), (5, 6) })
         {
-            using var engine = new Engine(model, 512, chunk, threads);
+            using var engine = new Engine(model, 512, chunk, Assets.ThreadsFor(threads));
             engine.Feed(ids);
             var actual = engine.Logits.ToArray();
             Assert.Equal(Array.IndexOf(expected, expected.Max()), Array.IndexOf(actual, actual.Max()));
@@ -81,7 +81,7 @@ public sealed class ParityTests : IDisposable
         var budget = Assets.GoldenBudget(golden);
         foreach (var threads in new[] { 1, 8 })
         {
-            using var caller = new ToolCaller(model, tools, threads: threads);
+            using var caller = new ToolCaller(model, tools, threads: Assets.ThreadsFor(threads));
             var output = new byte[4096];
             foreach (var item in golden.GetProperty("cases").EnumerateArray())
             {
