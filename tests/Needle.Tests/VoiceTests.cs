@@ -430,6 +430,7 @@ public sealed class VoiceTests : IDisposable
 internal static class VoiceProbe
 {
     public const string Variable = "NEEDLE_VOICE_PROBE";
+    const int Windows = 5;
 
     public readonly record struct Measurement(long CallerThread, long WholeProcess, long NativeCalls, bool NativeCounted, int Unexpected);
 
@@ -441,27 +442,39 @@ internal static class VoiceProbe
         var utf8 = new byte[whistle.MaxTranscriptTokens * 64];
         var words = new WordSlice[whistle.MaxTranscriptTokens + 1];
         for (var round = 0; round < 5; round++) whistle.TranscribeUtf8(pcm, utf8, words);
-        // Finalizers of warm-up garbage allocate on the finalizer thread, which the
-        // whole-process counter would blame on the measured loop.
-        GC.Collect();
-        GC.WaitForPendingFinalizers();
-        GC.Collect();
-        var unexpected = 0;
+        // The contract is that steady-state calls allocate nothing. A one-off allocation by the
+        // runtime or another process thread (finalizers, tiering, diagnostics) can land in any
+        // single window but cannot land in all of them, whereas a per-call allocation would.
+        // So: the caller thread must stay at zero in every window, and the whole process must
+        // reach zero in at least one.
         var silence = new float[3 * Wav.SampleRate];
-        var nativeBefore = MallocProbe.Available ? MallocProbe.Count : 0;
-        var threadBefore = GC.GetAllocatedBytesForCurrentThread();
-        var processBefore = GC.GetTotalAllocatedBytes(true);
-        for (var round = 0; round < 30; round++)
+        var unexpected = 0;
+        long callerWorst = 0, processBest = long.MaxValue, nativeWorst = 0;
+        for (var window = 0; window < Windows; window++)
         {
-            var speech = whistle.TranscribeUtf8(pcm, utf8, words);
-            if (speech.Truncated || speech.Utf8Length == 0) unexpected++;
+            // Finalizers of earlier garbage allocate on the finalizer thread, which the
+            // whole-process counter would blame on the measured loop.
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+            var nativeBefore = MallocProbe.Available ? MallocProbe.Count : 0;
+            var threadBefore = GC.GetAllocatedBytesForCurrentThread();
+            var processBefore = GC.GetTotalAllocatedBytes(true);
+            for (var round = 0; round < 8; round++)
+            {
+                var speech = whistle.TranscribeUtf8(pcm, utf8, words);
+                if (speech.Truncated || speech.Utf8Length == 0) unexpected++;
+            }
+            for (var round = 0; round < 3; round++)
+                if (whistle.TranscribeUtf8(silence, utf8, words).Utf8Length != 0) unexpected++;
+            var processAfter = GC.GetTotalAllocatedBytes(true);
+            var threadAfter = GC.GetAllocatedBytesForCurrentThread();
+            var nativeAfter = MallocProbe.Available ? MallocProbe.Count : 0;
+            callerWorst = Math.Max(callerWorst, threadAfter - threadBefore);
+            processBest = Math.Min(processBest, processAfter - processBefore);
+            nativeWorst = Math.Max(nativeWorst, nativeAfter - nativeBefore);
         }
-        for (var round = 0; round < 10; round++)
-            if (whistle.TranscribeUtf8(silence, utf8, words).Utf8Length != 0) unexpected++;
-        var processAfter = GC.GetTotalAllocatedBytes(true);
-        var threadAfter = GC.GetAllocatedBytesForCurrentThread();
-        var nativeAfter = MallocProbe.Available ? MallocProbe.Count : 0;
-        return new Measurement(threadAfter - threadBefore, processAfter - processBefore, nativeAfter - nativeBefore, MallocProbe.Available, unexpected);
+        return new Measurement(callerWorst, processBest, nativeWorst, MallocProbe.Available, unexpected);
     }
 }
 

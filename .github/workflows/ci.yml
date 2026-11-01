@@ -282,6 +282,10 @@ jobs:
         if: matrix.netstandard
         run: dotnet build src/Needle -f netstandard2.1 -c Release
 
+      - name: Game-loop sample (zero-allocation hot path on the game thread)
+        if: matrix.name == 'linux-x64' && matrix.shard == 'core'
+        run: dotnet run -c Release --project samples/SquadCommander
+
       - name: Publish NativeAOT CLI
         run: dotnet publish src/Needle.Cli -c Release -o out/aot
 

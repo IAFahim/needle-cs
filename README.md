@@ -19,7 +19,7 @@ Early but usable for a showcase: everything below works on Linux x64 today and i
 | Per-call allocations | About 6 KB of managed allocations per call today. Zero-allocation API and typed C# calls are planned |
 | Voice | Whistle transcription matches the upstream library on record, test and hotword; long25 keeps the queen passage but differs by one short phrase (issue #38). Beam search is on by default (`BeamWidth = 3`), `BeamWidth = 1` gives faster greedy decoding |
 | Evaluating tool sets | `needle eval` with 208 game prompts, see below |
-| Unity | Sample package exists, the Entities `ISystem` version is planned |
+| Unity | Package with a plain `MonoBehaviour` sample (Squad commander) and an Entities `ISystem` sample, see below |
 
 The roadmap lives in [plan.md](plan.md), and every work item is a GitHub issue. Start at the tracking issue [#31](https://github.com/IAFahim/needle-cs/issues/31).
 
@@ -47,6 +47,27 @@ These steps need no golden fixtures. Only `dotnet test` does.
 - **Needle 3 Tool Calling:** Schema-driven byte-level pushdown automaton grammar constraint, multi-turn sessions, confidence scoring, top-K tool retrieval, structured extraction, and 3072-d embeddings.
 - **Whistle Speech-to-Text:** 16 kHz WAV resampling, language detection/forcing, keyword biasing, DTW word timestamps, long-audio windowing, streaming, and direct audio-to-tool-call (`VoiceSession`).
 - **Portable & Embeddable:** Full scalar fallback for platforms without SIMD, `Model.FromBytes` for platforms without `mmap`, dedicated-thread `Task` wrappers (`NeedleService`, `SpeechService`), and automatic placement of worker threads on the fastest physical cores (Linux; `NEEDLE_PIN=0` disables, `NEEDLE_NODP=1` forces the NEON widening-fallback tier).
+
+### Using it in a game
+
+[`samples/SquadCommander`](samples/SquadCommander) is a 60 Hz game loop where the player gives a squad free-form orders ("move to 120, 45", "switch to wedge formation", "give 3 potions to Lyra"). The model runs on `NeedleHost`'s own thread; the game thread only submits a query, polls for the reply and applies a typed command. The program measures exactly that surface and fails if it allocates or costs a visible slice of a frame:
+
+```sh
+tools/fetch.sh
+dotnet run -c Release --project samples/SquadCommander
+```
+
+```
+game-thread needle cost: median 0.0001 ms, p99 0.0073 ms, worst 0.4010 ms (budget 1 ms at p99)
+game-thread allocations: 0 bytes in needle calls
+order latency          : median 3 frames (50 ms)
+```
+
+The same code as a Unity `MonoBehaviour` (no ECS, no Burst needed) is the **Squad commander** sample of the `com.needle.inference` package (Package Manager, Samples). Three things worth knowing:
+
+- Describe your commands as an interface with `[NeedleTools]`; the source generator produces the schema, the grammar and a blittable command struct. Short parameter descriptions (`[Param]`) noticeably raise confidence.
+- Set `HostOptions.StatelessQueries = true` when each order is independent (almost always in a game). Otherwise every query continues the previous conversation and confidence decays.
+- Replies below `NeedleOptions.RefuseBelow` arrive as `Refused` but still carry their calls. Ask the player to rephrase instead of acting on them.
 
 ### Unmanaged channel (game thread → worker, Burst-callable)
 

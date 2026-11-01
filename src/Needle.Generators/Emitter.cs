@@ -414,6 +414,13 @@ internal static class Emitter
             builder.Append(indent).Append("            case \"").Append(CSharpEscape(tool.Alias)).Append("\":\n");
             builder.Append(indent).Append("            {\n");
             builder.Append(indent).Append("                command.Kind = ").Append(model.CommandName).Append("Kind.").Append(tool.Name).Append(";\n");
+            if (tool.Args.Length == 0)
+            {
+                // Nothing to bind: emitting an empty `switch (member.Key)` would not compile (CS1522).
+                builder.Append(indent).Append("                return true;\n");
+                builder.Append(indent).Append("            }\n");
+                continue;
+            }
             builder.Append(indent).Append("                var parsed = global::Needle.JsonValue.Parse(call.ArgumentsJson);\n");
             builder.Append(indent).Append("                if (parsed.Kind == global::Needle.JsonKind.Object)\n");
             builder.Append(indent).Append("                    foreach (var member in parsed.Members)\n");

@@ -411,6 +411,10 @@ public sealed unsafe partial class Whistle
     {
         var rows = tokens + 1;
         var columns = frames;
+        // The align buffers hold MaxSeq + 1 rows of maxFrames; say which size was exceeded instead of
+        // failing with a bare IndexOutOfRangeException somewhere in the dynamic program below.
+        if (tokens > g.MaxSeq || columns > maxFrames)
+            throw new InvalidOperationException($"alignment exceeds its buffers: tokens={tokens} (max {g.MaxSeq}), frames={columns} (max {maxFrames})");
         var cost = alignA!;
         var total = alignB!;
         var filtered = alignRow!;

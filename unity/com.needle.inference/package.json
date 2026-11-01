@@ -9,5 +9,22 @@
     "com.unity.burst": "1.8.31",
     "com.unity.collections": "2.7.1",
     "com.unity.entities": "1.5.0"
-  }
+  },
+  "samples": [
+    {
+      "displayName": "Squad commander (MonoBehaviour)",
+      "description": "Free-form orders for a squad from a text box or voice transcript. Allocation-free on the main thread, no ECS needed.",
+      "path": "Samples~/SquadCommander"
+    },
+    {
+      "displayName": "NPC commands (Entities)",
+      "description": "Burst ISystem pumping the unmanaged channel with typed NPC commands.",
+      "path": "Samples~/NpcCommands"
+    },
+    {
+      "displayName": "Voice",
+      "description": "Push-to-talk speech to text with Whistle.",
+      "path": "Samples~/Voice"
+    }
+  ]
 }

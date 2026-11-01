@@ -12,6 +12,14 @@ public readonly struct HostOptions
     public NeedleOptions? Session { get; init; }
     public int RequestCapacity { get; init; }
     public int ReplyCapacity { get; init; }
+
+    /// <summary>
+    /// Treat every <see cref="ChannelRequestKind.Query"/> as a fresh conversation: the session is
+    /// rewound to the primed tool prefix first, so unrelated orders never see each other and the
+    /// context never fills up. <see cref="ChannelRequestKind.ToolResult"/> still continues the
+    /// turn it answers. Leave off for chat-style use where each query builds on the last.
+    /// </summary>
+    public bool StatelessQueries { get; init; }
 }
 
 public sealed unsafe class NeedleHost : IDisposable
@@ -26,6 +34,7 @@ public sealed unsafe class NeedleHost : IDisposable
     byte* scratch;
     GCHandle self;
     long runningTicket = -1;
+    bool statelessQueries;
     int started;
     int disposed;
     int stopping;
@@ -46,6 +55,7 @@ public sealed unsafe class NeedleHost : IDisposable
         try
         {
             runner = run;
+            statelessQueries = options.StatelessQueries;
             var sessionOptions = options.Session ?? new NeedleOptions();
             policy = sessionOptions.ResolvedThreading;
             model = Model.Open(options.ModelPath);
@@ -116,6 +126,7 @@ public sealed unsafe class NeedleHost : IDisposable
         var calls = new Span<byte>(scratch, ChannelLimits.CallsCapacity);
         var reasoning = new Span<byte>(scratch + ChannelLimits.CallsCapacity, ChannelLimits.TextCapacity);
         var response = new Span<byte>(scratch + ChannelLimits.CallsCapacity + ChannelLimits.TextCapacity, ChannelLimits.TextCapacity);
+        if (statelessQueries && request.Kind == ChannelRequestKind.Query) session!.Reset();
         return request.Kind == ChannelRequestKind.ToolResult
             ? session!.CompleteWithToolResult(payload, calls, reasoning, response)
             : session!.Complete(payload, calls, reasoning, response);
@@ -132,6 +143,7 @@ public sealed unsafe class NeedleHost : IDisposable
         var reasoning = new Span<byte>(scratch + ChannelLimits.CallsCapacity, ChannelLimits.TextCapacity);
         var response = new Span<byte>(scratch + ChannelLimits.CallsCapacity + ChannelLimits.TextCapacity, ChannelLimits.TextCapacity);
         var sink = new TSink();
+        if (statelessQueries && request.Kind == ChannelRequestKind.Query) session!.Reset();
         var reply = request.Kind == ChannelRequestKind.ToolResult
             ? session!.CompleteWithToolResult(payload, commands, reasoning, response, ref sink)
             : session!.Complete(payload, commands, reasoning, response, ref sink);

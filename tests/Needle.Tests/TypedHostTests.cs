@@ -50,6 +50,35 @@ public sealed unsafe class TypedHostTests
     }
 
     [Fact]
+    public void StatelessQueriesAnswerEveryOrderAsIfItWereTheFirst()
+    {
+        Assets.Require();
+        using var host = new NeedleHost();
+        var channel = host.StartTyped<GameSink, GameCommand>(new HostOptions
+        {
+            ModelPath = Assets.Model,
+            ToolsJson = File.ReadAllText(Assets.Tools),
+            Session = new NeedleOptions { Threads = 2 },
+            StatelessQueries = true,
+        });
+
+        var firstConfidence = 0f;
+        var firstCommand = default(GameCommand);
+        // An unrelated order in between must not leak into the repeat of the first one.
+        foreach (var query in new[] { "what's it like in Lagos right now?"u8.ToArray(), "set a timer for 12 minutes"u8.ToArray(), "what's it like in Lagos right now?"u8.ToArray() })
+        {
+            Assert.True(channel.TrySubmitQuery(query, out var ticket));
+            Assert.True(WaitForReply(channel, ticket, out var reply));
+            Assert.Equal(ReplyStatus.Called, reply.Reply.Status);
+            var command = MemoryMarshal.Read<GameCommand>(MemoryMarshal.CreateSpan(ref reply.Calls[0], reply.Reply.Utf8Length));
+            if (firstConfidence == 0f) { firstConfidence = reply.Reply.Confidence; firstCommand = command; continue; }
+            if (query.Length == "set a timer for 12 minutes".Length) continue;
+            Assert.Equal(firstConfidence, reply.Reply.Confidence);
+            Assert.Equal(firstCommand.Kind, command.Kind);
+        }
+    }
+
+    [Fact]
     public void TypedHostReportsZeroCommandBytesOnEmptyInput()
     {
         Assets.Require();
