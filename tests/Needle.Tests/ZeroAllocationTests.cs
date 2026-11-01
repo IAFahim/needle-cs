@@ -22,8 +22,10 @@ internal static unsafe class MallocProbe
 internal static class AllocationProbe
 {
     public const string Variable = "NEEDLE_ALLOCATION_PROBE";
-    const int WarmUpRounds = 20;
-    const int MeasuredRounds = 100;
+    // The scalar backend is an order of magnitude slower, so the NEEDLE_SCALAR=1 rerun would blow
+    // the probe's 5 minute budget; a handful of warm rounds shows the same allocation behavior.
+    static int WarmUpRounds => Tiers.Active == CpuTier.Scalar ? 4 : 20;
+    static int MeasuredRounds => Tiers.Active == CpuTier.Scalar ? 20 : 100;
 
     public readonly record struct Measurement(long CallerThread, long WholeProcess, long NativeCalls, bool NativeCounted, int Unexpected);
 
