@@ -51,11 +51,33 @@ internal unsafe struct FeatureJob
     public Frontend* Front;
     public float* Padded;
     public float* Output;
+    public float* TaskPeaks;
+    public float Floor;
     public int Frames;
 
     public const int FramesPerTask = 16;
+    public const float RelativeFloor = 1e-8f, MinimumFloor = 1e-30f;
 
-    public static void Run(Pool pool, FeatureJob* job) => pool.Run(&Execute, job, (job->Frames + FramesPerTask - 1) / FramesPerTask);
+    public static int Tasks(int frames) => (frames + FramesPerTask - 1) / FramesPerTask;
+
+    public static void Run(Pool pool, FeatureJob* job)
+    {
+        var tasks = Tasks(job->Frames);
+        pool.Run(&Execute, job, tasks);
+        var peak = 0f;
+        for (var t = 0; t < tasks; t++) peak = MathF.Max(peak, job->TaskPeaks[t]);
+        job->Floor = MathF.Max(peak * RelativeFloor, MinimumFloor);
+        pool.Run(&Logarithm, job, tasks);
+    }
+
+    static void Logarithm(void* context, int task)
+    {
+        var job = (FeatureJob*)context;
+        var mels = job->Front->Mels;
+        var first = task * FramesPerTask * mels;
+        var last = Math.Min(job->Frames, (task + 1) * FramesPerTask) * mels;
+        for (var i = first; i < last; i++) job->Output[i] = MathF.Log(job->Output[i] + job->Floor);
+    }
 
     [System.Runtime.CompilerServices.SkipLocalsInit]
     static void Execute(void* context, int task)
@@ -66,6 +88,7 @@ internal unsafe struct FeatureJob
         var im = stackalloc float[f->Fft];
         var power = stackalloc float[f->Fft / 2 + 1];
         var mel = stackalloc float[f->Mels];
+        var peak = 0f;
         for (var frame = task * FramesPerTask; frame < Math.Min(job->Frames, (task + 1) * FramesPerTask); frame++)
         {
             var segment = job->Padded + (long)frame * f->Hop;
@@ -79,8 +102,13 @@ internal unsafe struct FeatureJob
             Ops.Zero(mel, f->Mels);
             for (var k = 0; k <= f->Fft / 2; k++) Ops.AddScaled(mel, f->MelBank + k * f->Mels, power[k], f->Mels);
             var row = job->Output + (long)frame * f->Mels;
-            for (var m = 0; m < f->Mels; m++) row[m] = MathF.Log(mel[m] + 5.9604645e-8f);
+            for (var m = 0; m < f->Mels; m++)
+            {
+                row[m] = mel[m];
+                peak = MathF.Max(peak, mel[m]);
+            }
         }
+        job->TaskPeaks[task] = peak;
     }
 
     static void Butterflies(Frontend* f, float* re, float* im)

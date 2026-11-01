@@ -12,6 +12,9 @@
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
   </PropertyGroup>
   <ItemGroup>
+    <EmbeddedResource Include="..\..\tools\game_tools.json" LogicalName="game_tools.json" />
+  </ItemGroup>
+  <ItemGroup>
     <ProjectReference Include="..\Needle\Needle.csproj" />
   </ItemGroup>
 </Project>

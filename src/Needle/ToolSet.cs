@@ -11,6 +11,7 @@ public sealed class ToolSet
     public IReadOnlyList<JsonValue> Tools { get; }
     public IReadOnlyDictionary<string, string> NameAliases { get; }
     readonly Dictionary<string, Dictionary<string, string>> propertyAliases;
+    internal AliasTable Aliases { get; }
 
     public ToolSet(string toolsJson)
     {
@@ -39,20 +40,22 @@ public sealed class ToolSet
         Tools = list;
         NameAliases = names;
         propertyAliases = properties;
+        Aliases = new AliasTable(names, properties);
     }
 
-    ToolSet(List<JsonValue> tools, IReadOnlyDictionary<string, string> names, Dictionary<string, Dictionary<string, string>> properties)
+    ToolSet(List<JsonValue> tools, IReadOnlyDictionary<string, string> names, Dictionary<string, Dictionary<string, string>> properties, AliasTable aliases)
     {
         Tools = tools;
         NameAliases = names;
         propertyAliases = properties;
+        Aliases = aliases;
     }
 
     public ToolSet Subset(IReadOnlyList<int> indices)
     {
         var list = new List<JsonValue>();
         foreach (var index in indices) list.Add(Tools[index]);
-        return new ToolSet(list, NameAliases, propertyAliases);
+        return new ToolSet(list, NameAliases, propertyAliases, Aliases);
     }
 
     public string Render() => JsonValue.Array(Tools).ToString();

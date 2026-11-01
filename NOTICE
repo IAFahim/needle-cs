@@ -1,0 +1,55 @@
+needle-cs
+Third-party materials and provenance
+
+The license of this repository's own source code has not been chosen yet.
+It will be stated in a LICENSE file once the repository owner decides.
+See CONTRIBUTING.md.
+
+1. Model weights (downloaded, not redistributed)
+
+   needle3.cact   https://huggingface.co/Cactus-Compute/needle3
+   whistle.cact   https://huggingface.co/Cactus-Compute/whistle
+
+   Both Hugging Face model cards declare "license: apache-2.0".
+   Copyright belongs to Cactus Compute and the model card authors.
+   This repository contains no model weights, tokenizers or model
+   configuration files. tools/fetch.sh downloads them into ref/, which is
+   git-ignored. Anyone who ships these files with a game or an application
+   must comply with the Apache License, Version 2.0
+   (https://www.apache.org/licenses/LICENSE-2.0): include a copy of the
+   license text and keep the copyright and attribution notices that come
+   with the files.
+
+2. Model architecture and reference implementation
+
+   https://github.com/cactus-compute/needle
+   Licensed under the Apache License, Version 2.0.
+
+   The architecture, the .cact format as documented there, and the
+   Python reference are the basis for tools/golden.py and for the C#
+   implementation in this repository.
+
+3. Upstream native engine (not used, not copied)
+
+   https://github.com/cactus-compute/cactus
+   Licensed under a custom license from Cactus Compute, Inc. that is not
+   Apache-2.0. No code from that repository is included here. See the
+   clean-room rule in CONTRIBUTING.md.
+
+4. Upstream wheel (local benchmarking only)
+
+   tools/fetch.sh downloads cactus_needle-3.3.3-py3-none-manylinux2014_x86_64.whl
+   from the needle3 Hugging Face repository into ref/hf/wheel/. It contains
+   the native library libneedle3.so. It is used only to compare speed on a
+   developer machine. It must never be committed, packaged or shipped.
+
+5. Test audio clips (downloaded, not redistributed)
+
+   tools/fetch.sh downloads test.wav, test_long.wav, hotword.wav and
+   record.wav from the cactus-compute/cactus repository into ref/audio/,
+   which is git-ignored. They are not part of this repository. Check the
+   license that applies to that repository before using them anywhere
+   other than local testing.
+
+Names such as Needle, Whistle and Cactus belong to their respective owners.
+This project is not affiliated with or endorsed by Cactus Compute, Inc.

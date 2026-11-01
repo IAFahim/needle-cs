@@ -1,0 +1,8 @@
+[{"name":"set_volume","description":"Set the volume of an audio channel from 0 to 100.","parameters":{"type":"object","properties":{"channel":{"type":"string","enum":["master","music","effects","voice"]},"level":{"type":"integer","description":"Volume from 0 to 100"}},"required":["channel","level"]}},
+{"name":"set_difficulty","description":"Change the game difficulty.","parameters":{"type":"object","properties":{"level":{"type":"string","enum":["easy","normal","hard"]}},"required":["level"]}},
+{"name":"toggle_subtitles","description":"Turn subtitles on or off.","parameters":{"type":"object","properties":{"enabled":{"type":"boolean","description":"True to show subtitles"}},"required":["enabled"]}},
+{"name":"set_graphics","description":"Set the graphics quality preset.","parameters":{"type":"object","properties":{"quality":{"type":"string","enum":["low","medium","high","ultra"]}},"required":["quality"]}},
+{"name":"open_menu","description":"Open a game menu screen.","parameters":{"type":"object","properties":{"menu":{"type":"string","enum":["inventory","map","quests","settings","pause"]}},"required":["menu"]}},
+{"name":"save_game","description":"Save the game to a slot.","parameters":{"type":"object","properties":{"slot":{"type":"integer","description":"Save slot number"}},"required":["slot"]}},
+{"name":"load_game","description":"Load the game from a slot.","parameters":{"type":"object","properties":{"slot":{"type":"integer","description":"Save slot number"}},"required":["slot"]}},
+{"name":"set_language","description":"Change the interface language.","parameters":{"type":"object","properties":{"language":{"type":"string","enum":["english","spanish","french","german","japanese"]}},"required":["language"]}}]

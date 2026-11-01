@@ -1,3 +1,4 @@
+import hashlib
 import json
 import struct
 import sys
@@ -10,10 +11,13 @@ ROOT = Path(__file__).resolve().parent.parent
 CACT = ROOT / "ref/hf/needle3.cact"
 SPM = ROOT / "ref/hf/tokenizer/tokenizer.model"
 OUT = ROOT / "ref/golden"
+LOCK = ROOT / "tools/ref.lock"
 
 HEADER = "<48If"
 RECORD = "<BBHIIIIQQII"
 FP16, FP32, CQ, RAW = 1, 2, 3, 4
+END_OF_TEXT, IM_END = 1, 5
+DECODE_BUDGET = 40
 GROUP = 128
 M32 = 0xFFFFFFFF
 PRIME = 0x01000193
@@ -28,6 +32,14 @@ TOOLS = [
      "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "Song or artist"}}, "required": ["query"]}},
 ]
 QUERIES = ["what's it like in Lagos right now?", "set a timer for 12 minutes and play some Miles Davis"]
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for block in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def prompt_of(query, tools):
@@ -359,13 +371,14 @@ def main():
     logits.astype(np.float32).tofile(dump / "logits.bin")
     ids.astype(np.int32).tofile(dump / "ids.bin")
     print("first token:", int(logits.argmax()), repr(sp.Decode([int(logits.argmax())])))
+    budget = int(sys.argv[1]) if len(sys.argv) > 1 else DECODE_BUDGET
     results = []
     for case in cases:
         seq = list(case["sp_ids"])
         generated = []
-        for _ in range(int(sys.argv[1]) if len(sys.argv) > 1 else 48):
+        for _ in range(budget):
             nxt = int(model.forward(np.array(seq))[0].argmax())
-            if nxt == 1:
+            if nxt in (END_OF_TEXT, IM_END):
                 break
             seq.append(nxt)
             generated.append(nxt)
@@ -373,7 +386,8 @@ def main():
         case["text"] = sp.Decode(generated)
         print(case["query"], "->", case["text"])
         results.append(case)
-    (OUT / "golden.json").write_text(json.dumps({"cases": results, "probes": probe_cases}, ensure_ascii=False))
+    provenance = {"model_sha256": file_sha256(CACT), "ref_lock_sha256": file_sha256(LOCK)}
+    (OUT / "golden.json").write_text(json.dumps({"budget": budget, **provenance, "cases": results, "probes": probe_cases}, ensure_ascii=False))
 
 
 if __name__ == "__main__":

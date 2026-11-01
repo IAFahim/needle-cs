@@ -1,0 +1,43 @@
+{"tools":"rpg","tags":["ci"],"query":"give Lyra 3 potions","expected":[{"name":"give_item","args":{"item":"potion","count":3,"to":"Lyra"}}]}
+{"tools":"rpg","query":"hand Borin two swords","expected":[{"name":"give_item","args":{"item":"sword","count":2,"to":"Borin"}}]}
+{"tools":"rpg","query":"gve lyra 10 arrows","expected":[{"name":"give_item","args":{"item":"arrow","count":10,"to":{"contains":"lyra"}}}]}
+{"tools":"rpg","query":"give 50 gold to Mira","expected":[{"name":"give_item","args":{"item":"gold","count":50,"to":"Mira"}}]}
+{"tools":"rpg","query":"pass the shield to Tomas","expected":[{"name":"give_item","args":{"item":"shield","count":1,"to":"Tomas"}}]}
+{"tools":"rpg","query":"give Elric five potions","expected":[{"name":"give_item","args":{"item":"potion","count":5,"to":"Elric"}}]}
+{"tools":"rpg","query":"send 100 gold to Kara","expected":[{"name":"give_item","args":{"item":"gold","count":100,"to":"Kara"}}]}
+{"tools":"rpg","tags":["ci"],"query":"use a potion on Lyra","expected":[{"name":"use_item","args":{"item":"potion","target":"Lyra"}}]}
+{"tools":"rpg","query":"give Borin an antidote, he's poisoned","expected":[{"name":"use_item","args":{"item":"antidote","target":"Borin"}}]}
+{"tools":"rpg","query":"light a torch","expected":[{"name":"use_item","args":{"item":"torch","target":{"any":true}}}]}
+{"tools":"rpg","query":"Kara drinks an ether","expected":[{"name":"use_item","args":{"item":"ether","target":"Kara"}}]}
+{"tools":"rpg","query":"have Mira read the scroll","expected":[{"name":"use_item","args":{"item":"scroll","target":"Mira"}}]}
+{"tools":"rpg","query":"cure Mira's poison with an antidote","expected":[{"name":"use_item","args":{"item":"antidote","target":"Mira"}}]}
+{"tools":"rpg","query":"equip the iron sword on Borin","expected":[{"name":"equip_item","args":{"item":{"contains":"sword"},"member":"Borin"}}]}
+{"tools":"rpg","query":"have Lyra equip her staff","expected":[{"name":"equip_item","args":{"item":{"contains":"staff"},"member":"Lyra"}}]}
+{"tools":"rpg","query":"put the steel shield on Tomas","expected":[{"name":"equip_item","args":{"item":{"contains":"shield"},"member":"Tomas"}}]}
+{"tools":"rpg","query":"Kara should wear the leather armor","expected":[{"name":"equip_item","args":{"item":{"contains":"armor"},"member":"Kara"}}]}
+{"tools":"rpg","tags":["ci"],"query":"cast fireball on the goblin","expected":[{"name":"cast_spell","args":{"spell":"fireball","target":{"contains":"goblin"}}}]}
+{"tools":"rpg","query":"heal Lyra","expected":[{"name":"cast_spell","args":{"spell":"heal","target":"Lyra"}}]}
+{"tools":"rpg","query":"cast heal on Borin","expected":[{"name":"cast_spell","args":{"spell":"heal","target":"Borin"}}]}
+{"tools":"rpg","query":"revive Elric","expected":[{"name":"cast_spell","args":{"spell":"revive","target":"Elric"}}]}
+{"tools":"rpg","query":"lightning at the dragon","expected":[{"name":"cast_spell","args":{"spell":"lightning","target":{"contains":"dragon"}}}]}
+{"tools":"rpg","query":"put a shield spell on Mira","expected":[{"name":"cast_spell","args":{"spell":"shield","target":"Mira"}}]}
+{"tools":"rpg","query":"cast frebal at the skeleton","expected":[{"name":"cast_spell","args":{"spell":"fireball","target":{"contains":"skeleton"}}}]}
+{"tools":"rpg","query":"recruit Garrick","expected":[{"name":"recruit_member","args":{"name":"Garrick"}}]}
+{"tools":"rpg","query":"let Nyx join the party","expected":[{"name":"recruit_member","args":{"name":"Nyx"}}]}
+{"tools":"rpg","query":"add Sora to my team","expected":[{"name":"recruit_member","args":{"name":"Sora"}}]}
+{"tools":"rpg","query":"kick Garrick out of the party","expected":[{"name":"dismiss_member","args":{"name":"Garrick"}}]}
+{"tools":"rpg","query":"dismiss Nyx","expected":[{"name":"dismiss_member","args":{"name":"Nyx"}}]}
+{"tools":"rpg","query":"Tomas can go, he's useless","expected":[{"name":"dismiss_member","args":{"name":"Tomas"}}]}
+{"tools":"rpg","query":"drop 5 arrows","expected":[{"name":"drop_item","args":{"item":{"contains":"arrow"},"count":5}}]}
+{"tools":"rpg","query":"throw away the rusty dagger","expected":[{"name":"drop_item","args":{"item":{"contains":"dagger"},"count":1}}]}
+{"tools":"rpg","query":"what do I have in my bag","expected":[{"name":"show_inventory","args":{}}]}
+{"tools":"rpg","query":"show inventory","expected":[{"name":"show_inventory","args":{}}]}
+{"tools":"rpg","query":"open my backpack","expected":[{"name":"show_inventory","args":{}}]}
+{"tools":"rpg","query":"check my items","expected":[{"name":"show_inventory","args":{}}]}
+{"tools":"rpg","query":"attack the orc","expected":[]}
+{"tools":"rpg","query":"move to 10 20","expected":[]}
+{"tools":"rpg","tags":["ci"],"query":"what's the weather today","expected":[]}
+{"tools":"rpg","query":"tell me a joke","expected":[]}
+{"tools":"rpg","query":"save game to slot 2","expected":[]}
+{"tools":"rpg","query":"how are you doing","expected":[]}
+{"tools":"rpg","query":"set the music volume to max","expected":[]}

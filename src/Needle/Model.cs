@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Threading;
 
 namespace Needle;
 
@@ -217,6 +218,8 @@ internal unsafe struct Reader
         Codebook.Fill(book4, codebook + 12, 16);
     }
 
+    public bool ExactHalves;
+
     public Arena Arena => arena;
 
     public float* Rows(Cq tensor)
@@ -236,7 +239,7 @@ internal unsafe struct Reader
         var count = Elements(record);
         var destination = arena.Take<float>(count);
         var source = map + record->Offset;
-        if (record->Dtype == Fp16) for (nuint i = 0; i < count; i++) destination[i] = Scalar.HalfToSingle(((ushort*)source)[i]);
+        if (record->Dtype == Fp16) for (nuint i = 0; i < count; i++) destination[i] = ExactHalves ? Scalar.HalfToSingle(((ushort*)source)[i]) : Scalar.HalfToSingleUpstream(((ushort*)source)[i]);
         else if (record->Dtype == Fp32) Buffer.MemoryCopy(source, destination, count * 4, count * 4);
         else throw new InvalidDataException("dense tensor expected");
         return destination;
@@ -286,22 +289,31 @@ public sealed unsafe class Model : IDisposable
     internal readonly byte* TokenizerBlob;
     internal readonly nuint TokenizerLength;
 
-    readonly byte* map;
-    readonly nuint mapLength;
+    readonly ModelMemory memory;
     Arena arena;
+    int disposed;
+    Vocabulary? vocabulary;
+    readonly object vocabularyGate = new();
 
-    readonly bool mapped;
-
-    Model(byte* data, nuint length, bool mapped)
+    internal Vocabulary GetVocabulary()
     {
-        map = data;
-        mapLength = length;
-        this.mapped = mapped;
+        lock (vocabularyGate)
+        {
+            vocabulary ??= new Vocabulary(this);
+            return vocabulary;
+        }
+    }
+
+    Model(ModelMemory memory)
+    {
+        this.memory = memory;
+        var map = memory.Address;
+        var length = memory.Length;
         var header = (uint*)map;
-        if (length < 196 || header[0] != 0x05E12A84) throw new InvalidDataException("not a Needle 3 .cact archive");
+        RequireWellFormed(map, length);
         var count = (int)header[1];
-        var codebook = (float*)(map + 196);
-        var records = (Record*)(map + 196 + header[2] * 4);
+        var codebook = (float*)(map + ModelInfo.HeaderBytes);
+        var records = (Record*)(map + ModelInfo.HeaderBytes + header[2] * 4);
 
         nuint denseBytes = 0;
         for (var i = 0; i < count; i++)
@@ -311,11 +323,15 @@ public sealed unsafe class Model : IDisposable
         var orders = arena.Take<int>(4);
         var sites = arena.Take<int>(16);
         Geometry = new Geometry(header, orders, sites);
-        Require(Geometry.QkDim == 48 && Geometry.VDim == 64 && Geometry.Lanes == 4, "unsupported head geometry");
-        Require(Geometry.HadaCols % 8 == 0 && Geometry.HadaRows * Geometry.HadaCols == Geometry.HadaN, "unsupported MLP geometry");
-        Require(Geometry.ConvTaps == 3 && Geometry.EngramConvTaps == 4 && Geometry.Dim % Cq.GroupSize == 0, "unsupported convolution geometry");
+        Require(Geometry.QkDim == 48 && Geometry.VDim == 64 && Geometry.Lanes == 4,
+            $"unsupported head geometry: found QkDim={Geometry.QkDim}, VDim={Geometry.VDim}, Lanes={Geometry.Lanes}; this build supports QkDim=48, VDim=64, Lanes=4");
+        Require(Geometry.HadaCols % 8 == 0 && Geometry.HadaRows * Geometry.HadaCols == Geometry.HadaN,
+            $"unsupported MLP geometry: found HadaN={Geometry.HadaN}; this build supports sizes that split into rows by columns with columns divisible by 8");
+        Require(Geometry.ConvTaps == 3 && Geometry.EngramConvTaps == 4 && Geometry.Dim % Cq.GroupSize == 0,
+            $"unsupported convolution geometry: found ConvTaps={Geometry.ConvTaps}, EngramConvTaps={Geometry.EngramConvTaps}, Dim={Geometry.Dim}; this build supports ConvTaps=3, EngramConvTaps=4 and Dim divisible by {Cq.GroupSize}");
 
         var reader = new Reader(map, records, arena, codebook);
+        reader.ExactHalves = !HasAudioWeights(records, count);
         Embedding = reader.Quantized();
         Blocks = reader.Take<LayerWeights>((nuint)Geometry.Layers);
         for (var l = 0; l < Geometry.Layers; l++) Blocks[l] = new LayerWeights(ref reader);
@@ -327,6 +343,7 @@ public sealed unsafe class Model : IDisposable
         if (reader.Next->Dtype == Reader.Fp32 && reader.Next->Ndim == 1 && reader.Next->Shape0 == 13)
         {
             Audio = reader.Take<AudioWeights>(1);
+            reader.ExactHalves = true;
             *Audio = new AudioWeights(ref reader, Geometry.Layers, Geometry.HadaN);
         }
         else if (reader.Next != tail)
@@ -343,25 +360,68 @@ public sealed unsafe class Model : IDisposable
         }
 
         var tokenizer = records + count - 1;
-        Require(tokenizer->Dtype == Reader.Raw, "tokenizer blob missing");
+        Require(tokenizer->Dtype == Reader.Raw, $"tokenizer blob missing: the last tensor has dtype {tokenizer->Dtype}, expected {Reader.Raw}");
         TokenizerBlob = map + tokenizer->Offset;
         TokenizerLength = (nuint)tokenizer->Bytes;
         arena = reader.Arena;
+        Info = new ModelInfo(Geometry, header[0], (long)length, count, (int)header[2], (long)tokenizer->Bytes, Audio != null, Confidence != null, EmbeddingHead != null);
     }
 
-    public static Model Open(string path)
+    public ModelInfo Info { get; }
+
+    static void RequireWellFormed(byte* map, nuint length)
     {
-        var data = Libc.MapReadOnly(path, out var length);
-        return new Model(data, length, true);
+        if (length < ModelInfo.HeaderBytes)
+            throw Malformed($"not a Needle 3 .cact archive: the file has {length} bytes, shorter than the {ModelInfo.HeaderBytes}-byte header");
+        var header = (uint*)map;
+        if (header[0] != ModelInfo.SupportedMagic)
+            throw Malformed($"not a supported Needle 3 .cact archive: found magic 0x{header[0]:X8}, supported magic is 0x{ModelInfo.SupportedMagic:X8}");
+        var count = header[1];
+        var tableEnd = (ulong)ModelInfo.HeaderBytes + (ulong)header[2] * 4 + (ulong)count * (ulong)sizeof(Record);
+        if (count == 0 || tableEnd > length)
+            throw Malformed($"truncated or corrupt .cact archive: the header declares {count} tensors and {header[2]} codebook entries, needing {tableEnd} bytes of tables, but the file has {length} bytes");
+        var records = (Record*)(map + ModelInfo.HeaderBytes + (nuint)header[2] * 4);
+        for (uint i = 0; i < count; i++)
+            if (records[i].Offset > length || records[i].Bytes > length - records[i].Offset)
+                throw Malformed($"truncated .cact archive: tensor {i} ends at byte {records[i].Offset + records[i].Bytes}, but the file has {length} bytes");
+        if (header[26] > 4 || header[31] > 16)
+            throw new NotSupportedException($"unsupported engram layout: found {header[26]} orders and {header[31]} sites; this build supports at most 4 orders and 16 sites. {ModelInfo.RefreshGuidance}");
     }
 
-    public static Model FromMemory(byte* data, nuint length) => new(data, length, false);
-
-    public static Model FromBytes(byte[] bytes)
+    static bool HasAudioWeights(Record* records, int count)
     {
-        var copy = (byte*)Mem.Alloc((nuint)bytes.Length);
-        Marshal.Copy(bytes, 0, (nint)copy, bytes.Length);
-        return new Model(copy, (nuint)bytes.Length, true);
+        for (var i = 0; i < count; i++)
+            if (records[i].Dtype == Reader.Fp32 && records[i].Ndim == 1 && records[i].Shape0 == 13) return true;
+        return false;
+    }
+
+    static InvalidDataException Malformed(string facts) => new($"{facts}. {ModelInfo.RefreshGuidance}");
+
+    public static Model Open(string path) => Open(path, true);
+
+    public static Model Open(string path, bool prefault) => From(ModelMemory.Map(path), prefault);
+
+    public static Model FromMemory(byte* data, nuint length) => From(ModelMemory.Borrow(data, length), false);
+
+    public static Model FromBytes(byte[] bytes) => From(ModelMemory.Copy(bytes), false);
+
+    public static Model FromStream(Stream stream) => From(ModelMemory.Read(stream), false);
+
+    public void Prefault() => memory.Prefault();
+
+    static Model From(ModelMemory memory, bool prefault)
+    {
+        try
+        {
+            var model = new Model(memory);
+            if (prefault) model.Prefault();
+            return model;
+        }
+        catch
+        {
+            memory.Dispose();
+            throw;
+        }
     }
 
     public int VocabSize => Geometry.Vocab;
@@ -369,12 +429,15 @@ public sealed unsafe class Model : IDisposable
 
     static void Require(bool condition, string message)
     {
-        if (!condition) throw new NotSupportedException(message);
+        if (!condition) throw new NotSupportedException($"{message}. {ModelInfo.RefreshGuidance}");
     }
 
     public void Dispose()
     {
-        if (mapped) Libc.Unmap(map, mapLength);
+        if (Interlocked.Exchange(ref disposed, 1) != 0) return;
+        vocabulary?.Dispose();
+        vocabulary = null;
         arena.Free();
+        memory.Dispose();
     }
 }

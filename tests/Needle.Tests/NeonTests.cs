@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.Arm;
@@ -319,8 +320,11 @@ public sealed unsafe class NeonTests
         AssertClose(actual, expected, 64, "Combine4");
 
         Fill(l, 256, 57);
-        Neon.Taps3(l, 64, r, actual);
-        Scalar.Taps3(l, 64, r, expected);
+        var history = stackalloc float[192];
+        Fill(history, 192, 57);
+        var current = history + 128;
+        Neon.Taps3(l, 64, current, actual);
+        Scalar.Taps3(l, 64, current, expected);
         AssertClose(actual, expected, 64, "Taps3");
 
         Fill(l, 256, 57);
@@ -410,23 +414,127 @@ public sealed unsafe class NeonTests
         var input = stackalloc float[dim];
         for (var i = 0; i < dim; i++) input[i] = (float)(random.NextDouble() * 2 - 1);
 
-        var expectedCondition = stackalloc float[width];
-        var actualCondition = stackalloc float[width];
-        Scalar.Condition(condV, condU, input, dim, width, expectedCondition);
-        Neon.Condition(condV, condU, input, dim, width, actualCondition);
-        AssertClose(actualCondition, expectedCondition, width, "Condition");
+        var permutation = stackalloc int[width];
+        for (var i = 0; i < width; i++) permutation[i] = (i * 389 + 17) % width;
 
+        var expectedWeights = stackalloc float[8];
+        var actualWeights = stackalloc float[8];
+        Scalar.ConditionWeights(condV, input, dim, expectedWeights);
+        Neon.ConditionWeights(condV, input, dim, actualWeights);
+        AssertClose(actualWeights, expectedWeights, 8, "ConditionWeights");
+
+        var expectedInput = stackalloc float[width];
+        var actualInput = stackalloc float[width];
+        Scalar.ScaleInput(input, d2, dim, 160, expectedInput);
+        Neon.ScaleInput(input, d2, dim, 160, actualInput);
+        AssertClose(actualInput, expectedInput, 160, "ScaleInput");
+
+        var source = stackalloc float[width];
+        for (var i = 0; i < width; i++) source[i] = (float)(random.NextDouble() * 2 - 1);
         var expectedA = stackalloc float[width];
         var actualA = stackalloc float[width];
-        for (var i = 0; i < width; i++) { expectedA[i] = actualA[i] = (float)(random.NextDouble() * 2 - 1); }
-        Scalar.ModulateActivate(d2, expectedCondition, expectedA, b2, width);
-        Neon.ModulateActivate(d2, actualCondition, actualA, b2, width);
-        AssertClose(actualA, expectedA, width, "ModulateActivate");
+        Scalar.PermuteModulateActivate(permutation, source, d2, expectedWeights, condU, b2, width, expectedA);
+        Neon.PermuteModulateActivate(permutation, source, d2, expectedWeights, condU, b2, width, actualA);
+        AssertClose(actualA, expectedA, width, "PermuteModulateActivate");
+
+        Scalar.PermuteScale(permutation, source, d2, width, expectedA);
+        Neon.PermuteScale(permutation, source, d2, width, actualA);
+        AssertClose(actualA, expectedA, width, "PermuteScale");
 
         var expectedOut = stackalloc float[width];
         var actualOut = stackalloc float[width];
-        Scalar.Kron(expectedA, left, right, 32, 32, expectedOut);
-        Neon.Kron(actualA, left, right, 32, 32, actualOut);
+        Scalar.Kron(expectedA, 24, left, right, 32, 32, 32, expectedOut);
+        Neon.Kron(actualA, 24, left, right, 32, 32, 32, actualOut);
         AssertClose(actualOut, expectedOut, width, "Kron");
+
+        var expectedResidual = stackalloc float[dim];
+        var actualResidual = stackalloc float[dim];
+        for (var i = 0; i < dim; i++) expectedResidual[i] = actualResidual[i] = input[i];
+        Scalar.AccumulateOutput(expectedResidual, expectedOut, d2, 0.5f, dim);
+        Neon.AccumulateOutput(actualResidual, actualOut, d2, 0.5f, dim);
+        AssertClose(actualResidual, expectedResidual, dim, "AccumulateOutput");
+    }
+
+    // GEMV-vs-scalar comparison in the MatMulTests convention: the int-domain
+    // dot products accumulate in a different order than Scalar, so outputs can
+    // differ by a few ulps at large magnitudes (e.g. 0.03 at |y| ~ 900). A
+    // global-magnitude 1e-3 band absorbs that without hiding real errors.
+    static void AssertMatMulClose(float* actual, float* expected, int n, string what)
+    {
+        var magnitude = 1f;
+        for (var i = 0; i < n; i++) magnitude = MathF.Max(magnitude, MathF.Abs(expected[i]));
+        for (var i = 0; i < n; i++)
+            Assert.True(MathF.Abs(actual[i] - expected[i]) <= 1e-3f * magnitude,
+                $"{what}[{i}]: {actual[i]} vs {expected[i]} (mag {magnitude})");
+    }
+
+    public static IEnumerable<object[]> MultiRowShapes()
+    {
+        foreach (var bits in new[] { 2, 4 })
+            // Single row, 2-row pair, 4-row block, block plus 1-3 tail rows, odd counts.
+            foreach (var (rows, cols) in new[] { (1, 128), (2, 128), (3, 256), (4, 256), (5, 768), (6, 384), (7, 768), (8, 768), (9, 768), (13, 768), (24, 768), (37, 768) })
+                // 1-3 tokens exercise DotBlock tails, 4+ the DotPair/DotTile tiles.
+                foreach (var tokens in new[] { 1, 2, 3, 4, 5, 7, 8, 9 })
+                    yield return new object[] { bits, rows, cols, tokens };
+    }
+
+    [Theory]
+    [MemberData(nameof(MultiRowShapes))]
+    public void MultiRowMatMulMatchesScalar(int bits, int rows, int cols, int tokens)
+    {
+        if (!Simd.UseNeon) return;
+        var w = MakeWeights(rows, cols, bits, rows * 131 + cols + bits * 17 + tokens);
+        var groups = cols / Cq.GroupSize;
+        var stride = (groups + 7) & ~7;
+        var x = stackalloc float[tokens * cols];
+        Fill(x, tokens * cols, rows * 1000 + tokens * 37 + bits);
+        var values = stackalloc sbyte[tokens * cols];
+        var scales = stackalloc float[tokens * stride];
+        var offsets = stackalloc float[tokens * stride];
+        var activations = new Activations(values, scales, offsets, cols);
+        Quant.Prepare(x, tokens, cols, bits, activations);
+        var expected = stackalloc float[tokens * rows];
+        var actual = stackalloc float[tokens * rows];
+        Scalar.MatMulRows(w, activations, tokens, expected, rows, 0, rows);
+        Neon.MatMulRows(w, activations, tokens, actual, rows, 0, rows);
+        AssertMatMulClose(actual, expected, tokens * rows, $"MultiRow{bits} {rows}x{cols}x{tokens}");
+        FreeWeights(w);
+    }
+
+    [Theory]
+    [InlineData(2, 9, 768, 1, 0, 9)]
+    [InlineData(2, 9, 768, 1, 2, 6)]
+    [InlineData(2, 9, 768, 4, 1, 8)]
+    [InlineData(2, 9, 768, 5, 3, 9)]
+    [InlineData(4, 9, 768, 1, 0, 9)]
+    [InlineData(4, 9, 768, 7, 2, 7)]
+    [InlineData(4, 13, 384, 3, 5, 13)]
+    [InlineData(2, 24, 768, 8, 7, 18)]
+    [InlineData(4, 5, 768, 6, 1, 4)]
+    public void MultiRowSlicesMatchScalar(int bits, int rows, int cols, int tokens, int rowStart, int rowEnd)
+    {
+        if (!Simd.UseNeon) return;
+        var w = MakeWeights(rows, cols, bits, rows * 57 + cols + bits + tokens);
+        var groups = cols / Cq.GroupSize;
+        var stride = (groups + 7) & ~7;
+        var x = stackalloc float[tokens * cols];
+        Fill(x, tokens * cols, rows * 2000 + tokens * 91 + bits);
+        var values = stackalloc sbyte[tokens * cols];
+        var scales = stackalloc float[tokens * stride];
+        var offsets = stackalloc float[tokens * stride];
+        var activations = new Activations(values, scales, offsets, cols);
+        Quant.Prepare(x, tokens, cols, bits, activations);
+        var expected = stackalloc float[tokens * rows];
+        var actual = stackalloc float[tokens * rows];
+        for (var i = 0; i < tokens * rows; i++) expected[i] = actual[i] = 12345f;
+        Scalar.MatMulRows(w, activations, tokens, expected, rows, rowStart, rowEnd);
+        Neon.MatMulRows(w, activations, tokens, actual, rows, rowStart, rowEnd);
+        for (var t = 0; t < tokens; t++)
+        {
+            for (var n = 0; n < rows; n++)
+                if (n < rowStart || n >= rowEnd) Assert.Equal(12345f, actual[t * rows + n]);
+            AssertMatMulClose(actual + t * rows + rowStart, expected + t * rows + rowStart, rowEnd - rowStart, $"MultiRowSlice{bits} {rows}x{cols}x{tokens}[{rowStart},{rowEnd}) t{t}");
+        }
+        FreeWeights(w);
     }
 }

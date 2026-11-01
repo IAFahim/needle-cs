@@ -44,6 +44,52 @@ public sealed unsafe class Tokenizer : IDisposable
     readonly int* symbolEnd, previousSymbol, nextSymbol;
     readonly Merge* heap;
 
+    internal byte* SharedBlob => blob;
+    internal int SharedPieceCount => pieceCount;
+    internal bool SharedAddDummyPrefix => addDummyPrefix;
+    internal bool SharedByteFallback => byteFallback;
+    internal int SharedUnknownId => unknownId;
+    internal int* SharedPieceOffset => pieceOffset;
+    internal ushort* SharedPieceLength => pieceLength;
+    internal float* SharedPieceScore => pieceScore;
+    internal byte* SharedPieceType => pieceType;
+    internal int* SharedTable => table;
+    internal uint SharedTableMask => tableMask;
+    internal int* SharedByteIds => byteIds;
+    internal int* SharedMarkers => markers;
+    internal int SharedMarkerCount => markerCount;
+
+    internal Tokenizer(Vocabulary vocabulary, int maxInputBytes)
+    {
+        var shared = vocabulary.Tables;
+        maxInput = maxInputBytes;
+        blob = shared.SharedBlob;
+        pieceCount = shared.SharedPieceCount;
+        PadId = shared.PadId;
+        EndId = shared.EndId;
+        BeginId = shared.BeginId;
+        unknownId = shared.SharedUnknownId;
+        addDummyPrefix = shared.SharedAddDummyPrefix;
+        byteFallback = shared.SharedByteFallback;
+        pieceOffset = shared.SharedPieceOffset;
+        pieceLength = shared.SharedPieceLength;
+        pieceScore = shared.SharedPieceScore;
+        pieceType = shared.SharedPieceType;
+        table = shared.SharedTable;
+        tableMask = shared.SharedTableMask;
+        byteIds = shared.SharedByteIds;
+        markers = shared.SharedMarkers;
+        markerCount = shared.SharedMarkerCount;
+
+        var worst = (nuint)maxInput * 3 + 8;
+        arena = new Arena(worst * 13 + worst * 3 * (nuint)sizeof(Merge) + 4096);
+        escaped = arena.TakeUncleared<byte>(worst);
+        symbolEnd = arena.TakeUncleared<int>(worst);
+        previousSymbol = arena.TakeUncleared<int>(worst);
+        nextSymbol = arena.TakeUncleared<int>(worst);
+        heap = arena.TakeUncleared<Merge>(worst * 3);
+    }
+
     public Tokenizer(Model model, int maxInputBytes = 1 << 16)
     {
         maxInput = maxInputBytes;
@@ -263,6 +309,11 @@ public sealed unsafe class Tokenizer : IDisposable
     }
 
     static bool Before(in Merge a, in Merge b) => a.Score > b.Score || (a.Score == b.Score && a.Left < b.Left);
+
+    internal byte* PiecePointer(int id) => blob + pieceOffset[id];
+    internal int PieceByteLength(int id) => pieceLength[id];
+    internal static bool PieceStartsWord(byte* piece, int length) =>
+        length >= 3 && piece[0] == 0xE2 && piece[1] == 0x96 && piece[2] == 0x81;
 
     public int Append(int id, Span<byte> output, bool first)
     {

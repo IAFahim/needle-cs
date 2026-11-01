@@ -1,0 +1,44 @@
+{"tools":"settings","query":"set the volume to 50","expected":[{"name":"set_volume","args":{"channel":"master","level":50}}]}
+{"tools":"settings","tags":["ci"],"query":"music volume to 30","expected":[{"name":"set_volume","args":{"channel":"music","level":30}}]}
+{"tools":"settings","query":"turn the sound effects down to 10","expected":[{"name":"set_volume","args":{"channel":"effects","level":10}}]}
+{"tools":"settings","query":"mute the music","expected":[{"name":"set_volume","args":{"channel":"music","level":0}}]}
+{"tools":"settings","query":"voice chat volume 80","expected":[{"name":"set_volume","args":{"channel":"voice","level":80}}]}
+{"tools":"settings","query":"master volume max","expected":[{"name":"set_volume","args":{"channel":"master","level":100}}]}
+{"tools":"settings","query":"make the music volume seventy","expected":[{"name":"set_volume","args":{"channel":"music","level":70}}]}
+{"tools":"settings","query":"make it easy","expected":[{"name":"set_difficulty","args":{"level":"easy"}}]}
+{"tools":"settings","tags":["ci"],"query":"set difficulty to hard","expected":[{"name":"set_difficulty","args":{"level":"hard"}}]}
+{"tools":"settings","query":"im too weak, easy mode","expected":[{"name":"set_difficulty","args":{"level":"easy"}}]}
+{"tools":"settings","query":"normal difficulty","expected":[{"name":"set_difficulty","args":{"level":"normal"}}]}
+{"tools":"settings","query":"I want a challenge, go hard","expected":[{"name":"set_difficulty","args":{"level":"hard"}}]}
+{"tools":"settings","query":"turn on subtitles","expected":[{"name":"toggle_subtitles","args":{"enabled":true}}]}
+{"tools":"settings","query":"subtitles off","expected":[{"name":"toggle_subtitles","args":{"enabled":false}}]}
+{"tools":"settings","query":"I can't hear anything, show captions","expected":[{"name":"toggle_subtitles","args":{"enabled":true}}]}
+{"tools":"settings","query":"hide the subtitles","expected":[{"name":"toggle_subtitles","args":{"enabled":false}}]}
+{"tools":"settings","query":"enable subtitles","expected":[{"name":"toggle_subtitles","args":{"enabled":true}}]}
+{"tools":"settings","query":"graphics to low","expected":[{"name":"set_graphics","args":{"quality":"low"}}]}
+{"tools":"settings","query":"set graphics quality to ultra","expected":[{"name":"set_graphics","args":{"quality":"ultra"}}]}
+{"tools":"settings","query":"my pc is slow, lowest graphics","expected":[{"name":"set_graphics","args":{"quality":"low"}}]}
+{"tools":"settings","query":"high graphics","expected":[{"name":"set_graphics","args":{"quality":"high"}}]}
+{"tools":"settings","query":"medium quality","expected":[{"name":"set_graphics","args":{"quality":"medium"}}]}
+{"tools":"settings","query":"open the map","expected":[{"name":"open_menu","args":{"menu":"map"}}]}
+{"tools":"settings","query":"show my quests","expected":[{"name":"open_menu","args":{"menu":"quests"}}]}
+{"tools":"settings","query":"pause","expected":[{"name":"open_menu","args":{"menu":"pause"}}]}
+{"tools":"settings","query":"open settings","expected":[{"name":"open_menu","args":{"menu":"settings"}}]}
+{"tools":"settings","query":"inventory","expected":[{"name":"open_menu","args":{"menu":"inventory"}}]}
+{"tools":"settings","query":"let me see the quest log","expected":[{"name":"open_menu","args":{"menu":"quests"}}]}
+{"tools":"settings","tags":["ci"],"query":"save to slot 3","expected":[{"name":"save_game","args":{"slot":3}}]}
+{"tools":"settings","query":"save game in slot one","expected":[{"name":"save_game","args":{"slot":1}}]}
+{"tools":"settings","query":"quicksave to slot 2","expected":[{"name":"save_game","args":{"slot":2}}]}
+{"tools":"settings","query":"load slot 2","expected":[{"name":"load_game","args":{"slot":2}}]}
+{"tools":"settings","query":"load my save from slot five","expected":[{"name":"load_game","args":{"slot":5}}]}
+{"tools":"settings","query":"go back to slot 1","expected":[{"name":"load_game","args":{"slot":1}}]}
+{"tools":"settings","query":"switch to french","expected":[{"name":"set_language","args":{"language":"french"}}]}
+{"tools":"settings","query":"change language to japanese","expected":[{"name":"set_language","args":{"language":"japanese"}}]}
+{"tools":"settings","query":"in German please","expected":[{"name":"set_language","args":{"language":"german"}}]}
+{"tools":"settings","query":"attack the orc","expected":[]}
+{"tools":"settings","query":"give Lyra 3 potions","expected":[]}
+{"tools":"settings","tags":["ci"],"query":"what's the weather today","expected":[]}
+{"tools":"settings","query":"tell me a joke","expected":[]}
+{"tools":"settings","query":"move to 100 100","expected":[]}
+{"tools":"settings","query":"how do I beat the final boss","expected":[]}
+{"tools":"settings","query":"thanks!","expected":[]}
