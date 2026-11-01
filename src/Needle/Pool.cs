@@ -128,7 +128,12 @@ internal sealed unsafe class Pool : IDisposable
         control->TeamContext = context;
         Volatile.Write(ref control->TeamDone, 0);
         Volatile.Write(ref control->TeamActive, 1);
-        Volatile.Write(ref control->TeamTicket, generation);
+        // Dekker handshake with Park(): the worker increments Sleeping (a full fence) and then looks
+        // for team work; this side must publish the team and then look for sleepers. A plain
+        // Volatile.Write followed by a Volatile.Read may be reordered (store then load), so both
+        // sides could miss each other and the worker would sleep through the team forever. The
+        // interlocked write is the full fence, as in Run().
+        Interlocked.Exchange(ref control->TeamTicket, generation);
         if (Volatile.Read(ref control->Sleeping) > 0) WakeAll();
         if (policy.Caller == CallerRole.Participates)
         {
