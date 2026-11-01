@@ -441,6 +441,11 @@ internal static class VoiceProbe
         var utf8 = new byte[whistle.MaxTranscriptTokens * 64];
         var words = new WordSlice[whistle.MaxTranscriptTokens + 1];
         for (var round = 0; round < 5; round++) whistle.TranscribeUtf8(pcm, utf8, words);
+        // Finalizers of warm-up garbage allocate on the finalizer thread, which the
+        // whole-process counter would blame on the measured loop.
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
         var unexpected = 0;
         var silence = new float[3 * Wav.SampleRate];
         var nativeBefore = MallocProbe.Available ? MallocProbe.Count : 0;
