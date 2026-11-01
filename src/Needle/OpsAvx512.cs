@@ -42,17 +42,32 @@ internal static unsafe class OpsAvx512
             Avx.Store(x + i, Avx.Multiply(Avx.LoadVector256(x + i), Ops.Sigmoid(Avx.LoadVector256(gate + i))));
     }
 
+    // The AVX2 reductions step by 16, so callers pad to 16 (not 32): the main loop
+    // takes 32 floats at a time and one 16-float vector plus an 8-float vector
+    // finish the tail, never reading past n.
     public static float SumOfSquares(float* x, int n)
     {
         var s0 = Vector512<float>.Zero;
         var s1 = Vector512<float>.Zero;
-        for (var i = 0; i < n; i += 32)
+        var i = 0;
+        for (; i + 32 <= n; i += 32)
         {
             s0 = Avx512F.FusedMultiplyAdd(Avx512F.LoadVector512(x + i), Avx512F.LoadVector512(x + i), s0);
             s1 = Avx512F.FusedMultiplyAdd(Avx512F.LoadVector512(x + i + 16), Avx512F.LoadVector512(x + i + 16), s1);
         }
+        if (i + 16 <= n)
+        {
+            s0 = Avx512F.FusedMultiplyAdd(Avx512F.LoadVector512(x + i), Avx512F.LoadVector512(x + i), s0);
+            i += 16;
+        }
         var folded = Avx512F.Add(s0, s1);
-        return Vector256.Sum(Avx.Add(folded.GetLower(), folded.GetUpper()));
+        var sum = Avx.Add(folded.GetLower(), folded.GetUpper());
+        for (; i < n; i += 8)
+        {
+            var v = Avx.LoadVector256(x + i);
+            sum = Fma.MultiplyAdd(v, v, sum);
+        }
+        return Vector256.Sum(sum);
     }
 
     public static void RmsUnit(float* x, int n, float* destination)
@@ -70,13 +85,21 @@ internal static unsafe class OpsAvx512
     {
         var s0 = Vector512<float>.Zero;
         var s1 = Vector512<float>.Zero;
-        for (var i = 0; i < n; i += 32)
+        var i = 0;
+        for (; i + 32 <= n; i += 32)
         {
             s0 = Avx512F.FusedMultiplyAdd(Avx512F.LoadVector512(a + i), Avx512F.LoadVector512(b + i), s0);
             s1 = Avx512F.FusedMultiplyAdd(Avx512F.LoadVector512(a + i + 16), Avx512F.LoadVector512(b + i + 16), s1);
         }
+        if (i + 16 <= n)
+        {
+            s0 = Avx512F.FusedMultiplyAdd(Avx512F.LoadVector512(a + i), Avx512F.LoadVector512(b + i), s0);
+            i += 16;
+        }
         var folded = Avx512F.Add(s0, s1);
-        return Vector256.Sum(Avx.Add(folded.GetLower(), folded.GetUpper()));
+        var sum = Avx.Add(folded.GetLower(), folded.GetUpper());
+        for (; i < n; i += 8) sum = Fma.MultiplyAdd(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i), sum);
+        return Vector256.Sum(sum);
     }
 
     public static void Softmax(float* s, int n)

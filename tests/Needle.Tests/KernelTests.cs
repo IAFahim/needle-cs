@@ -690,3 +690,75 @@ public sealed unsafe class FusedKernelTests
         ExpectBits(expected, actual, 16);
     }
 }
+
+#if NEEDLE_SIMD
+public sealed unsafe class Avx512OpsTests
+{
+    // Callers pad to 16 floats (the AVX2 reductions step by 16), so lengths that are
+    // multiples of 16 but not 32 must work. Everything past n is NaN: a read beyond n
+    // poisons the result, a write beyond n shows up as a changed canary.
+    const int Guard = 64;
+
+    static bool Supported => System.Runtime.Intrinsics.X86.Avx512F.IsSupported && System.Runtime.Intrinsics.Vector512.IsHardwareAccelerated;
+
+    static float* Poisoned(int n, Random random)
+    {
+        var p = (float*)Mem.Alloc((nuint)(n + Guard) * sizeof(float));
+        for (var i = 0; i < n; i++) p[i] = (float)(random.NextDouble() * 2 - 1);
+        for (var i = n; i < n + Guard; i++) p[i] = float.NaN;
+        return p;
+    }
+
+    static void AssertTailUntouched(float* p, int n)
+    {
+        for (var i = n; i < n + Guard; i++) Assert.True(float.IsNaN(p[i]), $"wrote past n={n} at {i}");
+    }
+
+    public static TheoryData<int> Lengths => new() { 16, 24, 32, 48, 64, 80, 96, 112, 768, 784 };
+
+    [Theory]
+    [MemberData(nameof(Lengths))]
+    public void ReductionsAndElementwiseOpsStayInsideTheirLength(int n)
+    {
+        if (!Supported) return;
+        var random = new Random(n);
+        var a = Poisoned(n, random);
+        var b = Poisoned(n, random);
+        var destination = Poisoned(n, random);
+        var other = Poisoned(n, random);
+        try
+        {
+            double squares = 0, dot = 0;
+            for (var i = 0; i < n; i++) { squares += (double)a[i] * a[i]; dot += (double)a[i] * b[i]; }
+            Assert.InRange(OpsAvx512.SumOfSquares(a, n), squares - 1e-4, squares + 1e-4);
+            Assert.InRange(OpsAvx512.Dot(a, b, n), dot - 1e-4, dot + 1e-4);
+
+            var inverse = 1 / Math.Sqrt(squares / n + 1e-6);
+            OpsAvx512.RmsUnit(a, n, destination);
+            for (var i = 0; i < n; i++) Assert.InRange(destination[i], a[i] * inverse - 1e-5, a[i] * inverse + 1e-5);
+            AssertTailUntouched(destination, n);
+
+            OpsAvx512.Subtract(a, b, n, destination);
+            for (var i = 0; i < n; i++) Assert.Equal(a[i] - b[i], destination[i]);
+            AssertTailUntouched(destination, n);
+
+            for (var i = 0; i < n; i++) other[i] = a[i];
+            OpsAvx512.AddScaled(other, b, 0.5f, n);
+            for (var i = 0; i < n; i++) Assert.InRange(other[i], a[i] + 0.5 * b[i] - 1e-6, a[i] + 0.5 * b[i] + 1e-6);
+            AssertTailUntouched(other, n);
+
+            for (var i = 0; i < n; i++) destination[i] = a[i];
+            OpsAvx512.Silu(destination, n);
+            for (var i = 0; i < n; i++) Assert.InRange(destination[i], a[i] / (1 + Math.Exp(-a[i])) - 1e-3, a[i] / (1 + Math.Exp(-a[i])) + 1e-3);
+            AssertTailUntouched(destination, n);
+        }
+        finally
+        {
+            Mem.Free(a);
+            Mem.Free(b);
+            Mem.Free(destination);
+            Mem.Free(other);
+        }
+    }
+}
+#endif
