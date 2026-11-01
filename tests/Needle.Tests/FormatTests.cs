@@ -45,9 +45,25 @@ public sealed class FormatTests
     // fetch.sh invocation exited 1 with empty output.
     static string ForBash(string path) => path.Replace(Path.DirectorySeparatorChar, '/');
 
+    // A bare "bash" on Windows resolves to System32\bash.exe (the WSL launcher)
+    // or the WindowsApps stub before Git bash, and either one exits 1 with no
+    // output when no distro is installed, so look for a real bash first.
+    static readonly Lazy<string> Bash = new(() =>
+    {
+        if (!OperatingSystem.IsWindows()) return "bash";
+        var windows = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+        var candidates = (Environment.GetEnvironmentVariable("PATH") ?? "")
+            .Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries)
+            .Where(dir => !dir.StartsWith(windows, StringComparison.OrdinalIgnoreCase) && !dir.Contains("WindowsApps", StringComparison.OrdinalIgnoreCase))
+            .Select(dir => Path.Combine(dir.Trim('"'), "bash.exe"))
+            .Concat(new[] { Environment.SpecialFolder.ProgramFiles, Environment.SpecialFolder.ProgramFilesX86 }
+                .Select(folder => Path.Combine(Environment.GetFolderPath(folder), "Git", "bin", "bash.exe")));
+        return candidates.FirstOrDefault(File.Exists) ?? "bash";
+    });
+
     static ScriptResult RunFetch(string argument, string refDirectory, string lockPath)
     {
-        var start = new ProcessStartInfo("bash") { RedirectStandardOutput = true, RedirectStandardError = true };
+        var start = new ProcessStartInfo(Bash.Value) { RedirectStandardOutput = true, RedirectStandardError = true };
         start.ArgumentList.Add(ForBash(Path.Combine(Assets.Root, "tools/fetch.sh")));
         if (argument.Length > 0) start.ArgumentList.Add(argument);
         start.Environment["NEEDLE_REF_DIR"] = ForBash(refDirectory);

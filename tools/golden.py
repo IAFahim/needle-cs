@@ -387,7 +387,7 @@ def main():
         print(case["query"], "->", case["text"])
         results.append(case)
     provenance = {"model_sha256": file_sha256(CACT), "ref_lock_sha256": file_sha256(LOCK)}
-    (OUT / "golden.json").write_text(json.dumps({"budget": budget, **provenance, "cases": results, "probes": probe_cases}, ensure_ascii=False))
+    (OUT / "golden.json").write_text(json.dumps({"budget": budget, **provenance, "cases": results, "probes": probe_cases}, ensure_ascii=False), encoding="utf-8")
 
 
 if __name__ == "__main__":
