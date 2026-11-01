@@ -65,12 +65,14 @@ public sealed class SpeechTests : IDisposable
     public void TestClipAndHotwordClipKeepUpstreamPhrases()
     {
         var test = whistle.Transcribe(Clip("test.wav")).Text;
-        Assert.Contains("creating a way of file", test);
-        Assert.Contains("Wi-Fi", test);
-        Assert.Contains("this will transcribe properly", test);
+        // Full transcripts in the messages: xUnit truncates long strings, which hides where a
+        // different CPU's beam search diverges.
+        Assert.True(test.Contains("creating a way of file"), $"test.wav: {test}");
+        Assert.True(test.Contains("Wi-Fi"), $"test.wav: {test}");
+        Assert.True(test.Contains("this will transcribe properly"), $"test.wav: {test}");
         var hotword = whistle.Transcribe(Clip("hotword.wav")).Text;
-        Assert.Contains("part of the cactus team and, you know, I also", hotword);
-        Assert.Contains("called Omep Brazil", hotword);
+        Assert.True(hotword.Contains("part of the cactus team and, you know, I also"), $"hotword.wav: {hotword}");
+        Assert.True(hotword.Contains("called Omep Brazil"), $"hotword.wav: {hotword}");
     }
 
     [Fact]
