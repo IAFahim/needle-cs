@@ -43,11 +43,25 @@ public sealed class FormatTests
     // break file lookup, so hand bash forward-slash paths on every platform
     // (no-op on Unix). CI evidence: run 41030471519 windows-x64, every
     // fetch.sh invocation exited 1 with empty output.
+    // Process.Start("bash") on Windows resolves System32\bash.exe (the WSL
+    // launcher) ahead of PATH, which has no distro on CI and exits 1 silently.
+    static string BashExecutable()
+    {
+        if (!OperatingSystem.IsWindows()) return "bash";
+        foreach (var root in new[] { Environment.GetEnvironmentVariable("ProgramFiles"), Environment.GetEnvironmentVariable("ProgramW6432"), Environment.GetEnvironmentVariable("ProgramFiles(x86)") })
+        {
+            if (string.IsNullOrEmpty(root)) continue;
+            var candidate = Path.Combine(root, "Git", "bin", "bash.exe");
+            if (File.Exists(candidate)) return candidate;
+        }
+        return "bash";
+    }
+
     static string ForBash(string path) => path.Replace(Path.DirectorySeparatorChar, '/');
 
     static ScriptResult RunFetch(string argument, string refDirectory, string lockPath)
     {
-        var start = new ProcessStartInfo("bash") { RedirectStandardOutput = true, RedirectStandardError = true };
+        var start = new ProcessStartInfo(BashExecutable()) { RedirectStandardOutput = true, RedirectStandardError = true };
         start.ArgumentList.Add(ForBash(Path.Combine(Assets.Root, "tools/fetch.sh")));
         if (argument.Length > 0) start.ArgumentList.Add(argument);
         start.Environment["NEEDLE_REF_DIR"] = ForBash(refDirectory);
