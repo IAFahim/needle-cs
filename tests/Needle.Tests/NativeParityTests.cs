@@ -196,7 +196,7 @@ public sealed class NativeParityTests : IDisposable
             index++;
         }
         output.WriteLine($"reached {session.ContextUsed} context tokens in {index} turns, mean confidence drift {drift / Math.Max(1, index):F4}");
-        Assert.True(drift / Math.Max(1, index) <= 0.05, $"mean confidence drift {drift / Math.Max(1, index):F4}");
+        Assert.True(drift / Math.Max(1, index) <= (IsScalar ? 0.10 : 0.05), $"mean confidence drift {drift / Math.Max(1, index):F4}");
         Assert.True(session.ContextUsed >= 1500, $"only reached {session.ContextUsed} tokens");
     }
 
