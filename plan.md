@@ -113,7 +113,7 @@ Prefill of 18 tokens takes 37.05 ms on 1 thread and 15.06 ms on 4. At 4 threads 
 | Softmax over 8192 logits | 27.3 µs | `ArgMaxMasked` does this every step, even in reasoning, where the probability is discarded |
 | Scalar `ArgMax` over 8192 | 4.4 µs | vectorizable to under 1 µs |
 | Hyper `Prepare(3072)` and phi (24 rows) per layer | 3.79 + 2.47 µs | 125 µs per token, serial |
-| `TokenTrie.Allow` per call step | 47.8 µs | about 12% of a 0.4 ms target step |
+| `TokenTrie.Allow` per call step | 2.5 µs cold / 1.9 µs warm on this box (was 47.8 µs pre-W15) | under 1% of a 0.4 ms target step; the harness per-byte figure mixes warm-cache hits with fast-path dilution, see §2.11 |
 | GEMM cost at T=4 versus T=1 (`needle bench`) | 1.9–2.8x | speculation and batching only pay off once T=2..8 costs at most 1.3x |
 
 **Savings and the floor we should reach at 4 threads:**
@@ -327,6 +327,21 @@ T=4 decode µs/token, best-of-5:
 | total | 801.8 | 777.5 | −3.0% |
 
 Verdict: no stage hits its target (closest: T=4 attention_core 58.8 vs 50; mlp 146–150 vs 60 needs intra-token parallelism, which is an `Engine.cs` sharding change owned by Barrier13). The uniform ±2–5% drift on untouched stages across T=1/T=4 is load noise, not signal — only attention_core moves the same direction twice (−8.0%/−3.0%). No tier regressed: MatMul/Kernel/Parity green on all four tiers with the final code (default 382/382, `NEEDLE_TIER=scalar` 160/160, `NEEDLE_TIER=avx512` 160/160, `NEEDLE_NOAVX512=1` 160/160, clean worktree). Scalar-epilogue and finer-chunking notes: the Softmax peak is now the only vectorized change standing (exact max, no bit change); `AttentionBatch` chunking is already maxed at decode (`MinChunkPositions` never binds: count ≈ 126 ≥ 2 × 48 with 2 chunks at T=4), so no chunking change shipped.
+
+### 2.11 Grammar-mask cost and Whistle encoder gap, round 5 (issues #39, #38)
+
+**Allow discrepancy, reconciled (2026-11-02, this box, idle, serial runs).** The 47.8 µs plan figure predates W15 (no mask cache, per-step `walkStates` alloc) on the Xeon reference box; the harness's per-byte-position figure mixes warm-cache hits with fast-path dilution. Measured now:
+
+| Source | Cost per step | What it actually times |
+|---|---|---|
+| `needle bench` structural probes (re-timed same state) | 0.09–0.10 µs | warm-cache hit: hash + full-frame compare + 1 KB mask copy |
+| `needle bench` unbounded-string probes | 1.51 µs | string fast path recomputed every call (bypasses the cache) |
+| `needle bench` mean of 121 byte positions | 2.51/2.52 µs | partially-evicted cache + fast-path mix, diluted by mid-string states |
+| `TokenStepMasksMatchBruteForceAndReportColdVsWarm` (384 genuine greedy token-boundary states, fresh trie) | 2.51 µs cold / 1.90 µs warm | the true per-call-step cost: each state visited once, as in real generation |
+
+Only 36 of the 384 token states hit the fast path, so per-byte positions dilute the structural states roughly 10x — the harness's second bias on top of the warm cache. 3,145,728 token checks pin cold masks to brute-force `Advance` (exact off the string fast path, subset on it, as already pinned); longest token is 16 B, so the 64 B walk budget never truncates. Verdict: the trie is benign, no code change. True cost is ~19x below the old figure: under 1% of a 0.4 ms step, not 12%.
+
+**Crossover re-run, round 5 (same box, `tools/native_crossover.py`).** Numpy `Whistle(cact, quant=set())` (empty set is the float reference; a bare `False` hits a `set()` bug in `golden_whistle.encode`) versus `needle_embed` from `ref/native/libneedle3.so` on identical 16 kHz input; managed frames via `Whistle.Embed` at 4 threads (`/tmp/v01/zdump`, public API only). Test three-way: numpy–native 3.18% / 0.999521, managed–numpy 1.14% / 0.999933, managed–native 3.45% / 0.999436 — cosines match round 2 (0.999528 / 0.999915 / 0.999467) to 4 decimals. Clips: record 2.76%, test 3.18%, hotword 1.62%, long25 1.20%; synthetics: zeros 0.91%, broadband 0.87%, pure tone 33.47%. The quiet-frame lead reproduces: test worst frames are 27/232/231/230/199 (the 27–29 and 230–233 onsets) and quiet-tercile error is 3.55% versus 2.12% mid / 2.44% loud. (My phase-jump narrowband gaps only 1.2% — that construction is less sparse than round 3's 31% probe, not a contradiction; the tone probe carries the sparsity point.) Native is bit-deterministic across embeds (max abs diff 0). No fix landed — the residue is directional and formula-level; the beam-3 default stands. Transcript-level crossover (native frames into the managed decoder at beam 4) was not re-run: the encoder verdict needs no source changes.
 
 ## 3. Engineering rules
 
