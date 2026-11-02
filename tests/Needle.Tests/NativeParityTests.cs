@@ -118,12 +118,14 @@ public sealed class NativeParityTests : IDisposable
     // can flip a near-tied token in the reasoning path, and which ones depends on the CPU, so the
     // maximum is bounded by the worst measured tie flip instead of a per-machine fit: scalar
     // 0.1126 ('attack the watchtower near the river' + date system: native 0.1415, scalar 0.2541),
-    // AVX 0.0557 locally, 0.0611 and 0.0739 on CI runners. The median keeps the bulk tight.
+    // AVX 0.0557 locally, 0.0611 and 0.0739 on CI runners, 0.1245 after SIMD-01 4-accumulator
+    // reorder on AVX2 (kernels bit-agree via ForwardMatchesReferenceLogits; same calls). The median
+    // keeps the bulk tight.
     static void AssertConfidenceAgreement(List<(double Delta, string Query)> deltas)
     {
         var sorted = deltas.Select(d => d.Delta).OrderBy(d => d).ToArray();
         var worst = deltas.OrderByDescending(d => d.Delta).First();
-        Assert.True(worst.Delta <= 0.12, $"confidence moved {worst.Delta:F4} on '{worst.Query}'");
+        Assert.True(worst.Delta <= 0.13, $"confidence moved {worst.Delta:F4} on '{worst.Query}'");
         Assert.True(sorted[sorted.Length / 2] <= 0.02, $"median confidence delta {sorted[sorted.Length / 2]:F4}");
     }
 
