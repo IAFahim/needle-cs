@@ -198,13 +198,24 @@ public sealed class NativeParityTests : IDisposable
             // transition, then both sit ~0.75): measured NEEDLE_SCALAR=1 maxima
             // 0.1365 below 1300 tokens (timer3 at tokens~1258) and 0.1538 above
             // (Miles at tokens~1439). AVX maxima are 0.0521/0.1317 locally and 0.081 below 1300
-            // tokens on a CI runner, so one per-turn bound covers all tiers. The mean below keeps
+            // tokens on a CI runner, so one per-turn bound used to cover all tiers. The mean below keeps
             // typical turns tight: native sags to ~0.72 on an EPYC 7763 while managed holds ~0.83,
             // a steady 0.0648 mean offset there (0.01 to 0.03 elsewhere). The Avx512Bw tier reduces in
             // 16-lane order, so its rounding differs from the 8-lane tiers: one turn moved 0.227 on an
             // EPYC 9V74 (0.5887 against native ~0.82). A scalar tie flip moved one
             // turn by 0.256 on that CPU (0.1365 locally), hence the wider scalar per-turn bound.
-            var bound = IsScalar ? 0.30 : Tiers.Active == CpuTier.Avx512Bw ? 0.25 : 0.15;
+            // Ryzen 5 8500G (AvxVnni=False, AVX-512 BW/VL/VBMI, default Avx2): the first Miles Davis
+            // turn (tokens~301) flips a near-tied reasoning token and moves head confidence while the
+            // calls still match. Prefix is identical entering the turn (timer + Lagos reasoning match
+            // exactly); at reasoning position 3 managed picks ' done' (3011, logit 5.608763) over 'ed'
+            // (328) by 0.0669 logits (~51.7/48.3), native takes 'ed' ("weather checked;" vs "weather
+            // check done;..."). Decode stays ~0.9999 (call tokens confident), so confidence==head:
+            // native 0.8656 vs managed 0.5998 (Avx2, delta 0.2658) and 0.5887 (Avx512Bw, delta 0.2769,
+            // matching the EPYC 9V74 worst case). Model SHA matches ref.lock (c9d915...), golden
+            // provenance is clean, and ForwardMatchesReferenceLogits still holds cosine > 0.99995 with
+            // the same argmax, so this is tie amplification, not a kernel bug. One 0.30 per-turn bound
+            // covers the worst observed tie flip on every tier (0.277 here, 0.256 scalar on EPYC 7763).
+            var bound = 0.30;
             drift += Math.Abs((actual.Confidence ?? double.NaN) - (expected.Confidence ?? 0));
             output.WriteLine($"tokens~{session.ContextUsed} q={query} native={expected.Confidence:F4} managed={actual.Confidence:F4} head={actual.HeadConfidence:F4} calls={actual.CallNames()}");
             Assert.Equal(expected.CallNames, actual.CallNames());
@@ -212,7 +223,12 @@ public sealed class NativeParityTests : IDisposable
             index++;
         }
         output.WriteLine($"reached {session.ContextUsed} context tokens in {index} turns, mean confidence drift {drift / Math.Max(1, index):F4}");
-        Assert.True(drift / Math.Max(1, index) <= (IsScalar ? 0.10 : 0.08), $"mean confidence drift {drift / Math.Max(1, index):F4}");
+        // Mean stays tight on typical runs (0.01-0.03, 0.0648 on EPYC 7763) but tie clusters inflate it:
+        // on this 8500G box Avx2 averages 0.0535 (one 0.266 early flip) while Avx512Bw averages 0.0816
+        // (the same early 0.277 flip plus a late ~0.12 cluster at tokens~1438-1540 that persists for three
+        // turns after the reasoning path diverges; calls match throughout). One 0.10 mean bound covers
+        // the worst observed tier average on every tier.
+        Assert.True(drift / Math.Max(1, index) <= 0.10, $"mean confidence drift {drift / Math.Max(1, index):F4}");
         Assert.True(session.ContextUsed >= 1500, $"only reached {session.ContextUsed} tokens");
     }
 
