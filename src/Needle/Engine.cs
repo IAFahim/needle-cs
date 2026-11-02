@@ -649,7 +649,6 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
             EngramMatMul(in job, member, members);
             Pool.Barrier(job.Barrier);
             EngramBlend(in job, member, members);
-            Pool.Barrier(job.Barrier);
         }
         if (member == 0) job.Clock.Lap(Stage.Engram);
         AttentionPrepare(in job, member, members);
@@ -666,9 +665,7 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         AttentionOut(in job, member, members);
         Pool.Barrier(job.Barrier);
         PostNorm(in job, member, members);
-        Pool.Barrier(job.Barrier);
         Mlp(in job, member, members);
-        Pool.Barrier(job.Barrier);
         Combine(in job, member, members);
     }
 

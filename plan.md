@@ -238,6 +238,28 @@ Findings for #20. (a) The gate (T=2..8 ≤ 1.3x T=1) is unmet on every tier; bes
 
 GEMV edge-norm wart fixed the same day (`Gemv.cs`: `CorrectionsAtEdge` + the two `Row4`/`Row2` edge branches now sign-extend the half bits via `(short)`, so the fp16 sign lands in the float sign; bit-identical on the non-negative scales real models carry). Parity on the four tiers after the fix: default/avx2/avx512 20/21, scalar 21/21 — the single failure is `LongContextStaysCloseToNative`'s Miles-Davis turn (native 0.8656 vs managed ~0.60, Δ≈0.27 > 0.15/0.25 bounds), which reproduces identically on the pristine base commit, so it is a pre-existing CPU-specific tie amplification, not a regression.
 
+#### Layer-team barrier fusion + spin re-decision (2026-11-02, same box, quiet, serial runs)
+
+Method: `bench-e2e --threads 1,4 --reps 5 --sets golden --profile`, interleaved fused-vs-HEAD A/B in identical quiet-box worktrees (only `Engine.cs` differs, 3 lines); best of reps per cell, each 4T cell replicated. 1T (single member, team barriers no-op) is the no-change control.
+
+Change (`src/Needle/Engine.cs`, 3 lines removed, numerics-preserving): dropped the team barriers between same-token-partition elementwise stages — PostNorm→Mlp, Mlp→Combine (all three shard `count` identically, so producer and consumer are the same member) and the EngramBlend→AttentionPrepare barrier on site layers (same argument; the member-0 history save it brackets is read only by the next token, ordered by the RunTeam join). All cross-partition barriers (Prepare→QKVG, Core→Gate, Gate→Out, Out→PostNorm, Gather→MatMul→Blend) and all member-0 publish barriers (history Loads, arrivals zeroing) stay. Team barriers per token: 275 → 230 (15×11 + 5×10 across 20 layers / 5 engram sites); `Pool.Run`/token stays 21.0 (20 layer teams + head, asserted by `BenchHarnessTests`).
+
+Retained deliberately after measurement: the Taps→SaveHistory barrier looks redundant (Save reads `QRaw` tails while other members' `Taps3` reads overlapping `QRaw` windows — read-read) but removing it deterministically breaks `ForwardMatchesReferenceLogits` (chunk-64/threads-8 cosine 0.99973 vs the >0.99995 bound; 3/3 fail without, 4/4 pass with on a clean tree). Same-partition reasoning does not cover that trio — do not fuse it without parity proof. The QKVG→Taps and Heads→Core outer barriers were likewise kept (their inner F1/H1 joins looked sufficient but were not isolated as safe). `RowsPerTask` coarsening was evaluated and rejected: the heterogeneous QKVG batch (576/96/128/768 rows) would idle members (6 tasks over 4 members); the current 3-tasks-per-thread (~12–13 tasks) balances better and homogeneous batches already balance — no change.
+
+Results (mean of the 2 golden prompts, decode µs/token best):
+
+| cell | HEAD | fused | Δ |
+|---|---|---|---|
+| 1T prefill ms | 14.58 | 14.56 | ~0 (control, as expected) |
+| 1T decode | 1142 | 1139 | ~0 (control) |
+| 4T prefill ms | 6.64 | 6.45 | −3% best |
+| 4T decode | 841 | 812 | −3.4% best (29 µs) |
+| Pool.Run/token | 21.0 | 21.0 | unchanged |
+
+#33 spin re-decision at the new barrier count (`NEEDLE_SPIN_US` on the fused binary, reps 5): 4T mean decode best 832 (50 µs) vs 841 (300 µs); 1T 1158 vs 1176 (no workers at 1T — pure noise control). All inside the 812–846 run band: spin explains none of the variance, since dispatches land every ~40 µs during decode and workers never park mid-call under either setting. Decision: keep `DefaultSpinMicroseconds = 300` (`Game` stays 50) — no evidence 50 is free across bursty game gaps, and 300 keeps the #6 wake-storm protection; the frame-budget hint (#33 item 2) already exists (`FrameBudget` + `FrameBudgetHit` wiring, covered by `PoolTests`/`JumpForward`/`Speculative`/`SpanApi`/`Service` tests). No code change for #33.
+
+Design notes: the pool is a two-phase waiter (spin `spinTicks`, then park) and the layer team is a centralized sense barrier over one shared `TeamBarrier` — the small-N regime where centralized barriers win (O(N) on one line for N ≤ 8 members; https://www.cs.rice.edu/~johnmc/papers/tocs91.pdf, https://unseel.com/cs/barrier-synchronization), with spin-then-park set past the context-switch cost (https://www.cs.huji.ac.il/labs/parallel/stud/Tsafrir-MsC.pdf).
+
 ### 2.9 Unity W23 proofs (2026-10-30, in-Editor 7000.0.0a12, Linux x64)
 
 - **64-NPC load (LoadProof harness, 1.2 s cadence ≈ 50 asks/min/NPC, 120 warmup + 600 measured frames, two runs):** main-thread managed allocations in the per-frame NPC pump bracket: **0 bytes, 0 nonzero frames** both runs. 38–39 replies per run, 100% carrying dispatched tool calls (`MoveTo`/`GiveItem`); 64 asks pending at end (engine does ~1 reply/s on 2 threads vs ~53 asks/s offered — saturation is expected, the Unity side stays flat).
