@@ -92,24 +92,41 @@ jobs:
     runs-on: ${{ matrix.os }}
     continue-on-error: ${{ matrix.expected-fail }}
     timeout-minutes: 90
-    # Per-job policy (never a blanket flag; originally for issue #32). The
-    # linux legs are required-green: linux-x64 is the primary gate (suite +
-    # NEEDLE_SCALAR=1 rerun + netstandard2.1 + NativeAOT publish/smoke) and
-    # linux-arm64 covers NeonTests natively plus the NEON widening fallback
-    # tier (NEEDLE_NODP=1).
-    # windows-x64 unit+core are required-green since the #49 fetch.sh fix
-    # (Git bash resolution a689371 + LF checkout eb1b596): 7 consecutive
-    # green runs on both shards through 41423270190, including all
-    # FormatTests on windows runners. Known remaining red, classified, not
-    # waived:
-    #  - windows-x64/heavy stays expected-fail for the speech-numerics flake
-    #    in #38/#48 (SpeechTests.LongClipMatchesUpstreamThroughTheQueenPassage
-    #    failed once on 41348708967; green on the 5 runs since);
-    #  - macos-arm64 stays expected-fail pending the #48 TokenFrames
-    #    IndexOutOfRange (heavy legs) and native parity skips where the
-    #    upstream wheel has no usable library (wheel is manylinux x86-64
-    #    only; NativeParityTests.TryLoad returns null and each test skips
-    #    with a message instead of throwing).
+    # Per-job policy (never a blanket flag; originally for issue #32). Every
+    # leg below is required-green; expected-fail returns only for new,
+    # unobserved probes, and only with an issue link. Evidence is completed
+    # runs on master (cancelled legs are cancel-in-progress scheduling
+    # fallout, not results):
+    #  - linux-x64 is the primary gate (suite + NEEDLE_SCALAR=1 rerun +
+    #    netstandard2.1 + NativeAOT publish/smoke).
+    #  - linux-arm64 covers NeonTests natively plus the NEON widening
+    #    fallback tier (NEEDLE_NODP=1); tier log on 41375210271: NeonDot.
+    #  - windows-x64 runs the AVX tier matrix it supports (tier log: Avx2,
+    #    no VNNI/512 on windows-latest). Heavy joined unit+core as
+    #    required-green: green on every completed run since 41348708967
+    #    (verified 6/6 across 41366006614-41427532179). The #38/#48
+    #    speech-numerics flake cited before (LongClip failed once on
+    #    41348708967) has not recurred on windows since.
+    #  - macos-arm64 unit (6/6 green) and core (3/3 executed) promoted;
+    #    heavy promoted on two consecutive green completions (41372129451,
+    #    41375210271). Tier log: NeonDot (AdvSimd+Dp), so NeonTests execute
+    #    natively here too; unit+core now also run the NEEDLE_NODP=1
+    #    fallback. Heavy stays neon:false: it already runs longest and the
+    #    fallback is covered by unit+core. History: 41366006614 heavy
+    #    failed WhistleStageTests.StagesMatchTheNumpyReference plus two
+    #    ZeroAllocation 5-minute timeouts (see #40); watch for recurrence.
+    #    The hang watchdog now covers macos-arm64 for the same reason
+    #    (BSD top lacks the per-thread flags, so only the dotnet-stack
+    #    dumps apply there).
+    #  - linux-x64-noavx512 (DOTNET_EnableAVX512F=0 experiment, AVX2
+    #    fallback path) promoted after 5 consecutive green runs; history:
+    #    41366006614 failed GenerationMatchesReferenceGreedyDecode +
+    #    LongContextStaysCloseToNative, the same flake family as the
+    #    required legs, not tier-specific.
+    # No macos-x64 leg: the last stable Intel image (macos-13) retired Dec
+    # 2025; Intel-only coverage stays on windows/linux x64. No
+    # windows-arm64 leg yet (image GA Aug 2026): unobserved with no owner,
+    # so no probe leg either — see plan.md for the validation plan.
     strategy:
       fail-fast: false
       matrix:
@@ -137,7 +154,7 @@ jobs:
             shard: heavy
           - name: linux-x64-noavx512
             os: ubuntu-latest
-            expected-fail: true
+            expected-fail: false
             scalar: false
             netstandard: false
             neon: false
@@ -180,28 +197,28 @@ jobs:
             shard: core
           - name: windows-x64
             os: windows-latest
-            expected-fail: true
+            expected-fail: false
             scalar: false
             netstandard: false
             neon: false
             shard: heavy
           - name: macos-arm64
             os: macos-14
-            expected-fail: true
+            expected-fail: false
             scalar: false
             netstandard: false
-            neon: false
+            neon: true
             shard: unit
           - name: macos-arm64
             os: macos-14
-            expected-fail: true
+            expected-fail: false
             scalar: false
             netstandard: false
-            neon: false
+            neon: true
             shard: core
           - name: macos-arm64
             os: macos-14
-            expected-fail: true
+            expected-fail: false
             scalar: false
             netstandard: false
             neon: false
@@ -232,7 +249,7 @@ jobs:
           grep -m1 'model name' /proc/cpuinfo 2>/dev/null || sysctl -n machdep.cpu.brand_string 2>/dev/null || powershell -NoProfile -Command '(Get-CimInstance Win32_Processor).Name' 2>/dev/null || true
 
       - name: Hang watchdog (stacks + per-thread CPU before the blame fuse)
-        if: matrix.shard != 'unit' && (startsWith(matrix.name, 'linux-x64') || matrix.name == 'linux-arm64')
+        if: matrix.shard != 'unit' && (startsWith(matrix.name, 'linux-x64') || matrix.name == 'linux-arm64' || matrix.name == 'macos-arm64')
         run: |
           dotnet tool install dotnet-stack --tool-path "$RUNNER_TEMP/diag"
           mkdir -p hang-snapshots
