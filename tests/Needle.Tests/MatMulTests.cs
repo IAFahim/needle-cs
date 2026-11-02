@@ -62,6 +62,29 @@ public sealed unsafe class MatMulTests : IDisposable
         AssertClose(expected, actual, tokens * rows);
     }
 
+    [Theory]
+    [InlineData(2, 5, 768, 2)]
+    [InlineData(2, 7, 768, 4)]
+    [InlineData(2, 97, 768, 8)]
+    [InlineData(4, 5, 768, 3)]
+    [InlineData(4, 7, 768, 6)]
+    [InlineData(2, 24, 3072, 5)]
+    [InlineData(4, 320, 3072, 9)]
+    public void PanelTilesMatchScalarWhenEnabled(int bits, int rows, int cols, int tokens)
+    {
+        if (Environment.GetEnvironmentVariable("NEEDLE_PANEL") == null) return;
+        var random = new Random(rows * 31 + cols + bits);
+        var w = Weights(random, rows, cols, bits);
+        var a = Prepared(random, tokens, cols, bits);
+        var expected = (float*)Allocate((nuint)(tokens * rows) * 4);
+        var actual = (float*)Allocate((nuint)(tokens * rows) * 4);
+        Fill(expected, tokens * rows, Sentinel);
+        Fill(actual, tokens * rows, Sentinel);
+        Scalar.MatMulRows(w, a, tokens, expected, rows, 0, rows);
+        Quant.MatMulRows(w, a, tokens, actual, rows, 0, rows);
+        AssertClose(expected, actual, tokens * rows);
+    }
+
     [Fact]
     public void HalfToSingleDecodesEveryFiniteBitPatternPerIeee754()
     {
