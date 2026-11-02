@@ -149,8 +149,12 @@ internal static unsafe class Ops
         if (!Simd.Enabled) { Scalar.Softmax(s, n); return; }
 #if NEEDLE_SIMD
         if (Tiers.Active == CpuTier.Avx512Bw) { OpsAvx512.Softmax(s, n); return; }
-        var peak = float.NegativeInfinity;
-        for (var i = 0; i < n; i++) peak = MathF.Max(peak, s[i]);
+        var peakVector = Vector256.Create(float.NegativeInfinity);
+        var peakEnd = n & ~7;
+        var p = 0;
+        for (; p < peakEnd; p += 8) peakVector = Avx.Max(peakVector, Avx.LoadVector256(s + p));
+        var peak = Max8(peakVector);
+        for (; p < n; p++) peak = MathF.Max(peak, s[p]);
         var shift = Vector256.Create(peak);
         var sum = Vector256<float>.Zero;
         var vectorEnd = n & ~7;

@@ -410,6 +410,12 @@ internal static unsafe class Attention
         var valueScales = tile.ValueScales + (long)tile.First * tile.ScaleStride;
         for (var s = 0; s < tile.Count; s++)
             Avx.Store(scores + s * Lanes, Avx.Multiply(Avx.LoadVector256(scores + s * Lanes), Vector256.Create(valueScales[(long)s * tile.ScaleStride])));
+        if (tile.Heads == MaxTileHeads)
+        {
+            for (var firstDim = 0; firstDim < VDim; firstDim += 16)
+                AccumulateFloatSix(tile, inverse, firstDim);
+            return;
+        }
         for (var firstHead = 0; firstHead < tile.Heads; firstHead += 3)
             for (var firstDim = 0; firstDim < VDim; firstDim += 32)
                 switch (tile.Heads - firstHead)
@@ -418,6 +424,72 @@ internal static unsafe class Attention
                     case 2: AccumulateFloat<TwoHeads>(tile, inverse, firstHead, firstDim); break;
                     default: AccumulateFloat<ThreeHeads>(tile, inverse, firstHead, firstDim); break;
                 }
+    }
+
+    // One V-row read feeds all six query heads of a GQA group. The 3-head
+    // chunked path above loads and converts every V row twice per group;
+    // here the six heads accumulate side by side over 16-wide dim slices
+    // (6 heads x 2 vectors = 12 chains, inside the 16-register budget), so
+    // the byte traffic halves while the per-head sum order over s is
+    // unchanged.
+    static void AccumulateFloatSix(in AttentionTile tile, float* inverse, int firstDim)
+    {
+        var a00 = Vector256<float>.Zero;
+        var a01 = a00;
+        var a10 = a00;
+        var a11 = a00;
+        var a20 = a00;
+        var a21 = a00;
+        var a30 = a00;
+        var a31 = a00;
+        var a40 = a00;
+        var a41 = a00;
+        var a50 = a00;
+        var a51 = a00;
+        var count = tile.Count;
+        var rows = tile.Values + (long)tile.First * tile.ValueStride + firstDim;
+        var rowStride = tile.ValueStride;
+        var weights = tile.Scores;
+        for (var s = 0; s < count; s++)
+        {
+            var row = rows + (long)s * rowStride;
+            if (Sse.IsSupported) Sse.Prefetch0(row + 4 * rowStride);
+            var v0 = Avx.ConvertToVector256Single(Avx2.ConvertToVector256Int32(row));
+            var v1 = Avx.ConvertToVector256Single(Avx2.ConvertToVector256Int32(row + 8));
+            var w0 = Avx.BroadcastScalarToVector256(weights + s * Lanes);
+            a00 = Fma.MultiplyAdd(w0, v0, a00);
+            a01 = Fma.MultiplyAdd(w0, v1, a01);
+            var w1 = Avx.BroadcastScalarToVector256(weights + s * Lanes + 1);
+            a10 = Fma.MultiplyAdd(w1, v0, a10);
+            a11 = Fma.MultiplyAdd(w1, v1, a11);
+            var w2 = Avx.BroadcastScalarToVector256(weights + s * Lanes + 2);
+            a20 = Fma.MultiplyAdd(w2, v0, a20);
+            a21 = Fma.MultiplyAdd(w2, v1, a21);
+            var w3 = Avx.BroadcastScalarToVector256(weights + s * Lanes + 3);
+            a30 = Fma.MultiplyAdd(w3, v0, a30);
+            a31 = Fma.MultiplyAdd(w3, v1, a31);
+            var w4 = Avx.BroadcastScalarToVector256(weights + s * Lanes + 4);
+            a40 = Fma.MultiplyAdd(w4, v0, a40);
+            a41 = Fma.MultiplyAdd(w4, v1, a41);
+            var w5 = Avx.BroadcastScalarToVector256(weights + s * Lanes + 5);
+            a50 = Fma.MultiplyAdd(w5, v0, a50);
+            a51 = Fma.MultiplyAdd(w5, v1, a51);
+        }
+        var output = tile.Output + firstDim;
+        StoreScaledPair(output, a00, a01, inverse[0]);
+        StoreScaledPair(output + VDim, a10, a11, inverse[1]);
+        StoreScaledPair(output + 2 * VDim, a20, a21, inverse[2]);
+        StoreScaledPair(output + 3 * VDim, a30, a31, inverse[3]);
+        StoreScaledPair(output + 4 * VDim, a40, a41, inverse[4]);
+        StoreScaledPair(output + 5 * VDim, a50, a51, inverse[5]);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    static void StoreScaledPair(float* output, Vector256<float> a0, Vector256<float> a1, float factor)
+    {
+        var scale = Vector256.Create(factor);
+        Avx.Store(output, Avx.Multiply(a0, scale));
+        Avx.Store(output + 8, Avx.Multiply(a1, scale));
     }
 
     static void AccumulateFloat<THeads>(in AttentionTile tile, float* inverse, int firstHead, int firstDim) where THeads : struct, IHeadCount

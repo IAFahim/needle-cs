@@ -245,6 +245,62 @@ GEMV edge-norm wart fixed the same day (`Gemv.cs`: `CorrectionsAtEdge` + the two
 - **Voice end to end in PlayMode** (`whistle.cact` + `test.wav` from StreamingAssets, `PushToTalk` streaming + `Release`): full 41-word transcript, not truncated. 4-thread `Transcribe` matches upstream exactly ("creating a way of file", "Wi-Fi"); the sample default 1-thread lands on the known beam knife-edge ("grading away a file"). So the transcript is **thread-count-sensitive** — `ThreadCountDoesNotChangeTheTranscript` only pins `record.wav`, not the knife-edge clip; evidence for #38, not a W23 problem. The sample is unchanged (still 1 thread).
 - **Repro:** the harness lives in the test project only (`Assets/LoadProof/LoadProof.cs`, dormant `LoadProof` GameObject in `NeedleTest.unity`); rerun = enter PlayMode, read the `LOADPROOF` console line.
 
+### 2.10 MLP/attention stage work, issues #37 (MLP ≤ 60 µs/tok) and #41 (attention ≤ 50 µs/tok)
+
+Shipped (2026-11-02, `Blocks.cs` + `Ops.cs` only): (a) GQA-shared V accumulate — one V-row read feeds all six query heads of a GQA group (`AccumulateFloatSix`: 6 heads x 2 vecs = 12 chains, inside the 16-ymm budget; the 3-head chunked path loaded and converted every V row twice). Per-head sums keep ascending-s order, so the output is bit-identical to the chunked path. (b) Vectorized `Ops.Softmax` peak reduction (AVX max fold + scalar tail; max is exact, so bits are unchanged). (c) One `Sse.Prefetch0` (4 rows ahead) in the shared-V loop; Kron prefetch skipped (4 KB working set is L1-resident). Research: 10 unrolled FMA chains saturate AVX2/FMA ports ([MicroArchBench](https://github.com/Olajide-Badejo/MicroArchBench)); 4-row GEMV blocking on Zen 3 ([ZenGEMV](https://annals-csis.org/Volume_47/drp/6278.html)); single-KV-shared-across-heads formulation ([GQA](https://arxiv.org/html/2305.13245v3/)); ~5% from prefetch distance tuning ([llama.cpp #768](https://github.com/ggerganov/llama.cpp/pull/768)); FMA latency/throughput tables ([Agner Fog](https://www.agner.org/optimize/instruction_tables.pdf)).
+
+Negative result, reverted: 16-chain `KronAvx2Wide32` (4 rows x 4 vecs, single 32-wide chunk). Isolated micro (`activeRows` 24/32, best of 2000): 0.956x / 1.313x vs the 8-chain `KronAvx2` — doubling the chains doubles the per-iteration FMA work (16 FMAs = 8 cycles at 2/cycle) past the ~5-cycle latency it was meant to hide, so the wider kernel goes throughput-bound and loses; 12 chains (the ~10-chain sweet spot) is unreachable with power-of-2 blocking on 32x32. Removed with no trace (method + dispatch + test deleted).
+
+Method: `bench-e2e --profile` golden set, reps 5, interleaved base/patched alternating order, 5 rounds, best-of-5 per stage per thread count, clean-HEAD worktree + patch (sibling WIP kept out of the tree). Base == HEAD `21f4f79`, patched == base + (a)–(c) above (sweep ran with Wide32 still in: the mlp patched column below carries its ~+3% regression; post-revert mlp is expected ≈ base — the box sat at load 29–40 during the confirmatory window, so no trustworthy re-measure exists yet).
+
+T=1 decode µs/token, best-of-5 (targets: mlp ≤ 60, attention_core ≤ 50 — neither met):
+
+| stage | base | patched | delta |
+|---|---|---|---|
+| embed | 0.8 | 0.8 | +0.0% |
+| hyper_prepare | 40.7 | 41.9 | +2.9% |
+| hyper_phi | 27.9 | 29.3 | +5.0% |
+| hyper_mix | 11.8 | 12.2 | +3.4% |
+| engram | 95.6 | 100.0 | +4.6% |
+| attention_prep | 12.2 | 12.6 | +3.3% |
+| attention_qkvg | 316.5 | 330.1 | +4.3% |
+| attention_post_projection | 25.9 | 27.3 | +5.4% |
+| attention_core | 131.0 | 120.5 | −8.0% |
+| attention_gate | 14.3 | 14.6 | +2.1% |
+| attention_out | 150.0 | 157.6 | +5.1% |
+| attention_post_norm | 4.4 | 4.6 | +4.5% |
+| cross | 0.0 | 0.0 | — |
+| mlp | 123.7 | 128.5 | +3.9% (Wide32 regression, reverted) |
+| combine | 7.4 | 7.5 | +1.4% |
+| logits | 91.7 | 92.2 | +0.5% |
+| unattributed | 3.7 | 4.0 | +8.1% |
+| total | 1060.0 | 1090.5 | +2.9% |
+
+T=4 decode µs/token, best-of-5:
+
+| stage | base | patched | delta |
+|---|---|---|---|
+| embed | 0.8 | 0.8 | +0.0% |
+| hyper_prepare | 86.3 | 86.4 | +0.1% |
+| hyper_phi | 10.6 | 10.9 | +2.8% |
+| hyper_mix | 37.4 | 35.9 | −4.0% |
+| engram | 57.8 | 58.3 | +0.9% |
+| attention_prep | 19.4 | 19.3 | −0.5% |
+| attention_qkvg | 151.4 | 149.5 | −1.3% |
+| attention_post_projection | 39.1 | 34.4 | −12.0% |
+| attention_core | 60.6 | 58.8 | −3.0% |
+| attention_gate | 30.2 | 29.9 | −1.0% |
+| attention_out | 58.9 | 58.0 | −1.5% |
+| attention_post_norm | 18.0 | 10.3 | −42.8% (small absolute, noisy) |
+| cross | 0.0 | 0.0 | — |
+| mlp | 146.5 | 150.7 | +2.9% (Wide32 regression, reverted) |
+| combine | 10.8 | 10.7 | −0.9% |
+| logits | 37.7 | 37.7 | +0.0% |
+| unattributed | 4.1 | 4.3 | +4.9% |
+| total | 801.8 | 777.5 | −3.0% |
+
+Verdict: no stage hits its target (closest: T=4 attention_core 58.8 vs 50; mlp 146–150 vs 60 needs intra-token parallelism, which is an `Engine.cs` sharding change owned by Barrier13). The uniform ±2–5% drift on untouched stages across T=1/T=4 is load noise, not signal — only attention_core moves the same direction twice (−8.0%/−3.0%). No tier regressed: MatMul/Kernel/Parity green on all four tiers with the final code (default 382/382, `NEEDLE_TIER=scalar` 160/160, `NEEDLE_TIER=avx512` 160/160, `NEEDLE_NOAVX512=1` 160/160, clean worktree). Scalar-epilogue and finer-chunking notes: the Softmax peak is now the only vectorized change standing (exact max, no bit change); `AttentionBatch` chunking is already maxed at decode (`MinChunkPositions` never binds: count ≈ 126 ≥ 2 × 48 with 2 chunks at T=4), so no chunking change shipped.
+
 ## 3. Engineering rules
 
 1. **No comments.** Names, types and data layout carry the meaning. A stranger should learn the domain, not the author's mood.
