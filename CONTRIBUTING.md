@@ -83,6 +83,10 @@ Refresh procedure, only when you deliberately adopt a new upstream model:
 
 `ref/` stays git-ignored. Never commit the lock-listed files themselves.
 
+## Benchmark discipline
+
+Report numbers only from a quiet box (load below 2), interleaved A/B, best of at least 5. Run `needle cpu` in the same shell and paste its `active tier` line with every row: since #51 a forced `NEEDLE_TIER` the CPU does not support fails loud instead of benchmarking the wrong tier. When the shared tree holds others' uncommitted WIP, verify in an isolated worktree (`git worktree` with only your files): shared-tree runs confound results.
+
 ## Pull request checklist
 
 From `plan.md` section 8 and section 7.

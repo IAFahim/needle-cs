@@ -103,8 +103,22 @@ internal static class Tiers
 
     static CpuTier Select()
     {
-        if (TryParseTier(Environment.GetEnvironmentVariable("NEEDLE_TIER"), out var forced) && Supported(forced))
+        return Resolve(Environment.GetEnvironmentVariable("NEEDLE_TIER"));
+    }
+
+    internal static CpuTier Resolve(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+            return Auto();
+        if (TryParseTier(raw, out var forced) && Supported(forced))
             return forced;
+        var requested = TryParseTier(raw, out var named) ? named.ToString() : "unknown tier '" + raw + "'";
+        throw new InvalidOperationException(
+            $"NEEDLE_TIER={raw} requests {requested}, which is unsupported on this CPU (auto-pick is {Auto()}). Unset NEEDLE_TIER to run the auto-picked tier.");
+    }
+
+    static CpuTier Auto()
+    {
         if (Environment.GetEnvironmentVariable("NEEDLE_SCALAR") != null)
             return CpuTier.Scalar;
         return Best();
