@@ -188,6 +188,7 @@ public sealed class NativeParityTests : IDisposable
         var turn = new[] { "set a timer for 5 minutes", "what's it like in Lagos right now?", "play some Miles Davis", "set a timer for 3 minutes" };
         var index = 0;
         var drift = 0.0;
+        var forked = false; // native and managed trajectories have diverged after a reasoning flip
         while (session.ContextUsed < 1500 && index < 64)
         {
             var query = turn[index % turn.Length];
@@ -198,12 +199,12 @@ public sealed class NativeParityTests : IDisposable
             // transition, then both sit ~0.75): measured NEEDLE_SCALAR=1 maxima
             // 0.1365 below 1300 tokens (timer3 at tokens~1258) and 0.1538 above
             // (Miles at tokens~1439). AVX maxima are 0.0521/0.1317 locally and 0.081 below 1300
-            // tokens on a CI runner, so one per-turn bound used to cover all tiers. The mean below keeps
+            // tokens on a CI runner. The mean below keeps
             // typical turns tight: native sags to ~0.72 on an EPYC 7763 while managed holds ~0.83,
             // a steady 0.0648 mean offset there (0.01 to 0.03 elsewhere). The Avx512Bw tier reduces in
             // 16-lane order, so its rounding differs from the 8-lane tiers: one turn moved 0.227 on an
             // EPYC 9V74 (0.5887 against native ~0.82). A scalar tie flip moved one
-            // turn by 0.256 on that CPU (0.1365 locally), hence the wider scalar per-turn bound.
+            // turn by 0.256 on that CPU (0.1365 locally), an early example of the flip the gate keys on.
             // Ryzen 5 8500G (AvxVnni=False, AVX-512 BW/VL/VBMI, default Avx2): the first Miles Davis
             // turn (tokens~301) flips a near-tied reasoning token and moves head confidence while the
             // calls still match. Prefix is identical entering the turn (timer + Lagos reasoning match
@@ -213,9 +214,18 @@ public sealed class NativeParityTests : IDisposable
             // native 0.8656 vs managed 0.5998 (Avx2, delta 0.2658) and 0.5887 (Avx512Bw, delta 0.2769,
             // matching the EPYC 9V74 worst case). Model SHA matches ref.lock (c9d915...), golden
             // provenance is clean, and ForwardMatchesReferenceLogits still holds cosine > 0.99995 with
-            // the same argmax, so this is tie amplification, not a kernel bug. One 0.30 per-turn bound
-            // covers the worst observed tie flip on every tier (0.277 here, 0.256 scalar on EPYC 7763).
-            var bound = 0.30;
+            // the same argmax, so this is tie amplification, not a kernel bug.
+            // Tie-aware per-turn bound: while native and managed reasoning agree, both engines walk the
+            // same trajectory and 0.15 holds (typical agreement there is ~0.01). Once a reasoning token
+            // flips, the contexts differ for good and later turns compare confounded prefixes, so the
+            // flip turn and everything after it gets the 0.30 tie allowance. The allowance is keyed to
+            // the flip signature (reasoning divergence), calibrated by the measured 0.0669-logit top-2
+            // gap at the flip — native logits are not exposed to the test, and kernel accuracy on
+            // identical inputs is guarded separately by ForwardMatchesReferenceLogits. This covers the
+            // worst observed tie flip on every tier (0.277 Avx512Bw here, 0.256 scalar on EPYC 7763)
+            // while keeping pre-flip turns at full sensitivity to real regressions.
+            if (expected.Reasoning != actual.Reasoning) forked = true;
+            var bound = forked ? 0.30 : 0.15;
             drift += Math.Abs((actual.Confidence ?? double.NaN) - (expected.Confidence ?? 0));
             output.WriteLine($"tokens~{session.ContextUsed} q={query} native={expected.Confidence:F4} managed={actual.Confidence:F4} head={actual.HeadConfidence:F4} calls={actual.CallNames()}");
             Assert.Equal(expected.CallNames, actual.CallNames());
