@@ -73,6 +73,25 @@ public sealed class ParityTests : IDisposable
         Assert.Equal(first, engine.Logits.ToArray());
     }
 
+    // Lagos greedy tie branch: decode step 12 of the Lagos case is a measured near-tie between
+    // closing the echo quote (8121 `'`) and continuing it (1633 `▁right`). Replaying the rollout
+    // step by step on this box (scalar/default x threads 1/8 x runtimes 10.0.12/10.0.14) gives a
+    // top-2 gap of 0.06-0.19 there, while the same configs swing the step-12 top-1 logit by ~0.10
+    // (e.g. scalar 4.09181 vs 4.13271 across builds) — the margin is smaller than demonstrated
+    // cross-environment rounding variation, the same class as the Miles-Davis flip (0.0669 gap,
+    // see NativeParityTests.LongContextStaysCloseToNative). Windows scalar (same Ryzen 5 8500G
+    // silicon, .NET 10.0.12, issue #50 Job 3) takes `▁right` and echoes `right now' -> ...` where
+    // the golden takes `'`; its output `<think>\n'what's it like in Lagos right no...` matches the
+    // forced-continuation replay below exactly through the observed prefix. Every other decode
+    // position in both cases has top-2 gap >= 0.29 (next-smallest: Lagos step 23 at 0.34, Davis
+    // step 9 at 0.40), and ForwardMatchesReferenceLogits still passes on scalar everywhere, so the
+    // kernels agree and only this one decision is environment-sensitive. Both full 40-step branches
+    // reconverge to the same get_weather call with identical bytes on scalar t1/t8 + avx2 t1/t8, so
+    // the test accepts either branch for the Lagos case and stays byte-strict everywhere else; a
+    // third branch (a new flip) still fails loudly.
+    const string LagosQuery = "what's it like in Lagos right now?";
+    const string LagosTieBranch = "<think>\n'what's it like in Lagos right now' -> get_weather with city 'Lagos'.\n</think>\n<tool_call>[{\"name\":\"get_weather\",\"arguments\":{\"c";
+
     [Fact]
     public void GenerationMatchesReferenceGreedyDecode()
     {
@@ -90,7 +109,12 @@ public sealed class ParityTests : IDisposable
             {
                 var result = caller.Complete(Encoding.UTF8.GetBytes(item.GetProperty("query").GetString()!), output, budget);
                 var expected = item.GetProperty("text").GetString()!;
-                Assert.StartsWith(expected, Encoding.UTF8.GetString(output, 0, result.Bytes));
+                var actual = Encoding.UTF8.GetString(output, 0, result.Bytes);
+                if (item.GetProperty("query").GetString() == LagosQuery)
+                    Assert.True(actual.StartsWith(expected, StringComparison.Ordinal) || actual.StartsWith(LagosTieBranch, StringComparison.Ordinal),
+                        $"Lagos greedy left both tie branches:\n{actual}");
+                else
+                    Assert.StartsWith(expected, actual);
             }
         }
     }
