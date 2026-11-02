@@ -124,6 +124,11 @@ internal static unsafe class Ops
         #if NEEDLE_SIMD
         if (Simd.UseNeon) { return Neon.Dot(a, b, n); }
 #endif
+        var kernelFp = Kernels.Active.Dot;
+        if ((void*)kernelFp != null)
+        {
+            return ((delegate* unmanaged[Cdecl]<float*, float*, int, float>)(void*)kernelFp)(a, b, n);
+        }
         if (!Simd.Enabled) return Scalar.Dot(a, b, n);
 #if NEEDLE_SIMD
         if (Tiers.Active == CpuTier.Avx512Bw) return OpsAvx512.Dot(a, b, n);
@@ -163,6 +168,12 @@ internal static unsafe class Ops
 #if NEEDLE_SIMD
         if (Simd.UseNeon) { Neon.RmsUnit(x, n, destination); return; }
 #endif
+        var kernelFp = Kernels.Active.RmsUnit;
+        if ((void*)kernelFp != null)
+        {
+            ((delegate* unmanaged[Cdecl]<float*, int, float*, void>)(void*)kernelFp)(x, n, destination);
+            return;
+        }
         if (!Simd.Enabled) { var scalarInverse = InverseRms(x, n); for (var i = 0; i < n; i++) destination[i] = x[i] * scalarInverse; return; }
 #if NEEDLE_SIMD
         if (Tiers.Active == CpuTier.Avx512Bw) { OpsAvx512.RmsUnit(x, n, destination); return; }
@@ -176,6 +187,12 @@ internal static unsafe class Ops
 #if NEEDLE_SIMD
         if (Simd.UseNeon) { Neon.ZeroCenteredRms(x, scale, n, destination); return; }
 #endif
+        var kernelFp = Kernels.Active.ZeroCenteredRms;
+        if ((void*)kernelFp != null)
+        {
+            ((delegate* unmanaged[Cdecl]<float*, float*, int, float*, void>)(void*)kernelFp)(x, scale, n, destination);
+            return;
+        }
         if (!Simd.Enabled) { var scalarInverse = InverseRms(x, n); for (var i = 0; i < n; i++) destination[i] = (1f + scale[i]) * x[i] * scalarInverse; return; }
 #if NEEDLE_SIMD
         if (Tiers.Active == CpuTier.Avx512Bw) { OpsAvx512.ZeroCenteredRms(x, scale, n, destination); return; }
@@ -195,6 +212,12 @@ internal static unsafe class Ops
         #if NEEDLE_SIMD
         if (Simd.UseNeon) { Neon.Softmax(s, n); return; }
 #endif
+        var kernelFp = Kernels.Active.Softmax;
+        if ((void*)kernelFp != null)
+        {
+            ((delegate* unmanaged[Cdecl]<float*, int, void>)(void*)kernelFp)(s, n);
+            return;
+        }
         if (!Simd.Enabled) { Scalar.Softmax(s, n); return; }
 #if NEEDLE_SIMD
         if (Tiers.Active == CpuTier.Avx512Bw) { OpsAvx512.Softmax(s, n); return; }
@@ -231,6 +254,12 @@ internal static unsafe class Ops
         #if NEEDLE_SIMD
         if (Simd.UseNeon) { Neon.Rope(x, heads, headDim, cos, sin); return; }
 #endif
+        var kernelFp = Kernels.Active.Rope;
+        if ((void*)kernelFp != null)
+        {
+            ((delegate* unmanaged[Cdecl]<float*, int, int, float*, float*, void>)(void*)kernelFp)(x, heads, headDim, cos, sin);
+            return;
+        }
         if (!Simd.Enabled) { Scalar.Rope(x, heads, headDim, cos, sin); return; }
 #if NEEDLE_SIMD
         var half = headDim / 2;
@@ -256,6 +285,12 @@ internal static unsafe class Ops
         #if NEEDLE_SIMD
         if (Simd.UseNeon) { Neon.Mix4(s, dim, w0, w1, w2, w3, destination); return; }
 #endif
+        var kernelFp = Kernels.Active.Mix4;
+        if ((void*)kernelFp != null)
+        {
+            ((delegate* unmanaged[Cdecl]<float*, int, float, float, float, float, float*, void>)(void*)kernelFp)(s, dim, w0, w1, w2, w3, destination);
+            return;
+        }
         if (!Simd.Enabled) { Scalar.Mix4(s, dim, w0, w1, w2, w3, destination); return; }
 #if NEEDLE_SIMD
         if (Tiers.Active == CpuTier.Avx512Bw) { OpsAvx512.Mix4(s, dim, w0, w1, w2, w3, destination); return; }
@@ -279,6 +314,12 @@ internal static unsafe class Ops
         #if NEEDLE_SIMD
         if (Simd.UseNeon) { Neon.Combine4(s, dim, w0, w1, w2, w3, y, post, destination); return; }
 #endif
+        var kernelFp = Kernels.Active.Combine4;
+        if ((void*)kernelFp != null)
+        {
+            ((delegate* unmanaged[Cdecl]<float*, int, float, float, float, float, float*, float, float*, void>)(void*)kernelFp)(s, dim, w0, w1, w2, w3, y, post, destination);
+            return;
+        }
         if (!Simd.Enabled) { Scalar.Combine4(s, dim, w0, w1, w2, w3, y, post, destination); return; }
 #if NEEDLE_SIMD
         if (Tiers.Active == CpuTier.Avx512Bw) { OpsAvx512.Combine4(s, dim, w0, w1, w2, w3, y, post, destination); return; }
@@ -303,6 +344,12 @@ internal static unsafe class Ops
         #if NEEDLE_SIMD
         if (Simd.UseNeon) { Neon.Sinkhorn4x4(logits, result); return; }
 #endif
+        var kernelFp = Kernels.Active.Sinkhorn4x4;
+        if ((void*)kernelFp != null)
+        {
+            ((delegate* unmanaged[Cdecl]<float*, float*, void>)(void*)kernelFp)(logits, result);
+            return;
+        }
         if (!Simd.Enabled) { Scalar.Sinkhorn4x4(logits, result); return; }
 #if NEEDLE_SIMD
         var scratch = stackalloc float[4];
@@ -360,6 +407,12 @@ internal static unsafe class Ops
         #if NEEDLE_SIMD
         if (Simd.UseNeon) { Neon.RmsFakeA8(x, n, destination); return; }
 #endif
+        var kernelFp = Kernels.Active.RmsFakeA8;
+        if ((void*)kernelFp != null)
+        {
+            ((delegate* unmanaged[Cdecl]<float*, int, float*, void>)(void*)kernelFp)(x, n, destination);
+            return;
+        }
         if (!Simd.Enabled) { Scalar.RmsFakeA8(x, n, destination); return; }
 #if NEEDLE_SIMD
         var inverse = Vector256.Create(InverseRms(x, n));
@@ -379,6 +432,12 @@ internal static unsafe class Ops
         #if NEEDLE_SIMD
         if (Simd.UseNeon) { Neon.CenteredRmsFakeA8(x, scale, n, destination); return; }
 #endif
+        var kernelFp = Kernels.Active.CenteredRmsFakeA8;
+        if ((void*)kernelFp != null)
+        {
+            ((delegate* unmanaged[Cdecl]<float*, float*, int, float*, void>)(void*)kernelFp)(x, scale, n, destination);
+            return;
+        }
         if (!Simd.Enabled) { Scalar.CenteredRmsFakeA8(x, scale, n, destination); return; }
 #if NEEDLE_SIMD
         var inverse = Vector256.Create(InverseRms(x, n));
@@ -399,6 +458,12 @@ internal static unsafe class Ops
         #if NEEDLE_SIMD
         if (Simd.UseNeon) { Neon.GateFakeA8(x, gate, n); return; }
 #endif
+        var kernelFp = Kernels.Active.GateFakeA8;
+        if ((void*)kernelFp != null)
+        {
+            ((delegate* unmanaged[Cdecl]<float*, float*, int, void>)(void*)kernelFp)(x, gate, n);
+            return;
+        }
         if (!Simd.Enabled) { Scalar.GateFakeA8(x, gate, n); return; }
 #if NEEDLE_SIMD
         var peak = Vector256<float>.Zero;
@@ -440,6 +505,12 @@ internal static unsafe class Ops
         #if NEEDLE_SIMD
         if (Simd.UseNeon) { Neon.CombineDiff4(s, dim, w0, w1, w2, w3, x, u, post, destination); return; }
 #endif
+        var kernelFp = Kernels.Active.CombineDiff4;
+        if ((void*)kernelFp != null)
+        {
+            ((delegate* unmanaged[Cdecl]<float*, int, float, float, float, float, float*, float*, float, float*, void>)(void*)kernelFp)(s, dim, w0, w1, w2, w3, x, u, post, destination);
+            return;
+        }
         if (!Simd.Enabled) { Scalar.CombineDiff4(s, dim, w0, w1, w2, w3, x, u, post, destination); return; }
 #if NEEDLE_SIMD
         var v0 = Vector256.Create(w0);
@@ -465,6 +536,12 @@ internal static unsafe class Ops
         #if NEEDLE_SIMD
         if (Simd.UseNeon) { Neon.PostNormAdd(residual, x, scale, gate, n); return; }
 #endif
+        var kernelFp = Kernels.Active.PostNormAdd;
+        if ((void*)kernelFp != null)
+        {
+            ((delegate* unmanaged[Cdecl]<float*, float*, float*, float, int, void>)(void*)kernelFp)(residual, x, scale, gate, n);
+            return;
+        }
         if (!Simd.Enabled) { Scalar.PostNormAdd(residual, x, scale, gate, n); return; }
 #if NEEDLE_SIMD
         var inverse = Vector256.Create(InverseRms(x, n));
@@ -496,6 +573,12 @@ internal static unsafe class Ops
         #if NEEDLE_SIMD
         if (Simd.UseNeon) { Neon.MultiplyAccumulate(destination, a, b, n); return; }
 #endif
+        var kernelFp = Kernels.Active.MultiplyAccumulate;
+        if ((void*)kernelFp != null)
+        {
+            ((delegate* unmanaged[Cdecl]<float*, float*, float*, int, void>)(void*)kernelFp)(destination, a, b, n);
+            return;
+        }
         if (!Simd.Enabled) { Scalar.MultiplyAccumulate(destination, a, b, n); return; }
 #if NEEDLE_SIMD
         if (Tiers.Active == CpuTier.Avx512Bw) { OpsAvx512.MultiplyAccumulate(destination, a, b, n); return; }
@@ -509,6 +592,12 @@ internal static unsafe class Ops
         #if NEEDLE_SIMD
         if (Simd.UseNeon) { Neon.ScaleAdd(destination, scale, x, xScale, n); return; }
 #endif
+        var kernelFp = Kernels.Active.ScaleAdd;
+        if ((void*)kernelFp != null)
+        {
+            ((delegate* unmanaged[Cdecl]<float*, float, float*, float, int, void>)(void*)kernelFp)(destination, scale, x, xScale, n);
+            return;
+        }
         if (!Simd.Enabled) { Scalar.ScaleAdd(destination, scale, x, xScale, n); return; }
 #if NEEDLE_SIMD
         if (Tiers.Active == CpuTier.Avx512Bw) { OpsAvx512.ScaleAdd(destination, scale, x, xScale, n); return; }
@@ -522,7 +611,13 @@ internal static unsafe class Ops
     {
         #if NEEDLE_SIMD
         if (Simd.UseNeon) { Neon.AddScaled(destination, x, scale, n); return; }
-#endif
+        #endif
+        var kernelFp = Kernels.Active.AddScaled;
+        if ((void*)kernelFp != null)
+        {
+            ((delegate* unmanaged[Cdecl]<float*, float*, float, int, void>)(void*)kernelFp)(destination, x, scale, n);
+            return;
+        }
         if (!Simd.Enabled) { Scalar.AddScaled(destination, x, scale, n); return; }
 #if NEEDLE_SIMD
         if (Tiers.Active == CpuTier.Avx512Bw) { OpsAvx512.AddScaled(destination, x, scale, n); return; }
@@ -553,7 +648,13 @@ internal static unsafe class Ops
     {
         #if NEEDLE_SIMD
         if (Simd.UseNeon) { Neon.Taps3(taps, width, current, destination); return; }
-#endif
+        #endif
+        var kernelFp = Kernels.Active.Taps3;
+        if ((void*)kernelFp != null)
+        {
+            ((delegate* unmanaged[Cdecl]<float*, int, float*, float*, void>)(void*)kernelFp)(taps, width, current, destination);
+            return;
+        }
         if (!Simd.Enabled) { Scalar.Taps3(taps, width, current, destination); return; }
 #if NEEDLE_SIMD
         if (Tiers.Active == CpuTier.Avx512Bw) { OpsAvx512.Taps3(taps, width, current, destination); return; }
@@ -584,6 +685,11 @@ internal static unsafe class Ops
 #if NEEDLE_SIMD
         if (!Simd.UseNeon && Simd.Enabled) return ArgMaxMaskedAvx(x, mask, words, length);
 #endif
+        var kernelFp = Kernels.Active.ArgMaxMasked;
+        if ((void*)kernelFp != null)
+        {
+            return ((delegate* unmanaged[Cdecl]<float*, uint*, int, int, int>)(void*)kernelFp)(x, mask, words, length);
+        }
         return ArgMaxMaskedScalar(x, mask, words, length);
     }
 
@@ -678,6 +784,11 @@ internal static unsafe class Ops
 #if NEEDLE_SIMD
         if (Simd.UseNeon) return Neon.BestProbability(values, count, best);
 #endif
+        var kernelFp = Kernels.Active.BestProbability;
+        if ((void*)kernelFp != null)
+        {
+            return ((delegate* unmanaged[Cdecl]<float*, int, float, float>)(void*)kernelFp)(values, count, best);
+        }
         if (!Simd.Enabled) return ScalarBestProbability(values, count, best);
 #if NEEDLE_SIMD
         var shift = Vector256.Create(best);
