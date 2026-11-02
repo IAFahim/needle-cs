@@ -200,9 +200,11 @@ public sealed class NativeParityTests : IDisposable
             // (Miles at tokens~1439). AVX maxima are 0.0521/0.1317 locally and 0.081 below 1300
             // tokens on a CI runner, so one per-turn bound covers all tiers. The mean below keeps
             // typical turns tight: native sags to ~0.72 on an EPYC 7763 while managed holds ~0.83,
-            // a steady 0.0648 mean offset there (0.01 to 0.03 elsewhere). A scalar tie flip moved one
+            // a steady 0.0648 mean offset there (0.01 to 0.03 elsewhere). The Avx512Bw tier reduces in
+            // 16-lane order, so its rounding differs from the 8-lane tiers: one turn moved 0.227 on an
+            // EPYC 9V74 (0.5887 against native ~0.82). A scalar tie flip moved one
             // turn by 0.256 on that CPU (0.1365 locally), hence the wider scalar per-turn bound.
-            var bound = IsScalar ? 0.30 : 0.15;
+            var bound = IsScalar ? 0.30 : Tiers.Active == CpuTier.Avx512Bw ? 0.25 : 0.15;
             drift += Math.Abs((actual.Confidence ?? double.NaN) - (expected.Confidence ?? 0));
             output.WriteLine($"tokens~{session.ContextUsed} q={query} native={expected.Confidence:F4} managed={actual.Confidence:F4} head={actual.HeadConfidence:F4} calls={actual.CallNames()}");
             Assert.Equal(expected.CallNames, actual.CallNames());

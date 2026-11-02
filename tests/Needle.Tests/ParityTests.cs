@@ -81,7 +81,10 @@ public sealed class ParityTests : IDisposable
         var budget = Assets.GoldenBudget(golden);
         foreach (var threads in new[] { 1, 8 })
         {
-            using var caller = new ToolCaller(model, tools, threads: Assets.ThreadsFor(threads));
+            // Exactly 1 and 8 threads: the strict golden prefix is sensitive to how float reductions are
+            // partitioned, and capping 8 to a small runner's cores flipped a near-tied token on the
+            // 16-lane AVX-512 tier. (The hang that motivated a cap was the RunTeam lost wakeup.)
+            using var caller = new ToolCaller(model, tools, threads: threads);
             var output = new byte[4096];
             foreach (var item in golden.GetProperty("cases").EnumerateArray())
             {
