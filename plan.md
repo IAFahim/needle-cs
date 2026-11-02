@@ -210,6 +210,21 @@ Small-T ratios on Avx2+permute, 768x768 2b (T=1/2/4/8 µs: 7.0/14.6/23.7/47.4, i
 
 Elementwise/Kron on the same box: Silu-8192 Avx2 2.5–3.4 µs vs Avx512 3.2–4.9 µs (no win); Rms/Dot ~1 µs either way; `Kron` 512-bit (`Blocks.Wide`, tier-independent) beats Avx2 1.6–1.67x (4x1024: 78.7 vs 128.6 µs; 8x2048: 2024.9 vs 3319.7 µs; 32x2048: 6604.6 vs 11013.4 µs) — Wide stays on.
 
+#### Real-weight `needle bench` + `bench-e2e` (2026-11-02, same box, idle, serial runs)
+
+Method: `needle bench ref/hf/needle3.cact --threads 1,4` and `bench-e2e ... --threads 1,4 --profile --sets golden` (reps 5), best-of-9 per kernel, `NEEDLE_TIER` forced per row. GB/s = weight bytes / best time. Default tier == forced avx2 within noise (gate 768x768 2b T=1: 7.26 vs 7.23 µs), so the platform-table row stands — no faster default emerged.
+
+| gate_proj 768x768 2b, best µs, T=1/2/4/8/16/32/64 | T=1 GB/s | T-ratios |
+|---|---|---|
+| default/avx2: 7.26/14.03/24.83/49.41/98.78/197.50/397.26 | 20.3 | 1x/1.93x/3.42x/6.81x |
+| avx512 (BwDot): 13.75/26.25/58.28/116.30/234.30/464.04/928.83 | 10.7 | 1x/1.91x/4.24x/8.46x |
+
+head 8192x768 4b T=1 (3.15 MB, decode-realistic): default/avx2 80.9 µs, 38.9 GB/s; avx512 147.7 µs, 21.3 GB/s. Pooled (4 threads) T=1: gate default/avx2 3.2/3.1 µs (45.8/47.1 GB/s), avx512 5.4 µs (27.3 GB/s); head default/avx2 29.4 µs (107 GB/s), avx512 53.1 µs (59.3 GB/s). #20 gate (T=2..8 ≤ 1.3x T=1) is not met on any tier — still needs the register-blocked T=16..64 tile.
+
+`bench-e2e` golden set (2 prompts, prefix 125 tokens, reps 5): 1 thread — prefill 14.7 ms, decode 1146/1150 µs per token (best/med), total 66.7 ms; 4 threads — prefill 6.5 ms, decode 820/828 µs per token, total 43.9 ms; 21.0 Pool.Run per token both. Decode profile T=1 top stages: attention_qkvg 316.3 µs (31%), attention_out 149.7 (14%), attention_core 125.8 (12%), mlp 113.8 (11%), engram 94.2 (9%), logits 87.2 (8%); T=4 top: qkvg 152.5 (20%), mlp 139.4 (19%), hyper_prepare 80.5 (11%).
+
+GEMV edge-norm wart fixed the same day (`Gemv.cs`: `CorrectionsAtEdge` + the two `Row4`/`Row2` edge branches now sign-extend the half bits via `(short)`, so the fp16 sign lands in the float sign; bit-identical on the non-negative scales real models carry). Parity on the four tiers after the fix: default/avx2/avx512 20/21, scalar 21/21 — the single failure is `LongContextStaysCloseToNative`'s Miles-Davis turn (native 0.8656 vs managed ~0.60, Δ≈0.27 > 0.15/0.25 bounds), which reproduces identically on the pristine base commit, so it is a pre-existing CPU-specific tie amplification, not a regression.
+
 ### 2.9 Unity W23 proofs (2026-10-30, in-Editor 7000.0.0a12, Linux x64)
 
 - **64-NPC load (LoadProof harness, 1.2 s cadence ≈ 50 asks/min/NPC, 120 warmup + 600 measured frames, two runs):** main-thread managed allocations in the per-frame NPC pump bracket: **0 bytes, 0 nonzero frames** both runs. 38–39 replies per run, 100% carrying dispatched tool calls (`MoveTo`/`GiveItem`); 64 asks pending at end (engine does ~1 reply/s on 2 threads vs ~53 asks/s offered — saturation is expected, the Unity side stays flat).

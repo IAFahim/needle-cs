@@ -174,7 +174,7 @@ internal static unsafe class Gemv
 
     static Vector256<float> CorrectionsAtEdge(ushort* norms, int groups, int stride, float* weightedScales, float* offsets, float* scaled)
     {
-        for (var i = 0; i < stride; i++) scaled[i] = i < groups ? BitConverter.Int32BitsToSingle(norms[i] << 13) : 0f;
+        for (var i = 0; i < stride; i++) scaled[i] = i < groups ? BitConverter.Int32BitsToSingle((short)norms[i] << 13) : 0f;
         var correction = Vector256<float>.Zero;
         for (var v = 0; v < stride; v += HalvesPerVector)
         {
@@ -424,7 +424,7 @@ internal static unsafe class Gemv
         if (convertible)
             for (var v = 0; v < stride; v += HalvesPerVector) Avx.Store(rowFactors + v, UnbiasedHalfToSingle(Avx2.ConvertToVector256Int32(norms + v)));
         else
-            for (var i = 0; i < stride; i++) rowFactors[i] = i < groups ? BitConverter.Int32BitsToSingle(norms[i] << 13) : 0f;
+            for (var i = 0; i < stride; i++) rowFactors[i] = i < groups ? BitConverter.Int32BitsToSingle((short)norms[i] << 13) : 0f;
         var accumulator0 = TileCorrections(rowFactors, weightedScales, offsets, scaled, stride);
         var accumulator1 = TileCorrections(rowFactors, weightedScales + stride, offsets + stride, scaled + stride, stride);
         var accumulator2 = TileCorrections(rowFactors, weightedScales + 2 * stride, offsets + 2 * stride, scaled + 2 * stride, stride);
@@ -491,7 +491,7 @@ internal static unsafe class Gemv
         if (convertible)
             for (var v = 0; v < stride; v += HalvesPerVector) Avx.Store(rowFactors + v, UnbiasedHalfToSingle(Avx2.ConvertToVector256Int32(norms + v)));
         else
-            for (var i = 0; i < stride; i++) rowFactors[i] = i < groups ? BitConverter.Int32BitsToSingle(norms[i] << 13) : 0f;
+            for (var i = 0; i < stride; i++) rowFactors[i] = i < groups ? BitConverter.Int32BitsToSingle((short)norms[i] << 13) : 0f;
         var accumulator0 = TileCorrections(rowFactors, weightedScales, offsets, scaled, stride);
         var accumulator1 = TileCorrections(rowFactors, weightedScales + stride, offsets + stride, scaled + stride, stride);
         for (var g = 0; g < groups; g++)
