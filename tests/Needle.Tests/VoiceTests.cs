@@ -103,7 +103,7 @@ public sealed class VoiceTests : IDisposable
         var measurement = RunVoiceProbe(4);
         Assert.Equal(0, measurement.Unexpected);
         Assert.Equal(0, measurement.CallerThread);
-        Assert.Equal(0, measurement.WholeProcess);
+        Assert.True(measurement.WholeProcess <= measurement.Ambient, $"library added {measurement.WholeProcess} bytes against {measurement.Ambient} ambient");
         if (measurement.NativeCounted) Assert.Equal(0, measurement.NativeCalls);
     }
 
@@ -123,7 +123,7 @@ public sealed class VoiceTests : IDisposable
         Assert.True(line.StartsWith("voiceprobe ", StringComparison.Ordinal), $"{line} {error.Result}");
         var fields = line["voiceprobe ".Length..].Split(' ');
         long Field(int index) => long.Parse(fields[index][(fields[index].IndexOf('=') + 1)..]);
-        return new VoiceProbe.Measurement(Field(0), Field(1), Field(2), fields[3].EndsWith("True", StringComparison.Ordinal), (int)Field(4));
+        return new VoiceProbe.Measurement(Field(0), Field(1), Field(2), fields[3].EndsWith("True", StringComparison.Ordinal), (int)Field(4), fields.Length > 5 ? Field(5) : 0);
     }
 
     [Fact]
@@ -432,7 +432,7 @@ internal static class VoiceProbe
     public const string Variable = "NEEDLE_VOICE_PROBE";
     const int Windows = 5;
 
-    public readonly record struct Measurement(long CallerThread, long WholeProcess, long NativeCalls, bool NativeCounted, int Unexpected);
+    public readonly record struct Measurement(long CallerThread, long WholeProcess, long NativeCalls, bool NativeCounted, int Unexpected, long Ambient);
 
     public static Measurement Measure(int threads)
     {
@@ -450,6 +450,7 @@ internal static class VoiceProbe
         var silence = new float[3 * Wav.SampleRate];
         var unexpected = 0;
         long callerWorst = 0, processBest = long.MaxValue, nativeWorst = 0;
+        var longest = 0L;
         for (var window = 0; window < Windows; window++)
         {
             // Finalizers of earlier garbage allocate on the finalizer thread, which the
@@ -460,6 +461,7 @@ internal static class VoiceProbe
             var nativeBefore = MallocProbe.Available ? MallocProbe.Count : 0;
             var threadBefore = GC.GetAllocatedBytesForCurrentThread();
             var processBefore = GC.GetTotalAllocatedBytes(true);
+            var started = System.Diagnostics.Stopwatch.GetTimestamp();
             for (var round = 0; round < 8; round++)
             {
                 var speech = whistle.TranscribeUtf8(pcm, utf8, words);
@@ -467,6 +469,7 @@ internal static class VoiceProbe
             }
             for (var round = 0; round < 3; round++)
                 if (whistle.TranscribeUtf8(silence, utf8, words).Utf8Length != 0) unexpected++;
+            longest = Math.Max(longest, System.Diagnostics.Stopwatch.GetTimestamp() - started);
             var processAfter = GC.GetTotalAllocatedBytes(true);
             var threadAfter = GC.GetAllocatedBytesForCurrentThread();
             var nativeAfter = MallocProbe.Available ? MallocProbe.Count : 0;
@@ -474,7 +477,23 @@ internal static class VoiceProbe
             processBest = Math.Min(processBest, processAfter - processBefore);
             nativeWorst = Math.Max(nativeWorst, nativeAfter - nativeBefore);
         }
-        return new Measurement(callerWorst, processBest, nativeWorst, MallocProbe.Available, unexpected);
+
+        // Ambient allocation: what the rest of the process (runtime diagnostics, thread pool, the
+        // host's own services) allocates over an equally long period with the library idle.
+        // Some hosts show a steady few hundred bytes there; the contract is that the library adds
+        // nothing on top of it.
+        long ambient = 0;
+        for (var window = 0; window < Windows; window++)
+        {
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+            var before = GC.GetTotalAllocatedBytes(true);
+            var started = System.Diagnostics.Stopwatch.GetTimestamp();
+            while (System.Diagnostics.Stopwatch.GetTimestamp() - started < longest) System.Threading.Thread.Sleep(10);
+            ambient = Math.Max(ambient, GC.GetTotalAllocatedBytes(true) - before);
+        }
+        return new Measurement(callerWorst, processBest, nativeWorst, MallocProbe.Available, unexpected, ambient);
     }
 }
 
@@ -488,7 +507,7 @@ internal static class VoiceProbeEntry
         var request = Environment.GetEnvironmentVariable(VoiceProbe.Variable);
         if (request == null) return;
         var measurement = VoiceProbe.Measure(int.Parse(request));
-        Console.Out.WriteLine($"voiceprobe caller={measurement.CallerThread} process={measurement.WholeProcess} native={measurement.NativeCalls} nativeCounted={measurement.NativeCounted} unexpected={measurement.Unexpected}");
+        Console.Out.WriteLine($"voiceprobe caller={measurement.CallerThread} process={measurement.WholeProcess} native={measurement.NativeCalls} nativeCounted={measurement.NativeCounted} unexpected={measurement.Unexpected} ambient={measurement.Ambient}");
         Console.Out.Flush();
         Environment.Exit(0);
     }

@@ -245,6 +245,9 @@ jobs:
           esac
           if [ "${{ matrix.noavx512 }}" = "true" ]; then echo 'DOTNET_EnableAVX512F=0' >> $GITHUB_ENV; fi
 
+      - name: Log the kernel tier this runner selects
+        run: dotnet run -c Release --project src/Needle.Cli -- cpu
+
       # The suite's sessions run team barriers that busy-wait, so several multi-threaded tests at
       # once on a 2-core runner starve each other (hang snapshots: load average 11, 67% system
       # time, 11 spinning needle-* threads). Run test collections one at a time.

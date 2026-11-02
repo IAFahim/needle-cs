@@ -9,6 +9,7 @@ using Needle.Cli;
 
 return args switch
 {
+    ["cpu"] => CpuInfo.Run(),
     ["verify", var model, var golden] => Verify(model, golden),
     ["bench", var model, .. var options] => BenchKernels.Run(model, options),
     ["bench-e2e", var model, var tools, .. var options] => BenchE2E.Run(model, tools, options),
@@ -25,6 +26,7 @@ return args switch
 
 static int Usage()
 {
+    Console.Error.WriteLine("needle cpu");
     Console.Error.WriteLine("needle verify <model.cact> <golden-dir>");
     Console.Error.WriteLine("needle run <model.cact> <tools.json> <query> [repeat]");
     Console.Error.WriteLine("needle bench <needle3.cact> [--threads 4] [--json]");

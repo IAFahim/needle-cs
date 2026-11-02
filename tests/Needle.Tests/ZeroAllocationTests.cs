@@ -37,7 +37,7 @@ internal static class AllocationProbe
         var tools = retrieval ? SessionCases.Catalog() : SessionCases.DefaultTools();
         // The jumpforward mode decodes with token-forced chunking on the same
         // prompts: the chunk buffers are stack-owned, so the 0 B bar holds.
-        using var session = new NeedleSession(model, tools, new NeedleOptions { Threads = threads, AutoDate = false, RetrievalTopK = 5, JumpForward = mode == "jumpforward" });
+        using var session = new NeedleSession(model, tools, new NeedleOptions { Threads = Assets.ThreadsFor(threads), AutoDate = false, RetrievalTopK = 5, JumpForward = mode == "jumpforward" });
         var calls = new byte[4096];
         var reasoning = new byte[4096];
         var response = new byte[4096];
