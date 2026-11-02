@@ -296,6 +296,132 @@ public sealed unsafe class MaskedDecodingTests : IDisposable
     }
 
     [Fact]
+    public void TokenStepMasksMatchBruteForceAndReportColdVsWarm()
+    {
+        // Issue #39: the bench harness times Allow per byte position with a
+        // warm mask cache (repeated rounds over the same states turn every
+        // structural state into a cache hit), and byte positions dilute the
+        // structural states with cheap mid-string fast-path states. Real call
+        // generation calls Allow once per token at token-boundary states,
+        // each visited once. This replays a genuine greedy walk token by
+        // token and reports the true cold cost per call step next to the
+        // warm cost, so the plan's per-step figure stays honest.
+        var tools = new ToolSet(BenchPrompts.GameToolsJson);
+        using var grammar = new Grammar(tools.Tools);
+        using var tokenizer = new Tokenizer(model);
+        using var walkTrie = new TokenTrie(tokenizer, model.VocabSize);
+        var prompt = Encoding.UTF8.GetBytes(BenchPrompts.Game[0]);
+        var ids = new int[8192];
+        ids[0] = tokenizer.BeginId;
+        var promptCount = 1 + tokenizer.Encode(prompt, ids.AsSpan(1), true);
+        using var full = new Engine(model, 1024, 64, 1);
+        full.Feed(new ReadOnlySpan<int>(ids, 0, promptCount));
+        var words = walkTrie.Words;
+        var mask = new uint[words];
+        var gathered = new float[model.VocabSize];
+        var bytes = new byte[256];
+        var single = new uint[words];
+        var states = new List<GrammarState>();
+        var state = Grammar.Start(grammar.Program);
+        var steps = 0;
+        while (!Grammar.Complete(state) && steps < 384)
+        {
+            steps++;
+            states.Add(state);
+            uint[] effective = mask;
+            fixed (uint* m = mask) walkTrie.Allow(grammar.Program, state, m);
+            var allowed = 0;
+            for (var w = 0; w < words; w++) allowed += System.Numerics.BitOperations.PopCount(mask[w]);
+            Assert.True(allowed > 0, "grammar dead end on the full walk");
+            if (steps == 2)
+            {
+                Array.Clear(single, 0, words);
+                var forced = -1;
+                var forcedLength = int.MaxValue;
+                for (var id = 0; id < model.VocabSize; id++)
+                {
+                    if ((mask[id / 32] >> (id % 32) & 1) == 0) continue;
+                    int len;
+                    fixed (byte* p = bytes) len = tokenizer.ConstraintBytes(id, p);
+                    if (len > 0 && bytes[0] == (byte)'{' && len < forcedLength) { forced = id; forcedLength = len; }
+                }
+                Assert.True(forced >= 0, "no '{'-leading token in the mask");
+                single[forced / 32] |= 1u << (forced % 32);
+                effective = single;
+            }
+            int pick;
+            float probability;
+            var logits = full.Logits;
+            fixed (float* c = logits)
+            fixed (float* g = gathered)
+            fixed (uint* m = effective)
+                pick = ArgMaxWithProbabilityReference(c, m, words, g, out probability);
+            var cursor = state;
+            AdvanceToken(grammar.Program, tokenizer, &cursor, pick, bytes);
+            var done = Grammar.Complete(cursor);
+            full.Feed(new ReadOnlySpan<int>(&pick, 1), !done);
+            state = cursor;
+        }
+        Assert.True(states.Count > 0, "walk produced no steps");
+        // Cold pass on a fresh trie: every token state is a first visit, as
+        // in real generation. Masks are saved for the brute-force check.
+        using var trie = new TokenTrie(tokenizer, model.VocabSize);
+        var saved = new uint[states.Count * words];
+        var tick = Stopwatch.GetTimestamp();
+        for (var s = 0; s < states.Count; s++)
+        {
+            fixed (uint* m = mask) trie.Allow(grammar.Program, states[s], m);
+            for (var w = 0; w < words; w++) saved[s * words + w] = mask[w];
+        }
+        var coldTicks = Stopwatch.GetTimestamp() - tick;
+        var fast = 0;
+        var compared = 0;
+        for (var s = 0; s < states.Count; s++)
+        {
+            var exact = !IsStringFastPath(grammar.Program, states[s]);
+            if (!exact) fast++;
+            for (var id = 0; id < model.VocabSize; id++)
+            {
+                int length;
+                fixed (byte* p = bytes) length = tokenizer.ConstraintBytes(id, p);
+                var expected = false;
+                if (length > 0)
+                {
+                    var copy = states[s];
+                    expected = true;
+                    for (var i = 0; i < length && expected; i++)
+                        expected = Grammar.Advance(grammar.Program, &copy, bytes[i]);
+                }
+                var actual = (saved[s * words + id / 32] >> (id % 32) & 1) != 0;
+                if (exact) Assert.Equal(expected, actual);
+                else if (actual) Assert.True(expected);
+                compared++;
+            }
+        }
+        // Every token must fit the trie walker's byte budget, otherwise Walk
+        // silently drops it from the mask.
+        var longest = 0;
+        for (var id = 0; id < model.VocabSize; id++)
+        {
+            int length;
+            fixed (byte* p = bytes) length = tokenizer.ConstraintBytes(id, p);
+            longest = Math.Max(longest, length);
+        }
+        Assert.True(longest <= 63, $"token spans {longest} bytes, beyond the trie walk budget");
+        // Warm pass on the same trie: structural states are now cache hits.
+        tick = Stopwatch.GetTimestamp();
+        foreach (var tokenState in states)
+        {
+            fixed (uint* m = mask) trie.Allow(grammar.Program, tokenState, m);
+        }
+        var warmTicks = Stopwatch.GetTimestamp() - tick;
+        var frequency = (double)Stopwatch.Frequency;
+        output.WriteLine($"token_steps={states.Count} fast_path={fast}/{states.Count} longest_token={longest} compared={compared} " +
+            $"cold_us={coldTicks / frequency * 1e6 / states.Count:F2} " +
+            $"warm_us={warmTicks / frequency * 1e6 / states.Count:F2}");
+    }
+
+    [Fact]
     public void SparseHeadMatchesFullHeadBitForBit()
     {
         using var engine = new Engine(model, 512, 64, 1);
