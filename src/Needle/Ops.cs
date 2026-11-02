@@ -71,6 +71,9 @@ internal static unsafe class Ops
 #endif
     }
 
+    // SIMD-01: 4 independent FMA accumulators hide ~4-5-cycle FMA latency
+    // (QuanTAlib SimdExtensions 4xVector256 shape). Bulk stride is 32 floats;
+    // tail handles 16-wide then 8-wide + scalar without reading past n.
     public static float SumOfSquares(float* x, int n)
     {
         #if NEEDLE_SIMD
@@ -81,17 +84,41 @@ internal static unsafe class Ops
         if (Tiers.Active == CpuTier.Avx512Bw) return OpsAvx512.SumOfSquares(x, n);
         var s0 = Vector256<float>.Zero;
         var s1 = Vector256<float>.Zero;
-        for (var i = 0; i < n; i += 16)
+        var s2 = Vector256<float>.Zero;
+        var s3 = Vector256<float>.Zero;
+        var i = 0;
+        var bulk = n & ~31;
+        for (; i < bulk; i += 32)
+        {
+            var a0 = Avx.LoadVector256(x + i);
+            var a1 = Avx.LoadVector256(x + i + 8);
+            var a2 = Avx.LoadVector256(x + i + 16);
+            var a3 = Avx.LoadVector256(x + i + 24);
+            s0 = Fma.MultiplyAdd(a0, a0, s0);
+            s1 = Fma.MultiplyAdd(a1, a1, s1);
+            s2 = Fma.MultiplyAdd(a2, a2, s2);
+            s3 = Fma.MultiplyAdd(a3, a3, s3);
+        }
+        for (; i + 16 <= n; i += 16)
         {
             var a = Avx.LoadVector256(x + i);
             var b = Avx.LoadVector256(x + i + 8);
             s0 = Fma.MultiplyAdd(a, a, s0);
             s1 = Fma.MultiplyAdd(b, b, s1);
         }
-        return Vector256.Sum(Avx.Add(s0, s1));
+        if (i + 8 <= n)
+        {
+            var a = Avx.LoadVector256(x + i);
+            s2 = Fma.MultiplyAdd(a, a, s2);
+            i += 8;
+        }
+        var tail = 0f;
+        for (; i < n; i++) tail = MathF.FusedMultiplyAdd(x[i], x[i], tail);
+        return Vector256.Sum(Avx.Add(Avx.Add(s0, s1), Avx.Add(s2, s3))) + tail;
 #endif
     }
 
+    // SIMD-01: 4 independent FMA accumulators (see SumOfSquares above).
     public static float Dot(float* a, float* b, int n)
     {
         #if NEEDLE_SIMD
@@ -102,12 +129,30 @@ internal static unsafe class Ops
         if (Tiers.Active == CpuTier.Avx512Bw) return OpsAvx512.Dot(a, b, n);
         var s0 = Vector256<float>.Zero;
         var s1 = Vector256<float>.Zero;
-        for (var i = 0; i < n; i += 16)
+        var s2 = Vector256<float>.Zero;
+        var s3 = Vector256<float>.Zero;
+        var i = 0;
+        var bulk = n & ~31;
+        for (; i < bulk; i += 32)
+        {
+            s0 = Fma.MultiplyAdd(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i), s0);
+            s1 = Fma.MultiplyAdd(Avx.LoadVector256(a + i + 8), Avx.LoadVector256(b + i + 8), s1);
+            s2 = Fma.MultiplyAdd(Avx.LoadVector256(a + i + 16), Avx.LoadVector256(b + i + 16), s2);
+            s3 = Fma.MultiplyAdd(Avx.LoadVector256(a + i + 24), Avx.LoadVector256(b + i + 24), s3);
+        }
+        for (; i + 16 <= n; i += 16)
         {
             s0 = Fma.MultiplyAdd(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i), s0);
             s1 = Fma.MultiplyAdd(Avx.LoadVector256(a + i + 8), Avx.LoadVector256(b + i + 8), s1);
         }
-        return Vector256.Sum(Avx.Add(s0, s1));
+        if (i + 8 <= n)
+        {
+            s2 = Fma.MultiplyAdd(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i), s2);
+            i += 8;
+        }
+        var tail = 0f;
+        for (; i < n; i++) tail = MathF.FusedMultiplyAdd(a[i], b[i], tail);
+        return Vector256.Sum(Avx.Add(Avx.Add(s0, s1), Avx.Add(s2, s3))) + tail;
 #endif
     }
 
@@ -134,6 +179,10 @@ internal static unsafe class Ops
         if (!Simd.Enabled) { var scalarInverse = InverseRms(x, n); for (var i = 0; i < n; i++) destination[i] = (1f + scale[i]) * x[i] * scalarInverse; return; }
 #if NEEDLE_SIMD
         if (Tiers.Active == CpuTier.Avx512Bw) { OpsAvx512.ZeroCenteredRms(x, scale, n, destination); return; }
+        // SIMD-05 reverted: the Mul+FMA affine is ~25% faster on this path but
+        // changes rounding vs the Neon/Avx512/scalar siblings (which this lane
+        // does not own), breaking the exact-bits fused-kernel tests on avx512.
+        // Keep the Add + Mul + Mul form so every tier stays bit-consistent.
         var inverse = Vector256.Create(InverseRms(x, n));
         var one = Vector256.Create(1f);
         for (var i = 0; i < n; i += 8)
@@ -410,6 +459,7 @@ internal static unsafe class Ops
 #endif
     }
 
+    // SIMD-05: inner affine matches ZeroCenteredRms FMA form (bit-consistent).
     public static void PostNormAdd(float* residual, float* x, float* scale, float gate, int n)
     {
         #if NEEDLE_SIMD
