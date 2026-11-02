@@ -66,6 +66,12 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
     float* qkvHistory, engramHistory;
     int* previousTokens;
     int markedLength;
+    // MEM-21: snapshot generations. Prefix captures (Mark/Import) draw from
+    // prefixVersion, speculative captures (CheckpointSpec) from specVersion;
+    // rollback validates the token against its own domain, so a stale or
+    // cross-domain token throws instead of restoring the wrong state.
+    int prefixVersion;
+    int specVersion;
     // Token count of the last Forward chunk; the sparse head reads that row.
     int lastForwardCount;
     float* poolMax, poolSum, poolAcc, cell;
@@ -363,6 +369,34 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         }
     }
 
+    // MEM-21: O(1) prefix snapshot/rollback token (cf. QuanTAlib RingBuffer
+    // SnapshotToken). Mark/CheckpointSpec snapshot the recurrent state once
+    // into the preallocated snapshot/spec buffers; rollback is then pure
+    // assignment (length, trailing tokens, lazy flags) — never recompute.
+    // The token pins its capture point: Length plus the trailing token pair
+    // plus the capture generation. Prefix generations are positive,
+    // speculative generations negative (stored sign-flipped), so each
+    // rollback accepts only tokens from its own domain and generation;
+    // prefix-edit (re-Mark/Import) and draft (re-Checkpoint) captures retire
+    // earlier tokens, which then throw instead of restoring superseded
+    // state. A zero Version never validates: counters start at 0 and
+    // pre-increment. 16 bytes, readonly, zero allocation.
+    public readonly struct PrefixSnapshot
+    {
+        public readonly int Length;
+        internal readonly int Token0;
+        internal readonly int Token1;
+        internal readonly int Version;
+
+        internal PrefixSnapshot(int length, int token0, int token1, int version)
+        {
+            Length = length;
+            Token0 = token0;
+            Token1 = token1;
+            Version = version;
+        }
+    }
+
     internal int MarkedLength => markedLength;
 
     internal long PrimedPrefixBytes =>
@@ -395,11 +429,12 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         }
     }
 
-    internal void ImportPrimedPrefix(ReadOnlySpan<byte> source)
+    internal PrefixSnapshot ImportPrimedPrefix(ReadOnlySpan<byte> source)
     {
+        int length;
         fixed (byte* src = source)
         {
-            var length = *(int*)src;
+            length = *(int*)src;
             if (length < 0 || length > capacity) throw new ArgumentException("primed prefix length exceeds context capacity");
             var expected = sizeof(int) + (long)stateBytes +
                 (long)g.Layers * length * (kWidth + vWidth + 2L * g.KvHeads * sizeof(float));
@@ -426,19 +461,23 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
             markedLength = length;
             historyPending = false;
             poolPending = false;
+            prefixVersion++;
         }
+        return new PrefixSnapshot(length, previousTokens[0], previousTokens[1], prefixVersion);
     }
 
     static void CopyPrefix<T>(T* from, T* to, long offset, long count) where T : unmanaged =>
         Buffer.MemoryCopy(from + offset, to + offset, count * sizeof(T), count * sizeof(T));
 
-    public void Mark()
+    public PrefixSnapshot Mark()
     {
         if (!historyPending) Buffer.MemoryCopy(state, snapshot, historyBytes, historyBytes);
         snapshotTokens[0] = previousTokens[0];
         snapshotTokens[1] = previousTokens[1];
         if (!poolPending) Buffer.MemoryCopy(poolMax, snapshotPoolMax, poolBytes, poolBytes);
         markedLength = Length;
+        prefixVersion++;
+        return new PrefixSnapshot(markedLength, previousTokens[0], previousTokens[1], prefixVersion);
     }
 
     public void Rewind()
@@ -450,15 +489,30 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         Length = markedLength;
     }
 
+    // MEM-21 token rollback for prefix-edit turns: validates the capture,
+    // then takes the same O(1) lazy path as Rewind (two ints, two flags,
+    // Length — no memcpy, no allocation). A re-Mark/Import retires earlier
+    // tokens via the generation check, so a stale token throws instead of
+    // restoring a superseded prefix.
+    public void Rewind(in PrefixSnapshot token)
+    {
+        if (token.Version <= 0 || token.Version != prefixVersion || token.Length != markedLength ||
+            token.Token0 != snapshotTokens[0] || token.Token1 != snapshotTokens[1])
+            throw new ArgumentException("stale or foreign prefix snapshot");
+        Rewind();
+    }
+
     // Saves the recurrent state (conv/engram histories, previous tokens,
     // confidence pooling) plus Length from before a speculative draft chunk.
     // Must be called with a settled state (right after a feed, when
     // historyPending/poolPending are false); RestoreSpec then reinstalls a
     // self-consistent state, so the lazy flags stay clear.
-    internal void CheckpointSpec()
+    internal PrefixSnapshot CheckpointSpec()
     {
         Buffer.MemoryCopy(state, specSnapshot, stateBytes, stateBytes);
         specLength = Length;
+        specVersion++;
+        return new PrefixSnapshot(specLength, previousTokens[0], previousTokens[1], -specVersion);
     }
 
     // Drops a rejected draft tail: reinstalls the pre-chunk recurrent state
@@ -468,6 +522,22 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
     {
         Buffer.MemoryCopy(specSnapshot, state, stateBytes, stateBytes);
         Length = specLength;
+    }
+
+    // MEM-21 token rollback for the speculative path: validates the capture
+    // (own domain via the negative generation, current generation, Length,
+    // trailing tokens — all O(1) integer compares), then reinstalls the
+    // pre-chunk state exactly like RestoreSpec. Covers rejected draft tails
+    // without recompute; a re-Checkpoint or any foreign/domain-crossed token
+    // throws instead of restoring the wrong draft point.
+    internal void RestoreSpec(in PrefixSnapshot token)
+    {
+        if (token.Version >= 0 || token.Version != -specVersion || token.Length != specLength)
+            throw new ArgumentException("stale or foreign speculative snapshot");
+        var snapTokens = (int*)((byte*)specSnapshot + ((byte*)previousTokens - (byte*)state));
+        if (token.Token0 != snapTokens[0] || token.Token1 != snapTokens[1])
+            throw new ArgumentException("stale or foreign speculative snapshot");
+        RestoreSpec();
     }
 
     public void Feed(ReadOnlySpan<int> tokens, bool computeLogits = true)
