@@ -41,7 +41,7 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
     Activations streamAct, dimAct, headAct;
     float* input, residual, quantizedInput, qRaw, kRaw, vRaw, qConv, kConv, vConv, gateOut, attnOut, attnProj, scratch;
     float* engramInput, engramKey, engramConv, engramValueBuffer, logits;
-    float* ropeCos, ropeSin, keyScale, valueScale;
+    float* ropeCos, ropeSin, ropeFreq, keyScale, valueScale;
     sbyte* queryInt8, keyCache, valueCache;
     float* queryScale;
     int* engramRows;
@@ -310,16 +310,31 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         return logit;
     }
 
+    // MATH-M7: hoisted RoPE frequency schedule. Frequencies depend only on the
+    // config (theta, qkDim), so they are computed once per dim here instead of
+    // once per (position, dim) below: capacity*half Pow calls collapse to half.
+    // The expression is deliberately identical to the historical per-entry
+    // formula, not a log-domain exp reformulation: ~1e-7 exp-vs-Pow noise flips
+    // the documented 'attack the watchtower near the river' knife-edge between
+    // native-refuse and managed-call (NativeParityTests), so this stays
+    // bit-identical while still removing 99.9%+ of the Pow calls.
+    internal static void RopeFrequencies(float theta, int qkDim, float* freq, int half)
+    {
+        for (var i = 0; i < half; i++)
+            freq[i] = 1f / MathF.Pow(theta, 2f * i / qkDim);
+    }
+
     void BuildRopeTables()
     {
         var half = g.QkDim / 2;
+        ropeFreq = arena.Take<float>((nuint)half);
+        RopeFrequencies(g.RopeTheta, g.QkDim, ropeFreq, half);
         ropeCos = arena.Take<float>((nuint)(capacity * half));
         ropeSin = arena.Take<float>((nuint)(capacity * half));
         for (var p = 0; p < capacity; p++)
             for (var i = 0; i < half; i++)
             {
-                var frequency = 1f / MathF.Pow(g.RopeTheta, 2f * i / g.QkDim);
-                var angle = p * frequency;
+                var angle = p * ropeFreq[i];
                 ropeCos[p * half + i] = MathF.Cos(angle);
                 ropeSin[p * half + i] = MathF.Sin(angle);
             }
