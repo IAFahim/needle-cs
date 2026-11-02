@@ -92,17 +92,24 @@ jobs:
     runs-on: ${{ matrix.os }}
     continue-on-error: ${{ matrix.expected-fail }}
     timeout-minutes: 90
-    # Per-job policy for issue #32 (never a blanket flag). The linux legs are
-    # required-green: linux-x64 is the primary gate (suite + NEEDLE_SCALAR=1
-    # rerun + netstandard2.1 + NativeAOT publish/smoke) and linux-arm64 covers
-    # NeonTests natively plus the NEON widening fallback tier (NEEDLE_NODP=1).
-    # windows-x64 and macos-arm64 keep expected-fail until a re-run proves
-    # them green; their known failures are classified, not waived:
-    #  - native parity skips where the upstream wheel has no usable library
-    #    (wheel is manylinux x86-64 only; NativeParityTests.TryLoad returns
-    #    null and each test skips with a message instead of throwing);
-    #  - remaining red is engine/voice numerics under investigation in #32
-    #    (whisper transcripts, confidence head, whistle stage goldens).
+    # Per-job policy (never a blanket flag; originally for issue #32). The
+    # linux legs are required-green: linux-x64 is the primary gate (suite +
+    # NEEDLE_SCALAR=1 rerun + netstandard2.1 + NativeAOT publish/smoke) and
+    # linux-arm64 covers NeonTests natively plus the NEON widening fallback
+    # tier (NEEDLE_NODP=1).
+    # windows-x64 unit+core are required-green since the #49 fetch.sh fix
+    # (Git bash resolution a689371 + LF checkout eb1b596): 7 consecutive
+    # green runs on both shards through 41423270190, including all
+    # FormatTests on windows runners. Known remaining red, classified, not
+    # waived:
+    #  - windows-x64/heavy stays expected-fail for the speech-numerics flake
+    #    in #38/#48 (SpeechTests.LongClipMatchesUpstreamThroughTheQueenPassage
+    #    failed once on 41348708967; green on the 5 runs since);
+    #  - macos-arm64 stays expected-fail pending the #48 TokenFrames
+    #    IndexOutOfRange (heavy legs) and native parity skips where the
+    #    upstream wheel has no usable library (wheel is manylinux x86-64
+    #    only; NativeParityTests.TryLoad returns null and each test skips
+    #    with a message instead of throwing).
     strategy:
       fail-fast: false
       matrix:
@@ -159,14 +166,14 @@ jobs:
             shard: heavy
           - name: windows-x64
             os: windows-latest
-            expected-fail: true
+            expected-fail: false
             scalar: false
             netstandard: false
             neon: false
             shard: unit
           - name: windows-x64
             os: windows-latest
-            expected-fail: true
+            expected-fail: false
             scalar: false
             netstandard: false
             neon: false
