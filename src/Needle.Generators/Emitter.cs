@@ -7,7 +7,7 @@ namespace Needle.Generators;
 
 internal static class Emitter
 {
-    public static string Emit(ToolSetModel model, bool implementToolSet)
+    public static string Emit(ToolSetModel model, bool implementToolSet, bool useUtf8Literals)
     {
         var builder = new StringBuilder(4096);
         builder.Append("""
@@ -24,7 +24,7 @@ internal static class Emitter
         foreach (var tool in model.Tools) EmitArgsStruct(builder, model, tool, indent);
         EmitCommandStruct(builder, model, indent);
         EmitSink(builder, model, indent);
-        EmitCommandsClass(builder, model, indent);
+        EmitCommandsClass(builder, model, indent, useUtf8Literals);
         if (implementToolSet) EmitToolSetAdapter(builder, model, indent);
         if (!model.GlobalNamespace) builder.Append("}\n");
         return builder.ToString();
@@ -248,12 +248,19 @@ internal static class Emitter
     }
 
 
-    static void EmitCommandsClass(StringBuilder builder, ToolSetModel model, string indent)
+    static void EmitCommandsClass(StringBuilder builder, ToolSetModel model, string indent, bool useUtf8Literals)
     {
         builder.Append(indent).Append("public static ").Append("class ").Append(model.CommandsName).Append('\n');
         builder.Append(indent).Append("{\n");
         builder.Append(indent).Append("    public const int ToolCount = ").Append(model.Tools.Length).Append(";\n\n");
-        builder.Append(indent).Append("    public static System.ReadOnlySpan<byte> Schema => \"").Append(CSharpEscape(SchemaText(model))).Append("\"u8;\n\n");
+        if (useUtf8Literals)
+            builder.Append(indent).Append("    public static System.ReadOnlySpan<byte> Schema => \"").Append(CSharpEscape(SchemaText(model))).Append("\"u8;\n\n");
+        else
+        {
+            // C# 9 (Unity): no u8 literals. A byte[] converts implicitly to ReadOnlySpan<byte>.
+            builder.Append(indent).Append("    static readonly byte[] SchemaBytes = new byte[] { ").Append(string.Join(", ", Encoding.UTF8.GetBytes(SchemaText(model)))).Append(" };\n");
+            builder.Append(indent).Append("    public static System.ReadOnlySpan<byte> Schema => SchemaBytes;\n\n");
+        }
         EmitGrammarTables(builder, model, indent);
         EmitDispatch(builder, model, indent);
         EmitBind(builder, model, indent);

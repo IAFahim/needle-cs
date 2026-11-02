@@ -23,6 +23,12 @@ internal static unsafe class Scalar
 {
     const float HadamardScale = 0.08838834764831845f;
     const float InverseSqrtQkDim = 0.14433756729740643f;
+    // N23: magic-constant round-to-nearest-even. Exact for |x| < 2^22; all
+    // quantized inputs here are pre-scaled to |x| <= 128. Avoids MathF.Round
+    // calls in scalar hot loops on every Unity runtime.
+    const float RoundBias = 12582912f; // 1.5 * (1 << 23)
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    static float RoundEven(float x) => (x + RoundBias) - RoundBias;
 
     public static float AbsMax(float* x, int n)
     {
@@ -33,7 +39,7 @@ internal static unsafe class Scalar
 
     public static void RoundTrip(float* x, int n, float inverse, float scale)
     {
-        for (var i = 0; i < n; i++) x[i] = MathF.Min(MathF.Max(MathF.Round(x[i] * inverse), -128f), 127f) * scale;
+        for (var i = 0; i < n; i++) x[i] = MathF.Min(MathF.Max(RoundEven(x[i] * inverse), -128f), 127f) * scale;
     }
 
     public static float QuantizeInt8(float* x, int n, sbyte* destination)
@@ -41,7 +47,7 @@ internal static unsafe class Scalar
         var peak = AbsMax(x, n);
         var scale = peak > 0f ? peak / 127f : 1f;
         var inverse = 1f / scale;
-        for (var i = 0; i < n; i++) destination[i] = (sbyte)MathF.Min(MathF.Max(MathF.Round(x[i] * inverse), -128f), 127f);
+        for (var i = 0; i < n; i++) destination[i] = (sbyte)MathF.Min(MathF.Max(RoundEven(x[i] * inverse), -128f), 127f);
         return scale;
     }
 
@@ -365,7 +371,7 @@ internal static unsafe class Scalar
         }
         var scale = peak > 0f ? peak / 127f : 1f;
         var round = 1f / scale;
-        for (var i = 0; i < n; i++) destination[i] = MathF.Min(MathF.Max(MathF.Round(destination[i] * round), -128f), 127f) * scale;
+        for (var i = 0; i < n; i++) destination[i] = MathF.Min(MathF.Max(RoundEven(destination[i] * round), -128f), 127f) * scale;
     }
 
     public static void CenteredRmsFakeA8(float* x, float* scale, int n, float* destination)
@@ -381,7 +387,7 @@ internal static unsafe class Scalar
         }
         var factor = peak > 0f ? peak / 127f : 1f;
         var round = 1f / factor;
-        for (var i = 0; i < n; i++) destination[i] = MathF.Min(MathF.Max(MathF.Round(destination[i] * round), -128f), 127f) * factor;
+        for (var i = 0; i < n; i++) destination[i] = MathF.Min(MathF.Max(RoundEven(destination[i] * round), -128f), 127f) * factor;
     }
 
     public static void GateFakeA8(float* x, float* gate, int n)
@@ -394,7 +400,7 @@ internal static unsafe class Scalar
         }
         var scale = peak > 0f ? peak / 127f : 1f;
         var round = 1f / scale;
-        for (var i = 0; i < n; i++) x[i] = MathF.Min(MathF.Max(MathF.Round(x[i] * round), -128f), 127f) * scale;
+        for (var i = 0; i < n; i++) x[i] = MathF.Min(MathF.Max(RoundEven(x[i] * round), -128f), 127f) * scale;
     }
 
     public static void CombineDiff4(float* s, int dim, float w0, float w1, float w2, float w3, float* x, float* u, float post, float* destination)

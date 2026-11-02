@@ -1,0 +1,17 @@
+{
+    "name": "Needle.Bench",
+    "rootNamespace": "Needle.Bench",
+    "references": [
+        "Needle.Unity",
+        "Needle.Kernels.Burst"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

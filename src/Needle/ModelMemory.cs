@@ -2,9 +2,7 @@ using System;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
-#if !NETSTANDARD2_1
 using System.IO.MemoryMappedFiles;
-#endif
 
 namespace Needle;
 
@@ -23,10 +21,8 @@ internal sealed unsafe class ModelMemory : IDisposable
     public readonly nuint Length;
     public readonly ModelStorage Storage;
 
-#if !NETSTANDARD2_1
     readonly MemoryMappedFile? file;
     readonly MemoryMappedViewAccessor? view;
-#endif
     int released;
 
     ModelMemory(byte* address, nuint length, ModelStorage storage)
@@ -36,14 +32,12 @@ internal sealed unsafe class ModelMemory : IDisposable
         Storage = storage;
     }
 
-#if !NETSTANDARD2_1
     ModelMemory(byte* address, nuint length, MemoryMappedFile file, MemoryMappedViewAccessor view)
         : this(address, length, ModelStorage.Mapped)
     {
         this.file = file;
         this.view = view;
     }
-#endif
 
     public static ModelMemory Borrow(byte* address, nuint length) => new(address, length, ModelStorage.Borrowed);
 
@@ -87,15 +81,25 @@ internal sealed unsafe class ModelMemory : IDisposable
 #if NETSTANDARD2_1
     public static ModelMemory Map(string path)
     {
-        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16, FileOptions.SequentialScan);
-        return Read(stream);
-    }
-
-    public void Prefault()
-    {
+        // Mapping can fail on restricted players (notably some mobile/sandboxed Unity
+        // targets); fall back to a plain read so Open still works. Genuine path errors
+        // (missing file, empty file) propagate unchanged.
+        // FromBytes (Android APK assets) never reaches here.
+        try
+        {
+            return MapMapped(path);
+        }
+        catch (Exception e) when (e is not InvalidDataException && e is not FileNotFoundException && e is not DirectoryNotFoundException)
+        {
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16, FileOptions.SequentialScan);
+            return Read(stream);
+        }
     }
 #else
-    public static ModelMemory Map(string path)
+    public static ModelMemory Map(string path) => MapMapped(path);
+#endif
+
+    static ModelMemory MapMapped(string path)
     {
         var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1, FileOptions.RandomAccess);
         var length = stream.Length;
@@ -135,7 +139,6 @@ internal sealed unsafe class ModelMemory : IDisposable
         if (Storage == ModelStorage.Mapped) Paging.WillNeed(Address, Length);
         for (nuint offset = 0; offset < Length; offset += PageBytes) Volatile.Read(ref Address[offset]);
     }
-#endif
 
     public void Dispose()
     {
@@ -145,13 +148,11 @@ internal sealed unsafe class ModelMemory : IDisposable
             case ModelStorage.Owned:
                 Mem.Free(Address);
                 break;
-#if !NETSTANDARD2_1
             case ModelStorage.Mapped:
                 view!.SafeMemoryMappedViewHandle.ReleasePointer();
                 view.Dispose();
                 file!.Dispose();
                 break;
-#endif
         }
     }
 }

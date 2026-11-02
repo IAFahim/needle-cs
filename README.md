@@ -128,6 +128,8 @@ session.Resume();
 
 Creating a session never changes the affinity or priority of the thread that creates it. Worker threads park shortly after finishing work (about 300 microseconds by default, 50 for `ThreadPolicy.Game`) and `Pause()` makes calls run inline on the caller while the workers sleep.
 
+The Unity samples (`SquadCommander`, `NpcSample`, `VoiceSample`) default to `ThreadPolicy.Game` with automatic threads — half the logical cores capped at 4 (4 where the box has headroom, 2 on a 4-core laptop), overridable per sample in the Inspector. BelowNormal priority plus the 50 µs park is what keeps workers off the main thread's core: measured Editor frame cost is 2–3 µs median, under 11 µs at p99, identical at 2 and 4 threads. In the Editor, `NEEDLE_PIN=0` additionally disables core pinning for `Default`-policy sessions. Details and the measurement method are in `unity/com.needle.inference/Documentation~/thread-budget.md`.
+
 ```csharp
 var budgeted = new NeedleOptions { Threading = ThreadPolicy.Game.WithThreads(3), FrameBudget = FrameBudget.FromMilliseconds(4) };
 ```

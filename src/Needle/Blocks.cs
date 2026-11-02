@@ -67,6 +67,12 @@ internal static unsafe class Attention
 #if NEEDLE_SIMD
         if (Simd.UseNeon) { Neon.AttentionTile(tile); return; }
 #endif
+        var kernelFp = Kernels.Active.AttentionTile;
+        if ((void*)kernelFp != null)
+        {
+            InvokeAttentionTile(kernelFp, tile);
+            return;
+        }
         if (!Simd.Enabled) { Scalar.AttentionTile(tile); return; }
 #if NEEDLE_SIMD
         if (tile.Heads == 1)
@@ -164,6 +170,12 @@ internal static unsafe class Attention
     [SkipLocalsInit]
     public static void MergePartials(float* partials, int count, int heads, float* output)
     {
+        var kernelFp = Kernels.Active.MergePartials;
+        if ((void*)kernelFp != null)
+        {
+            InvokeMergePartials(kernelFp, partials, count, heads, output);
+            return;
+        }
         // Decode always lands on count == 2: same accumulation order as the
         // generic loop (identical bits), with the weight broadcasts hoisted
         // out of the dim loop.
@@ -725,6 +737,18 @@ internal static unsafe class Attention
         Avx.Store(output + 24, Avx.Permute2x128(f2, f3, 0x31));
     }
 #endif
+    // N30: outlined table invokers; see the note on the Ops.cs set. The
+    // `fixed` pin lives in the tile helper so Run stays branch-only.
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static void InvokeAttentionTile(nint fp, in AttentionTile tile)
+    {
+        fixed (AttentionTile* p = &tile)
+            ((delegate* unmanaged[Cdecl]<AttentionTile*, void>)(void*)fp)(p);
+    }
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static void InvokeMergePartials(nint fp, float* partials, int count, int heads, float* output) =>
+        ((delegate* unmanaged[Cdecl]<float*, int, int, float*, void>)(void*)fp)(partials, count, heads, output);
+
 }
 
 internal unsafe struct AttentionBatch
@@ -896,6 +920,12 @@ internal static unsafe class HadamardMlp
 
     public static void Apply(MlpBatch* b, float* residual, float* scratch)
     {
+        var kernelFp = Kernels.Active.HadamardMlp;
+        if ((void*)kernelFp != null)
+        {
+            InvokeHadamardMlp(kernelFp, b, residual, scratch);
+            return;
+        }
         var w = b->Weights;
         var dim = b->Dim;
         var rows = b->Rows;
@@ -1241,6 +1271,11 @@ internal static unsafe class HadamardMlp
         }
     }
 #endif
+    // N30: outlined table invoker; see the note on the Ops.cs set.
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static void InvokeHadamardMlp(nint fp, MlpBatch* b, float* residual, float* scratch) =>
+        ((delegate* unmanaged[Cdecl]<MlpBatch*, float*, float*, void>)(void*)fp)(b, residual, scratch);
+
 }
 
 internal static unsafe class Sinkhorn

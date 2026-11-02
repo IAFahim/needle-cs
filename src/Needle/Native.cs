@@ -54,8 +54,17 @@ internal static unsafe class Mem
 
     public static void Clear(void* p, nuint bytes)
     {
+        // InitBlockUnaligned lowers to memset. The Unsafe assembly is already a hard
+        // dependency of the ns2.1 build (Engine/Utf8Text paths), so this ships nothing new.
+        // Slice: the count parameter is uint.
         var b = (byte*)p;
-        for (nuint i = 0; i < bytes; i++) b[i] = 0;
+        while (bytes > 0)
+        {
+            uint chunk = bytes > (1u << 30) ? (1u << 30) : (uint)bytes;
+            System.Runtime.CompilerServices.Unsafe.InitBlockUnaligned(ref b[0], 0, chunk);
+            b += chunk;
+            bytes -= chunk;
+        }
     }
 
     public static void* AlignedAlloc(nuint bytes, nuint alignment)
@@ -105,9 +114,49 @@ internal static unsafe partial class Paging
     internal static bool ParseHugePagesSetting(string? value) => value is { Length: > 0 } && value != "0";
 
 #if NETSTANDARD2_1
-    public static bool WillNeed(byte* address, nuint length) => false;
+    const int AdviceWillNeed = 3;
+    const int AdviceHugePage = 14;
 
-    public static bool AdviseHugePages(byte* address, nuint length) => false;
+    // LibraryImport needs the .NET 7+ source generator; netstandard2.1 (Unity) uses DllImport.
+    // A missing libc degrades to false via the catch below, so unsupported players just skip advice.
+    [DllImport("libc", EntryPoint = "madvise")]
+    static extern int Madvise(nint address, nuint length, int advice);
+
+    // OperatingSystem.Is* is .NET 5+; netstandard2.1 reports via RuntimeInformation instead.
+    static bool HasMadvise =>
+        RuntimeInformation.IsOSPlatform(OSPlatform.Linux) ||
+        RuntimeInformation.IsOSPlatform(OSPlatform.OSX) ||
+        RuntimeInformation.IsOSPlatform(OSPlatform.Create("ANDROID")) ||
+        RuntimeInformation.IsOSPlatform(OSPlatform.Create("IOS")) ||
+        RuntimeInformation.IsOSPlatform(OSPlatform.Create("FREEBSD"));
+
+    public static bool WillNeed(byte* address, nuint length)
+    {
+        if (!HasMadvise) return false;
+        try
+        {
+            return Madvise((nint)address, length, AdviceWillNeed) == 0;
+        }
+        catch (Exception e) when (e is DllNotFoundException || e is EntryPointNotFoundException)
+        {
+            return false;
+        }
+    }
+
+    public static bool AdviseHugePages(byte* address, nuint length)
+    {
+        if (!HugePagesEnabled || length == 0 || !RuntimeInformation.IsOSPlatform(OSPlatform.Linux)) return false;
+        const nuint PageBytes = 4096;
+        var start = (nuint)address & ~(PageBytes - 1);
+        try
+        {
+            return Madvise((nint)start, length + ((nuint)address - start), AdviceHugePage) == 0;
+        }
+        catch (Exception e) when (e is DllNotFoundException || e is EntryPointNotFoundException)
+        {
+            return false;
+        }
+    }
 #else
     const int AdviceWillNeed = 3;
     const int AdviceHugePage = 14;

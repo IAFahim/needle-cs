@@ -148,7 +148,11 @@ public readonly unsafe struct VoiceChannel
         utterance = 0;
         if (Volatile.Read(ref *head) == 0) return false;
         if (Interlocked.CompareExchange(ref *sealedFlag, 1, 0) != 0) return false;
+#if NETSTANDARD2_1
+        var spin = new Spinner();
+#else
         var spin = new SpinWait();
+#endif
         while (Volatile.Read(ref *writers) != 0) spin.SpinOnce();
         var slot = -1;
         for (var i = 0; i < SlotCount; i++)
@@ -307,7 +311,11 @@ public sealed unsafe class VoiceHost : IDisposable
         channel.FreeSlot(job.Slot);
         var length = Math.Min(speech.Utf8Length, ChannelLimits.QueryCapacity);
         var ticket = 0ul;
+#if NETSTANDARD2_1
+        var spin = new Spinner();
+#else
         var spin = new SpinWait();
+#endif
         while (!hubChannel.TrySubmitQuery(new ReadOnlySpan<byte>(textScratch!, 0, length), out ticket))
 #if NETSTANDARD2_1
             spin.SpinOnce();
@@ -350,7 +358,11 @@ public sealed unsafe class VoiceHost : IDisposable
             voice.TranscriptLength = pendingLength[slot];
             voice.TranscriptTruncated = pendingLength[slot] < pendingTotal![slot];
             voice.QueryTruncated = pendingTotal[slot] > ChannelLimits.QueryCapacity;
+#if NETSTANDARD2_1
+            var spin = new Spinner();
+#else
             var spin = new SpinWait();
+#endif
             while (!channel.TryPublishReply(in voice))
 #if NETSTANDARD2_1
                 spin.SpinOnce();
@@ -361,7 +373,11 @@ public sealed unsafe class VoiceHost : IDisposable
             pendingCount -= i + 1;
             return;
         }
+#if NETSTANDARD2_1
+        var forward = new Spinner();
+#else
         var forward = new SpinWait();
+#endif
         while (!channel.TryPublishDirect(in reply))
 #if NETSTANDARD2_1
             forward.SpinOnce();

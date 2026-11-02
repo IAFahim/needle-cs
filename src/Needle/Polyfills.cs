@@ -1,4 +1,6 @@
 #if NETSTANDARD2_1
+[module: System.Runtime.CompilerServices.SkipLocalsInit]
+
 namespace System.Runtime.CompilerServices
 {
     internal static class IsExternalInit

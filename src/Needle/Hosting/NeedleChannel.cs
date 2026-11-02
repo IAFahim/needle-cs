@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -200,6 +201,17 @@ public readonly unsafe struct NeedleChannel
 {
     public const int DefaultCapacity = 64;
 
+    // N71: cross-process header. Bytes 8..63 of the block are free in the
+    // local layout (wake slots live at 128/136, rings at 256+). Shared mode
+    // marks the block as polled on both sides; the wake slots then hold a
+    // process-local address (or nothing) and SignalWake must never call them.
+    const int SharedOffset = 8;
+    const int RequestCellsOffset = 16;
+    const int ReplyCellsOffset = 24;
+    const int CancelWordsOffset = 32;
+    const int MagicOffset = 40;
+    const long BlockMagic = 0x31304E48434C444EL; // "NDLCHN01" little-endian
+
     const int SleepingOffset = 0;
     const int WakeFunctionOffset = 128;
     const int WakeStateOffset = 136;
@@ -221,30 +233,58 @@ public readonly unsafe struct NeedleChannel
         this.cancelWords = cancelWords;
         this.cancelMask = cancelMask;
     }
-
-    public static NeedleChannel Allocate(int requestCapacity = DefaultCapacity, int replyCapacity = DefaultCapacity)
+    internal static void ComputeLayout(int requestCapacity, int replyCapacity, out int requestCells, out int replyCells, out int words, out int total)
     {
-        var requestCells = PowerOfTwo(requestCapacity);
-        var replyCells = PowerOfTwo(replyCapacity);
-        var words = Math.Max(1, (2 * Math.Max(requestCells, replyCells) + 63) / 64);
-        var requestCellOffset = RequestHeaderOffset + sizeof(RingOps.Header);
-        var replyHeaderOffset = Align(requestCellOffset + requestCells * sizeof(RingOps.Cell<ChannelRequest>));
-        var replyCellOffset = replyHeaderOffset + sizeof(RingOps.Header);
-        var cancelOffset = Align(replyCellOffset + replyCells * sizeof(RingOps.Cell<ChannelReply>));
-        var total = Align(cancelOffset + words * sizeof(long));
-        var block = (byte*)Mem.AlignedAlloc((nuint)total, 64);
-        Mem.Clear(block, (nuint)total);
+        requestCells = PowerOfTwo(requestCapacity);
+        replyCells = PowerOfTwo(replyCapacity);
+        words = Math.Max(1, (2 * Math.Max(requestCells, replyCells) + 63) / 64);
+        total = Align(CancelOffset(requestCells, replyCells) + words * sizeof(long));
+    }
+
+    internal static NeedleChannel InitializeBlock(byte* block, int requestCells, int replyCells, int words, long shared)
+    {
         var requests = (RingOps.Header*)(block + RequestHeaderOffset);
-        var replies = (RingOps.Header*)(block + replyHeaderOffset);
+        var replies = (RingOps.Header*)(block + ReplyHeaderOffset(requestCells));
         RingOps.Initialize<ChannelRequest>(requests, requestCells);
         RingOps.Initialize<ChannelReply>(replies, replyCells);
-        return new NeedleChannel(block, (long*)(block + SleepingOffset), requests, replies, (long*)(block + cancelOffset), words - 1);
+        WriteLayout(block, requestCells, replyCells, words, shared);
+        return Attach(block);
+    }
+
+    internal static NeedleChannel Attach(byte* block)
+    {
+        if (block == null) throw new ArgumentNullException(nameof(block));
+        if (Volatile.Read(ref *(long*)(block + MagicOffset)) != BlockMagic)
+            throw new InvalidDataException("Not a Needle channel block (bad magic).");
+        var requestCells = (int)Volatile.Read(ref *(long*)(block + RequestCellsOffset));
+        var replyCells = (int)Volatile.Read(ref *(long*)(block + ReplyCellsOffset));
+        var words = (int)Volatile.Read(ref *(long*)(block + CancelWordsOffset));
+        if (requestCells < 1 || replyCells < 1 || words < 1 ||
+            (requestCells & (requestCells - 1)) != 0 || (replyCells & (replyCells - 1)) != 0)
+            throw new InvalidDataException("Corrupt Needle channel header.");
+        var requests = (RingOps.Header*)(block + RequestHeaderOffset);
+        var replies = (RingOps.Header*)(block + ReplyHeaderOffset(requestCells));
+        return new NeedleChannel(block, (long*)(block + SleepingOffset), requests, replies, (long*)(block + CancelOffset(requestCells, replyCells)), words - 1);
     }
 
     public void Free()
     {
         if (block != null) Mem.AlignedFree(block);
     }
+
+    public static NeedleChannel Allocate(int requestCapacity = DefaultCapacity, int replyCapacity = DefaultCapacity)
+    {
+        ComputeLayout(requestCapacity, replyCapacity, out var requestCells, out var replyCells, out var words, out var total);
+        var block = (byte*)Mem.AlignedAlloc((nuint)total, 64);
+        Mem.Clear(block, (nuint)total);
+        return InitializeBlock(block, requestCells, replyCells, words, shared: 0);
+    }
+
+    /// <summary>
+    /// N71: true when the block lives in shared memory and both sides poll.
+    /// Game-side submit/receive calls are unchanged; only the wake is skipped.
+    /// </summary>
+    public bool IsShared => block != null && Volatile.Read(ref *(long*)(block + SharedOffset)) != 0;
 
     internal void SetWake(delegate*<void*, void> wake, void* state)
     {
@@ -358,12 +398,31 @@ public readonly unsafe struct NeedleChannel
 
     void SignalWake()
     {
+        // N71: shared blocks are polled on both sides. The wake slots hold a
+        // process-local address (or nothing); calling them here would jump to
+        // a foreign address, so polling replaces the wake entirely.
+        if (Volatile.Read(ref *(long*)(block + SharedOffset)) != 0) return;
         var function = Volatile.Read(ref *(nint*)(block + WakeFunctionOffset));
         if (function == IntPtr.Zero) return;
         if (Interlocked.CompareExchange(ref *sleeping, 0, 0) == 0) return;
         var state = Volatile.Read(ref *(nint*)(block + WakeStateOffset));
         ((delegate*<void*, void>)(void*)function)((void*)state);
     }
+
+    static void WriteLayout(byte* block, int requestCells, int replyCells, int words, long shared)
+    {
+        Volatile.Write(ref *(long*)(block + SharedOffset), shared);
+        Volatile.Write(ref *(long*)(block + RequestCellsOffset), (long)requestCells);
+        Volatile.Write(ref *(long*)(block + ReplyCellsOffset), (long)replyCells);
+        Volatile.Write(ref *(long*)(block + CancelWordsOffset), (long)words);
+        Volatile.Write(ref *(long*)(block + MagicOffset), BlockMagic);
+    }
+
+    static int ReplyHeaderOffset(int requestCells) =>
+        Align(RequestHeaderOffset + sizeof(RingOps.Header) + requestCells * sizeof(RingOps.Cell<ChannelRequest>));
+
+    static int CancelOffset(int requestCells, int replyCells) =>
+        Align(ReplyHeaderOffset(requestCells) + sizeof(RingOps.Header) + replyCells * sizeof(RingOps.Cell<ChannelReply>));
 
     static int PowerOfTwo(int requested)
     {

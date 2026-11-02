@@ -14,7 +14,23 @@ public sealed class NeedleOptions
     public ThreadPolicy? Threading { get; init; }
     public FrameBudget FrameBudget { get; init; }
     public int Context { get; init; } = 2048;
-    public int MaxReasoningTokens { get; init; } = 96;
+    /// <summary>
+    /// Cap on generated <c>&lt;think&gt;</c> reasoning tokens per call (N61).
+    /// Reasoning is the largest decode slice (plan.md §2.4), so lowering the
+    /// cap is the largest pass lever that changes model behavior: the eval
+    /// suite under <c>tests/eval</c> is the accuracy gate, and the default
+    /// stays put until it passes (plan.md §8 rule 4). Zero skips reasoning
+    /// entirely: the call/respond decision comes straight from the prefill
+    /// logits because <c>thinkEndForced</c> is folded into the prefill chunk
+    /// (see <c>EncodePrompt</c>), saving one engine pass.
+    /// </summary>
+    public int ReasoningBudget { get; init; } = 96;
+    /// <summary>
+    /// Back-compat alias for <see cref="ReasoningBudget"/> (the eval policy
+    /// name and existing hosts). Setting either sets the same budget; when
+    /// both appear in one initializer the last one wins.
+    /// </summary>
+    public int MaxReasoningTokens { get => ReasoningBudget; init => ReasoningBudget = value; }
     public int MaxCallTokens { get; init; } = 384;
     public string? System { get; init; }
     public bool AutoDate { get; init; }
@@ -58,7 +74,39 @@ public sealed class NeedleOptions
     /// </summary>
     public bool PromptLookup { get; init; }
 
+    /// <summary>
+    /// Stateless fast path (N62): defer the trailing <c>callClosing</c> /
+    /// <c>responseClosing</c> feed. Enable only when the caller rewinds the
+    /// session (<see cref="NeedleSession.Reset"/>) after every turn, as
+    /// <c>NeedleHost</c> does for stateless queries and the eval loop does
+    /// before each case. The closing feed is then pure waste: the next rewind
+    /// discards it, so deferring it saves one engine pass per call. A
+    /// continued turn (tool result, chat follow-up) replays the deferred
+    /// feed first, so continued history is bit-identical; only the pooled
+    /// confidence is computed pre-closing, so re-tune
+    /// <see cref="RefuseBelow"/> from the eval curve when enabling this.
+    /// Default off: exact legacy behavior (close every turn inline).
+    /// </summary>
+    public bool Stateless { get; init; }
+
     internal ThreadPolicy ResolvedThreading => Threading ?? ThreadPolicy.Default.WithThreads(Threads);
+
+    internal NeedleOptions WithStateless(bool stateless) => new()
+    {
+        Threads = Threads,
+        Threading = Threading,
+        FrameBudget = FrameBudget,
+        Context = Context,
+        ReasoningBudget = ReasoningBudget,
+        MaxCallTokens = MaxCallTokens,
+        System = System,
+        AutoDate = AutoDate,
+        RefuseBelow = RefuseBelow,
+        RetrievalTopK = RetrievalTopK,
+        JumpForward = JumpForward,
+        PromptLookup = PromptLookup,
+        Stateless = stateless,
+    };
 }
 
 public sealed record FunctionCall(string Name, string ArgumentsJson);
@@ -223,6 +271,16 @@ public sealed unsafe partial class NeedleSession : IDisposable
     readonly uint* specMasks;
     int specHistoryLength;
     int specPrimedLength;
+    // N62 stateless fast path: turn-closing tokens deferred instead of fed.
+    // Non-null only when options.Stateless stashed a closing at the end of a
+    // turn; the next turn replays it first (identical history), while Reset
+    // or a re-prime drops it (the pass is then saved entirely). The flag
+    // records whether the slow path would have fed it through FeedCallChunk
+    // (call closings: a counted pass plus spec history) or plain TryFeed
+    // (response closings: neither), so replay matches each path exactly.
+    // No allocation: both closings are shared readonly arrays.
+    int[]? pendingClosing;
+    bool pendingClosingCounted;
 
     public NeedleSession(Model model, string toolsJson, NeedleOptions? options = null)
         : this(model, toolsJson, null, default, options)
@@ -348,6 +406,10 @@ public sealed unsafe partial class NeedleSession : IDisposable
         var ids = new List<int> { tokenizer.BeginId };
         ids.AddRange(Tokens(head, true));
         engine.Reset();
+        // A re-prime replaces the engine lineage (retrieval subset change),
+        // so a deferred closing from the old lineage is dropped, exactly as
+        // the slow path's fed closing is discarded by the Reset here.
+        pendingClosing = null;
         engine.Feed(ids.ToArray(), computeLogits: false);
         engine.Mark();
         // The primed tool-schema tokens seed the prompt-lookup history: tool
@@ -364,6 +426,9 @@ public sealed unsafe partial class NeedleSession : IDisposable
         engine.Rewind();
         turnOne = true;
         specHistoryLength = specPrimedLength;
+        // The rewind discards the deferred closing along with everything
+        // past the mark: this is the saved pass of the fast path.
+        pendingClosing = null;
     }
 
     const int PrefixMagic = 0x3150444E;
@@ -475,6 +540,10 @@ public sealed unsafe partial class NeedleSession : IDisposable
             var selection = SelectTools(input);
             if (selection != FailureReason.None) return Failed(selection, progress);
         }
+        // N62: a continued turn replays the previous turn's deferred closing
+        // first, so its history matches the slow path token for token. After
+        // a re-prime above the pending closing is already dropped.
+        if (!ReplayPendingClosing()) return Failed(FailureReason.ContextExhausted, progress);
         progress.PromptTokens = EncodePrompt(input, toolResult);
         if (engine.Length + progress.PromptTokens > contextCapacity) return Failed(FailureReason.ContextExhausted, progress);
         turnOne = false;
@@ -493,6 +562,9 @@ public sealed unsafe partial class NeedleSession : IDisposable
         if (!toolResult && input.Length == 0) return Failed(FailureReason.EmptyInput, progress);
         if (input.Length > maxInputBytes) return Failed(FailureReason.InputTooLong, progress);
         if (retrieval) return Failed(FailureReason.ToolContextFailed, progress);
+        // N62: same replay as Run: a continued typed turn sees the identical
+        // token history as the slow path.
+        if (!ReplayPendingClosing()) return Failed(FailureReason.ContextExhausted, progress);
         progress.PromptTokens = EncodePrompt(input, toolResult);
         if (engine.Length + progress.PromptTokens > contextCapacity) return Failed(FailureReason.ContextExhausted, progress);
         turnOne = false;
@@ -506,6 +578,11 @@ public sealed unsafe partial class NeedleSession : IDisposable
         return GenerateCallsTyped(ref progress, commands, ref sink);
     }
 
+    // True when the last EncodePrompt folded thinkEndForced into the prefill
+    // (ReasoningBudget <= 0 and the ids fit). Reason then skips its separate
+    // feed: the decision ArgMax reads the prefill logits directly.
+    bool thinkEndFolded;
+
     int EncodePrompt(ReadOnlySpan<byte> input, bool toolResult)
     {
         var head = toolResult ? ToolResultHead : turnOne ? FirstQueryHead : LaterQueryHead;
@@ -516,7 +593,19 @@ public sealed unsafe partial class NeedleSession : IDisposable
         tail.CopyTo(text[(head.Length + input.Length)..]);
         var count = tokenizer.Encode(text[..(head.Length + input.Length + tail.Length)], promptIds, false);
         promptIds[count] = ThinkStart;
-        return count + 1;
+        var total = count + 1;
+        // N61: with no reasoning budget the think span is empty, so the forced
+        // tail (ThinkEnd + newline) joins the prefill chunk instead of costing
+        // its own engine pass. The fed token sequence is identical either way;
+        // single-threaded chunk feeds equal split feeds bit-for-bit
+        // (ChunkParityTests), and the eval suite gates any drift otherwise.
+        thinkEndFolded = options.ReasoningBudget <= 0 && total + thinkEndForced.Length <= promptIds.Length;
+        if (thinkEndFolded)
+        {
+            thinkEndForced.CopyTo(promptIds, total);
+            total += thinkEndForced.Length;
+        }
+        return total;
     }
 
     Reply Generate(ref TurnProgress progress, Span<byte> calls, Span<byte> reasoning, Span<byte> response)
@@ -534,7 +623,7 @@ public sealed unsafe partial class NeedleSession : IDisposable
         decision = ToolCallStart;
         var budget = options.FrameBudget;
         var firstPiece = true;
-        for (var i = 0; i < options.MaxReasoningTokens; i++)
+        for (var i = 0; i < options.ReasoningBudget; i++)
         {
             if (CancelRequested) return Abandon(ReplyStatus.Cancelled, FailureReason.None, progress);
             var next = ArgMax(reasoningMask);
@@ -548,8 +637,11 @@ public sealed unsafe partial class NeedleSession : IDisposable
             progress.DecodeTokens++;
             if (!budget.IsUnlimited && FrameBudgetHit(progress, budget)) return Abandon(ReplyStatus.Failed, FailureReason.FrameBudgetExceeded, progress);
         }
-        if (!TryFeed(thinkEndForced)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
-        for (var f = 0; f < thinkEndForced.Length; f++) RecordSpecHistory(thinkEndForced[f]);
+        if (!thinkEndFolded)
+        {
+            if (!TryFeed(thinkEndForced)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
+            for (var f = 0; f < thinkEndForced.Length; f++) RecordSpecHistory(thinkEndForced[f]);
+        }
         decision = ArgMax(decisionMask);
         if (decision < 0) return Abandon(ReplyStatus.Failed, FailureReason.GrammarDeadEnd, progress);
         if (decision != ToolCallStart) return Respond(decision, ref progress, response);
@@ -724,8 +816,7 @@ public sealed unsafe partial class NeedleSession : IDisposable
                 full = true;
             }
         }
-        if (!FeedCallChunk(callClosing, computeLogits: false)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
-        for (var c = 0; c < callClosing.Length; c++) RecordSpecHistory(callClosing[c]);
+        if (!FinishClosing(callClosing, countPass: true)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
 
         var head = HeadProbability();
         // Jumped forced tokens contribute probability 1, so the mean below
@@ -897,8 +988,7 @@ public sealed unsafe partial class NeedleSession : IDisposable
                 full = true;
             }
         }
-        if (!FeedCallChunk(callClosing, computeLogits: false)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
-        for (var c = 0; c < callClosing.Length; c++) RecordSpecHistory(callClosing[c]);
+        if (!FinishClosing(callClosing, countPass: true)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
 
         var head = HeadProbability();
         // Jumped forced tokens contribute probability 1, matching
@@ -930,7 +1020,7 @@ public sealed unsafe partial class NeedleSession : IDisposable
             next = ArgMax(responseMask);
             if (next < 0) return Abandon(ReplyStatus.Failed, FailureReason.GrammarDeadEnd, progress);
         }
-        if (!TryFeed(responseClosing, computeLogits: false)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
+        if (!FinishClosing(responseClosing, countPass: false)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
         var confidence = (float)HeadProbability();
         return new Reply(ReplyStatus.Responded, FailureReason.None, progress.Flags, confidence, confidence, float.NaN, 0, 0,
             progress.ReasoningLength, progress.ResponseLength, progress.PromptTokens, progress.DecodeTokens, progress.PrefillTicks, progress.FirstTokenTicks, Stopwatch.GetTimestamp() - progress.Started);
@@ -963,6 +1053,40 @@ public sealed unsafe partial class NeedleSession : IDisposable
     {
         if (engine.Length + tokens.Length > contextCapacity) return false;
         engine.Feed(tokens, computeLogits);
+        return true;
+    }
+
+    // N62 stateless fast path. When options.Stateless is set, the trailing
+    // turn-closing feed is deferred instead of paid: it is replayed at the
+    // start of the next turn (ReplayPendingClosing), so a continued turn sees
+    // the identical token history, while a Reset or re-prime drops it and the
+    // engine pass is saved. Confidence is therefore always computed from the
+    // pre-closing pool when deferred. Zero allocation either way.
+    bool FinishClosing(int[] closing, bool countPass)
+    {
+        if (options.Stateless)
+        {
+            if (engine.Length + closing.Length > contextCapacity) return false;
+            pendingClosing = closing;
+            pendingClosingCounted = countPass;
+            return true;
+        }
+        if (countPass)
+        {
+            if (!FeedCallChunk(closing, computeLogits: false)) return false;
+        }
+        else if (!TryFeed(closing, computeLogits: false)) return false;
+        if (countPass) for (var c = 0; c < closing.Length; c++) RecordSpecHistory(closing[c]);
+        return true;
+    }
+
+    bool ReplayPendingClosing()
+    {
+        var pending = pendingClosing;
+        if (pending == null) return true;
+        if (!TryFeed(pending, computeLogits: false)) return false;
+        if (pendingClosingCounted) for (var c = 0; c < pending.Length; c++) RecordSpecHistory(pending[c]);
+        pendingClosing = null;
         return true;
     }
 

@@ -1,0 +1,14 @@
+{
+    "name": "Needle.Kernels.Burst",
+    "rootNamespace": "Needle.BurstKernels",
+    "references": ["Unity.Burst"],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": true,
+    "overrideReferences": true,
+    "precompiledReferences": ["Needle.Inference.dll"],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

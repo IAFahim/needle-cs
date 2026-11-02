@@ -16,18 +16,37 @@ public sealed class NeedleToolsGenerator : IIncrementalGenerator
 
     public void Initialize(IncrementalGeneratorInitializationContext context)
     {
+        // Unity 7000's CoreCLR script compiler is Roslyn 5.6 (DotNetSdk 10.0.303), so
+        // ForAttributeWithMetadataName (4.3+) is available. The old MonoBleedingEdge
+        // csc is Roslyn 3.7 with no incremental-generator support; that path is out
+        // of scope (CoreCLR is the N00 target), hence no CreateSyntaxProvider fallback.
         var models = context.SyntaxProvider.ForAttributeWithMetadataName(
             AttributeName,
             static (node, _) => node is InterfaceDeclarationSyntax,
             static (context, _) => ToolModelBuilder.Build((INamedTypeSymbol)context.TargetSymbol));
         var hasToolSet = context.CompilationProvider.Select(static (compilation, _) =>
             compilation.GetTypeByMetadataName("Needle.Tools.IToolSet") is not null);
-        context.RegisterSourceOutput(models.Combine(hasToolSet), static (context, pair) =>
+        // Unity compiles scripts at C# 9 (u8 literals need C# 11). Default to the
+        // C# 9-safe byte[] when the language version is unknown.
+        var useUtf8Literals = context.ParseOptionsProvider.Select(static (options, _) =>
+            options is CSharpParseOptions cs && (int)cs.LanguageVersion >= 1100); // 1100 == C# 11 (u8); the CSharp11 enum member postdates the 4.3 build-time Roslyn
+        var combined = models.Combine(hasToolSet).Combine(useUtf8Literals);
+        context.RegisterSourceOutput(combined.Combine(context.CompilationProvider), static (context, pair) =>
         {
-            foreach (var diagnostic in pair.Left.Diagnostics)
+            var triple = pair.Left;
+            var compilation = pair.Right;
+            var built = triple.Left;
+            foreach (var diagnostic in built.Left.Diagnostics)
                 context.ReportDiagnostic(Diagnostic.Create(diagnostic.Descriptor, Location.Create(diagnostic.FilePath, diagnostic.Span, diagnostic.LineSpan)));
-            if (pair.Left.IsValid && pair.Left.Model is { } model)
-                context.AddSource(model.InterfaceName + "Tools.g.cs", Emitter.Emit(model, pair.Right));
+            if (built.Left.IsValid && built.Left.Model is { } model)
+            {
+                // Transition guard: while a checked-in .g.cs still declares this toolset's
+                // Commands class, emitting as well would duplicate every type (CS0101).
+                // Skip emission; delete the checked-in file once recompile passes alone.
+                var qualified = model.GlobalNamespace ? model.CommandsName : model.Namespace + "." + model.CommandsName;
+                if (compilation.GetTypeByMetadataName(qualified) is not null) return;
+                context.AddSource(model.InterfaceName + "Tools.g.cs", Emitter.Emit(model, built.Right, triple.Right));
+            }
         });
     }
 }

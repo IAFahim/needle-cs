@@ -592,6 +592,7 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         RunLayerTeam(l, count, position);
     }
 
+    [StructLayout(LayoutKind.Sequential)] // N40: layout frozen — BurstLayer mirrors this struct field for field (see BurstLayer.JobSize).
     unsafe struct LayerJob
     {
         public TeamBarrier* Barrier;

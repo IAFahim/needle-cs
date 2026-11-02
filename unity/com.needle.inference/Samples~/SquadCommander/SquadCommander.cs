@@ -22,6 +22,8 @@ namespace Needle.Samples.SquadCommander
         public Transform Squad;
         public float Speed = 6f;
         [Range(0f, 1f)] public float MinConfidence = 0.1f;
+        [Tooltip("Needle worker threads. 0 = automatic: half the logical cores, capped at 4 (4 threads where the box has headroom, 2 on a 4-core laptop). Set 1-4 to force a count.")]
+        public int Threads = 0;
 
         NeedleHost host;
         NeedleChannel channel;
@@ -47,8 +49,29 @@ namespace Needle.Samples.SquadCommander
                 StatelessQueries = true,
                 // Keep every tool in context: the typed path has no tool retrieval, which
                 // otherwise starts above RetrievalTopK (5) tools.
-                Session = new NeedleOptions { Threading = ThreadPolicy.Game.WithThreads(2), RetrievalTopK = SquadCommands.GrammarToolCount },
+                // Thread budget (see Documentation~/thread-budget.md): Game workers run
+                // BelowNormal and park after 50 us, and never pin cores, so Unity's job
+                // workers, render thread and main thread keep their cores. Threads = 0
+                // means half the logical cores capped at 4: 4 threads where the box has
+                // headroom, 2 on a 4-core laptop.
+                Session = new NeedleOptions { Threading = ThreadPolicy.Game.WithThreads(ResolveThreads()), RetrievalTopK = SquadCommands.GrammarToolCount },
             });
+        }
+
+        int ResolveThreads() => Threads > 0 ? Math.Max(1, Math.Min(4, Threads)) : DefaultThreads();
+
+        // Slow runtimes get 2 threads, roomy boxes 4 (N25). Deliberately NOT
+        // cores-minus-Unity-job-workers: JobWorkerCount counts parked threads, not
+        // busy cores — this 32-core Editor reports 31 workers, which would collapse
+        // the default to 1 thread (and in Unity 7000 JobsUtility lives in
+        // UnityEngine.ManagedKernelModule, so the old "Unity.Jobs" assembly lookup
+        // misses everywhere). Coexistence with Unity comes from the Game policy
+        // instead: BelowNormal priority, 50 us park, no pinning. Measured frame
+        // impact is identical at 2 and 4 threads; see thread-budget.md.
+        static int DefaultThreads()
+        {
+            int cores = Math.Max(1, Environment.ProcessorCount);
+            return Math.Max(1, Math.Min(4, cores / 2));
         }
 
         /// <summary>Submit an order. Allocation-free; returns false if the text is empty, too long or the queue is full.</summary>

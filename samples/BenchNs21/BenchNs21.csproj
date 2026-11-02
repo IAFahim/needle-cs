@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- N11a: CoreCLR host forced onto the netstandard2.1 build.
+       SetTargetFramework pins the Needle reference to its netstandard2.1 TFM,
+       so this exe measures CoreCLR + ns2.1 IL (scalar + Sleep waits) while the
+       host itself runs on .NET 10. BenchDriver.cs is linked from the Unity
+       package copy so all four runners share one source of truth. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>bench-ns21</AssemblyName>
+    <Nullable>disable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Needle\Needle.csproj" SetTargetFramework="TargetFramework=netstandard2.1" />
+    <Compile Include="..\..\unity\com.needle.inference\Tests\Bench\BenchDriver.cs" />
+    <!-- MonoMain is compiled by the mono leg (Unity 6.13 csc), not dotnet. -->
+    <Compile Remove="MonoMain.cs" />
+  </ItemGroup>
+</Project>

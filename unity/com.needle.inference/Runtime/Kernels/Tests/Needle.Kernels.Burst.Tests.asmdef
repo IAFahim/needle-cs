@@ -1,0 +1,15 @@
+{
+    "name": "Needle.Kernels.Burst.Tests",
+    "rootNamespace": "Needle.BurstKernels",
+    "references": ["Needle.Kernels.Burst", "Needle.Unity", "UnityEngine.TestRunner", "UnityEditor.TestRunner"],
+    "includePlatforms": ["Editor"],
+    "excludePlatforms": [],
+    "allowUnsafeCode": true,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": false,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false,
+    "optionalUnityReferences": []
+}

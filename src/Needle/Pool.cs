@@ -12,6 +12,29 @@ internal struct TeamBarrier
     [FieldOffset(8)] public int Arrived;
     [FieldOffset(12)] public int Participants;
 }
+#if NETSTANDARD2_1
+// N20: CoreCLR's parameterless SpinWait.SpinOnce() calls Thread.Sleep(1) once a wait
+// passes ~20 spins. With ~260 team barriers per token that parks every token in
+// millisecond-scale sleeps (V4). Spinner backs off with user-space spins only, then
+// yields the timeslice without ever sleeping. net10 keeps SpinWait.SpinOnce(-1).
+internal struct Spinner
+{
+    int _count;
+
+    public void SpinOnce()
+    {
+        if (_count < 10)
+        {
+            Thread.SpinWait(4 << _count);
+            _count++;
+        }
+        else
+        {
+            Thread.Yield();
+        }
+    }
+}
+#endif
 
 internal sealed unsafe class Pool : IDisposable
 {
@@ -104,7 +127,11 @@ internal sealed unsafe class Pool : IDisposable
         Interlocked.Exchange(ref control->Ticket, generation << 32);
         if (Volatile.Read(ref control->Sleeping) > 0) WakeAll();
         if (policy.Caller == CallerRole.Participates) Drain();
+#if NETSTANDARD2_1
+        var spin = new Spinner();
+#else
         var spin = new SpinWait();
+#endif
         while (Volatile.Read(ref control->Done) < count)
 #if NETSTANDARD2_1
             spin.SpinOnce();
@@ -140,7 +167,11 @@ internal sealed unsafe class Pool : IDisposable
             function(context, workers.Length);
             Interlocked.Increment(ref control->TeamDone);
         }
+#if NETSTANDARD2_1
+        var spin = new Spinner();
+#else
         var spin = new SpinWait();
+#endif
         while (Volatile.Read(ref control->TeamDone) < members)
 #if NETSTANDARD2_1
             spin.SpinOnce();
@@ -162,7 +193,11 @@ internal sealed unsafe class Pool : IDisposable
         }
         else
         {
+#if NETSTANDARD2_1
+            var spin = new Spinner();
+#else
             var spin = new SpinWait();
+#endif
             while (Volatile.Read(ref barrier->Phase) == phase)
 #if NETSTANDARD2_1
                 spin.SpinOnce();

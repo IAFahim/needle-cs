@@ -63,6 +63,11 @@ internal static unsafe class Quant
 
     public static float FakeA8(float* x, int n)
     {
+        var kernelFp = Kernels.Active.FakeA8;
+        if ((void*)kernelFp != null)
+        {
+            return InvokeFakeA8(kernelFp, x, n);
+        }
         var peak = AbsMax(x, n);
         var scale = peak > 0f ? peak / 127f : 1f;
         RoundTrip(x, n, 1f / scale, scale);
@@ -93,6 +98,11 @@ internal static unsafe class Quant
         #if NEEDLE_SIMD
         if (Simd.UseNeon) { return Neon.QuantizeInt8(x, n, destination); }
 #endif
+        var kernelFp = Kernels.Active.QuantizeInt8;
+        if ((void*)kernelFp != null)
+        {
+            return InvokeQuantizeInt8(kernelFp, x, n, destination);
+        }
         if (!Simd.Enabled) return Scalar.QuantizeInt8(x, n, destination);
 #if NEEDLE_SIMD
         var peak = AbsMax(x, n);
@@ -153,6 +163,12 @@ internal static unsafe class Quant
         #if NEEDLE_SIMD
         if (Simd.UseNeon) { Neon.Prepare(x, tokens, cols, bits, a); return; }
 #endif
+        var kernelFp = Kernels.Active.Prepare;
+        if ((void*)kernelFp != null)
+        {
+            InvokePrepare(kernelFp, x, tokens, cols, bits, a);
+            return;
+        }
         var rotated = stackalloc float[Cq.GroupSize];
         var quantized = stackalloc sbyte[Cq.GroupSize];
 #if NEEDLE_SIMD
@@ -246,6 +262,12 @@ internal static unsafe class Quant
 
     public static void GatherRow(in Cq w, int row, float* destination)
     {
+        var kernelFp = Kernels.Active.GatherRow;
+        if ((void*)kernelFp != null)
+        {
+            InvokeGatherRow(kernelFp, w, row, destination);
+            return;
+        }
         DecodeRow(w, row, destination);
         for (var g = 0; g < w.Groups; g++) Hadamard(destination + g * Cq.GroupSize);
     }
@@ -292,6 +314,12 @@ internal static unsafe class Quant
         #if NEEDLE_SIMD
         if (Simd.UseNeon) { Neon.MatMulRows(w, a, tokens, y, ldy, rowStart, rowEnd); return; }
 #endif
+        var kernelFp = Kernels.Active.MatMulRows;
+        if ((void*)kernelFp != null)
+        {
+            InvokeMatMulRows(kernelFp, w, a, tokens, y, ldy, rowStart, rowEnd);
+            return;
+        }
         if (!Simd.Enabled) { Scalar.MatMulRows(w, a, tokens, y, ldy, rowStart, rowEnd); return; }
 #if NEEDLE_SIMD
         var tiledTokens = tokens & ~(TokenTile - 1);
@@ -300,6 +328,34 @@ internal static unsafe class Quant
         for (var t = tiledTokens; t < tokens; t++) Gemv.Rows(w, a, t, y + (long)t * ldy, rowStart, rowEnd);
 #endif
     }
+    // N30: outlined table invokers; see the note on the Ops.cs set. The
+    // `fixed` pins live here so the dispatch methods stay branch-only.
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static float InvokeFakeA8(nint fp, float* x, int n) =>
+        ((delegate* unmanaged[Cdecl]<float*, int, float>)(void*)fp)(x, n);
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static float InvokeQuantizeInt8(nint fp, float* x, int n, sbyte* destination) =>
+        ((delegate* unmanaged[Cdecl]<float*, int, sbyte*, float>)(void*)fp)(x, n, destination);
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static void InvokePrepare(nint fp, float* x, int tokens, int cols, int bits, in Activations a)
+    {
+        fixed (Activations* pa = &a)
+            ((delegate* unmanaged[Cdecl]<float*, int, int, int, Activations*, void>)(void*)fp)(x, tokens, cols, bits, pa);
+    }
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static void InvokeGatherRow(nint fp, in Cq w, int row, float* destination)
+    {
+        fixed (Cq* pw = &w)
+            ((delegate* unmanaged[Cdecl]<Cq*, int, float*, void>)(void*)fp)(pw, row, destination);
+    }
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static void InvokeMatMulRows(nint fp, in Cq w, in Activations a, int tokens, float* y, int ldy, int rowStart, int rowEnd)
+    {
+        fixed (Cq* pw = &w)
+        fixed (Activations* pa = &a)
+            ((delegate* unmanaged[Cdecl]<Cq*, Activations*, int, float*, int, int, int, void>)(void*)fp)(pw, pa, tokens, y, ldy, rowStart, rowEnd);
+    }
+
 }
 
 internal unsafe struct MatMulJob

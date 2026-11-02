@@ -20,7 +20,9 @@ return args switch
     ["embed", var model, var text] => EmbedText(model, text),
     ["eval", var model, var dataset, .. var options] => Eval.Run(model, dataset, options),
     ["call", var model, var tools, .. var queries] => Call(model, tools, queries),
-    ["run", var model, var tools, var query, .. var rest] => Run(model, tools, query, rest),
+    ["run", var rmodel, var rtools, var query, .. var rrest] => Run(rmodel, rtools, query, rrest),
+    ["serve", var smodel, var stools, .. var srest] => Serve.Run(smodel, stools, srest),
+    ["prime", var pmodel, var ptools, var pout, .. var prest] => Prime.Run(pmodel, ptools, pout, prest),
     _ => Usage(),
 };
 
@@ -32,7 +34,9 @@ static int Usage()
     Console.Error.WriteLine("needle bench <needle3.cact> [--threads 4] [--json]");
     Console.Error.WriteLine("needle bench-e2e <needle3.cact> <tools.json> [--threads 1,2,4] [--reps N] [--sets golden|game|all] [--api span|text] [--profile] [--json] [--max-managed-bytes N] [--max-native-allocs N]");
     Console.Error.WriteLine(Eval.Usage);
-    Console.Error.WriteLine("needle call <needle3.cact> <tools.json> [--no-date] [--no-retrieval] <query>... ('tool:<json>' feeds a tool result)");
+    Console.Error.WriteLine("needle serve <needle3.cact> <tools.json> [options] (stdin JSON lines -> stdout replies)");
+    Console.Error.WriteLine("needle prime <model.cact> <tools.json> <out.prefix> [--system TEXT] [--context N] [--threads N] [--max-reasoning N] [--max-calls N]");
+    Console.Error.WriteLine("needle call <model.cact> <tools.json> [query ...] [--no-date] [--no-retrieval] [--prefix <out.prefix>]");
     Console.Error.WriteLine("needle transcribe <whistle.cact> <clip.wav> [--language xx] [--words] [--keywords a,b] [--repeat n]");
     Console.Error.WriteLine("needle stream <whistle.cact> <clip.wav>");
     Console.Error.WriteLine("needle voice <needle3.cact> <whistle.cact> <tools.json> <clip.wav>");
@@ -123,11 +127,34 @@ static int Call(string modelPath, string toolsPath, string[] rest)
     var system = Environment.GetEnvironmentVariable("NEEDLE_SYSTEM");
     var autoDate = !rest.Contains("--no-date");
     var topK = rest.Contains("--no-retrieval") ? int.MaxValue : 5;
-    var queries = rest.Where(q => q != "--no-date" && q != "--no-retrieval").ToArray();
+    string? prefixPath = null;
+    var queries = new System.Collections.Generic.List<string>();
+    for (var i = 0; i < rest.Length; i++)
+    {
+        if (rest[i] == "--prefix")
+        {
+            if (i + 1 >= rest.Length) { Console.Error.WriteLine("needle call: --prefix needs a file"); return 2; }
+            prefixPath = rest[++i];
+        }
+        else if (rest[i] != "--no-date" && rest[i] != "--no-retrieval") queries.Add(rest[i]);
+    }
+    // A shipped prefix bakes a date-free system prompt (AutoDate=false); a
+    // dated prompt would fail prefix validation, so require --no-date here.
+    if (prefixPath != null && autoDate) { Console.Error.WriteLine("needle call: --prefix requires --no-date (primed prefixes bake AutoDate=false)"); return 2; }
+    byte[]? prefix = null;
+    if (prefixPath != null)
+    {
+        try { prefix = File.ReadAllBytes(prefixPath); }
+        catch (Exception e) { Console.Error.WriteLine($"cannot read prefix {prefixPath}: {e.Message}"); return 1; }
+    }
     using var model = Model.Open(modelPath);
     var started = Stopwatch.GetTimestamp();
-    using var session = new NeedleSession(model, File.ReadAllText(toolsPath), new NeedleOptions { Threads = threads, System = system, AutoDate = autoDate, RetrievalTopK = topK });
-    Console.Error.WriteLine($"ready in {(Stopwatch.GetTimestamp() - started) * 1000.0 / Stopwatch.Frequency:F1} ms, prefix {session.ContextUsed} tokens");
+    var toolsJson = File.ReadAllText(toolsPath);
+    var options = new NeedleOptions { Threads = threads, System = system, AutoDate = autoDate, RetrievalTopK = topK };
+    using var session = prefix != null
+        ? new NeedleSession(model, toolsJson, prefix, options)
+        : new NeedleSession(model, toolsJson, options);
+    Console.Error.WriteLine($"ready in {(Stopwatch.GetTimestamp() - started) * 1000.0 / Stopwatch.Frequency:F1} ms, prefix {session.ContextUsed} tokens{(prefix != null ? " (primed file)" : "")}");
     foreach (var query in queries)
     {
         var result = query.StartsWith("tool:") ? session.CompleteWithToolResult(query[5..]) : session.Complete(query);
