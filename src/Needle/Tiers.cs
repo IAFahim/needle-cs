@@ -119,9 +119,12 @@ internal static class Tiers
             if (HasAvx && AvxVnniInt8.IsSupported) return CpuTier.AvxVnniInt8;
             if (HasAvx && AvxVnni.IsSupported) return CpuTier.AvxVnni;
         }
-        if (HasAvx && Avx512F.IsSupported && Avx512BW.IsSupported && Vector512.IsHardwareAccelerated
-            && Environment.GetEnvironmentVariable("NEEDLE_NOAVX512") == null)
-            return CpuTier.Avx512Bw;
+        // Measured 2026-11-02 on Zen 4 (Ryzen 5 8500G, AVX-512BW/VL/VBMI, no VEX VNNI):
+        // BwDot is ~0.5x Avx2Dot (512-bit madd is double-pumped) and OpsAvx512 is no
+        // faster than the 256-bit paths, so Avx2 is the default here. Avx512Bw stays
+        // force-selectable via NEEDLE_TIER=avx512 (all suites pass on it); the 512-bit
+        // Kron (Blocks.Wide) still wins ~1.6x and is tier-independent. Revisit if a
+        // full 512-bit plane expansion lands or fast-512-bit hardware is detectable.
         if (HasAvx) return CpuTier.Avx2;
         return CpuTier.Scalar;
     }

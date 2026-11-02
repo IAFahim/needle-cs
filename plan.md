@@ -188,10 +188,27 @@ Indicative numbers from the loaded 32-core dev box (JIT, avx2); latency is too n
 |---|---|---|---|
 | Intel 12th–14th gen | AVX2 + AVX-VNNI, no AVX-512 | AvxVnni-256 | multi-row GEMV, scheduling |
 | AMD Zen 3 | AVX2 | Avx2 3-op path | same |
-| AMD Zen 4 | AVX-512 with EVEX VNNI, **no VEX AVX-VNNI** | Avx2 3-op path | Avx512BW path, about 2x |
+| AMD Zen 4 | AVX-512 with EVEX VNNI, **no VEX AVX-VNNI** | Avx2 3-op + VBMI permute planes (default since 2026-11-02) | BwDot measured ~0.5x Avx2 — tier kept selectable, full 512-bit expansion open |
 | AMD Zen 5 | AVX-512 + AVX-VNNI | AvxVnni-256 | measure Avx512BW |
 | Steam Deck, PS5, Xbox Series (Zen 2) | AVX2 | Avx2 | same as Zen 3 |
 | Apple Silicon, recent Android, Switch-class ARM | NEON, dotprod (i8mm on newer cores) | Neon SDOT | i8mm tier; verify per device |
+
+#### Zen 4 tier measurements (2026-11-02, Ryzen 5 8500G, 12 threads, idle box)
+
+Method: synthetic `Cq` weights + `Quant.Prepare`d activations, `Quant.MatMulRows` best-of-7 on 1 thread; GB/s = weight bytes / best time (decode GEMV is weight-traffic bound). Temporary xunit sweep, deleted after measuring. All 372 `MatMulTests`/`KernelTests`/`Int8DotTierTests`/`NeonTests` pass on every config (default, `NEEDLE_TIER=avx512|avx2|scalar`, `NEEDLE_NOAVX512=1`) — the VBMI permute planes ran on AMD for the first time.
+
+| Shape | T=1 Avx2+permute | T=1 BwDot+permute | T=1 shuffle+Avx2 | T=1 scalar |
+|---|---|---|---|---|
+| 768x768 2b (147 KB) | 7.0 µs, 21 GB/s | 20.1 µs, 7.3 GB/s | 7.4 µs, 20 GB/s | 351 µs, 0.4 GB/s |
+| 2048x768 2b (393 KB) | 18.8 µs, 21 GB/s | 35.7 µs, 11 GB/s | 19.7 µs, 20 GB/s | 936 µs, 0.4 GB/s |
+| 2048x768 4b (786 KB) | 19.6 µs, 40 GB/s | 36.3 µs, 22 GB/s | 22.3 µs, 35 GB/s | 884 µs, 0.9 GB/s |
+| 3072x768 4b (1.18 MB) | 30.7 µs, 38 GB/s | 55.1 µs, 21 GB/s | 33.9 µs, 35 GB/s | 1323 µs, 0.9 GB/s |
+
+BwDot is 0.5–0.55x Avx2Dot everywhere (512-bit `madd` is double-pumped on Zen 4, plus the 512 combine + 256 fold); permute planes are ≥ shuffle planes (notably T=4 2b: 23.7 vs 37.8 µs). `Tiers.Best` therefore picks Avx2 over Avx512Bw — `NEEDLE_TIER=avx512` still forces the tier for future work.
+
+Small-T ratios on Avx2+permute, 768x768 2b (T=1/2/4/8 µs: 7.0/14.6/23.7/47.4, i.e. 1x/2.1x/3.4x/6.8x): `Tile4` scales ~linearly with no weight reuse — #20 stays open, target T=2..8 ≤ 1.3x needs the register-blocked T=16..64 tile.
+
+Elementwise/Kron on the same box: Silu-8192 Avx2 2.5–3.4 µs vs Avx512 3.2–4.9 µs (no win); Rms/Dot ~1 µs either way; `Kron` 512-bit (`Blocks.Wide`, tier-independent) beats Avx2 1.6–1.67x (4x1024: 78.7 vs 128.6 µs; 8x2048: 2024.9 vs 3319.7 µs; 32x2048: 6604.6 vs 11013.4 µs) — Wide stays on.
 
 ### 2.9 Unity W23 proofs (2026-10-30, in-Editor 7000.0.0a12, Linux x64)
 

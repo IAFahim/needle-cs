@@ -109,7 +109,10 @@ internal static unsafe class Gemv
     const int PrefetchBlocks = 4;
     const int CacheLine = 64;
     const int HalvesPerVector = 8;
-    static readonly bool UsePermute = Simd.UseAvx && AvxVnni.IsSupported && Avx512Vbmi.VL.IsSupported && Environment.GetEnvironmentVariable("NEEDLE_NOAVX512") == null;
+    // Plane expansion only needs VBMI+VL; the dot choice is orthogonal (RowsDot picks
+    // Vnni/Avx2/Bw per tier). Requiring VEX VNNI here kept the whole tier off Zen 4,
+    // which has VBMI+VL but no VEX VNNI.
+    static readonly bool UsePermute = Simd.UseAvx && Avx512Vbmi.VL.IsSupported && Environment.GetEnvironmentVariable("NEEDLE_NOAVX512") == null;
     const float HalfExponentRebias = 5.192296858534828e33f;
 
     public static void Rows(in Cq w, in Activations a, int token, float* y, int rowStart, int rowEnd)
