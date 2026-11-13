@@ -823,7 +823,8 @@ internal static unsafe class Ops
         var p1 = Avx.BroadcastScalarToVector256(postGate + 1);
         var p2 = Avx.BroadcastScalarToVector256(postGate + 2);
         var p3 = Avx.BroadcastScalarToVector256(postGate + 3);
-        for (var c = offsetStart; c < offsetEnd; c += 8)
+        var c = offsetStart;
+        for (; c + 8 <= offsetEnd; c += 8)
         {
             var diff = Avx.Subtract(Avx.LoadVector256(x + c), Avx.LoadVector256(u + c));
             var v0 = Avx.LoadVector256(s + c);
@@ -853,6 +854,18 @@ internal static unsafe class Ops
             a3 = Fma.MultiplyAdd(Avx.BroadcastScalarToVector256(mix + 14), v2, a3);
             a3 = Fma.MultiplyAdd(Avx.BroadcastScalarToVector256(mix + 15), v3, a3);
             Avx.Store(d3 + c, a3);
+        }
+        for (; c < offsetEnd; c++)
+        {
+            var diff = x[c] - u[c];
+            var v0 = s[c];
+            var v1 = s1[c];
+            var v2 = s2[c];
+            var v3 = s3[c];
+            destination[c] = postGate[0] * diff + mix[0] * v0 + mix[1] * v1 + mix[2] * v2 + mix[3] * v3;
+            d1[c] = postGate[1] * diff + mix[4] * v0 + mix[5] * v1 + mix[6] * v2 + mix[7] * v3;
+            d2[c] = postGate[2] * diff + mix[8] * v0 + mix[9] * v1 + mix[10] * v2 + mix[11] * v3;
+            d3[c] = postGate[3] * diff + mix[12] * v0 + mix[13] * v1 + mix[14] * v2 + mix[15] * v3;
         }
     }
 

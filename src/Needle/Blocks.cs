@@ -1007,8 +1007,11 @@ internal unsafe struct MlpBatch
 
     public static void RunToken(MlpBatch* batch, int token)
     {
-        var scratch = stackalloc float[HadamardMlp.ScratchFloats(batch->Dim, batch->Width)];
-        HadamardMlp.Apply(batch, batch->Residual + (long)token * batch->Dim, scratch);
+        var baseFloats = HadamardMlp.ScratchFloats(batch->Dim, batch->Width);
+        var tileStride = Math.Max(128, 4 * batch->Cols);
+        var scratch = stackalloc float[baseFloats + tileStride + 8];
+        var tileScratch = (float*)(((nuint)(scratch + baseFloats) + 31) & ~(nuint)31);
+        HadamardMlp.Apply(batch, batch->Residual + (long)token * batch->Dim, scratch, tileScratch);
     }
 
     [System.Runtime.CompilerServices.SkipLocalsInit]
@@ -1217,9 +1220,19 @@ internal static unsafe class HadamardMlp
 #endif
         if (!Simd.Enabled) { Scalar.AccumulateOutput(residual, product, d4, scale, count); return; }
 #if NEEDLE_SIMD
+        AccumulateOutputRange(residual, product, d4, scale, 0, count);
+#endif
+    }
+
+    static void AccumulateOutputRange(float* residual, float* product, float* d4, float scale, int offsetStart, int offsetEnd)
+    {
+#if NEEDLE_SIMD
+        if (!Simd.Enabled || Simd.UseNeon) return;
         var s = Vector256.Create(scale);
-        for (var i = 0; i < count; i += 8)
+        var i = offsetStart;
+        for (; i + 8 <= offsetEnd; i += 8)
             Avx.Store(residual + i, Fma.MultiplyAdd(s, Avx.Multiply(Avx.LoadVector256(product + i), Avx.LoadVector256(d4 + i)), Avx.LoadVector256(residual + i)));
+        for (; i < offsetEnd; i++) residual[i] = MathF.FusedMultiplyAdd(scale, product[i] * d4[i], residual[i]);
 #endif
     }
 
