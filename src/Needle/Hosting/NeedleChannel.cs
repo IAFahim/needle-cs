@@ -201,16 +201,12 @@ public readonly unsafe struct NeedleChannel
 {
     public const int DefaultCapacity = 64;
 
-    // N71: cross-process header. Bytes 8..63 of the block are free in the
-    // local layout (wake slots live at 128/136, rings at 256+). Shared mode
-    // marks the block as polled on both sides; the wake slots then hold a
-    // process-local address (or nothing) and SignalWake must never call them.
     const int SharedOffset = 8;
     const int RequestCellsOffset = 16;
     const int ReplyCellsOffset = 24;
     const int CancelWordsOffset = 32;
     const int MagicOffset = 40;
-    const long BlockMagic = 0x31304E48434C444EL; // "NDLCHN01" little-endian
+    const long BlockMagic = 0x31304E48434C444EL;
 
     const int SleepingOffset = 0;
     const int WakeFunctionOffset = 128;
@@ -280,10 +276,6 @@ public readonly unsafe struct NeedleChannel
         return InitializeBlock(block, requestCells, replyCells, words, shared: 0);
     }
 
-    /// <summary>
-    /// N71: true when the block lives in shared memory and both sides poll.
-    /// Game-side submit/receive calls are unchanged; only the wake is skipped.
-    /// </summary>
     public bool IsShared => block != null && Volatile.Read(ref *(long*)(block + SharedOffset)) != 0;
 
     internal void SetWake(delegate*<void*, void> wake, void* state)
@@ -398,9 +390,6 @@ public readonly unsafe struct NeedleChannel
 
     void SignalWake()
     {
-        // N71: shared blocks are polled on both sides. The wake slots hold a
-        // process-local address (or nothing); calling them here would jump to
-        // a foreign address, so polling replaces the wake entirely.
         if (Volatile.Read(ref *(long*)(block + SharedOffset)) != 0) return;
         var function = Volatile.Read(ref *(nint*)(block + WakeFunctionOffset));
         if (function == IntPtr.Zero) return;

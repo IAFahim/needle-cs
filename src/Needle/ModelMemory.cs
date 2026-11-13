@@ -81,10 +81,6 @@ internal sealed unsafe class ModelMemory : IDisposable
 #if NETSTANDARD2_1
     public static ModelMemory Map(string path)
     {
-        // Mapping can fail on restricted players (notably some mobile/sandboxed Unity
-        // targets); fall back to a plain read so Open still works. Genuine path errors
-        // (missing file, empty file) propagate unchanged.
-        // FromBytes (Android APK assets) never reaches here.
         try
         {
             return MapMapped(path);

@@ -5,18 +5,15 @@ using System.Threading;
 
 namespace Needle;
 
-[StructLayout(LayoutKind.Explicit, Size = 16)]
+[StructLayout(LayoutKind.Explicit, Size = 128)]
 internal struct TeamBarrier
 {
-    [FieldOffset(0)] public long Phase;
-    [FieldOffset(8)] public int Arrived;
-    [FieldOffset(12)] public int Participants;
+    [FieldOffset(0)] public int Arrived;
+    [FieldOffset(4)] public int Participants;
+    [FieldOffset(64)] public long Phase;
 }
+
 #if NETSTANDARD2_1
-// N20: CoreCLR's parameterless SpinWait.SpinOnce() calls Thread.Sleep(1) once a wait
-// passes ~20 spins. With ~260 team barriers per token that parks every token in
-// millisecond-scale sleeps (V4). Spinner backs off with user-space spins only, then
-// yields the timeslice without ever sleeping. net10 keeps SpinWait.SpinOnce(-1).
 internal struct Spinner
 {
     int _count;
@@ -127,17 +124,15 @@ internal sealed unsafe class Pool : IDisposable
         Interlocked.Exchange(ref control->Ticket, generation << 32);
         if (Volatile.Read(ref control->Sleeping) > 0) WakeAll();
         if (policy.Caller == CallerRole.Participates) Drain();
-#if NETSTANDARD2_1
-        var spin = new Spinner();
-#else
-        var spin = new SpinWait();
-#endif
+        var spins = 0;
         while (Volatile.Read(ref control->Done) < count)
-#if NETSTANDARD2_1
-            spin.SpinOnce();
-#else
-            spin.SpinOnce(-1);
+        {
+            if ((++spins & 4095) == 0) Thread.Yield();
+#if NET8_0_OR_GREATER
+            else if (System.Runtime.Intrinsics.X86.X86Base.IsSupported) System.Runtime.Intrinsics.X86.X86Base.Pause();
 #endif
+            else Thread.SpinWait(1);
+        }
     }
 
     public void RunTeam(delegate*<void*, int, void> function, void* context, TeamBarrier* barrier)
@@ -155,11 +150,6 @@ internal sealed unsafe class Pool : IDisposable
         control->TeamContext = context;
         Volatile.Write(ref control->TeamDone, 0);
         Volatile.Write(ref control->TeamActive, 1);
-        // Dekker handshake with Park(): the worker increments Sleeping (a full fence) and then looks
-        // for team work; this side must publish the team and then look for sleepers. A plain
-        // Volatile.Write followed by a Volatile.Read may be reordered (store then load), so both
-        // sides could miss each other and the worker would sleep through the team forever. The
-        // interlocked write is the full fence, as in Run().
         Interlocked.Exchange(ref control->TeamTicket, generation);
         if (Volatile.Read(ref control->Sleeping) > 0) WakeAll();
         if (policy.Caller == CallerRole.Participates)
@@ -167,17 +157,15 @@ internal sealed unsafe class Pool : IDisposable
             function(context, workers.Length);
             Interlocked.Increment(ref control->TeamDone);
         }
-#if NETSTANDARD2_1
-        var spin = new Spinner();
-#else
-        var spin = new SpinWait();
-#endif
+        var spins = 0;
         while (Volatile.Read(ref control->TeamDone) < members)
-#if NETSTANDARD2_1
-            spin.SpinOnce();
-#else
-            spin.SpinOnce(-1);
+        {
+            if ((++spins & 4095) == 0) Thread.Yield();
+#if NET8_0_OR_GREATER
+            else if (System.Runtime.Intrinsics.X86.X86Base.IsSupported) System.Runtime.Intrinsics.X86.X86Base.Pause();
 #endif
+            else Thread.SpinWait(1);
+        }
         Volatile.Write(ref control->TeamActive, 0);
     }
 
@@ -193,20 +181,17 @@ internal sealed unsafe class Pool : IDisposable
         }
         else
         {
-#if NETSTANDARD2_1
-            var spin = new Spinner();
-#else
-            var spin = new SpinWait();
-#endif
+            var spins = 0;
             while (Volatile.Read(ref barrier->Phase) == phase)
-#if NETSTANDARD2_1
-                spin.SpinOnce();
-#else
-                spin.SpinOnce(-1);
+            {
+                if ((++spins & 4095) == 0) Thread.Yield();
+#if NET8_0_OR_GREATER
+                else if (System.Runtime.Intrinsics.X86.X86Base.IsSupported) System.Runtime.Intrinsics.X86.X86Base.Pause();
 #endif
+                else Thread.SpinWait(1);
+            }
         }
     }
-
 
     void WakeAll()
     {
@@ -263,7 +248,16 @@ internal sealed unsafe class Pool : IDisposable
                 continue;
             }
             if (!paused && Drain()) { deadline = Stopwatch.GetTimestamp() + spinTicks; continue; }
-            if (!paused && Stopwatch.GetTimestamp() < deadline) { Thread.SpinWait(4); continue; }
+            if (!paused && Stopwatch.GetTimestamp() < deadline)
+            {
+#if NET8_0_OR_GREATER
+                if (System.Runtime.Intrinsics.X86.X86Base.IsSupported) System.Runtime.Intrinsics.X86.X86Base.Pause();
+                else Thread.SpinWait(4);
+#else
+                Thread.SpinWait(4);
+#endif
+                continue;
+            }
             Park();
             deadline = Stopwatch.GetTimestamp() + spinTicks;
         }

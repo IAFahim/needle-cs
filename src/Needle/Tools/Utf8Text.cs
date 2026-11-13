@@ -83,7 +83,6 @@ unsafe struct Utf8Text256Buffer
 #endif
 }
 
-/// <summary>Fixed UTF-8 text slot. Blittable, truncating, allocation-free to fill.</summary>
 public struct Utf8Text8
 {
     Utf8Text8Buffer data;
@@ -131,7 +130,6 @@ public struct Utf8Text8
     public override string ToString() => Encoding.UTF8.GetString(Span);
 }
 
-/// <summary>Fixed UTF-8 text slot. Blittable, truncating, allocation-free to fill.</summary>
 public struct Utf8Text16
 {
     Utf8Text16Buffer data;
@@ -179,7 +177,6 @@ public struct Utf8Text16
     public override string ToString() => Encoding.UTF8.GetString(Span);
 }
 
-/// <summary>Fixed UTF-8 text slot. Blittable, truncating, allocation-free to fill.</summary>
 public struct Utf8Text32
 {
     Utf8Text32Buffer data;
@@ -227,7 +224,6 @@ public struct Utf8Text32
     public override string ToString() => Encoding.UTF8.GetString(Span);
 }
 
-/// <summary>Fixed UTF-8 text slot. Blittable, truncating, allocation-free to fill.</summary>
 public struct Utf8Text64
 {
     Utf8Text64Buffer data;
@@ -275,7 +271,6 @@ public struct Utf8Text64
     public override string ToString() => Encoding.UTF8.GetString(Span);
 }
 
-/// <summary>Fixed UTF-8 text slot. Blittable, truncating, allocation-free to fill.</summary>
 public struct Utf8Text128
 {
     Utf8Text128Buffer data;
@@ -323,7 +318,6 @@ public struct Utf8Text128
     public override string ToString() => Encoding.UTF8.GetString(Span);
 }
 
-/// <summary>Fixed UTF-8 text slot. Blittable, truncating, allocation-free to fill.</summary>
 public struct Utf8Text256
 {
     Utf8Text256Buffer data;

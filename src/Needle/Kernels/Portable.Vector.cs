@@ -4,49 +4,14 @@ using System.Runtime.CompilerServices;
 
 namespace Needle;
 
-// N50: portable Vector<T> provider kernels (plan-netstandard.md Track C).
-//
-// Runs inside the netstandard2.1 core DLL: no System.Runtime.Intrinsics (Unity
-// compiles scripts at C# 9 against the .NET Standard surface, and the net10
-// SIMD assembly is unreferenceable from Unity scripts). Enabled only when
-// Vector.IsHardwareAccelerated is true. Every entry checks Available first
-// and runs the Scalar reference when false, so the methods are safe to call
-// unconditionally; the table installer should only install when Available.
-//
-// Scope (deliberate): float row ops + MLP elementwise that map cleanly onto
-// elementwise Vector<T> arithmetic (RMS family, softmax, dot, linear mixes,
-// rope, taps, post-norm, FakeA8 grid snaps, and the Kron two-phase AXPY which
-// needs no byte shuffle). NOT attempted here:
-//   - MatMulRows unpack (Vector<T> has no shuffle/multiply-add-unpack) — N51/N52.
-//   - Prepare planes, GatherRow dequant LUTs — byte-shuffle bound — N51/N52.
-//   - AttentionTile / MergePartials / whole HadamardMlp entries — N54 / N40.
-//   - Sinkhorn4x4 (fixed 16 elements: call overhead dominates) and
-//     ArgMaxMasked (sparse bit-driven branches) — Vector buys nothing.
-//   - Sigmoid-bound elementwise (Silu/Glu/MultiplyBySigmoid): these stay on
-//     Scalar. The vector minimax Exp core (ExpV) now covers Softmax,
-//     GateFakeA8 and BestProbability; Silu/Glu are outside the N50
-//     parenthetical (RMS, softmax, dot, Kron) and are left for N53/N54.
-//
-// Contract (matches section 2 provider rules): pure functions, no heap
-// allocation (only tiny stackalloc scratch in Kron/QuantizeInt8), pointer +
-// scalar arguments only, safe from any thread. Signatures mirror the
-// KernelTable entries in Kernels/KernelTable.cs so integration wires them 1:1.
-//
-// Correctness: float kernels meet the N13 parity bound (cosine >= 0.99995 vs
-// Scalar, same argmax); several are bit-exact by construction (same per-lane
-// op order as Scalar, no FMA contraction). QuantizeInt8 is bit-exact
-// (identical rounding, clamping and cast lane by lane).
 public static unsafe class PortableVector
 {
-    /// True when Vector&lt;T&gt; lowers to hardware SIMD on this runtime.
-    /// Install the portable table entries only when this is true.
     public static bool Available => Vector.IsHardwareAccelerated;
 
-    /// Float lane count on this runtime (8 where AVX2 is up, CoreCLR N11a).
     public static int Width => Vector<float>.Count;
 
     const float RmsEpsilon = 1e-6f;
-    const float RoundBias = 12582912f; // 1.5 * (1 << 23); matches Scalar.RoundEven
+    const float RoundBias = 12582912f;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     static Vector<float> Load(float* p, int i) =>
@@ -146,17 +111,9 @@ public static unsafe class PortableVector
         for (; i < n; i++) x[i] = MathF.Min(MathF.Max(((x[i] * (1f / scale)) + RoundBias) - RoundBias, -128f), 127f) * scale;
     }
 
-    // Vector exp: same degree-5 minimax core as Ops.Exp (net10 AVX), with
-    // mul+add in place of FMA and the 2^n ldexp done with integer Vector
-    // lanes. A few ulp from MathF.Exp; parity-checked (cosine + argmax), not
-    // bit-exact. Arguments here are clamped, and |n| <= 128 < 2^22, so the
-    // RoundEven magic rounds exactly like RoundToNearestInteger.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     static Vector<float> ExpV(Vector<float> x)
     {
-        // Clamp without Vector.Min/Max (those lower to NaN-propagating ~10
-        // instruction sequences; inputs here are finite, so compare+select
-        // is equivalent at 2 instructions each).
         var lo = new Vector<float>(-87.3f);
         var hi = new Vector<float>(88.7f);
         var xc = Vector.ConditionalSelect(Vector.GreaterThan(x, lo), x, lo);
@@ -175,7 +132,6 @@ public static unsafe class PortableVector
         return y * Vector.AsVectorSingle(bits);
     }
 
-    // Table wiring: void(float*, float*, int) -> Dot.
     public static float Dot(float* a, float* b, int n)
     {
         if (!Available) return Scalar.Dot(a, b, n);
@@ -209,7 +165,6 @@ public static unsafe class PortableVector
         return HSum(s0 + s1 + s2 + s3) + tail;
     }
 
-    // Table wiring: void(float*, int, float*) -> RmsUnit. Parity bound.
     public static void RmsUnit(float* x, int n, float* destination)
     {
         if (!Available)
@@ -226,7 +181,6 @@ public static unsafe class PortableVector
         for (; i < n; i++) destination[i] = x[i] * inv[0];
     }
 
-    // Table wiring: void(float*, float*, int, float*) -> ZeroCenteredRms. Parity bound.
     public static void ZeroCenteredRms(float* x, float* scale, int n, float* destination)
     {
         if (!Available)
@@ -245,8 +199,6 @@ public static unsafe class PortableVector
         for (; i < n; i++) destination[i] = (1f + scale[i]) * x[i] * inv[0];
     }
 
-    // Table wiring: void(float*, int) -> Softmax. Parity bound (same argmax:
-    // the max reduction is exact; the Exp is the vector minimax core).
     public static void Softmax(float* s, int n)
     {
         if (!Available)
@@ -283,7 +235,6 @@ public static unsafe class PortableVector
         for (; i < n; i++) s[i] /= total;
     }
 
-    // Table wiring: float(float*, int, float) -> BestProbability. Parity bound.
     public static float BestProbability(float* values, int count, float best)
     {
         if (!Available)
@@ -303,7 +254,6 @@ public static unsafe class PortableVector
         return 1f / total;
     }
 
-    // Table wiring: void(float*, int, int, float*, float*) -> Rope. Parity bound.
     public static void Rope(float* x, int heads, int headDim, float* cos, float* sin)
     {
         if (!Available)
@@ -338,8 +288,6 @@ public static unsafe class PortableVector
         }
     }
 
-    // Table wiring: void(float*, int, float x4, float*) -> Mix4. Bit-exact:
-    // same per-lane mul/add order as Scalar, no FMA contraction.
     public static void Mix4(float* s, int dim, float w0, float w1, float w2, float w3, float* destination)
     {
         if (!Available)
@@ -365,7 +313,6 @@ public static unsafe class PortableVector
         for (; c < dim; c++) destination[c] = w0 * s[c] + w1 * s[dim + c] + w2 * s[2 * dim + c] + w3 * s[3 * dim + c];
     }
 
-    // Table wiring: void(float*, int, float x4, float*, float, float*) -> Combine4.
     public static void Combine4(float* s, int dim, float w0, float w1, float w2, float w3, float* y, float post, float* destination)
     {
         if (!Available)
@@ -393,7 +340,6 @@ public static unsafe class PortableVector
         for (; c < dim; c++) destination[c] = post * y[c] + w0 * s[c] + w1 * s[dim + c] + w2 * s[2 * dim + c] + w3 * s[3 * dim + c];
     }
 
-    // Table wiring: void(float*, int, float x4, float*, float*, float, float*) -> CombineDiff4.
     public static void CombineDiff4(float* s, int dim, float w0, float w1, float w2, float w3, float* x, float* u, float post, float* destination)
     {
         if (!Available)
@@ -421,7 +367,6 @@ public static unsafe class PortableVector
         for (; c < dim; c++) destination[c] = post * (x[c] - u[c]) + w0 * s[c] + w1 * s[dim + c] + w2 * s[2 * dim + c] + w3 * s[3 * dim + c];
     }
 
-    // Table wiring: void(float*, int, float*, float*) -> Taps3.
     public static void Taps3(float* taps, int width, float* current, float* destination)
     {
         if (!Available)
@@ -442,9 +387,6 @@ public static unsafe class PortableVector
         for (; c < width; c++) destination[c] = taps[c] * current[c] + taps[width + c] * current[c - width] + taps[2 * width + c] * current[c - 2 * width];
     }
 
-    // Table wiring: void(float*, int, float*) -> RmsFakeA8. Parity bound
-    // (bit-exact unless an input sits exactly on a rounding tie shifted by the
-    // ~1ulp vector-sum ordering of the inverse).
     public static void RmsFakeA8(float* x, int n, float* destination)
     {
         if (!Available)
@@ -473,7 +415,6 @@ public static unsafe class PortableVector
         FinishFakeA8(destination, n, p);
     }
 
-    // Table wiring: void(float*, float*, int, float*) -> CenteredRmsFakeA8.
     public static void CenteredRmsFakeA8(float* x, float* scale, int n, float* destination)
     {
         if (!Available)
@@ -503,8 +444,6 @@ public static unsafe class PortableVector
         FinishFakeA8(destination, n, p);
     }
 
-    // Table wiring: void(float*, float*, int) -> GateFakeA8. Sigmoid via the
-    // vector Exp core; the grid snap is vectorized.
     public static void GateFakeA8(float* x, float* gate, int n)
     {
         if (!Available)
@@ -534,7 +473,6 @@ public static unsafe class PortableVector
         FinishFakeA8(x, n, p);
     }
 
-    // Table wiring: void(float*, float*, float*, float, int) -> PostNormAdd.
     public static void PostNormAdd(float* residual, float* x, float* scale, float gate, int n)
     {
         if (!Available)
@@ -557,7 +495,6 @@ public static unsafe class PortableVector
         for (; i < n; i++) residual[i] += gate * ((1f + scale[i]) * x[i] * inverse);
     }
 
-    // Table wiring: void(float*, float*, float*, int) -> MultiplyAccumulate.
     public static void MultiplyAccumulate(float* destination, float* a, float* b, int n)
     {
         if (!Available)
@@ -572,7 +509,6 @@ public static unsafe class PortableVector
         for (; i < n; i++) destination[i] += a[i] * b[i];
     }
 
-    // Table wiring: void(float*, float, float*, float, int) -> ScaleAdd.
     public static void ScaleAdd(float* destination, float scale, float* x, float xScale, int n)
     {
         if (!Available)
@@ -589,7 +525,6 @@ public static unsafe class PortableVector
         for (; i < n; i++) destination[i] = scale * destination[i] + xScale * x[i];
     }
 
-    // Table wiring: void(float*, float*, float, int) -> AddScaled.
     public static void AddScaled(float* destination, float* x, float scale, int n)
     {
         if (!Available)
@@ -605,12 +540,6 @@ public static unsafe class PortableVector
         for (; i < n; i++) destination[i] += scale * x[i];
     }
 
-    // Table wiring: float(float*, int, sbyte*) -> QuantizeInt8. Bit-exact:
-    // the peak is order-independent, and every lane repeats Scalar's exact
-    // round/clamp/cast sequence. The bulk path narrows four rounded float
-    // vectors through int/short to one sbyte vector (ConvertToInt32
-    // truncates, which is exact on already-integral lanes); the tail keeps
-    // the scalar cast loop.
     public static float QuantizeInt8(float* x, int n, sbyte* destination)
     {
         if (!Available) return Scalar.QuantizeInt8(x, n, destination);
@@ -647,7 +576,6 @@ public static unsafe class PortableVector
         return scale;
     }
 
-    // Table wiring: float(float*, int) -> FakeA8. In-place grid snap; bit-exact.
     public static float FakeA8(float* x, int n)
     {
         if (!Available)
@@ -677,10 +605,6 @@ public static unsafe class PortableVector
         return scale;
     }
 
-    // Kron two-phase AXPY (the HadamardMlp inner kernel that fits Vector:
-    // every phase is a strided AXPY over columns, no shuffle needed).
-    // Same per-lane op order as Scalar.Kron, hence bit-exact. Shape matches
-    // Scalar.Kron so the future HadamardMlp/Kron table entry can take it.
     public static void Kron(float* z, int activeRows, float* left, float* right, int rows, int cols, int resultRows, float* result)
     {
         if (!Available)

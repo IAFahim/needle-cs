@@ -1,15 +1,4 @@
 #!/usr/bin/env bash
-# N11: one runner per runtime, all emitting needle.bench-e2e/1 JSON.
-#   tools/bench-ns21.sh coreclr  -- CoreCLR + ns2.1 (net10 host pinned to the
-#                                  netstandard2.1 Needle build). Headless.
-#   tools/bench-ns21.sh mono     -- Unity's bundled Mono 6.13 running a harness
-#                                  built with its own csc against the netstandard
-#                                  facade. Headless.
-#   tools/bench-ns21.sh editmode -- unity test EditMode bench in the Editor.
-#   tools/bench-ns21.sh player   -- IL2CPP bench player: build + run headless.
-# Every leg reproduces the golden-set call outputs (Lagos -> get_weather,
-# timer+music -> set_timer,play_music) and prints the JSON to stdout.
-# Exit code: failure count from the runner (0 = reproduced + finite numbers).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 root="$PWD"
@@ -55,7 +44,7 @@ case "$mode" in
     fi
     ;;
   mono)
-    mono_root="$HOME/Unity/Hub/Editor/7000.0.0a12/Editor/Data/MonoBleedingEdge"
+    mono_root="${NEEDLE_MONO_ROOT:-$(ls -1d "$HOME/Unity/Hub/Editor/"*/Editor/Data/MonoBleedingEdge 2>/dev/null | sort -V | tail -n 1 || true)}"
     mono_bin="$mono_root/bin/mono"
     csc="$mono_root/lib/mono/4.5/csc.exe"
     facades="$mono_root/lib/mono/unityjit-linux/Facades"
@@ -63,18 +52,12 @@ case "$mode" in
     dotnet build "$root/src/Needle/Needle.csproj" -c Release -f netstandard2.1 --nologo -v q >&2
     ns21_dll="$root/src/Needle/bin/Release/netstandard2.1/Needle.Inference.dll"
     mkdir -p "$root/out/bench-ns21/mono"
-    # System.Runtime.CompilerServices.Unsafe ships with the ns2.1 build; Mono's
-    # GAC does not provide it, so stage it next to the harness.
     unsafe_dll="$(find "$HOME/.nuget/packages/system.runtime.compilerservices.unsafe" -name "System.Runtime.CompilerServices.Unsafe.dll" -path "*netstandard*" 2>/dev/null | head -1 || true)"
     if [ -n "${unsafe_dll:-}" ]; then cp -f "$unsafe_dll" "$root/out/bench-ns21/mono/"; fi
     cp -f "$ns21_dll" "$root/out/bench-ns21/mono/"
-    # Unity script profile: the unityjit-linux mscorlib + System.dll pair plus
-    # every netstandard facade (Stopwatch/Process live in System.dll here, not
-    # mscorlib; /lib alone does not resolve type forwarders, so pass each /r).
     profile="$mono_root/lib/mono/unityjit-linux"
     refs="/r:$profile/mscorlib.dll /r:$profile/System.dll /r:$profile/System.Core.dll"
     for f in "$facades"/*.dll; do refs="$refs /r:$f"; done
-    # shellcheck disable=SC2086
     "$mono_bin" "$csc" /nologo /nostdlib /noconfig /t:exe \
       "/out:$root/out/bench-ns21/mono/bench-mono.exe" \
       $refs \

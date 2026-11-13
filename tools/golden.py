@@ -33,7 +33,6 @@ TOOLS = [
 ]
 QUERIES = ["what's it like in Lagos right now?", "set a timer for 12 minutes and play some Miles Davis"]
 
-
 def file_sha256(path):
     digest = hashlib.sha256()
     with open(path, "rb") as stream:
@@ -41,29 +40,23 @@ def file_sha256(path):
             digest.update(block)
     return digest.hexdigest()
 
-
 def prompt_of(query, tools):
     return ("<|im_start|>user\n<tools>" + json.dumps(tools, separators=(",", ":"), ensure_ascii=False)
             + "</tools>\n" + query + "<|im_end|>\n<|im_start|>assistant\n")
 
-
 def sigmoid(x):
     return 1.0 / (1.0 + np.exp(-x))
-
 
 def a8(x):
     peak = np.abs(x).max(-1, keepdims=True)
     scale = np.where(peak > 0, peak / 127.0, 1.0)
     return np.clip(np.round(x / scale), -128, 127) * scale
 
-
 def unit(x):
     return x / np.sqrt((x * x).mean(-1, keepdims=True) + 1e-6)
 
-
 def zc(x, scale):
     return (1.0 + scale) * x / np.sqrt((x * x).mean(-1, keepdims=True) + 1e-6)
-
 
 def shift(x, k):
     if k == 0:
@@ -73,13 +66,11 @@ def shift(x, k):
         out[k:] = x[:-k]
     return out
 
-
 def walsh(n):
     h = np.array([[1.0]], np.float32)
     while h.shape[0] < n:
         h = np.block([[h, h], [h, -h]])
     return (h / np.sqrt(n)).astype(np.float32)
-
 
 def sinkhorn(logits, iters=20):
     k = logits
@@ -87,7 +78,6 @@ def sinkhorn(logits, iters=20):
         k = k - np.log(np.exp(k - k.max(-1, keepdims=True)).sum(-1, keepdims=True)) - k.max(-1, keepdims=True)
         k = k - np.log(np.exp(k - k.max(-2, keepdims=True)).sum(-2, keepdims=True)) - k.max(-2, keepdims=True)
     return np.exp(k)
-
 
 class Cact:
     def __init__(self, path):
@@ -133,7 +123,6 @@ class Cact:
         unit_rows = table[idx].reshape(n, pad // GROUP, GROUP) * norms.astype(np.float32)[:, :, None]
         return (unit_rows @ self.hada).reshape(n, pad)[:, :cols]
 
-
 def engram_indices(tokens, orders, heads, slots):
     u = tokens.astype(np.uint32)
     columns = []
@@ -145,7 +134,6 @@ def engram_indices(tokens, orders, heads, slots):
             acc = acc ^ (acc >> np.uint32(15))
             columns.append((acc % np.uint32(slots)).astype(np.int64))
     return np.stack(columns, -1)
-
 
 class Model:
     def __init__(self, cact):
@@ -284,7 +272,6 @@ class Model:
         x = zc(stream.mean(1), c.dense(572))
         return a8(x[-1:]) @ self.embedding.T
 
-
 def parse_tokenizer(blob):
     n, pad, eos, bos, unk, dummy, byte_fb, _ = struct.unpack_from("<IIIIIBBH", blob, 0)
     off = struct.calcsize("<IIIIIBBH")
@@ -297,7 +284,6 @@ def parse_tokenizer(blob):
         types.append(kind)
         off += ln
     return pieces, scores, types, dummy, byte_fb, unk
-
 
 class RefTokenizer:
     def __init__(self, blob):
@@ -345,7 +331,6 @@ class RefTokenizer:
                 i += 1
         return ids + self.bpe("".join(buf))
 
-
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
     cact = Cact(CACT)
@@ -388,7 +373,6 @@ def main():
         results.append(case)
     provenance = {"model_sha256": file_sha256(CACT), "ref_lock_sha256": file_sha256(LOCK)}
     (OUT / "golden.json").write_text(json.dumps({"budget": budget, **provenance, "cases": results, "probes": probe_cases}, ensure_ascii=False), encoding="utf-8")
-
 
 if __name__ == "__main__":
     main()

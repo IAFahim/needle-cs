@@ -1,9 +1,3 @@
-// N31: EditMode bootstrap for the Burst provider.
-//
-// The runtime assembly cannot name UnityEditor types (it ships in players),
-// so the [InitializeOnLoadMethod] half of the installer lives here in an
-// Editor-only assembly. Guarded: a failed compile must never break script
-// reload; inference falls back to Scalar and the failure is visible once.
 using System;
 using UnityEditor;
 using UnityEngine;

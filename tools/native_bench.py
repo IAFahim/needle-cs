@@ -35,7 +35,6 @@ GAME_QUERIES = [
 SAMPLED = ("prefill_tps", "decode_tps", "decode_us_per_token", "total_ms")
 HIGHER_IS_BETTER = ("prefill_tps", "decode_tps")
 
-
 def locate_library(source, extract_dir):
     if os.path.isfile(source) and source.endswith(".so"):
         return source
@@ -52,7 +51,6 @@ def locate_library(source, extract_dir):
             target_file.write(source_file.read())
     return target
 
-
 def bind(path):
     lib = ctypes.CDLL(os.path.abspath(path))
     lib.needle_load.argtypes = [ctypes.c_char_p, ctypes.c_uint64]
@@ -65,7 +63,6 @@ def bind(path):
     lib.needle_reset.restype = None
     return lib
 
-
 def complete(lib, buffer, query, max_tokens):
     lib.needle_reset()
     started = time.perf_counter()
@@ -75,12 +72,10 @@ def complete(lib, buffer, query, max_tokens):
         return None, wall_ms
     return json.loads(buffer.value.decode()), wall_ms
 
-
 def spread(values, higher_is_better=False):
     if not values:
         return {"best": None, "median": None}
     return {"best": max(values) if higher_is_better else min(values), "median": statistics.median(values)}
-
 
 def measure_set(lib, name, tools_path, queries, reps, warmups, max_tokens):
     with open(tools_path, "rb") as handle:
@@ -120,7 +115,6 @@ def measure_set(lib, name, tools_path, queries, reps, warmups, max_tokens):
         }
     return {"name": name, "tools": len(json.loads(tools)), "prefix_tokens": prefix_tokens, "prompts": entries, "summary": summary}
 
-
 def render(report):
     lines = [f"native bench {report['library']} | reps {report['reps']} | total ms is wall time around needle_complete"]
     for run in report["runs"]:
@@ -134,7 +128,6 @@ def render(report):
             lines.append(row("mean of prompts", group["summary"]))
     return "\n".join(lines)
 
-
 def row(label, metrics):
     cells = []
     for metric in ("prefill_tps", "decode_tps", "decode_us_per_token", "total_ms"):
@@ -142,7 +135,6 @@ def row(label, metrics):
             value = metrics[metric][key]
             cells.append(f"{float('nan') if value is None else value:>10.1f}")
     return f"{label[:47]:<48}" + "".join(cells)
-
 
 def main():
     parser = argparse.ArgumentParser(description="Run upstream libneedle3.so through ctypes on the bench-e2e prompt sets")
@@ -182,7 +174,6 @@ def main():
         "runs": [{"threads": None, "sets": sets}],
     }
     print(json.dumps(report, indent=2) if options.json else render(report))
-
 
 if __name__ == "__main__":
     main()

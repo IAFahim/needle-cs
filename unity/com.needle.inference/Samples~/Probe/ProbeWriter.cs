@@ -1,10 +1,3 @@
-// N10 player probe: writes a needle.probe/1 JSON report to
-// Application.persistentDataPath so IL2CPP/Mono players (Android, iOS,
-// Windows/Linux IL2CPP, consoles) report the same facts the EditMode test
-// reports in the Editor. Settles H3/H4 per runtime.
-// Self-contained (no test-assembly reference) so the sample imports into a
-// player build. Mirrors Tests/Probe/RuntimeProbe.cs field for field.
-// C# 9 safe: block namespaces, no target-typed new, no u8 literals.
 using System;
 using System.IO;
 using System.Reflection;

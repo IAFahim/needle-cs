@@ -5,7 +5,6 @@ using System.Text;
 
 namespace Needle;
 
-// Blittable word entry: byte offsets into the caller's UTF-8 transcript buffer plus times.
 public readonly struct WordSlice
 {
     public readonly int Utf8Offset;
@@ -24,8 +23,6 @@ public readonly struct WordSlice
     }
 }
 
-// Zero-allocation transcription result. Language references the cached language table;
-// no managed strings are created on the steady-state path.
 public readonly struct SpeechSpan
 {
     public readonly int Utf8Length;
@@ -50,8 +47,6 @@ public readonly struct SpeechSpan
 
 public sealed unsafe partial class Whistle
 {
-    // Greedy-only: the span path never runs beam search. Callers that need BeamWidth > 1
-    // should use Transcribe; TranscribeUtf8 with BeamWidth != 1 falls back to it and copies out.
     const int SpanCurrentChars = 512;
 
     int[]? spanTokens;
@@ -67,8 +62,6 @@ public sealed unsafe partial class Whistle
     IReadOnlyList<string>? spanKeywordSource = new List<string>();
     string[] spanKeywordStrings = Array.Empty<string>();
 
-    // Maximum words one span transcription can report. Size caller word buffers to this
-    // and the UTF-8 buffer to at least 64 bytes per word; check SpeechSpan.Truncated.
     public int MaxTranscriptTokens => g.MaxSeq;
 
     void EnsureSpanBuffers()
@@ -212,15 +205,12 @@ public sealed unsafe partial class Whistle
         {
             var a = scratch[w.Utf8Offset + w.Utf8Length - 3];
             var b = scratch[w.Utf8Offset + w.Utf8Length - 2];
-            // 。(E3 80 82) ？(EF BC 9F) ！(EF BC 81)
             if (a == 0xE3 && b == 0x80 && last == 0x82) return true;
             if (a == 0xEF && b == 0xBC && (last == 0x9F || last == 0x81)) return true;
         }
         return false;
     }
 
-    // Decodes greedily into the reusable token buffer. Returns the token count;
-    // empty is set when the input is silence or too short to encode.
     int DecodeSpan(ReadOnlySpan<float> pcm, string? language, out string? detected, out double ttftMs, out double tps, out double encodeMs, out bool empty)
     {
         detected = null;
@@ -243,14 +233,12 @@ public sealed unsafe partial class Whistle
         for (var step = 0; step < g.MaxSeq - 3; step++)
         {
             var logits = decoder.Logits;
-            for (var i = 0; i < textVocab; i++) scores[i] = logits[i];
+            logits.Slice(0, textVocab).CopyTo(new Span<float>(scores, textVocab));
             scores[0] = scores[2] = scores[3] = -1e30f;
             ApplyKeywordBiasSpan(new ReadOnlySpan<int>(tokens, 0, count), scores);
-            var best = 0;
-            for (var i = 1; i < textVocab; i++) if (scores[i] > scores[best]) best = i;
+            var best = Ops.ArgMax(scores, textVocab);
             if (step == 0) ttftMs = (Stopwatch.GetTimestamp() - started) * 1000.0 / Stopwatch.Frequency;
-            Ops.Softmax(scores, textVocab);
-            probs[count] = scores[best];
+            probs[count] = Ops.BestProbability(scores, textVocab, scores[best]);
             if (best == Eos)
             {
                 one[0] = Eos;
@@ -290,9 +278,6 @@ public sealed unsafe partial class Whistle
         return languages[tag - textVocab];
     }
 
-    // String-semantics keyword bias identical to ApplyKeywordBias, but the current word
-    // is rebuilt into a reusable char buffer instead of a StringBuilder, so the
-    // steady-state path allocates nothing. Skips bias for words over the scratch.
     void ApplyKeywordBiasSpan(ReadOnlySpan<int> generated, float* target)
     {
         var keys = spanKeywordStrings;
@@ -323,8 +308,6 @@ public sealed unsafe partial class Whistle
         }
     }
 
-    // Rebuilds the current word's chars from generated tokens. Returns -1 when the word
-    // overflows the scratch, in which case keyword bias is skipped for this step.
     int WordSoFarChars(ReadOnlySpan<int> generated, string[] pieces, Span<char> scratch)
     {
         var start = generated.Length;
@@ -375,12 +358,10 @@ public sealed unsafe partial class Whistle
             var from = w;
             var to = w + 1;
             while (to < tokens && !IsWordStart(tokenArray[to])) to++;
-            // Render the word into scratch, trimming padding like BuildText does.
             var at = 0;
             var overflow = false;
             for (var i = from; i < to; i++)
             {
-                // Append emits at most the raw piece bytes, so this reserves enough.
                 if (at + tokenizer.PieceByteLength(tokenArray[i]) > scratch.Length) { overflow = true; break; }
                 at += tokenizer.Append(tokenArray[i], scratch.AsSpan(at), i == from);
             }
@@ -406,13 +387,10 @@ public sealed unsafe partial class Whistle
         return new SpeechSpan(utf8Length, wordCount, utf8Length > 0 ? detected : null, ttftMs, tps, encodeMs, truncated);
     }
 
-    // Allocation-free port of TokenFrames into the reusable align buffers.
     int[] TokenFramesSpan(int tokens)
     {
         var rows = tokens + 1;
         var columns = frames;
-        // The align buffers hold MaxSeq + 1 rows of maxFrames; say which size was exceeded instead of
-        // failing with a bare IndexOutOfRangeException somewhere in the dynamic program below.
         if (tokens > g.MaxSeq || columns > maxFrames)
             throw new InvalidOperationException($"alignment exceeds its buffers: tokens={tokens} (max {g.MaxSeq}), frames={columns} (max {maxFrames})");
         var cost = alignA!;

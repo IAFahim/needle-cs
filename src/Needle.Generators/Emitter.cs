@@ -247,7 +247,6 @@ internal static class Emitter
         builder.Append(indent).Append("                    }\n");
     }
 
-
     static void EmitCommandsClass(StringBuilder builder, ToolSetModel model, string indent, bool useUtf8Literals)
     {
         builder.Append(indent).Append("public static ").Append("class ").Append(model.CommandsName).Append('\n');
@@ -257,7 +256,6 @@ internal static class Emitter
             builder.Append(indent).Append("    public static System.ReadOnlySpan<byte> Schema => \"").Append(CSharpEscape(SchemaText(model))).Append("\"u8;\n\n");
         else
         {
-            // C# 9 (Unity): no u8 literals. A byte[] converts implicitly to ReadOnlySpan<byte>.
             builder.Append(indent).Append("    static readonly byte[] SchemaBytes = new byte[] { ").Append(string.Join(", ", Encoding.UTF8.GetBytes(SchemaText(model)))).Append(" };\n");
             builder.Append(indent).Append("    public static System.ReadOnlySpan<byte> Schema => SchemaBytes;\n\n");
         }
@@ -423,7 +421,6 @@ internal static class Emitter
             builder.Append(indent).Append("                command.Kind = ").Append(model.CommandName).Append("Kind.").Append(tool.Name).Append(";\n");
             if (tool.Args.Length == 0)
             {
-                // Nothing to bind: emitting an empty `switch (member.Key)` would not compile (CS1522).
                 builder.Append(indent).Append("                return true;\n");
                 builder.Append(indent).Append("            }\n");
                 continue;

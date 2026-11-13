@@ -56,7 +56,6 @@ ENTRIES = {
                         "edges": ["count_1", "denormals", "wide_range"]},
 }
 
-
 def f32(x):
     return struct.unpack("f", struct.pack("f", x))[0]
 def softmax(xs):
@@ -66,7 +65,6 @@ def softmax(xs):
     for e in exps:
         total += e
     return [f32(e / total) for e in exps]
-
 
 def golden():
     out = {}
@@ -88,13 +86,11 @@ def golden():
     out["ArgMaxMasked_empty"] = -1
     print(json.dumps(out, indent=2))
 
-
 def generate(path):
     os.makedirs(path, exist_ok=True)
     with open(os.path.join(path, "inputs.json"), "w") as f:
         json.dump({"entries": ENTRIES, "version": 1}, f, indent=2)
     print("wrote %s" % os.path.join(path, "inputs.json"))
-
 
 def fnv1a(data):
     h = 0xCBF29CE484222325
@@ -102,7 +98,6 @@ def fnv1a(data):
         h ^= b
         h = (h * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
     return h
-
 
 def check(dump):
     with open(os.path.join(dump, "manifest.json")) as f:
@@ -125,7 +120,6 @@ def check(dump):
     print("%d entries, %d failures" % (len(manifest["entries"]), failures))
     return 1 if failures else 0
 
-
 def main(argv):
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
@@ -142,7 +136,6 @@ def main(argv):
         return check(args.dir)
     golden()
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv))

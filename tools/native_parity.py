@@ -50,7 +50,6 @@ SYSTEMS = ["", "date: 2026-10-26 Mon 09:41"]
 
 OUTPUT_CAPACITY = 1 << 16
 
-
 def locate_library():
     direct = os.path.join(WHEEL_DIR, "libneedle3.so")
     if os.path.isfile(direct):
@@ -67,7 +66,6 @@ def locate_library():
                 out.write(source.read())
     return target
 
-
 def bind(path):
     lib = ctypes.CDLL(os.path.abspath(path))
     lib.needle_load.argtypes = [ctypes.c_char_p, ctypes.c_uint64]
@@ -80,7 +78,6 @@ def bind(path):
     lib.needle_reset.argtypes = []
     lib.needle_reset.restype = None
     return lib
-
 
 def native_run(lib, system, tools_json, query):
     lib.needle_reset()
@@ -102,10 +99,8 @@ def native_run(lib, system, tools_json, query):
         "response": result.get("response", ""),
     }
 
-
 def canonical(value):
     return json.loads(json.dumps(value, sort_keys=True))
-
 
 def managed_run(system, tools_path, query, threads):
     env = dict(os.environ, NEEDLE_THREADS=str(threads))
@@ -138,7 +133,6 @@ def managed_run(system, tools_path, query, threads):
         "reasoning": result.get("reasoning", ""),
         "response": result.get("response", ""),
     }
-
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -239,7 +233,6 @@ def main():
         print(f"  managed reasoning: {row['reasoning']['managed']}")
         print(f"  native arguments: {json.dumps(row['arguments']['native'], ensure_ascii=False)}")
         print(f"  managed arguments: {json.dumps(row['arguments']['managed'], ensure_ascii=False)}")
-
 
 if __name__ == "__main__":
     main()

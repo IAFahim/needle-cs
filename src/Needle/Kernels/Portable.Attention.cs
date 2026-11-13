@@ -4,35 +4,6 @@ using System.Runtime.InteropServices;
 
 namespace Needle;
 
-// N54: portable scalar attention tile (plan-netstandard.md Track C).
-//
-// Fallback for runtimes with no SIMD provider (IL2CPP, Mono, or any host
-// that never installs a faster AttentionTile entry). Same numerical
-// contract as the kernel table: the integer QK dots are bit-exact with
-// Scalar, the float tail (softmax, value accumulate) is parity-bound
-// (conformance cosine >= 0.99995; in practice far tighter, since the exp
-// calls are the same MathF.Exp Scalar uses, in the same order).
-//
-// Layout mirrors Attention.GroupAvx2, not Scalar.AttentionTile: Scalar
-// scores one head at a time into a flat buffer, while the vector path
-// interleaves heads as scores[s * Lanes + h] so that one K row and one V
-// row each feed the whole GQA group. Portable keeps that interleaving:
-//   * scores: 4 positions per iteration; each K row is loaded once and
-//     dotted against every head (Dot48: 48-wide int dot, unrolled 4x).
-//   * values: each V row is loaded once per position and accumulated into
-//     every head (mirror of AccumulateFloatSix; the full 6-head group takes
-//     the unrolled path, smaller groups the generic loop; single-head tiles
-//     use a flat-scores fast path (Core1) that is bit-exact with Scalar).
-// Softmax, normalizers and probability capture follow Normalizers and
-// CaptureProbabilities exactly, including the chunked-partials path (Peaks
-// set: peaks/sums stored, deferred inverse of 1).
-//
-// Wiring: Kernels.Active.AttentionTile is void(AttentionTile*). The entry is
-// exposed through a Cdecl delegate rooted in Holder (install-time
-// allocation only; the hot path allocates nothing), so this file needs no
-// UnmanagedCallersOnly polyfill and compiles identically on net10.0 and
-// netstandard2.1. Install fills only an empty slot and never clobbers a
-// faster provider installed earlier.
 internal static unsafe class PortableAttention
 {
     const int QkDim = 48;
@@ -45,13 +16,8 @@ internal static unsafe class PortableAttention
 
     static readonly AttentionTileEntry Holder = Entry;
 
-    /// <summary>Address for Kernels.Active.AttentionTile (Cdecl, void(AttentionTile*)).</summary>
     public static nint Address => Marshal.GetFunctionPointerForDelegate(Holder);
 
-    /// <summary>
-    /// Install the portable tile when no provider claimed AttentionTile yet.
-    /// Returns true when the table now points at the portable entry.
-    /// </summary>
     public static bool Install(string? provider = "portable")
     {
         var table = Kernels.Active;
@@ -72,10 +38,6 @@ internal static unsafe class PortableAttention
 
     static void Entry(AttentionTile* tile) => Core(tile);
 
-    // Integer QK dot, exact: the products are exact for sbyte inputs and
-    // integer addition commutes, so any unroll order matches the naive
-    // Scalar loop bit for bit. Internal (not private) so conformance
-    // benches can spot-check it against a naive loop.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static int Dot48(sbyte* a, sbyte* b)
     {
@@ -93,15 +55,10 @@ internal static unsafe class PortableAttention
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     static void ScoreRow(sbyte* queries, int heads, float* queryScale, sbyte* key, float keyScale, float* dst)
     {
-        // Same float order as Attention.Score: (float)dot * keyScale, then
-        // the per-head query scale.
         for (var h = 0; h < heads; h++)
             dst[h] = Dot48(queries + (long)h * QkDim, key) * keyScale * queryScale[h];
     }
 
-    // Single-head tiles take a flat-scores fast path (no group to share, so
-    // the interleaved layout only costs): identical op order to
-    // Scalar.AttentionHead, hence bit-exact, with the unrolled Dot48.
     [SkipLocalsInit]
     static void Core1(AttentionTile* tile)
     {
@@ -177,7 +134,6 @@ internal static unsafe class PortableAttention
         var keyScales = tile->KeyScales + (long)tile->First * scaleStride;
         var scores = tile->Scores;
 
-        // 1. Scores, 4 positions per iteration; one K row feeds all heads.
         var blocked = count & ~3;
         var s = 0;
         for (; s < blocked; s += 4)
@@ -188,7 +144,6 @@ internal static unsafe class PortableAttention
             ScoreRow(queries, heads, queryScale, keys + (long)s * keyStride,
                 keyScales[(long)s * scaleStride], scores + (long)s * Lanes);
 
-        // 2. Per-head softmax + normalizers (mirrors Normalizers).
         var inverse = stackalloc float[Lanes];
         var peaks = tile->Peaks;
         var sums = tile->Sums;
@@ -216,7 +171,6 @@ internal static unsafe class PortableAttention
             }
         }
 
-        // 3. Probabilities (mirrors CaptureProbabilities).
         var probabilities = tile->Probabilities;
         if (probabilities != null)
         {
@@ -227,8 +181,6 @@ internal static unsafe class PortableAttention
                     probabilities[(long)h * stride + first + s] = scores[(long)s * Lanes + h] * inverse[h];
         }
 
-        // 4. Fold the value scales into the weights (mirrors the ValuesFloat
-        // prologue), so the accumulate below reads one V row per position.
         var valueScales = tile->ValueScales + (long)tile->First * scaleStride;
         for (s = 0; s < count; s++)
         {
@@ -238,10 +190,6 @@ internal static unsafe class PortableAttention
                 row[h] *= w;
         }
 
-        // 5. Shared V accumulate (mirror of AccumulateFloatSix): one V row
-        // read feeds every head; the deferred inverse applies at the store.
-        // Output is write-only, so the chunked path aliasing Output onto the
-        // partials slot needs no special handling.
         var values = tile->Values + (long)tile->First * valueStride;
         var output = tile->Output;
         for (var h = 0; h < heads; h++)
@@ -260,7 +208,6 @@ internal static unsafe class PortableAttention
         }
     }
 
-    // Full-group fast path: 6 explicit weight/output chains over each V row.
     static void AccumulateSix(sbyte* values, int valueStride, float* scores, int count, float* output)
     {
         var o0 = output;

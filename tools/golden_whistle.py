@@ -26,7 +26,6 @@ SITES = frozenset(["stem", "route", "attn_in", "qkv", "attn_out", "pw1_in", "pw2
 FLOAT_ENCODER = frozenset(["stem", "route", "attn_in", "attn_out", "pw1_in", "pw2_in"])
 RELATIVE_FLOOR = 1e-8
 
-
 def read_wav(path, limit=None):
     with wave.open(str(path)) as w:
         rate, channels, width = w.getframerate(), w.getnchannels(), w.getsampwidth()
@@ -40,7 +39,6 @@ def read_wav(path, limit=None):
     pcm = np.ascontiguousarray(pcm, np.float32)
     return pcm[:limit] if limit else pcm
 
-
 class Cursor:
     def __init__(self):
         self.next = 0
@@ -49,7 +47,6 @@ class Cursor:
         first = self.next
         self.next += count
         return first if count == 1 else list(range(first, first + count))
-
 
 class Whistle:
     def __init__(self, cact, quant=True, rotated=False, floor="relative", encoder_float=True):
@@ -363,7 +360,6 @@ class Whistle:
         x = zc(stream.mean(1), self.dense(self.final_norm))
         return self.mm(self.act(x, "logits"), self.embedding_id).astype(np.float32)
 
-
 def greedy(model, tokenizer, cross_kv, limit=96):
     vocab = len(tokenizer.pieces)
     text_vocab = vocab - 7
@@ -382,7 +378,6 @@ def greedy(model, tokenizer, cross_kv, limit=96):
         tokens.append(best)
     return generated
 
-
 def detokenize(tokenizer, ids):
     out = bytearray()
     for i in ids:
@@ -392,7 +387,6 @@ def detokenize(tokenizer, ids):
         else:
             out.extend(piece.replace("▁", " ").encode("utf-8"))
     return out.decode("utf-8", "replace").strip()
-
 
 def dump_clip(model, tokenizer, name, pcm, with_text):
     target = OUT / name
@@ -420,7 +414,6 @@ def dump_clip(model, tokenizer, name, pcm, with_text):
     (target / "meta.json").write_text(json.dumps(meta))
     print(name, "frames", frames)
 
-
 def main():
     names = sys.argv[1:] or list(CLIPS)
     with_text = "--text" in names
@@ -431,7 +424,6 @@ def main():
     for name in names:
         file, limit = CLIPS[name]
         dump_clip(model, tokenizer, name, read_wav(AUDIO / file, limit), with_text)
-
 
 if __name__ == "__main__":
     main()

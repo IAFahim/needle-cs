@@ -1,7 +1,3 @@
-// N11d: headless IL2CPP player build entry point for the bench scene.
-// Invoked by tools/bench-ns21.sh player via:
-//   unity build --execute-method Needle.Bench.Tests.BenchBuild.PerformLinuxIl2cpp
-// Env: NEEDLE_PLAYER_OUT (default out/bench-ns21/BenchNs21).
 #if UNITY_EDITOR
 using System;
 using UnityEditor;
@@ -29,10 +25,6 @@ namespace Needle.Bench.Tests
                 throw new Exception("bench player build failed: " + report.summary.result);
         }
 
-        // N01: CoreCLR twin of PerformLinuxIl2cpp (same scene). The player
-        // runs the ns2.1 reference plus the net10 sidecar (Editor/Standalone
-        // compatible, never a compile reference); the bench JSON's simd and
-        // runtime fields report which tier actually ran.
         public static void PerformLinuxCoreClr()
         {
             string scene = "Packages/com.needle.inference/Tests/Bench/BenchPlayerScene.unity";

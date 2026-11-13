@@ -6,13 +6,9 @@ namespace Needle.Samples.SquadCommander;
 public enum Item { Potion, Sword, Shield, Arrow, Gold }
 public enum Formation { Line, Wedge, Circle, Column }
 
-// The whole contract between the language model and your game. The source generator turns this
-// into a JSON schema, a grammar that makes malformed calls impossible, and a blittable command
-// struct, so nothing below the game thread ever parses JSON or allocates.
 [NeedleTools]
 public partial interface ISquadCommands
 {
-    // Short, concrete descriptions matter: they are all the model knows about your game.
     [Tool("Move the selected unit to a map position.")] void MoveTo([Param("Map x coordinate")] float x, [Param("Map y coordinate")] float y);
     [Tool("Attack a target.")] void Attack([Param("Name of the enemy or building")] Utf8Text64 target);
     [Tool("Give items to a party member.")] void GiveItem(Item item, [Param("How many")] int count, [Param("Party member name")] Utf8Text32 to);
@@ -21,7 +17,6 @@ public partial interface ISquadCommands
     [Tool("Stop all current actions.")] void Stop();
 }
 
-/// <summary>Plain game state. Nothing here knows about the language model.</summary>
 public sealed class Squad
 {
     public float X, Y, TargetX, TargetY;
@@ -45,7 +40,6 @@ public sealed class Squad
 
     static string Text(ReadOnlySpan<byte> utf8) => System.Text.Encoding.UTF8.GetString(utf8);
 
-    // Formatting allocates, so call it from tooling or between frames, never from the hot path.
     public override string ToString() =>
         $"at ({X:0},{Y:0}) {(Moving ? "moving" : "idle")} formation={Formation} engaging='{Text(Engaging.Span)}' following='{Text(Following.Span)}'";
 
@@ -61,10 +55,6 @@ public sealed class Squad
     };
 }
 
-/// <summary>
-/// Applies decoded commands on the game thread. A struct handler keeps dispatch free of virtual
-/// calls, boxing and allocation: it only copies fixed-size values into game state.
-/// </summary>
 public struct SquadHandler : ISquadCommands
 {
     public Squad Squad;

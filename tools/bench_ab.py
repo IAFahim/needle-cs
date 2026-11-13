@@ -9,11 +9,9 @@ import sys
 METRICS = ("prefill_ms", "decode_us_per_token", "ttft_ms", "total_ms", "prefill_tps", "decode_tps")
 HIGHER_IS_BETTER = ("prefill_tps", "decode_tps")
 
-
 def run_once(command):
     completed = subprocess.run(command, capture_output=True, text=True, check=True)
     return json.loads(completed.stdout)
-
 
 def summaries(document):
     for run in document["runs"]:
@@ -22,7 +20,6 @@ def summaries(document):
                 summary = group["summary"].get(metric)
                 if summary and summary["best"] is not None:
                     yield (run["threads"], group["name"], metric), summary
-
 
 def collect(commands, rounds):
     samples = {name: {} for name in commands}
@@ -35,21 +32,17 @@ def collect(commands, rounds):
                 samples[name].setdefault(key, []).append(summary)
     return samples
 
-
 def reduce(metric, rounds):
     pick = max if metric in HIGHER_IS_BETTER else min
     best = pick(entry["best"] for entry in rounds)
     median = statistics.median(entry["median"] for entry in rounds)
     return best, median
 
-
 def find(samples, key):
     return samples.get(key) or samples.get((None, key[1], key[2]))
 
-
 def percent(b, a):
     return (b / a - 1.0) * 100.0 if a else float("nan")
-
 
 def main():
     parser = argparse.ArgumentParser(description="Interleaved A/B comparison of two bench-e2e JSON producers")
@@ -84,7 +77,6 @@ def main():
     for row in rows:
         print(f"{str(row['threads']):>7} {row['set']:<8} {row['metric']:<20} {row['a_best']:>10.2f} {row['b_best']:>10.2f} {row['best_delta_percent']:>+7.1f}% "
               f"{row['a_median']:>10.2f} {row['b_median']:>10.2f} {row['median_delta_percent']:>+7.1f}%")
-
 
 if __name__ == "__main__":
     main()

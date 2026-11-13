@@ -73,22 +73,6 @@ public sealed class ParityTests : IDisposable
         Assert.Equal(first, engine.Logits.ToArray());
     }
 
-    // Lagos greedy tie branch: decode step 12 of the Lagos case is a measured near-tie between
-    // closing the echo quote (8121 `'`) and continuing it (1633 `▁right`). Replaying the rollout
-    // step by step on this box (scalar/default x threads 1/8 x runtimes 10.0.12/10.0.14) gives a
-    // top-2 gap of 0.06-0.19 there, while the same configs swing the step-12 top-1 logit by ~0.10
-    // (e.g. scalar 4.09181 vs 4.13271 across builds) — the margin is smaller than demonstrated
-    // cross-environment rounding variation, the same class as the Miles-Davis flip (0.0669 gap,
-    // see NativeParityTests.LongContextStaysCloseToNative). Windows scalar (same Ryzen 5 8500G
-    // silicon, .NET 10.0.12, issue #50 Job 3) takes `▁right` and echoes `right now' -> ...` where
-    // the golden takes `'`; its output `<think>\n'what's it like in Lagos right no...` matches the
-    // forced-continuation replay below exactly through the observed prefix. Every other decode
-    // position in both cases has top-2 gap >= 0.29 (next-smallest: Lagos step 23 at 0.34, Davis
-    // step 9 at 0.40), and ForwardMatchesReferenceLogits still passes on scalar everywhere, so the
-    // kernels agree and only this one decision is environment-sensitive. Both full 40-step branches
-    // reconverge to the same get_weather call with identical bytes on scalar t1/t8 + avx2 t1/t8, so
-    // the test accepts either branch for the Lagos case and stays byte-strict everywhere else; a
-    // third branch (a new flip) still fails loudly.
     const string LagosQuery = "what's it like in Lagos right now?";
     const string LagosTieBranch = "<think>\n'what's it like in Lagos right now' -> get_weather with city 'Lagos'.\n</think>\n<tool_call>[{\"name\":\"get_weather\",\"arguments\":{\"c";
 
@@ -100,9 +84,6 @@ public sealed class ParityTests : IDisposable
         var budget = Assets.GoldenBudget(golden);
         foreach (var threads in new[] { 1, 8 })
         {
-            // Exactly 1 and 8 threads: the strict golden prefix is sensitive to how float reductions are
-            // partitioned, and capping 8 to a small runner's cores flipped a near-tied token on the
-            // 16-lane AVX-512 tier. (The hang that motivated a cap was the RunTeam lost wakeup.)
             using var caller = new ToolCaller(model, tools, threads: threads);
             var output = new byte[4096];
             foreach (var item in golden.GetProperty("cases").EnumerateArray())
@@ -134,8 +115,6 @@ public sealed class ParityTests : IDisposable
             var logit = engine.ConfidenceLogit(pooled);
             var cosine = Cosine(new ReadOnlySpan<float>(pooled, 3072).ToArray(), reference);
             Assert.True(cosine > 0.9995, $"chunk {chunk}: cosine {cosine} logit {logit} expected {expected}");
-            // The raw logit scales the pooled error by the head weights (arm64 NEON lands 0.27 off at
-            // cosine > 0.9995), so compare what callers see: the confidence probability.
             static double Sigmoid(double x) => 1 / (1 + Math.Exp(-x));
             Assert.InRange(Sigmoid(logit), Sigmoid(expected) - 0.05, Sigmoid(expected) + 0.05);
         }

@@ -1,33 +1,5 @@
 namespace Needle;
 
-// N51: tuned scalar matmul (portable provider inside the core DLL).
-//
-// Blocking mirrors Gemv's RowBlock/Pair2 design, but in plain scalar C# so it
-// runs on every runtime (CoreCLR, Mono, IL2CPP) with no intrinsics:
-//   - 4-row x 2-token tiles. One activation load serves all 4 rows (the 128
-//     int8 values of a group are loaded once per token, not once per row) and
-//     one packed-weight load serves both tokens. Register (local) accumulators
-//     are held across the group loop and folded once per group.
-//   - The int8 dot loop is unrolled by 4 (four j-planes per iteration).
-//   - Each row's dot consumes its weight lookups immediately (no hoisted
-//     weight tables): this keeps the live set small so the JIT holds dots,
-//     activations and indices in registers instead of spilling to the stack.
-//   - Per-(row, token) float work keeps Scalar's exact order: for each group
-//     in order, scaled = HalfToSingle(norm) * byteScale * scale, then
-//     accumulator += scaled * dot and bias += scaled * offset, finishing with
-//     y = accumulator - bias. Integer dots cannot overflow (about 2M worst
-//     case), so any summation order is bit-identical; the float order matches
-//     Scalar term for term, hence bit-exact outputs.
-//   - HalfToSingle is evaluated once per (row, group) and shared by both
-//     tokens (pure function of the norm, same value Scalar recomputes).
-//   - Row tails (< 4 rows) delegate to Scalar.MatMulRows, trivially exact.
-//
-// Wiring API (for the N30 owner; this file adds no dispatch itself):
-//   PortableMatMul.MatMulRows(in Cq, in Activations, int tokens, float* y,
-//     int ldy, int rowStart, int rowEnd) — a drop-in for Scalar.MatMulRows.
-//   Suggested dispatch in Quant.MatMulRows, after the table check and before
-//   the Scalar fallback (or wherever the portable provider slots in):
-//     if (!Simd.Enabled) { PortableMatMul.MatMulRows(w, a, tokens, y, ldy, rowStart, rowEnd); return; }
 internal static unsafe class PortableMatMul
 {
     public static void MatMulRows(in Cq w, in Activations a, int tokens, float* y, int ldy, int rowStart, int rowEnd)
@@ -75,10 +47,6 @@ internal static unsafe class PortableMatMul
         TailRows(w, a, t, 1, y0, ldy, n, rowEnd);
     }
 
-    // Bit-identical copy of Scalar.HalfToSingle, forced inline: the group loop
-    // calls this 4x per group per tile and the JIT leaves cross-class calls
-    // uninlined in these large methods. Must stay bit-for-bit equal to the
-    // Scalar reference (exact conversion, no rounding involved).
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     static float HalfToSingle(ushort half)
     {
@@ -107,7 +75,6 @@ internal static unsafe class PortableMatMul
         TailRows(w, a, t, 1, y0, ldy, n, rowEnd);
     }
 
-    // Row remainder (< 4 rows): run the Scalar reference per token slice.
     static void TailRows(in Cq w, in Activations a, int t0, int count, float* y0, int ldy, int n, int rowEnd)
     {
         if (n >= rowEnd) return;

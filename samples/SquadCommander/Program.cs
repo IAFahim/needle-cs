@@ -8,26 +8,13 @@ using Needle;
 
 namespace Needle.Samples.SquadCommander;
 
-// A 60 Hz game loop in which the player gives a squad free-form orders ("send everyone to the
-// ridge", "form a wedge"). Inference runs on the host's own worker thread; the game thread only
-// submits a query, polls for the reply and applies it. The program measures exactly that
-// game-thread surface and exits non-zero if it ever allocates or eats a visible slice of a frame,
-// which is the property a Unity Update() or system needs.
-//
-//   dotnet run -c Release --project samples/SquadCommander [model.cact]
 internal static class Program
 {
     const int FramesPerSecond = 60;
     const double FrameSeconds = 1.0 / FramesPerSecond;
     const double RunSeconds = 12;
-    // The needle calls are a lock-free ring push, a ring pop and a small memcpy; anything near a
-    // millisecond means something other than that is happening on the game thread. The gate is the
-    // 99th percentile, because a single frame can lose its timeslice to the OS on a busy machine
-    // (the worst frame is still printed).
     const double NeedleBudgetMs = 1.0;
 
-    // (second the player speaks, what they say). The last two arrive about a frame apart: the second
-    // one supersedes the first, so the first is cancelled instead of being applied late.
     static readonly (double At, string Say)[] Script =
     {
         (0.5, "move to 120, 45"),
@@ -61,17 +48,10 @@ internal static class Program
         {
             ModelPath = modelPath,
             ToolsJson = Encoding.UTF8.GetString(SquadCommands.Schema),
-            // One worker leaves the rest of the cores to the game; Game parks idle workers and
-            // runs them below normal priority.
-            // The typed path does not do tool retrieval, which kicks in above RetrievalTopK (5) tools,
-            // so keep every tool in context. Games with many more tools should group them per scene.
-            // Each order is independent, so start every one from the primed tool prefix.
             StatelessQueries = true,
             Session = new NeedleOptions { Threading = ThreadPolicy.Game.WithThreads(2), RetrievalTopK = SquadCommands.GrammarToolCount },
         });
 
-        // Warm the game-thread path once so the measured frames see steady state: JIT-ed code
-        // and a touched channel. This is what a game does during its loading screen.
         Warm(channel);
 
         var stats = new Stats();
@@ -87,7 +67,6 @@ internal static class Program
             var frameStart = clock.Elapsed.TotalSeconds;
             squad.Tick((float)FrameSeconds);
 
-            // ---- the part a game integrates: everything Needle touches on the game thread ----
             var allocatedBefore = GC.GetAllocatedBytesForCurrentThread();
             var t0 = Stopwatch.GetTimestamp();
 
@@ -96,7 +75,6 @@ internal static class Program
                 if (channel.TrySubmitQuery(queries[next], out var ticket))
                 {
                     pending[next] = new Ticket(ticket, frame, true);
-                    // A newer order makes any still-unanswered older one stale.
                     for (var older = 0; older < next; older++)
                         if (pending[older].Open && !pending[older].Done) { host.Cancel(pending[older].Id); pending[older].Done = true; stats.Cancelled++; }
                 }
@@ -124,7 +102,6 @@ internal static class Program
             var elapsedMs = (Stopwatch.GetTimestamp() - t0) * 1000.0 / Stopwatch.Frequency;
             needleAllocated += GC.GetAllocatedBytesForCurrentThread() - allocatedBefore;
             stats.NeedleMs.Add(elapsedMs);
-            // ---------------------------------------------------------------------------------
 
             journal.Flush(squad, Script, frame / (double)FramesPerSecond);
 
@@ -133,9 +110,6 @@ internal static class Program
             while (clock.Elapsed.TotalSeconds < due) Thread.Sleep(0);
         }
 
-        // Anything the model had not answered by the end is reported, not hidden. A Refused reply
-        // (confidence below NeedleOptions.RefuseBelow) still carries its calls but is not applied:
-        // a game should ask the player to rephrase rather than act on a guess.
         var open = 0;
         foreach (var ticket in pending) if (ticket.Open && !ticket.Done) open++;
         var allocatedTotal = GC.GetAllocatedBytesForCurrentThread() - baselineAllocated;
@@ -164,8 +138,6 @@ internal static class Program
 
     static void Warm(NeedleChannel channel)
     {
-        // Two real round trips: the first primes the worker's session, the second proves the
-        // steady state. The replies are applied to a throwaway squad.
         var scratch = new SquadHandler { Squad = new Squad() };
         for (var i = 0; i < 2; i++)
         {
@@ -218,7 +190,6 @@ internal static class Program
         public int Replies, Cancelled, Unhandled;
     }
 
-    // Recorded in the hot path (a struct copy into a preallocated array), printed afterwards.
     sealed class Journal
     {
         readonly (int Frame, int Order, Reply Reply, SquadCommand Command, bool IsCommand)[] entries;

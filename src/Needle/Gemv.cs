@@ -102,6 +102,7 @@ internal readonly struct PermuteFourBitPlanes : IPlaneLayout
     }
 }
 
+[SkipLocalsInit]
 internal static unsafe class Gemv
 {
     const int RowBlock = Quant.RowBlock;
@@ -109,13 +110,7 @@ internal static unsafe class Gemv
     const int PrefetchBlocks = 4;
     const int CacheLine = 64;
     const int HalvesPerVector = 8;
-    // Plane expansion only needs VBMI+VL; the dot choice is orthogonal (RowsDot picks
-    // Vnni/Avx2/Bw per tier). Requiring VEX VNNI here kept the whole tier off Zen 4,
-    // which has VBMI+VL but no VEX VNNI.
     static readonly bool UsePermute = Simd.UseAvx && Avx512Vbmi.VL.IsSupported && Environment.GetEnvironmentVariable("NEEDLE_NOAVX512") == null;
-    // KleidiAI-style LHS panel prototype (NEEDLE_PANEL=1): repack the four token
-    // activation rows once per tile into group-major order, then stream the panel
-    // contiguously with loads hoisted across the row pair. Default path untouched.
     static readonly bool UsePanel = Environment.GetEnvironmentVariable("NEEDLE_PANEL") != null;
     const float HalfExponentRebias = 5.192296858534828e33f;
 
@@ -128,6 +123,75 @@ internal static unsafe class Gemv
         }
         else if (w.Bits == 2) RowsDot<TwoBitPlanes>(w, a, token, y, rowStart, rowEnd);
         else RowsDot<FourBitPlanes>(w, a, token, y, rowStart, rowEnd);
+    }
+
+    public static void RowsPhi(
+        in Cq pre, float* preOut,
+        in Cq post, float* postOut,
+        in Cq res, float* resOut,
+        in Activations a)
+    {
+        if (UsePermute) RowsPhiDot<PermuteFourBitPlanes>(pre, preOut, post, postOut, res, resOut, a);
+        else RowsPhiDot<FourBitPlanes>(pre, preOut, post, postOut, res, resOut, a);
+    }
+
+    static void RowsPhiDot<TPlanes>(
+        in Cq pre, float* preOut,
+        in Cq post, float* postOut,
+        in Cq res, float* resOut,
+        in Activations a) where TPlanes : struct, IPlaneLayout
+    {
+        if (Tiers.Active == CpuTier.AvxVnniInt8) RowsPhiImpl<TPlanes, VnniInt8Dot>(pre, preOut, post, postOut, res, resOut, a);
+        else if (Tiers.Active == CpuTier.Avx512Bw) RowsPhiImpl<TPlanes, BwDot>(pre, preOut, post, postOut, res, resOut, a);
+        else if (Tiers.Active == CpuTier.AvxVnni) RowsPhiImpl<TPlanes, VnniDot>(pre, preOut, post, postOut, res, resOut, a);
+        else RowsPhiImpl<TPlanes, Avx2Dot>(pre, preOut, post, postOut, res, resOut, a);
+    }
+
+    static void RowsPhiImpl<TPlanes, TDot>(
+        in Cq pre, float* preOut,
+        in Cq post, float* postOut,
+        in Cq res, float* resOut,
+        in Activations a)
+        where TPlanes : struct, IPlaneLayout
+        where TDot : struct, IInt8Dot
+    {
+        var groups = res.Groups;
+        var stride = a.Stride;
+        var weightedPre = stackalloc float[stride];
+        var weightedPost = stackalloc float[stride];
+        var weightedRes = stackalloc float[stride];
+        var scaled = stackalloc float[RowBlock * stride];
+        var bsPre = Vector256.Create(pre.Book->ByteScale * HalfExponentRebias);
+        var bsPost = Vector256.Create(post.Book->ByteScale * HalfExponentRebias);
+        var bsRes = Vector256.Create(res.Book->ByteScale * HalfExponentRebias);
+        for (var v = 0; v < stride; v += HalvesPerVector)
+        {
+            var actScale = Avx.LoadVector256(a.Scales + v);
+            Avx.Store(weightedPre + v, Avx.Multiply(actScale, bsPre));
+            Avx.Store(weightedPost + v, Avx.Multiply(actScale, bsPost));
+            Avx.Store(weightedRes + v, Avx.Multiply(actScale, bsRes));
+        }
+        RunRowsOnly<TPlanes, TDot>(pre, a, weightedPre, scaled, preOut);
+        RunRowsOnly<TPlanes, TDot>(post, a, weightedPost, scaled, postOut);
+        RunRowsOnly<TPlanes, TDot>(res, a, weightedRes, scaled, resOut);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    static void RunRowsOnly<TPlanes, TDot>(in Cq w, in Activations a, float* weightedScales, float* scaled, float* y)
+        where TPlanes : struct, IPlaneLayout
+        where TDot : struct, IInt8Dot
+    {
+        var groups = w.Groups;
+        var stride = a.Stride;
+        var tables = TPlanes.Tables(Avx.LoadVector256(w.Book->Bytes));
+        var rowBytes = w.RowBytes;
+        var paddedGroups = (groups + HalvesPerVector - 1) & ~(HalvesPerVector - 1);
+        var convertibleRows = (long)w.Rows * groups < paddedGroups ? 0 : (int)(((long)w.Rows * groups - paddedGroups) / groups) + 1;
+        var n = 0;
+        for (; n + RowBlock <= w.Rows && n + RowBlock <= convertibleRows; n += RowBlock)
+            Block<TPlanes, TDot>(w.Indices + (long)n * rowBytes, rowBytes, w.Norms + (long)n * groups, groups, stride, tables, weightedScales, a.Offsets, a.Values, scaled, y + n);
+        for (; n < w.Rows; n++)
+            y[n] = Single<TPlanes, TDot>(w.Indices + (long)n * rowBytes, w.Norms + (long)n * groups, groups, stride, n < convertibleRows, tables, weightedScales, a.Offsets, a.Values, scaled);
     }
 
     static void RowsDot<TPlanes>(in Cq w, in Activations a, int token, float* y, int rowStart, int rowEnd) where TPlanes : struct, IPlaneLayout
@@ -407,33 +471,18 @@ internal static unsafe class Gemv
                 Sse.Prefetch0(packed + ahead);
                 Sse.Prefetch0(row1 + ahead);
             }
-            TPlanes.Expand(packed + g * groupBytes, tables, out var p0, out var p1, out var p2, out var p3);
-            TPlanes.Expand(row1 + g * groupBytes, tables, out var q0, out var q1, out var q2, out var q3);
             var pg = panel + g * TileTokens * Cq.GroupSize;
-            var x0 = Avx.LoadVector256(pg);
-            var x1 = Avx.LoadVector256(pg + 32);
-            var x2 = Avx.LoadVector256(pg + 64);
-            var x3 = Avx.LoadVector256(pg + 96);
-            accumulator00 = ApplyPlanesVec<TDot>(p0, p1, p2, p3, x0, x1, x2, x3, scaled + g, accumulator00);
-            accumulator10 = ApplyPlanesVec<TDot>(q0, q1, q2, q3, x0, x1, x2, x3, scaled + 4 * stride + g, accumulator10);
-            var y0 = Avx.LoadVector256(pg + 128);
-            var y1 = Avx.LoadVector256(pg + 160);
-            var y2 = Avx.LoadVector256(pg + 192);
-            var y3 = Avx.LoadVector256(pg + 224);
-            accumulator01 = ApplyPlanesVec<TDot>(p0, p1, p2, p3, y0, y1, y2, y3, scaled + stride + g, accumulator01);
-            accumulator11 = ApplyPlanesVec<TDot>(q0, q1, q2, q3, y0, y1, y2, y3, scaled + 5 * stride + g, accumulator11);
-            var z0 = Avx.LoadVector256(pg + 256);
-            var z1 = Avx.LoadVector256(pg + 288);
-            var z2 = Avx.LoadVector256(pg + 320);
-            var z3 = Avx.LoadVector256(pg + 352);
-            accumulator02 = ApplyPlanesVec<TDot>(p0, p1, p2, p3, z0, z1, z2, z3, scaled + 2 * stride + g, accumulator02);
-            accumulator12 = ApplyPlanesVec<TDot>(q0, q1, q2, q3, z0, z1, z2, z3, scaled + 6 * stride + g, accumulator12);
-            var w0 = Avx.LoadVector256(pg + 384);
-            var w1 = Avx.LoadVector256(pg + 416);
-            var w2 = Avx.LoadVector256(pg + 448);
-            var w3 = Avx.LoadVector256(pg + 480);
-            accumulator03 = ApplyPlanesVec<TDot>(p0, p1, p2, p3, w0, w1, w2, w3, scaled + 3 * stride + g, accumulator03);
-            accumulator13 = ApplyPlanesVec<TDot>(q0, q1, q2, q3, w0, w1, w2, w3, scaled + 7 * stride + g, accumulator13);
+            var offset = g * groupBytes;
+            TPlanes.Expand(packed + offset, tables, out var p0, out var p1, out var p2, out var p3);
+            accumulator00 = ApplyPlanesVec<TDot>(p0, p1, p2, p3, Avx.LoadVector256(pg), Avx.LoadVector256(pg + 32), Avx.LoadVector256(pg + 64), Avx.LoadVector256(pg + 96), scaled + g, accumulator00);
+            accumulator01 = ApplyPlanesVec<TDot>(p0, p1, p2, p3, Avx.LoadVector256(pg + 128), Avx.LoadVector256(pg + 160), Avx.LoadVector256(pg + 192), Avx.LoadVector256(pg + 224), scaled + stride + g, accumulator01);
+            accumulator02 = ApplyPlanesVec<TDot>(p0, p1, p2, p3, Avx.LoadVector256(pg + 256), Avx.LoadVector256(pg + 288), Avx.LoadVector256(pg + 320), Avx.LoadVector256(pg + 352), scaled + 2 * stride + g, accumulator02);
+            accumulator03 = ApplyPlanesVec<TDot>(p0, p1, p2, p3, Avx.LoadVector256(pg + 384), Avx.LoadVector256(pg + 416), Avx.LoadVector256(pg + 448), Avx.LoadVector256(pg + 480), scaled + 3 * stride + g, accumulator03);
+            TPlanes.Expand(row1 + offset, tables, out p0, out p1, out p2, out p3);
+            accumulator10 = ApplyPlanesVec<TDot>(p0, p1, p2, p3, Avx.LoadVector256(pg), Avx.LoadVector256(pg + 32), Avx.LoadVector256(pg + 64), Avx.LoadVector256(pg + 96), scaled + 4 * stride + g, accumulator10);
+            accumulator11 = ApplyPlanesVec<TDot>(p0, p1, p2, p3, Avx.LoadVector256(pg + 128), Avx.LoadVector256(pg + 160), Avx.LoadVector256(pg + 192), Avx.LoadVector256(pg + 224), scaled + 5 * stride + g, accumulator11);
+            accumulator12 = ApplyPlanesVec<TDot>(p0, p1, p2, p3, Avx.LoadVector256(pg + 256), Avx.LoadVector256(pg + 288), Avx.LoadVector256(pg + 320), Avx.LoadVector256(pg + 352), scaled + 6 * stride + g, accumulator12);
+            accumulator13 = ApplyPlanesVec<TDot>(p0, p1, p2, p3, Avx.LoadVector256(pg + 384), Avx.LoadVector256(pg + 416), Avx.LoadVector256(pg + 448), Avx.LoadVector256(pg + 480), scaled + 7 * stride + g, accumulator13);
         }
         var quads0 = Avx.HorizontalAdd(Avx.HorizontalAdd(accumulator00, accumulator01), Avx.HorizontalAdd(accumulator02, accumulator03));
         var sums0 = Sse.Add(quads0.GetLower(), quads0.GetUpper());
@@ -573,6 +622,7 @@ internal static unsafe class Gemv
         y[ldy + 1] = Vector256.Sum(accumulator11);
     }
 
+    [SkipLocalsInit]
     static void Pair4<TPlanes, TDot>(byte* packed, int rowBytes, ushort* norms, int groups, int stride, int cols, in PlaneTables tables, float* weightedScales, float* offsets, sbyte* values, float* scaled, float* rowFactors, int groupBytes, long prefetchDistance, float* y, int ldy)
         where TPlanes : struct, IPlaneLayout
         where TDot : struct, IInt8Dot
@@ -593,26 +643,27 @@ internal static unsafe class Gemv
         var row1 = packed + rowBytes;
         for (var g = 0; g < groups; g++)
         {
-            if ((g * groupBytes & CacheLine - 1) == 0)
+            var offset = g * groupBytes;
+            if ((offset & CacheLine - 1) == 0)
             {
-                var ahead = g * groupBytes + prefetchDistance;
+                var ahead = offset + prefetchDistance;
                 Sse.Prefetch0(packed + ahead);
                 Sse.Prefetch0(row1 + ahead);
             }
-            TPlanes.Expand(packed + g * groupBytes, tables, out var p0, out var p1, out var p2, out var p3);
-            TPlanes.Expand(row1 + g * groupBytes, tables, out var q0, out var q1, out var q2, out var q3);
             var x = values + g * Cq.GroupSize;
             var x1 = x + cols;
             var x2 = x + 2 * cols;
             var x3 = x + 3 * cols;
+            TPlanes.Expand(packed + offset, tables, out var p0, out var p1, out var p2, out var p3);
             accumulator00 = ApplyPlanes<TDot>(p0, p1, p2, p3, x, scaled + g, accumulator00);
-            accumulator10 = ApplyPlanes<TDot>(q0, q1, q2, q3, x, scaled + 4 * stride + g, accumulator10);
             accumulator01 = ApplyPlanes<TDot>(p0, p1, p2, p3, x1, scaled + stride + g, accumulator01);
-            accumulator11 = ApplyPlanes<TDot>(q0, q1, q2, q3, x1, scaled + 5 * stride + g, accumulator11);
             accumulator02 = ApplyPlanes<TDot>(p0, p1, p2, p3, x2, scaled + 2 * stride + g, accumulator02);
-            accumulator12 = ApplyPlanes<TDot>(q0, q1, q2, q3, x2, scaled + 6 * stride + g, accumulator12);
             accumulator03 = ApplyPlanes<TDot>(p0, p1, p2, p3, x3, scaled + 3 * stride + g, accumulator03);
-            accumulator13 = ApplyPlanes<TDot>(q0, q1, q2, q3, x3, scaled + 7 * stride + g, accumulator13);
+            TPlanes.Expand(row1 + offset, tables, out p0, out p1, out p2, out p3);
+            accumulator10 = ApplyPlanes<TDot>(p0, p1, p2, p3, x, scaled + 4 * stride + g, accumulator10);
+            accumulator11 = ApplyPlanes<TDot>(p0, p1, p2, p3, x1, scaled + 5 * stride + g, accumulator11);
+            accumulator12 = ApplyPlanes<TDot>(p0, p1, p2, p3, x2, scaled + 6 * stride + g, accumulator12);
+            accumulator13 = ApplyPlanes<TDot>(p0, p1, p2, p3, x3, scaled + 7 * stride + g, accumulator13);
         }
         var quads0 = Avx.HorizontalAdd(Avx.HorizontalAdd(accumulator00, accumulator01), Avx.HorizontalAdd(accumulator02, accumulator03));
         var sums0 = Sse.Add(quads0.GetLower(), quads0.GetUpper());
@@ -674,20 +725,21 @@ internal static unsafe class Gemv
         var row1 = packed + rowBytes;
         for (var g = 0; g < groups; g++)
         {
-            if ((g * groupBytes & CacheLine - 1) == 0)
+            var offset = g * groupBytes;
+            if ((offset & CacheLine - 1) == 0)
             {
-                var ahead = g * groupBytes + prefetchDistance;
+                var ahead = offset + prefetchDistance;
                 Sse.Prefetch0(packed + ahead);
                 Sse.Prefetch0(row1 + ahead);
             }
-            TPlanes.Expand(packed + g * groupBytes, tables, out var p0, out var p1, out var p2, out var p3);
-            TPlanes.Expand(row1 + g * groupBytes, tables, out var q0, out var q1, out var q2, out var q3);
             var x = values + g * Cq.GroupSize;
             var x1 = x + cols;
+            TPlanes.Expand(packed + offset, tables, out var p0, out var p1, out var p2, out var p3);
             accumulator00 = ApplyPlanes<TDot>(p0, p1, p2, p3, x, scaled + g, accumulator00);
-            accumulator10 = ApplyPlanes<TDot>(q0, q1, q2, q3, x, scaled + 2 * stride + g, accumulator10);
             accumulator01 = ApplyPlanes<TDot>(p0, p1, p2, p3, x1, scaled + stride + g, accumulator01);
-            accumulator11 = ApplyPlanes<TDot>(q0, q1, q2, q3, x1, scaled + 3 * stride + g, accumulator11);
+            TPlanes.Expand(row1 + offset, tables, out p0, out p1, out p2, out p3);
+            accumulator10 = ApplyPlanes<TDot>(p0, p1, p2, p3, x, scaled + 2 * stride + g, accumulator10);
+            accumulator11 = ApplyPlanes<TDot>(p0, p1, p2, p3, x1, scaled + 3 * stride + g, accumulator11);
         }
         y[0] = Vector256.Sum(accumulator00);
         y[ldy] = Vector256.Sum(accumulator01);

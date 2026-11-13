@@ -148,18 +148,12 @@ public sealed unsafe partial class Whistle
         for (var step = 0; step < g.MaxSeq - 3 && (forced == null || align); step++)
         {
             logits = decoder.Logits;
-            for (var i = 0; i < textVocab; i++) scores[i] = logits[i];
+            logits.Slice(0, textVocab).CopyTo(new Span<float>(scores, textVocab));
             scores[0] = scores[2] = scores[3] = -1e30f;
             ApplyKeywordBias(keywords, pass.Tokens, scores);
-            var best = 0;
-            for (var i = 1; i < textVocab; i++) if (scores[i] > scores[best]) best = i;
-            if (forced != null) best = step < forced.Count ? forced[step] : Eos;
+            var best = forced != null ? (step < forced.Count ? forced[step] : Eos) : Ops.ArgMax(scores, textVocab);
             if (step == 0) pass.TtftMs = (Stopwatch.GetTimestamp() - started) * 1000.0 / Stopwatch.Frequency;
-            if (align)
-            {
-                Ops.Softmax(scores, textVocab);
-                pass.Probabilities.Add(scores[best]);
-            }
+            if (align) pass.Probabilities.Add(Ops.BestProbability(scores, textVocab, scores[best]));
             if (best == Eos)
             {
                 if (align)
@@ -230,14 +224,13 @@ public sealed unsafe partial class Whistle
             {
                 var row = beamScores + (long)i * textVocab;
                 var logits = live[i].Logits;
-                for (var v = 0; v < textVocab; v++) row[v] = logits[v];
+                logits.Slice(0, textVocab).CopyTo(new Span<float>(row, textVocab));
                 row[0] = row[2] = row[3] = -1e30f;
                 ApplyKeywordBias(keywords, liveTokens[i], row);
-                LogSoftmax(row, textVocab);
+                Ops.LogSoftmax(row, textVocab);
                 for (var k = 0; k < width; k++)
                 {
-                    var best = 0;
-                    for (var v = 1; v < textVocab; v++) if (row[v] > row[best]) best = v;
+                    var best = Ops.ArgMax(row, textVocab);
                     candidates.Add((liveScores[i] + row[best], i, best));
                     row[best] = float.NegativeInfinity;
                 }
@@ -294,15 +287,6 @@ public sealed unsafe partial class Whistle
         return winner ?? new List<int>();
     }
 
-    static void LogSoftmax(float* x, int n)
-    {
-        var peak = float.NegativeInfinity;
-        for (var i = 0; i < n; i++) peak = MathF.Max(peak, x[i]);
-        double sum = 0;
-        for (var i = 0; i < n; i++) sum += Math.Exp(x[i] - peak);
-        var shift = peak + (float)Math.Log(sum);
-        for (var i = 0; i < n; i++) x[i] -= shift;
-    }
 
     void Prime(string? language, bool align, Pass pass)
     {

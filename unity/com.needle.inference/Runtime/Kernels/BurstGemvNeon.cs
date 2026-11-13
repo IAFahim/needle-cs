@@ -1,72 +1,3 @@
-// N34: Burst port of Neon.MatMulRows, the Arm64 integer-dot GEMV path.
-//
-// Ports src/Needle/Neon.cs (DotBlock, DotPair, DotTile, DotRow, GroupDot,
-// TilePlane, BlockPlane, PairPlane, BlockToken, MatMulRows, plus the shared
-// Dot16, LoadFactors, ScaleFactors and HorizontalSum helpers) 1:1 to
-// Unity.Burst.Intrinsics. The x86 counterpart strategy (N32/N33) is the same:
-// keep the instruction order identical to the net10 kernel; that is what
-// makes H7 (bitwise parity) achievable.
-//
-// Plan cookbook mapping (net10 -> Burst), every name verified against the
-// Burst 1.8.25 intrinsics sources (the API surface the installed Burst 2.0
-// keeps for core Neon; the N31 kernel already proves the v128/v64,
-// vld1q/vst1q, vfmaq_f32, vpaddq_f32 and vshlq_n_u32 members below):
-//   AdvSimd.LoadVector128/Store (u8/s8/f32) -> vld1q_u8/vld1q_s8/vld1q_f32,
-//     vst1q_f32; LoadVector64(u16) -> vld1_u16.
-//   Dp.DotProduct(acc, a, b) -> Arm.Neon.vdotq_s32(acc, a, b), guarded by
-//     Arm.Neon.IsNeonDotProdSupported (both paths in this file; the guard
-//     folds at Burst compile time per target, so a dotprod player runs the
-//     SDOT lane and a baseline-arm64 player runs the widening lane).
-//   Widening fallback: SignExtendWideningLower(v64) -> vmovl_s8(vget_low_s8),
-//     SignExtendWideningUpper(v128) -> vmovl_high_s8, MultiplyWideningLowerAndAdd
-//     -> vmlal_s16(sum, vget_low_s16, vget_low_s16), MultiplyWideningUpperAndAdd
-//     -> vmlal_high_s16. Integer products/accumulation are exact mod 2^32, so
-//     the fallback and the SDOT lane agree bit for bit (same as net10).
-//   VectorTableLookup single-table + v64 index, twice (low/high halves) ->
-//     one vqtbl1q_u8(table, index): one TBL.16B over the same 16-byte table
-//     with the same 16 indices is lane-for-lane identical to two TBL.8B
-//     lookups; the And(mask) stays at the call sites exactly as in net10.
-//   AdvSimd.And/ShiftRightLogical on bytes -> vandq_u8/vshrq_n_u8.
-//   LoadFactors u32 bit rebuild (And/Shl/Add/CompareGreaterThan/Or/AsSingle)
-//     -> vandq_u32/vshlq_n_u32/vaddq_u32/vcgtq_s32/vorrq_u32 plus a 16-byte
-//     stack spill for the u32->f32 reinterpret (there is no bit-reinterpret
-//     intrinsic; N31 uses the same spill in ExpNeon and it preserves bits
-//     exactly). The vector path intentionally mirrors Neon's subnormal-blind
-//     rebuild, and the g-tail calls HalfToSingle, exactly like net10.
-//   AdvSimd.ConvertToSingle -> vcvtq_f32_s32; AddPairwise float fold ->
-//     two vpaddq_f32 + vgetq_lane_f32(..., 0) (same (l0+l1)+(l2+l3) order as
-//     Neon.HorizontalSum; N31 proves the mapping).
-//   AdvSimd.FusedMultiplyAdd(acc, a, b) -> vfmaq_f32(acc, a, b);
-//     Multiply -> vmulq_f32; ZeroExtendWideningLower(u16) -> vmovl_u16.
-//
-// H7 note: the Neon lane issues the same operations in the same order as
-// Neon.MatMulRows, so fixtures compare bitwise on device. Residual,
-// explicitly out-of-scope risks: none known inside this port — every float
-// op is an f32 add/mul/fma in net10 order under FloatMode.Strict, every int
-// op is exact, and NaN payloads travel the same pairwise tree on the same
-// architecture. The scalar lane mirrors Scalar.MatMulRows for targets
-// without Neon (and doubles as the host-readable reference for N13-style
-// edge review: tokens/rows tails, 2-bit vs 4-bit, subnormal norms).
-//
-// H8 note: this file needs no AVX-VNNI and no AVX-512; it is Neon-only plus
-// a scalar tail, like the N31 kernel.
-//
-// Layout contract: Cq/Activations/Codebook below are field-for-field,
-// order-for-order mirrors of the internal Needle.Cq, Needle.Activations and
-// Needle.Codebook structs in the precompiled Needle.Inference.dll (see
-// src/Needle/Model.cs and src/Needle/Quant.cs). C# structs default to
-// sequential layout, so the mirrors are ABI-identical and the installed
-// KernelTable.MatMulRows function pointer can be called with the core's
-// (Cq*, Activations*, tokens, y, ldy, rowStart, rowEnd) signature directly.
-// Only valid where pointers are 8 bytes, which holds everywhere this Neon
-// lane can execute (the entry dispatches to scalar off Neon).
-//
-// Burst rules followed: FloatMode.Strict, explicit FMA, no [NoAlias] claims,
-// blittable arguments only, no allocation (rowFactors/scaled are caller-sized
-// stackallocs exactly as in net10), no static mutable state, safe from any
-// thread (pool workers call via the table).
-//
-// C# 9 safe: block namespace, no target-typed new, no static lambdas.
 using System;
 using System.Runtime.InteropServices;
 using Unity.Burst;
@@ -75,13 +6,9 @@ using UnityEngine;
 
 namespace Needle.BurstKernels
 {
+    [BurstCompile]
     public static unsafe class BurstGemvNeon
     {
-        // Field-for-field mirror of Needle.Codebook (src/Needle/Model.cs):
-        // fixed float Levels[16] @0, fixed byte Bytes[32] @64, float @96.
-        // Plain (non-readonly) struct: C# forbids readonly fixed buffers,
-        // and readonly structs require all-readonly fields. Only ever used
-        // through Codebook*, never copied by value.
         public unsafe struct Codebook
         {
             public fixed float Levels[16];
@@ -89,7 +16,6 @@ namespace Needle.BurstKernels
             public float ByteScale;
         }
 
-        // Field-for-field mirror of Needle.Cq (src/Needle/Model.cs).
         public readonly unsafe struct Cq
         {
             public const int GroupSize = 128;
@@ -115,7 +41,6 @@ namespace Needle.BurstKernels
             public int RowBytes => Cols * Bits / 8;
         }
 
-        // Field-for-field mirror of Needle.Activations (src/Needle/Quant.cs).
         public readonly unsafe struct Activations
         {
             public readonly sbyte* Values;
@@ -136,26 +61,19 @@ namespace Needle.BurstKernels
             }
         }
 
-        // Cdecl delegate for the table slot, mirroring KernelTable.MatMulRows:
-        // void(Cq*, Activations*, int tokens, float* y, int ldy, int rowStart, int rowEnd).
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         public delegate void MatMulRowsFn(Cq* w, Activations* a, int tokens, float* y, int ldy, int rowStart, int rowEnd);
 
-        // Entry point installed into KernelTable.MatMulRows.
         [BurstCompile(CompileSynchronously = true, FloatMode = FloatMode.Strict)]
         public static void Invoke(Cq* w, Activations* a, int tokens, float* y, int ldy, int rowStart, int rowEnd)
         {
-            // Branches fold at Burst compile time: exactly one lane survives
-            // per target (arm64 Neon, scalar elsewhere), as in BurstSoftmax.
             if (Arm.Neon.IsNeonSupported) { MatMulRows(*w, *a, tokens, y, ldy, rowStart, rowEnd); return; }
             ScalarMatMulRows(*w, *a, tokens, y, ldy, rowStart, rowEnd);
         }
 
-        // Idempotent: safe from the auto-install hook below and from tests.
-        // Never overwrites an explicit or foreign provider's MatMulRows entry
-        // (plan §2 selection order: explicit install always wins).
         public static void Install()
         {
+            if (RuntimeInformation.ProcessArchitecture != Architecture.Arm64) return;
             if (Kernels.Active.MatMulRows != 0) return;
             FunctionPointer<MatMulRowsFn> compiled =
                 BurstCompiler.CompileFunctionPointer<MatMulRowsFn>(Invoke);
@@ -169,12 +87,11 @@ namespace Needle.BurstKernels
             Kernels.Install(table, Kernels.IsInstalled ? Kernels.Provider + "+burst" : "burst");
         }
 
-        // Player + play-mode entry: BeforeSceneLoad so the table is ready
-        // before Model.Open runs. Guarded: inference must survive a missing
-        // Burst toolchain (falls back to Scalar, logs once).
         [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]
         static void AutoInstall()
         {
+            if (Kernels.TryInstallSidecar()) return;
+            if (RuntimeInformation.ProcessArchitecture != Architecture.Arm64) return;
             try
             {
                 Install();
@@ -185,21 +102,14 @@ namespace Needle.BurstKernels
             }
         }
 
-        // Mirrors Neon.HorizontalSum: two pairwise adds, lane 0 out.
-        // vpaddq_f32(v,v) = [l0+l1, l2+l3, l0+l1, l2+l3] matches AddPairwise
-        // lane for lane, so the second fold lands on (l0+l1)+(l2+l3), the
-        // same sum in the same order.
         static float HorizontalSumNeon(v128 v)
         {
+            if (!Arm.Neon.IsNeonSupported) return 0f;
             v128 pairs = Arm.Neon.vpaddq_f32(v, v);
             v128 quad = Arm.Neon.vpaddq_f32(pairs, pairs);
             return Arm.Neon.vgetq_lane_f32(quad, 0);
         }
 
-        // Bit-identical copy of Scalar.HalfToSingle (src/Needle/Scalar.cs),
-        // used by the LoadFactors group tail exactly as in Neon.LoadFactors.
-        // The u32->f32 reinterpret goes through a 4-byte stack spill (the
-        // N31 ExpNeon pattern): a memory round-trip preserves bits exactly.
         static float HalfToSingle(ushort half)
         {
             var magnitude = half & 0x7FFF;
@@ -211,11 +121,9 @@ namespace Needle.BurstKernels
             return *(float*)spill;
         }
 
-        // Mirrors Neon.Dot16, both paths: SDOT when the target has dotprod,
-        // the vmovl/vmlal widening sequence otherwise. Integer arithmetic is
-        // exact mod 2^32, so both lanes agree bit for bit (as in net10).
         static v128 Dot16(v128 sum, v128 weights, v128 values)
         {
+            if (!Arm.Neon.IsNeonSupported) return sum;
             if (Arm.Neon.IsNeonDotProdSupported) return Arm.Neon.vdotq_s32(sum, weights, values);
             v128 weightLow = Arm.Neon.vmovl_s8(Arm.Neon.vget_low_s8(weights));
             v128 weightHigh = Arm.Neon.vmovl_high_s8(weights);
@@ -227,10 +135,9 @@ namespace Needle.BurstKernels
             return Arm.Neon.vmlal_high_s16(sum, valueHigh, weightHigh);
         }
 
-        // Mirrors Neon.LoadFactors: half-norm vector path (u32 bit rebuild,
-        // subnormal-blind exactly like net10) plus the HalfToSingle tail.
         static void LoadFactors(ushort* norms, int groups, float scale, float* factors)
         {
+            if (!Arm.Neon.IsNeonSupported) return;
             v128 multiplier = Arm.Neon.vdupq_n_f32(scale);
             var g = 0;
             for (; g + 4 <= groups; g += 4)
@@ -249,11 +156,9 @@ namespace Needle.BurstKernels
             for (; g < groups; g++) factors[g] = HalfToSingle(norms[g]) * scale;
         }
 
-        // Mirrors Neon.ScaleFactors: scaled[v] = factors[v]*scales[v],
-        // bias = Σ scaled[v]*offsets[v] via explicit vfmaq (Strict: no
-        // reassociation), folded with HorizontalSumNeon.
         static float ScaleFactors(float* factors, float* scaled, float* scales, float* offsets, int stride)
         {
+            if (!Arm.Neon.IsNeonSupported) return 0f;
             v128 bias = Arm.Neon.vdupq_n_f32(0f);
             for (var v = 0; v < stride; v += 4)
             {
@@ -264,20 +169,15 @@ namespace Needle.BurstKernels
             return HorizontalSumNeon(bias);
         }
 
-        // Mirrors Neon.Weights: one TBL.16B over the same 16-byte codebook
-        // with the same 16 indices. net10 issues two TBL.8B half-lookups and
-        // recombines; the single full-width lookup is lane-for-lane
-        // identical (out-of-range lanes cannot occur: indices are 2/4-bit).
         static v128 Weights(v128 table, v128 index)
         {
+            if (!Arm.Neon.IsNeonSupported) return default;
             return Arm.Neon.vqtbl1q_u8(table, index);
         }
 
-        // Mirrors Neon.GroupDot (single-row × single-token dot over groups).
-        // net10 derives `two` from mask lane 0; mask itself derives from
-        // w.Bits, so branching on w.Bits directly is the same decision.
         static v128 GroupDot(byte* packed, sbyte* values, v128 mask, v128 table, int bits)
         {
+            if (!Arm.Neon.IsNeonSupported) return default;
             v128 sum = Arm.Neon.vdupq_n_s32(0);
             if (bits == 2)
             {
@@ -302,9 +202,9 @@ namespace Needle.BurstKernels
             return sum;
         }
 
-        // Mirrors Neon.DotRow.
         static float DotRow(Cq w, byte* packedRows, Activations a, int token, float* factors, float* scaled)
         {
+            if (!Arm.Neon.IsNeonSupported) return 0f;
             var groups = a.Groups;
             float bias = ScaleFactors(factors, scaled, a.Scales + token * a.Stride, a.Offsets + token * a.Stride, a.Stride);
             v128 table = Arm.Neon.vld1q_u8(w.Book->Bytes);
@@ -319,9 +219,9 @@ namespace Needle.BurstKernels
             return accumulator - bias;
         }
 
-        // Mirrors Neon.TilePlane.
         static void TilePlane(v128 table, v128 mask, v128 index, int plane, int act, sbyte* v0, sbyte* v1, sbyte* v2, sbyte* v3, ref v128 sum0, ref v128 sum1, ref v128 sum2, ref v128 sum3)
         {
+            if (!Arm.Neon.IsNeonSupported) return;
             var offset = act + plane * 32;
             v128 weights = Weights(table, Arm.Neon.vandq_u8(index, mask));
             sum0 = Dot16(sum0, weights, Arm.Neon.vld1q_s8(v0 + offset));
@@ -330,9 +230,9 @@ namespace Needle.BurstKernels
             sum3 = Dot16(sum3, weights, Arm.Neon.vld1q_s8(v3 + offset));
         }
 
-        // Mirrors Neon.DotTile: one row × four tokens.
         static void DotTile(Cq w, byte* packedRows, Activations a, int token, float* factors, float* scaled, float* y, int ldy)
         {
+            if (!Arm.Neon.IsNeonSupported) return;
             var groups = a.Groups;
             var stride = a.Stride;
             var cols = a.Cols;
@@ -387,9 +287,9 @@ namespace Needle.BurstKernels
             y[3 * ldy] = accumulator3 - bias3;
         }
 
-        // Mirrors Neon.BlockPlane.
         static void BlockPlane(v128 table, v128 mask, v128 i0, v128 i1, v128 i2, v128 i3, int plane, int act, sbyte* values, ref v128 sum0, ref v128 sum1, ref v128 sum2, ref v128 sum3)
         {
+            if (!Arm.Neon.IsNeonSupported) return;
             v128 activation = Arm.Neon.vld1q_s8(values + act + plane * 32);
             sum0 = Dot16(sum0, Weights(table, Arm.Neon.vandq_u8(i0, mask)), activation);
             sum1 = Dot16(sum1, Weights(table, Arm.Neon.vandq_u8(i1, mask)), activation);
@@ -397,11 +297,9 @@ namespace Needle.BurstKernels
             sum3 = Dot16(sum3, Weights(table, Arm.Neon.vandq_u8(i3, mask)), activation);
         }
 
-        // Mirrors Neon.DotBlock: 4 rows × 1 token (the x64 Gemv.Block
-        // counterpart). Activation vectors load once per plane and are shared
-        // across four rows.
         static void DotBlock(Cq w, byte* packed, int rowBytes, ushort* norms, int groups, Activations a, int token, float* rowFactors, float* scaled, float* y, v128 table, v128 mask)
         {
+            if (!Arm.Neon.IsNeonSupported) return;
             var stride = a.Stride;
             for (var r = 0; r < 4; r++)
                 LoadFactors(norms + (long)r * groups, groups, w.Book->ByteScale, rowFactors + r * stride);
@@ -457,9 +355,9 @@ namespace Needle.BurstKernels
             y[3] = accumulator3 - bias3;
         }
 
-        // Mirrors Neon.PairPlane.
         static void PairPlane(v128 table, v128 mask, v128 i0, v128 i1, int plane, int act, sbyte* v0, sbyte* v1, sbyte* v2, sbyte* v3, ref v128 sum00, ref v128 sum01, ref v128 sum02, ref v128 sum03, ref v128 sum10, ref v128 sum11, ref v128 sum12, ref v128 sum13)
         {
+            if (!Arm.Neon.IsNeonSupported) return;
             v128 w0 = Weights(table, Arm.Neon.vandq_u8(i0, mask));
             v128 w1 = Weights(table, Arm.Neon.vandq_u8(i1, mask));
             var offset = act + plane * 32;
@@ -477,11 +375,9 @@ namespace Needle.BurstKernels
             sum13 = Dot16(sum13, w1, a3);
         }
 
-        // Mirrors Neon.DotPair: 2 rows × 4 tokens (the x64 Gemv.Pair4
-        // counterpart). Each weight plane expands once and dots against all
-        // four token activation vectors.
         static void DotPair(Cq w, byte* packed, int rowBytes, ushort* norms, int groups, Activations a, int token, float* rowFactors, float* scaled, float* y, int ldy, v128 table, v128 mask)
         {
+            if (!Arm.Neon.IsNeonSupported) return;
             var stride = a.Stride;
             var cols = a.Cols;
             LoadFactors(norms, groups, w.Book->ByteScale, rowFactors);
@@ -557,8 +453,6 @@ namespace Needle.BurstKernels
             y[3 * ldy + 1] = accumulator13 - bias13;
         }
 
-        // Mirrors Neon.BlockToken: 4-row DotBlock slices with a single-row
-        // DotRow tail for one decode token across a row range.
         static void BlockToken(Cq w, Activations a, int token, float* yToken, int rowStart, int rowEnd, float* rowFactors, float* scaled, v128 table, v128 mask)
         {
             var groups = w.Groups;
@@ -572,13 +466,9 @@ namespace Needle.BurstKernels
             }
         }
 
-        // Mirrors Neon.MatMulRows: prefill-leaning token-major pairs when
-        // (rowEnd - rowStart) * 4 <= tokens, decode-leaning row-major full
-        // tiles plus blocked tail tokens otherwise. Row factors for up to a
-        // 4-row decode block; scaled for up to a 2-row × 4-token pair tile
-        // (DotBlock uses the first four slots).
         static void MatMulRows(Cq w, Activations a, int tokens, float* y, int ldy, int rowStart, int rowEnd)
         {
+            if (!Arm.Neon.IsNeonSupported) return;
             float* rowFactors = stackalloc float[a.Stride * 4];
             float* scaled = stackalloc float[a.Stride * 8];
             var groups = w.Groups;
@@ -586,7 +476,6 @@ namespace Needle.BurstKernels
             v128 mask = Arm.Neon.vdupq_n_u8(w.Bits == 2 ? (byte)3 : (byte)15);
             if ((rowEnd - rowStart) * 4 <= tokens)
             {
-                // Prefill-leaning: token-major; row pairs share weight-plane expansion.
                 for (var t = 0; t + 4 <= tokens; t += 4)
                 {
                     var n = rowStart;
@@ -602,7 +491,6 @@ namespace Needle.BurstKernels
                     BlockToken(w, a, t, y + (long)t * ldy, rowStart, rowEnd, rowFactors, scaled, table, mask);
                 return;
             }
-            // Decode-leaning: row-major full tiles, then blocked tail tokens.
             var full = tokens & ~3;
             for (var n = rowStart; n < rowEnd; n++)
             {
@@ -614,11 +502,6 @@ namespace Needle.BurstKernels
                 BlockToken(w, a, t, y + (long)t * ldy, rowStart, rowEnd, rowFactors, scaled, table, mask);
         }
 
-        // Scalar lane for targets without Neon (and the host-readable shape
-        // every lane must agree with): mirrors Scalar.MatMulRows exactly —
-        // per (row, token, group) integer dot, scaled = HalfToSingle(norm) *
-        // byteScale * scale, accumulator += scaled * dot,
-        // bias += scaled * offset, y = accumulator - bias.
         static void ScalarMatMulRows(Cq w, Activations a, int tokens, float* y, int ldy, int rowStart, int rowEnd)
         {
             var groups = w.Groups;

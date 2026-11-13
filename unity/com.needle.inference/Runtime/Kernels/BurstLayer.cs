@@ -1,81 +1,3 @@
-// N40: Phase-2 fused layer member (Track B).
-//
-// Ports EngineCore<TClock>.ExecuteLayer and its stage functions
-// (HyperNorm, HyperPhi, HyperMix, EngramGather, EngramMatMul, EngramBlend,
-// AttentionPrepare, AttentionQkvg, TapsHistory, AttentionHeads,
-// AttentionCore, AttentionGate, AttentionOut, PostNorm, Mlp, Combine) as ONE
-// Burst entry taking a LayerJob mirror pointer plus a member index. Barriers
-// use Interlocked plus a Common.Pause spin loop; no managed calls inside.
-//
-// VERDICT (acceptance: >= 10% decode win over the per-kernel table, else
-// close with numbers): NOT WORTH wiring in. Measured headroom is ~0.1-0.4%,
-// about 75x below the bar. Numbers (all on the N40 probe box / repo evidence):
-//   - N12-after CoreCLR T4 decode: 17,623 us/token best (ref/bench/
-//     n12-after-coreclr.json), 20 layers => ~881 us/token/layer.
-//   - Function-pointer transition: 1.7 ns direct calli (probe, CoreCLR x64,
-//     20M iterations); H5 budgets < 100 ns for a managed->Burst call.
-//     Per member per layer the fused entry removes at most ~38 calls
-//     (member owning the decode token: 2 HyperNorm + 1 HyperPhi + 2 HyperMix
-//     + 2 AttentionPrepare + ~4 Qkvg + 3 Taps + ~12 Heads + 1 Core + 2 Gate
-//     + ~3 AttnOut + 1 PostNorm + 1 Mlp + 4 Combine) and ~15 on average.
-//     38 x 30 ns ~= 1.1 us/layer => ~23 us/token => 0.13% of decode.
-//     Even at the 100 ns H5 ceiling: 0.4%.
-//   - Barriers stay: ExecuteLayer issues 11 barriers per layer (14 on the 5
-//     engram layers; TapsHistory and AttentionCore add internal ones), all
-//     required by stage data dependencies. Hot rendezvous is 0.44 us (V12),
-//     so ~5 us/layer of synchronization cannot fuse away.
-//   - Fundamentals: decode is weight-bandwidth-bound (~17.5 MB/token across
-//     the same matrices); fusion moves identical bytes and FLOPs, and
-//     RunLayerTeam already issues one team dispatch per layer, so no
-//     dispatch collapses either.
-//   - Restructuring barriers away (redundant history loads, sharded arrivals
-//     zeroing) could save at most ~3 x 0.44 us x 20 ~= 26 us/token (0.15%)
-//     and changes engine scheduling invariants, so it belongs to the engine
-//     owner, not to this file.
-// The file is kept: it is the complete, exact port, so the finding above is
-// checkable instruction by instruction, and it becomes useful the day some
-// future geometry makes call overhead matter.
-//
-// Layout contract (mirrors use explicit offsets, not declaration order):
-// every offset below was read off the built net10 assembly with a reflection
-// probe (Marshal.OffsetOf per field, Unsafe.SizeOf per struct) on 2026-11-03:
-//   Geometry 120, Cq 40, Codebook 100, Activations 40, MlpWeights 104,
-//   LayerWeights 376, HyperConnections 184, EngramSite 128, TeamBarrier 16,
-//   MlpBatch 56, AttentionBatch/Tile 128. LayerJob (EngineCore<NoClock>)
-//   sums to 1248 bytes: Barrier @0, NoClock clock byte @8, Members @12 (+6
-//   ints), Geometry @40, Weights @160, Hyper @536, Engram @720,
-//   StreamAct @848, DimAct @888, then 40 pointers @928..1248.
-// The engine side is frozen by a single [StructLayout(Sequential)] line on
-// LayerJob (N40's one Engine.cs line); the numeric half of the freeze is
-// JobSize + AssertLayout below, which N30's owner (or a core test) calls as
-// BurstLayer.AssertLayout(Unsafe.SizeOf<LayerJob>()) from inside the
-// assembly where LayerJob is visible. If TClock ever stops being NoClock,
-// the size moves and the assert fires instead of silently misreading.
-//
-// Burst API provenance (names verified, not guessed):
-//   - Unity.Burst.Intrinsics.Common.Pause: cross-platform pause, documented
-//     under Unity 7000.0 scripting reference (Common/Pause).
-//   - System.Threading.Interlocked: Burst supports all Interlocked methods
-//     (7000.0 "C#/System namespace support" page); arrivals/participants
-//     are 4-byte aligned inside the 16-byte arena barrier, satisfying the
-//     natural-alignment rule on every 64-bit target.
-//   - System.Threading.Volatile: non-generic Read/Write supported (same page).
-//   - No managed calls inside Invoke: only sibling Burst entries, MathF,
-//     Interlocked/Volatile/Common, pointer arithmetic, stackalloc.
-//
-// Telemetry caveat: the fused entry cannot call IStageClock (a managed
-// interface call). Stage laps are skipped; RunLayerTeam's clock.PoolRun and
-// the lap-free path behave like a NoClock run. An N12 stage profile therefore
-// cannot be collected through this entry; end-to-end decode us/token still
-// compares directly.
-//
-// Wiring note: KernelTable has no LayerMember field yet (N30 reserved it).
-// Install() compiles Invoke and stashes the raw pointer in Function without
-// touching the table; N30's owner adds the field plus the one-line store and
-// the Engine.cs RunLayerTeam branch. Install is idempotent and never
-// overwrites.
-//
-// C# 9 safe: block namespace, no target-typed new, no static lambdas.
 using System;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -84,31 +6,29 @@ using Unity.Burst.Intrinsics;
 
 namespace Needle.BurstKernels
 {
+    [BurstCompile]
     public static unsafe class BurstLayer
     {
-        // ---- constants mirrored from the engine (Engine.cs / Blocks.cs) ----
         const int Lanes = 4;
         const int ConvTaps = 3;
         const int EngramHistory = 9;
         const int EngramTaps = 4;
         const int MaxTileHeads = 6;
-        const int PartialFloats = MaxTileHeads * 64 + 16; // 400, matches Attention.PartialFloats
-        const int PeaksOffset = MaxTileHeads * 64;        // 384
-        const int SumsOffset = MaxTileHeads * 64 + 8;     // 392
-        const int MinChunkPositions = 48;
+        const int PartialFloats = MaxTileHeads * 64 + 16;
+        const int PeaksOffset = MaxTileHeads * 64;
+        const int SumsOffset = MaxTileHeads * 64 + 8;
+        const int MinChunkPositions = 20;
         const int MaxChunks = 8;
         const int TasksPerThread = 3;
         const int MinimumRowsPerTask = 8;
-        const int RowBlock = 4; // Quant.RowBlock
+        const int RowBlock = 4;
 
-        // ---- explicit-layout mirrors (offsets: reflection probe, see header) ----
-
-        [StructLayout(LayoutKind.Explicit, Size = 16)]
+        [StructLayout(LayoutKind.Explicit, Size = 128)]
         public struct LayerBarrier
         {
-            [FieldOffset(0)] public long Phase;
-            [FieldOffset(8)] public int Arrived;
-            [FieldOffset(12)] public int Participants;
+            [FieldOffset(0)] public int Arrived;
+            [FieldOffset(4)] public int Participants;
+            [FieldOffset(64)] public long Phase;
         }
 
         [StructLayout(LayoutKind.Explicit, Size = 40)]
@@ -116,9 +36,6 @@ namespace Needle.BurstKernels
         {
             [FieldOffset(0)] public byte* Indices;
             [FieldOffset(8)] public ushort* Norms;
-            // Codebook base as bytes: Levels[16] floats @+0, Bytes[32] @+64,
-            // ByteScale float @+96 (Codebook size 100). Scalar lane reads the
-            // table/scale by offset; GatherRow reinterprets via BurstMisc.
             [FieldOffset(16)] public byte* Book;
             [FieldOffset(24)] public int Rows;
             [FieldOffset(28)] public int Cols;
@@ -164,7 +81,6 @@ namespace Needle.BurstKernels
             [FieldOffset(96)] public float RopeTheta;
             [FieldOffset(104)] public int* Orders;
             [FieldOffset(112)] public int* Sites;
-            // Computed, exactly like Geometry (not fields, so layout is untouched).
             public int QueryWidth => Heads * QkDim;
             public int KeyWidth => KvHeads * QkDim;
             public int ValueWidth => KvHeads * VDim;
@@ -188,8 +104,6 @@ namespace Needle.BurstKernels
             [FieldOffset(248)] public float* PostNorm;
             [FieldOffset(256)] public float AttnGate;
             [FieldOffset(264)] public float* PreHada;
-            // MlpWeights is 13 float* (104 bytes, probe); BurstMlpWeights is
-            // its identical twin, so the engine pointer is used directly.
             [FieldOffset(272)] public BurstMlpWeights* Mlp;
         }
 
@@ -218,9 +132,6 @@ namespace Needle.BurstKernels
             [FieldOffset(120)] public float* Taps;
         }
 
-        // Field-for-field mirror of EngineCore<NoClock>.LayerJob (private in
-        // the core assembly). Bytes @8..11 are the NoClock clock plus padding
-        // and are intentionally unmapped; JobSize pins the total.
         [StructLayout(LayoutKind.Explicit, Size = 1248)]
         public struct LayerJobMirror
         {
@@ -278,6 +189,7 @@ namespace Needle.BurstKernels
             [FieldOffset(1224)] public int* EngramRows;
             [FieldOffset(1232)] public int* AttnArrivals;
             [FieldOffset(1240)] public BurstMlpWeights* Mlp;
+            [FieldOffset(1248)] public float* MlpScratch;
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -288,13 +200,8 @@ namespace Needle.BurstKernels
             public int Ldy;
         }
 
-        // ---- layout freeze: numeric half (attribute half is Engine.cs) ----
+        public const int JobSize = 1256;
 
-        // Probed Unsafe.SizeOf<LayerJob> for EngineCore<NoClock> (x64/arm64).
-        public const int JobSize = 1248;
-
-        // Managed-side check for N30's owner / core tests:
-        // BurstLayer.AssertLayout(Unsafe.SizeOf<LayerJob>()).
         public static void AssertLayout(int engineJobSize)
         {
             if (engineJobSize != JobSize)
@@ -302,8 +209,6 @@ namespace Needle.BurstKernels
                     "N40: LayerJob size " + engineJobSize + " != BurstLayer.JobSize " +
                     JobSize + ". The engine struct moved; update BurstLayer mirrors.");
         }
-
-        // ---- function pointer surface (managed side; N30 wires the table) ----
 
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         public delegate void LayerMemberFn(LayerJobMirror* job, int member);
@@ -335,8 +240,6 @@ namespace Needle.BurstKernels
             laneFp = (nint)lane.Value;
         }
 
-        // 2 = x86 AVX2+FMA, 1 = arm Neon, 0 = scalar. Reads the COMPILED lane
-        // through the pointer (a managed IsSupported read is always False).
         public static int CompiledLane()
         {
             if (laneFp == 0) return -1;
@@ -344,8 +247,6 @@ namespace Needle.BurstKernels
         }
 
         public static string Describe() => "layer-fused=" + (Function != 0 ? "yes" : "no") + " lane=" + CompiledLane();
-
-        // ---- the fused entry ----
 
         [BurstCompile(CompileSynchronously = true, FloatMode = FloatMode.Strict)]
         public static void Invoke(LayerJobMirror* job, int member)
@@ -382,7 +283,6 @@ namespace Needle.BurstKernels
             Combine(job, member, members);
         }
 
-        // Compiled-lane reporter (same pattern as BurstSoftmax.Lane).
         [BurstCompile(CompileSynchronously = true, FloatMode = FloatMode.Strict)]
         public static int Lane()
         {
@@ -391,9 +291,6 @@ namespace Needle.BurstKernels
             return 0;
         }
 
-        // Mirrors Pool.Barrier exactly (arrivals/phase handshake), with the
-        // spin on Volatile phase backed by Common.Pause instead of
-        // Spinner/SpinWait (managed thread helpers cannot run in Burst).
         static void FusedBarrier(LayerBarrier* barrier)
         {
             int participants = Volatile.Read(ref barrier->Participants);
@@ -423,10 +320,12 @@ namespace Needle.BurstKernels
 
         static void CopyFloats(float* destination, float* source, int n)
         {
-            for (int i = 0; i < n; i++) destination[i] = source[i];
+            int i = 0;
+            if (X86.Avx2.IsAvx2Supported)
+                for (; i + 8 <= n; i += 8)
+                    X86.Avx.mm256_storeu_ps(destination + i, X86.Avx.mm256_loadu_ps(source + i));
+            for (; i < n; i++) destination[i] = source[i];
         }
-
-        // ---- matmul mini-scheduler (replicates MatMulBatch.Plan/RunTask) ----
 
         static void RunMatMulJobs(LayerActivations* act, int tokens, MatMulJobMirror* jobs, int jobCount, int member, int members)
         {
@@ -482,9 +381,6 @@ namespace Needle.BurstKernels
             return *(float*)&bits;
         }
 
-        // Exact port of Scalar.MatMulRows (sums in the same order; integer
-        // dots are exact). Fallback lane where neither AVX2+FMA nor Neon
-        // survives Burst compilation (WebGL-era targets).
         static void ScalarMatMulRows(LayerCq* w, LayerActivations* a, int tokens, float* y, int ldy, int rowStart, int rowEnd)
         {
             int groups = w->Cols / 128;
@@ -534,8 +430,6 @@ namespace Needle.BurstKernels
             }
         }
 
-        // ---- stages (same order, same sharding, same calls as Engine.cs) ----
-
         static void HyperNorm(LayerJobMirror* job, int member, int members)
         {
             int streamWidth = Lanes * job->Geometry.Dim;
@@ -559,7 +453,6 @@ namespace Needle.BurstKernels
             return s;
         }
 
-        // Mirrors Cq.Slice: per-layer row window into a shared codebook.
         static LayerCq SliceCq(LayerCq w, int first, int count)
         {
             int rowBytes = w.Cols * w.Bits / 8;
@@ -775,8 +668,6 @@ namespace Needle.BurstKernels
             int tilesPerGroup = (group + MaxTileHeads - 1) / MaxTileHeads;
             int tileHeads = (group + tilesPerGroup - 1) / tilesPerGroup;
             int planGroups = job->Count * kvHeads;
-            // CanSplitPositions in Burst terms: the x86 AVX2+FMA lane splits
-            // positions across chunks (net10 Simd.UseAvx equivalent).
             bool splittable = X86.Avx2.IsAvx2Supported && X86.Fma.IsFmaSupported && tilesPerGroup == 1 && group > 1;
             int chunks = splittable ? (members + planGroups - 1) / planGroups : 1;
             if (chunks < 1) chunks = 1;
@@ -798,7 +689,7 @@ namespace Needle.BurstKernels
             bool global = ((job->Geometry.GlobalMask >> job->Layer) & 1) != 0;
             int window = global ? 0 : job->Geometry.SlidingWindow;
             first = window == 0 ? 0 : (position - window + 1 > 0 ? position - window + 1 : 0);
-            count = position - first + 1; // Frames is 0 on this path
+            count = position - first + 1;
         }
 
         static void FillTile(LayerJobMirror* job, BurstAttentionTile* work, int token, int kv, int firstHead, int headCount, int first, int count, float* scores)
@@ -927,11 +818,9 @@ namespace Needle.BurstKernels
             b.Scale = 1f;
             int width = rows * cols;
             Shard(job->Count, member, members, out int first, out int count);
+            float* scratch = stackalloc float[8 + dim + 2 * width + 8];
             for (int t = first; t < first + count; t++)
-            {
-                float* scratch = stackalloc float[8 + dim + 2 * width + 8];
                 BurstMlp.Invoke(&b, job->Residual + (long)t * dim, scratch);
-            }
         }
 
         static void Combine(LayerJobMirror* job, int member, int members)

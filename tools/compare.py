@@ -16,13 +16,11 @@ OURS = ROOT / "out/aot/needle"
 TOOLS = ROOT / "tools/tools.json"
 QUERY = "what's it like in Lagos right now?"
 
-
 def status_kb(field):
     for line in Path("/proc/self/status").read_text().splitlines():
         if line.startswith(field):
             return int(line.split()[1])
     return 0
-
 
 def vendor(repeat):
     if not VENDOR_LIB.exists():
@@ -51,7 +49,6 @@ def vendor(repeat):
             "median_ms": statistics.median(times), "min_ms": min(times), "peak_rss_kb": status_kb("VmHWM"),
             "anon_kb": status_kb("RssAnon"), "output": last.decode()[:300]}
 
-
 def ours(repeat, threads):
     env = {"NEEDLE_THREADS": str(threads), "PATH": "/usr/bin:/bin"}
     process = subprocess.Popen([str(OURS), "run", str(CACT), str(TOOLS), QUERY, str(repeat)], env=env,
@@ -72,7 +69,6 @@ def ours(repeat, threads):
             "median_ms": statistics.median(totals), "min_ms": min(totals), "peak_rss_kb": peak, "anon_kb": anon,
             "output": stdout.strip()[-300:]}
 
-
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "all"
     repeat = int(sys.argv[2]) if len(sys.argv) > 2 else 30
@@ -87,7 +83,6 @@ def main():
         print(f"{row['engine']:<26}{row['prime_ms']:>10.1f}{row['median_ms']:>11.1f}{row['min_ms']:>9.1f}{row['peak_rss_kb'] / 1024:>13.1f}{row['anon_kb'] / 1024:>12.1f}")
     for row in rows:
         print(f"\n{row['engine']}:\n  {row['output']}")
-
 
 if __name__ == "__main__":
     main()

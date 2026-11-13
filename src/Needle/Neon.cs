@@ -131,9 +131,6 @@ internal static unsafe class Neon
         for (; i2 < n; i2++) s[i2] /= total;
     }
 
-    // Probability of the best (maximum) entry: 1 / sum(exp(v - best)).
-    // Vectorized counterpart of Ops.BestProbability; only the best probability
-    // is produced, unlike Softmax which normalizes every entry.
     public static float BestProbability(float* values, int count, float best)
     {
         var shift = Vector128.Create(best);
@@ -417,7 +414,6 @@ internal static unsafe class Neon
         return AdvSimd.MultiplyWideningUpperAndAdd(sum, valueHigh, weightHigh);
     }
 
-
     public static void LoadFactors(ushort* norms, int groups, float scale, float* factors)
     {
         var multiplier = Vector128.Create(scale);
@@ -674,9 +670,6 @@ internal static unsafe class Neon
         sum3 = Dot16(sum3, weights, AdvSimd.LoadVector128(v3 + offset));
     }
 
-    // Multi-row decode block: 4 rows x 1 token (the x64 Gemv.Block counterpart).
-    // Activation vectors are loaded once per plane and shared across four rows,
-    // so decode pays one activation pass per four rows instead of one per row.
     static void DotBlock(in Cq w, byte* packed, int rowBytes, ushort* norms, int groups, in Activations a, int token, float* rowFactors, float* scaled, float* y, Vector128<byte> table, Vector128<byte> mask)
     {
         var stride = a.Stride;
@@ -744,9 +737,6 @@ internal static unsafe class Neon
         sum3 = Dot16(sum3, Weights(table, AdvSimd.And(i3, mask)), activation);
     }
 
-    // Prefill tile: 2 rows x 4 tokens (the x64 Gemv.Pair4 counterpart). Each
-    // weight plane is expanded once and dotted against all four token activation
-    // vectors, halving weight traffic versus one DotTile per row.
     static void DotPair(in Cq w, byte* packed, int rowBytes, ushort* norms, int groups, in Activations a, int token, float* rowFactors, float* scaled, float* y, int ldy, Vector128<byte> table, Vector128<byte> mask)
     {
         var stride = a.Stride;
@@ -844,8 +834,6 @@ internal static unsafe class Neon
         sum13 = Dot16(sum13, w1, a3);
     }
 
-    // One decode token across a row range: 4-row DotBlock slices with a
-    // single-row DotRow tail.
     static void BlockToken(in Cq w, in Activations a, int token, float* yToken, int rowStart, int rowEnd, float* rowFactors, float* scaled, Vector128<byte> table, Vector128<byte> mask)
     {
         var groups = w.Groups;
@@ -861,8 +849,6 @@ internal static unsafe class Neon
 
     public static void MatMulRows(in Cq w, in Activations a, int tokens, float* y, int ldy, int rowStart, int rowEnd)
     {
-        // Row factors for up to a 4-row decode block; scaled for up to a
-        // 2-row x 4-token pair tile (DotBlock uses the first four slots).
         var rowFactors = stackalloc float[a.Stride * 4];
         var scaled = stackalloc float[a.Stride * 8];
         var groups = w.Groups;
@@ -870,7 +856,6 @@ internal static unsafe class Neon
         var mask = Vector128.Create(w.Bits == 2 ? (byte)0x03 : (byte)0x0F);
         if ((rowEnd - rowStart) * 4 <= tokens)
         {
-            // Prefill-leaning: token-major; row pairs share weight-plane expansion.
             for (var t = 0; t + 4 <= tokens; t += 4)
             {
                 var n = rowStart;
@@ -886,7 +871,6 @@ internal static unsafe class Neon
                 BlockToken(w, a, t, y + (long)t * ldy, rowStart, rowEnd, rowFactors, scaled, table, mask);
             return;
         }
-        // Decode-leaning: row-major full tiles, then blocked tail tokens.
         var full = tokens & ~3;
         for (var n = rowStart; n < rowEnd; n++)
         {
@@ -1019,7 +1003,6 @@ internal static unsafe class Neon
         AdvSimd.Store(row, AdvSimd.Arm64.Divide(v, Vector128.Create(lanes[0] + lanes[1] + lanes[2] + lanes[3])));
     }
 
-
     public static void RmsFakeA8(float* x, int n, float* destination)
     {
         var inverse = Vector128.Create(1f / MathF.Sqrt(SumOfSquares(x, n) / n + RmsEpsilon));
@@ -1092,9 +1075,6 @@ internal static unsafe class Neon
             AdvSimd.Store(residual + i, AdvSimd.FusedMultiplyAdd(AdvSimd.LoadVector128(residual + i), g,
                 AdvSimd.Multiply(AdvSimd.Multiply(AdvSimd.Add(one, AdvSimd.LoadVector128(scale + i)), AdvSimd.LoadVector128(x + i)), inverse)));
     }
-
-
-
 
     [SkipLocalsInit]
     public static void Kron(float* z, int activeRows, float* left, float* right, int rows, int cols, int resultRows, float* result)

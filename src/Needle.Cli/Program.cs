@@ -138,8 +138,6 @@ static int Call(string modelPath, string toolsPath, string[] rest)
         }
         else if (rest[i] != "--no-date" && rest[i] != "--no-retrieval") queries.Add(rest[i]);
     }
-    // A shipped prefix bakes a date-free system prompt (AutoDate=false); a
-    // dated prompt would fail prefix validation, so require --no-date here.
     if (prefixPath != null && autoDate) { Console.Error.WriteLine("needle call: --prefix requires --no-date (primed prefixes bake AutoDate=false)"); return 2; }
     byte[]? prefix = null;
     if (prefixPath != null)

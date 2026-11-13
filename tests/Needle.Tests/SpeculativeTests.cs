@@ -7,18 +7,6 @@ using Xunit.Abstractions;
 
 namespace Needle.Tests;
 
-// Issue #17: lossless prompt-lookup speculative decoding. Each call-decode
-// step proposes up to four draft tokens by 3/2/1-gram lookup into the prompt
-// and output token history, feeds pick+drafts as one chunk, and keeps the
-// longest prefix whose masked argmax equals the proposal (plus one freshly
-// picked correction token). Rejected tails rewind the engine to the
-// checkpoint and re-feed the accepted prefix, so the committed token/state
-// history is exactly what per-token greedy would produce. What these tests
-// prove is the losslessness (byte-identical calls/reasoning/response, token
-// counts AND confidences on every prompt), typed-sink event parity (the sink
-// sees accepted tokens only), budget/cancel accounting, and zero managed
-// allocation on the speculative path. Pass counts are reported per prompt
-// with a never-regress guard on the totals: speculation must earn its keep.
 public sealed class SpeculativeTests : IDisposable
 {
     readonly Model model;
@@ -33,13 +21,6 @@ public sealed class SpeculativeTests : IDisposable
 
     public void Dispose() => model.Dispose();
 
-    // The lossless gate runs single-threaded: a chunk feed computes
-    // bit-identical per-row logits to sequential singles only on one thread
-    // (see ChunkParityTests); at higher thread counts the engine's
-    // chunk/sequential drift can flip a borderline pick, so speculation
-    // stays default-off until the kernel work (W13/W20) closes that gap.
-    // Pass counts are thread-independent (one per feed), so the reported
-    // reductions transfer to any thread count.
     static NeedleOptions WithSpec(NeedleOptions options, bool spec) => new()
     {
         Threads = 1,
@@ -75,13 +56,6 @@ public sealed class SpeculativeTests : IDisposable
             reply.PromptTokens, reply.DecodeTokens, session.LastCallPasses);
     }
 
-    // Lossless here means the greedy token sequence is unchanged: status,
-    // calls, reasoning, response and token counts are byte/token-identical.
-    // Confidence floats are NOT bit-identical by construction: any chunk
-    // feed (including this one) pools rows differently than per-token feeds
-    // (the pool cell restarts every Forward), so the head confidence drifts
-    // at the ~1e-3 level while argmax picks stay put. The 0.05 guard catches
-    // real state corruption (e.g. a bad rewind) without pinning rounding.
     void AssertIdentical(string label, TextOutcome expected, TextOutcome actual)
     {
         var same = expected.Status == actual.Status && expected.Failure == actual.Failure &&
@@ -204,11 +178,6 @@ public sealed class SpeculativeTests : IDisposable
         Assert.Equal(jsonReply.Status, typedReply.Status);
         Assert.Equal(jsonReply.CallCount, typedReply.CallCount);
         Assert.Equal(jsonReply.DecodeTokens, typedReply.DecodeTokens);
-        // No LastCallPasses equality: json-vs-typed pass parity already
-        // flakes on this box without any speculation involved (its W16 twin
-        // fails the same way under load), so passes are reported, not
-        // asserted, on the json-vs-typed path. The off-vs-on pass gauge
-        // below covers speculation's own accounting.
         var restored = Encoding.UTF8.GetString(calls, 0, jsonReply.Utf8Length);
         var parsed = JsonValue.Parse(restored);
         Assert.Equal(parsed.Items.Count, typedReply.CallCount);
@@ -326,11 +295,6 @@ public sealed class SpeculativeTests : IDisposable
         Assert.Equal(0, allocated);
     }
 
-    // The rewind half of speculation must be exact: checkpoint, feed a draft
-    // chunk, restore, and re-feed the accepted prefix must reproduce the
-    // direct single-feed state bit-for-bit (logits and pooled confidence).
-    // This isolates rewind exactness from the chunk-vs-sequential pooling
-    // difference, which only affects multi-token feeds.
     [Fact]
     public unsafe void SpecCheckpointRestoreIsBitExact()
     {

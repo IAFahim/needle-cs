@@ -1,5 +1,3 @@
-// N11 arg parsing shared by the CoreCLR host and the Mono harness.
-// Kept at C#-7 level so Unity's bundled Mono 6.13 csc can compile it.
 using System;
 using System.IO;
 

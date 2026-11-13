@@ -2,21 +2,6 @@ using System;
 
 namespace Needle;
 
-// W26 multi-sequence batched decode: N independent sequences share one
-// engine pass per decode step. Weights stream once for all rows (the decode
-// step is weight-bound: 17.5 MB per token), while attention, convolution
-// history, engram state, pooling and the KV cache stay per sequence in
-// slots. Prefill stays per sequence through FeedSlot; only the decode step
-// batches. Grammar masks still differ per sequence: after each shared
-// forward the caller applies its own mask and argmax (see BatchedSession),
-// which is where the sharing stops — the per-sequence argmax, grammar walk
-// and token bookkeeping remain serial CPU work.
-//
-// Bit-identity contract: one batched step over rows produces the identical
-// logits and KV/history updates as feeding each slot's rows alone in the
-// same order. Attention runs one batch per slot run (it reads only that
-// sequence's KV, so sharing the pass would save nothing) to keep the exact
-// tiling the single-sequence path uses.
 public sealed unsafe class BatchedEngine : IDisposable
 {
     readonly EngineCore<NoClock> engine;

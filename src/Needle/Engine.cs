@@ -1,5 +1,11 @@
 using System;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Threading;
+#if NEEDLE_SIMD
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
+#endif
 
 namespace Needle;
 
@@ -48,6 +54,11 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
     TeamBarrier* barrier;
     float* attnPartials;
     int* attnArrivals;
+    int* stealCursors;
+    float* gatePeaks;
+    float* mlpScratch;
+    LayerWeights* blockTable;
+    EngramSite* siteTable;
 
     readonly float* state;
     readonly float* snapshot;
@@ -56,35 +67,19 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
     int* snapshotTokens;
     float* snapshotPoolMax, snapshotPoolSum, snapshotPoolAcc;
     bool historyPending, poolPending;
-    // Per-step speculative snapshot (issue #17): a full copy of the recurrent
-    // state plus Length from before a draft chunk. KV caches need no copy:
-    // they are indexed by absolute position, so a stale tail is simply
-    // overwritten by later feeds. Allocated once in the constructor; the
-    // speculative path only memcpys between these buffers (no allocation).
     float* specSnapshot;
     int specLength;
     float* qkvHistory, engramHistory;
     int* previousTokens;
     int markedLength;
-    // MEM-21: snapshot generations. Prefix captures (Mark/Import) draw from
-    // prefixVersion, speculative captures (CheckpointSpec) from specVersion;
-    // rollback validates the token against its own domain, so a stale or
-    // cross-domain token throws instead of restoring the wrong state.
     int prefixVersion;
     int specVersion;
-    // Token count of the last Forward chunk; the sparse head reads that row.
     int lastForwardCount;
     float* poolMax, poolSum, poolAcc, cell;
     bool pooling;
     CrossMemory cross;
-    // W26 multi-sequence slots. The single-sequence fields above stay the
-    // only state the prefetch/feed path touches; slots mirror their layout
-    // (state block, snapshot block, KV cache, lengths, pending flags) so one
-    // batched forward can step N independent sequences through the shared
-    // weight reads. Null unless the engine was constructed with slots.
     readonly int slotCount;
     readonly SlotView[]? slotViews;
-    // Batched-decode scratch, allocated only when slots > 0.
     float* batchLogits;
     float* batchQ, batchK, batchV;
     float* batchEngramStage;
@@ -101,6 +96,7 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
 
     internal EngineCore(Model model, int contextLength, int chunkSize, ThreadPolicy policy, Pool? shared, TClock clock, int slots = 0)
     {
+        Kernels.EnsureDefault();
         this.model = model;
         this.clock = clock;
         ownsPool = shared == null;
@@ -164,6 +160,16 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         barrier = arena.Take<TeamBarrier>(1);
         attnPartials = arena.Take<float>((nuint)chunk * (nuint)g.KvHeads * 8 * Attention.PartialFloats);
         attnArrivals = arena.Take<int>((nuint)chunk * (nuint)g.KvHeads);
+        stealCursors = arena.Take<int>(8 * 16);
+        gatePeaks = arena.Take<float>((nuint)(Math.Max(g.Heads, 8) * 16));
+        mlpScratch = arena.Take<float>((nuint)HadamardMlp.ScratchFloats(dim, g.HadaRows * g.HadaCols));
+        blockTable = arena.TakeUncleared<LayerWeights>((nuint)g.Layers);
+        for (var l = 0; l < g.Layers; l++) blockTable[l] = model.Blocks[l];
+        if (g.SiteCount > 0)
+        {
+            siteTable = arena.TakeUncleared<EngramSite>((nuint)g.SiteCount);
+            for (var s = 0; s < g.SiteCount; s++) siteTable[s] = model.Sites[s];
+        }
         keyCache = arena.TakeUncleared<sbyte>((nuint)capacity * (nuint)g.Layers * (nuint)kWidth);
         valueCache = arena.TakeUncleared<sbyte>((nuint)capacity * (nuint)g.Layers * (nuint)vWidth);
         keyScale = arena.TakeUncleared<float>((nuint)capacity * (nuint)g.Layers * (nuint)g.KvHeads);
@@ -316,14 +322,6 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         return logit;
     }
 
-    // MATH-M7: hoisted RoPE frequency schedule. Frequencies depend only on the
-    // config (theta, qkDim), so they are computed once per dim here instead of
-    // once per (position, dim) below: capacity*half Pow calls collapse to half.
-    // The expression is deliberately identical to the historical per-entry
-    // formula, not a log-domain exp reformulation: ~1e-7 exp-vs-Pow noise flips
-    // the documented 'attack the watchtower near the river' knife-edge between
-    // native-refuse and managed-call (NativeParityTests), so this stays
-    // bit-identical while still removing 99.9%+ of the Pow calls.
     internal static void RopeFrequencies(float theta, int qkDim, float* freq, int half)
     {
         for (var i = 0; i < half; i++)
@@ -369,18 +367,6 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         }
     }
 
-    // MEM-21: O(1) prefix snapshot/rollback token (cf. QuanTAlib RingBuffer
-    // SnapshotToken). Mark/CheckpointSpec snapshot the recurrent state once
-    // into the preallocated snapshot/spec buffers; rollback is then pure
-    // assignment (length, trailing tokens, lazy flags) — never recompute.
-    // The token pins its capture point: Length plus the trailing token pair
-    // plus the capture generation. Prefix generations are positive,
-    // speculative generations negative (stored sign-flipped), so each
-    // rollback accepts only tokens from its own domain and generation;
-    // prefix-edit (re-Mark/Import) and draft (re-Checkpoint) captures retire
-    // earlier tokens, which then throw instead of restoring superseded
-    // state. A zero Version never validates: counters start at 0 and
-    // pre-increment. 16 bytes, readonly, zero allocation.
     public readonly struct PrefixSnapshot
     {
         public readonly int Length;
@@ -489,11 +475,6 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         Length = markedLength;
     }
 
-    // MEM-21 token rollback for prefix-edit turns: validates the capture,
-    // then takes the same O(1) lazy path as Rewind (two ints, two flags,
-    // Length — no memcpy, no allocation). A re-Mark/Import retires earlier
-    // tokens via the generation check, so a stale token throws instead of
-    // restoring a superseded prefix.
     public void Rewind(in PrefixSnapshot token)
     {
         if (token.Version <= 0 || token.Version != prefixVersion || token.Length != markedLength ||
@@ -502,11 +483,6 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         Rewind();
     }
 
-    // Saves the recurrent state (conv/engram histories, previous tokens,
-    // confidence pooling) plus Length from before a speculative draft chunk.
-    // Must be called with a settled state (right after a feed, when
-    // historyPending/poolPending are false); RestoreSpec then reinstalls a
-    // self-consistent state, so the lazy flags stay clear.
     internal PrefixSnapshot CheckpointSpec()
     {
         Buffer.MemoryCopy(state, specSnapshot, stateBytes, stateBytes);
@@ -515,21 +491,12 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         return new PrefixSnapshot(specLength, previousTokens[0], previousTokens[1], -specVersion);
     }
 
-    // Drops a rejected draft tail: reinstalls the pre-chunk recurrent state
-    // and Length. KV caches are indexed by absolute position, so entries
-    // past the restored Length are simply overwritten by the next feed.
     internal void RestoreSpec()
     {
         Buffer.MemoryCopy(specSnapshot, state, stateBytes, stateBytes);
         Length = specLength;
     }
 
-    // MEM-21 token rollback for the speculative path: validates the capture
-    // (own domain via the negative generation, current generation, Length,
-    // trailing tokens — all O(1) integer compares), then reinstalls the
-    // pre-chunk state exactly like RestoreSpec. Covers rejected draft tails
-    // without recompute; a re-Checkpoint or any foreign/domain-crossed token
-    // throws instead of restoring the wrong draft point.
     internal void RestoreSpec(in PrefixSnapshot token)
     {
         if (token.Version >= 0 || token.Version != -specVersion || token.Length != specLength)
@@ -573,6 +540,19 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         }
         EngramHash.Rows(g, tokens, count, position, previousTokens, engramRows);
         clock.Lap(Stage.Embed);
+        if (count == 1 && Observer == null && Alignment == null)
+        {
+            if (pooling) RestorePool();
+            RunTokenTeam(position, wantLogits);
+            historyPending = false;
+            return;
+        }
+        if (count > 1 && cross.Frames == 0 && Observer == null && !pooling)
+        {
+            RunBatchTeam(position, count, wantLogits);
+            historyPending = false;
+            return;
+        }
         Observer?.Invoke(-1, new ReadOnlySpan<float>(stream, count * streamWidth));
         if (pooling) PoolTokens(0, count, true);
         for (var layer = 0; layer < g.Layers; layer++)
@@ -592,7 +572,7 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         RunLayerTeam(l, count, position);
     }
 
-    [StructLayout(LayoutKind.Sequential)] // N40: layout frozen — BurstLayer mirrors this struct field for field (see BurstLayer.JobSize).
+    [StructLayout(LayoutKind.Sequential)]
     unsafe struct LayerJob
     {
         public TeamBarrier* Barrier;
@@ -643,13 +623,686 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         public int* EngramRows;
         public int* AttnArrivals;
         public MlpWeights* Mlp;
+        public float* MlpScratch;
     }
 
     static void Shard(int tasks, int member, int members, out int first, out int count)
     {
-        var per = (tasks + members - 1) / members;
-        first = Math.Min(member * per, tasks);
-        count = Math.Min(first + per, tasks) - first;
+        var q = tasks / members;
+        var r = tasks % members;
+        first = member * q + Math.Min(member, r);
+        count = q + (member < r ? 1 : 0);
+    }
+
+    internal struct DecodeJob
+    {
+        public TeamBarrier* Barrier;
+        public TClock Clock;
+        public int Members, Count, Position, Capacity, HistoryPerLayer, WantLogits;
+        public Geometry Geometry;
+        public LayerWeights* Blocks;
+        public EngramSite* Sites;
+        public HyperConnections Hyper;
+        public Cq Embedding;
+        public float* FinalNorm;
+        public Activations StreamAct, DimAct, HeadAct;
+        public float* Stream;
+        public float* Next;
+        public float* Normed;
+        public float* Input;
+        public float* Residual;
+        public float* Quantized;
+        public float* QRaw;
+        public float* KRaw;
+        public float* VRaw;
+        public float* QConv;
+        public float* KConv;
+        public float* VConv;
+        public float* GateOut;
+        public float* AttnOut;
+        public float* AttnProj;
+        public float* EngramInput;
+        public float* EngramKey;
+        public float* EngramConv;
+        public float* EngramValueBuffer;
+        public float* QueryScale;
+        public float* KeyScale;
+        public float* ValueScale;
+        public float* RopeCos;
+        public float* RopeSin;
+        public float* ResidualMix;
+        public float* PostGate;
+        public float* PreOut;
+        public float* PostOut;
+        public float* ResOut;
+        public float* AttnPartials;
+        public float* QkvBase;
+        public float* EngramBase;
+        public float* QkvLive;
+        public float* EngramLive;
+        public float* Logits;
+        public float* Scratch;
+        public sbyte* QueryInt8;
+        public sbyte* KeyCache;
+        public sbyte* ValueCache;
+        public int* EngramRows;
+        public int* AttnArrivals;
+        public int* StealCursors;
+        public float* GatePeaks;
+        public float* MlpScratch;
+        public ProbeHead* Confidence;
+        public float* PoolMax;
+        public float* PoolSum;
+        public float* PoolAcc;
+        public float* Cell;
+        public float InverseRootDim;
+        public CrossWeights* CrossLayers;
+        public CrossMemory Cross;
+    }
+
+    DecodeJob BuildTeamJob(int count, int position, bool wantLogits) => new DecodeJob
+    {
+        Barrier = barrier,
+        Clock = clock,
+        Members = pool.Members,
+        Count = count,
+        Position = position,
+        Capacity = capacity,
+        HistoryPerLayer = historyPerLayer,
+        WantLogits = wantLogits ? 1 : 0,
+        Geometry = g,
+        Blocks = blockTable,
+        Sites = siteTable,
+        Hyper = model.Hyper,
+        Embedding = model.Embedding,
+        FinalNorm = model.FinalNorm,
+        StreamAct = streamAct,
+        DimAct = dimAct,
+        HeadAct = headAct,
+        Stream = stream,
+        Next = nextStream,
+        Normed = normalizedStream,
+        Input = input,
+        Residual = residual,
+        Quantized = quantizedInput,
+        QRaw = qRaw,
+        KRaw = kRaw,
+        VRaw = vRaw,
+        QConv = qConv,
+        KConv = kConv,
+        VConv = vConv,
+        GateOut = gateOut,
+        AttnOut = attnOut,
+        AttnProj = attnProj,
+        EngramInput = engramInput,
+        EngramKey = engramKey,
+        EngramConv = engramConv,
+        EngramValueBuffer = engramValueBuffer,
+        QueryScale = queryScale,
+        KeyScale = keyScale,
+        ValueScale = valueScale,
+        RopeCos = ropeCos,
+        RopeSin = ropeSin,
+        ResidualMix = residualMix,
+        PostGate = postGate,
+        PreOut = preOut,
+        PostOut = postOut,
+        ResOut = resOut,
+        AttnPartials = attnPartials,
+        AttnArrivals = attnArrivals,
+        StealCursors = stealCursors,
+        GatePeaks = gatePeaks,
+        QkvBase = historyPending ? snapshot + (qkvHistory - state) : qkvHistory,
+        EngramBase = historyPending ? snapshot + (engramHistory - state) : engramHistory,
+        QkvLive = qkvHistory,
+        EngramLive = engramHistory,
+        Logits = logits,
+        Scratch = scratch,
+        QueryInt8 = queryInt8,
+        KeyCache = keyCache,
+        ValueCache = valueCache,
+        EngramRows = engramRows,
+        MlpScratch = mlpScratch,
+        Confidence = pooling ? model.Confidence : null,
+        PoolMax = poolMax,
+        PoolSum = poolSum,
+        PoolAcc = poolAcc,
+        Cell = cell,
+        InverseRootDim = 1f / MathF.Sqrt(dim),
+        CrossLayers = cross.Frames > 0 ? model.Audio->Cross : null,
+        Cross = cross,
+    };
+
+    static void RunSidecarDecodeTeam(void* context, int member) =>
+        ((delegate* unmanaged[Cdecl]<void*, int, void>)(void*)Kernels.SidecarDecodeTeam)(context, member);
+
+    static void RunSidecarPrefillTeam(void* context, int member) =>
+        ((delegate* unmanaged[Cdecl]<void*, int, void>)(void*)Kernels.SidecarPrefillTeam)(context, member);
+
+    void RunTokenTeam(int position, bool wantLogits)
+    {
+        var job = BuildTeamJob(1, position, wantLogits);
+        clock.PoolRun();
+        var useSidecar = typeof(TClock) == typeof(NoClock) && (void*)Kernels.SidecarDecodeTeam != null && Kernels.Provider == "net10-unmanaged";
+        pool.RunTeam(useSidecar ? &RunSidecarDecodeTeam : &ExecuteDecodeTeam, Unsafe.AsPointer(ref job), barrier);
+        if ((g.Layers & 1) != 0)
+        {
+            var swap = stream;
+            stream = nextStream;
+            nextStream = swap;
+        }
+    }
+
+    void RunBatchTeam(int position, int count, bool wantLogits)
+    {
+        var job = BuildTeamJob(count, position, wantLogits);
+        clock.PoolRun();
+        var useSidecar = typeof(TClock) == typeof(NoClock) && (void*)Kernels.SidecarPrefillTeam != null && Kernels.Provider == "net10-unmanaged";
+        pool.RunTeam(useSidecar ? &RunSidecarPrefillTeam : &ExecutePrefillTeam, Unsafe.AsPointer(ref job), barrier);
+        if ((g.Layers & 1) != 0)
+        {
+            var swap = stream;
+            stream = nextStream;
+            nextStream = swap;
+        }
+    }
+
+    internal static void ExecutePrefillTeam(void* context, int member)
+    {
+        ref var job = ref Unsafe.AsRef<DecodeJob>(context);
+        var members = job.Members;
+        var g = job.Geometry;
+        var layers = g.Layers;
+        var dim = g.Dim;
+        var lj = new LayerJob
+        {
+            Barrier = job.Barrier,
+            Clock = job.Clock,
+            Members = members,
+            Count = job.Count,
+            Position = job.Position,
+            Capacity = job.Capacity,
+            Geometry = g,
+            Hyper = job.Hyper,
+            StreamAct = job.StreamAct,
+            DimAct = job.DimAct,
+            Normed = job.Normed,
+            Input = job.Input,
+            Residual = job.Residual,
+            Quantized = job.Quantized,
+            QRaw = job.QRaw,
+            KRaw = job.KRaw,
+            VRaw = job.VRaw,
+            QConv = job.QConv,
+            KConv = job.KConv,
+            VConv = job.VConv,
+            GateOut = job.GateOut,
+            AttnOut = job.AttnOut,
+            AttnProj = job.AttnProj,
+            EngramInput = job.EngramInput,
+            EngramKey = job.EngramKey,
+            EngramConv = job.EngramConv,
+            EngramValueBuffer = job.EngramValueBuffer,
+            QueryScale = job.QueryScale,
+            KeyScale = job.KeyScale,
+            ValueScale = job.ValueScale,
+            RopeCos = job.RopeCos,
+            RopeSin = job.RopeSin,
+            ResidualMix = job.ResidualMix,
+            PostGate = job.PostGate,
+            PreOut = job.PreOut,
+            PostOut = job.PostOut,
+            ResOut = job.ResOut,
+            AttnPartials = job.AttnPartials,
+            QkvBase = job.QkvBase,
+            EngramBase = job.EngramBase,
+            QkvLive = job.QkvLive,
+            EngramLive = job.EngramLive,
+            QueryInt8 = job.QueryInt8,
+            KeyCache = job.KeyCache,
+            ValueCache = job.ValueCache,
+            EngramRows = job.EngramRows,
+            AttnArrivals = job.AttnArrivals,
+            MlpScratch = job.MlpScratch,
+        };
+        for (var l = 0; l < layers; l++)
+        {
+            var site = g.SiteOf(l);
+            var sIdx = site >= 0 ? site : 0;
+            lj.Layer = l;
+            lj.Lane = l % Lanes;
+            lj.HasEngram = site >= 0 ? 1 : 0;
+            lj.Weights = job.Blocks[l];
+            if (site >= 0) lj.Engram = job.Sites[site];
+            lj.Stream = (l & 1) == 0 ? job.Stream : job.Next;
+            lj.Next = (l & 1) == 0 ? job.Next : job.Stream;
+            lj.QkvBase = job.QkvBase + (long)l * job.HistoryPerLayer;
+            lj.EngramBase = job.EngramBase + (long)sIdx * EngramHistory * dim;
+            lj.QkvLive = job.QkvLive + (long)l * job.HistoryPerLayer;
+            lj.EngramLive = job.EngramLive + (long)sIdx * EngramHistory * dim;
+            lj.Mlp = &job.Blocks[l].Mlp;
+            ExecuteLayerBody(in lj, member, members, job.StealCursors);
+            Pool.Barrier(lj.Barrier);
+        }
+        if (job.WantLogits != 0)
+        {
+            if (member == 0)
+            {
+                var finalStream = (layers & 1) == 0 ? job.Stream : job.Next;
+                PrepareHeadVectors(finalStream + (long)(job.Count - 1) * Lanes * dim, job.FinalNorm, dim, job.Scratch, job.HeadAct);
+                job.StealCursors[80] = 0;
+            }
+            Pool.Barrier(job.Barrier);
+            var head = new MatMulBatch(job.HeadAct, 1);
+            head.Add(job.Embedding, job.Logits, job.Embedding.Rows);
+            MatMulBatch.RunSteal(&head, job.StealCursors + 80, member, members);
+            if (member == 0) job.Clock.Lap(Stage.Logits);
+        }
+    }
+
+    static void PrepareHeadVectors(float* s, float* finalNorm, int dim, float* scratch, in Activations headAct)
+    {
+        var mean = scratch;
+        Ops.Mix4(s, dim, 0.25f, 0.25f, 0.25f, 0.25f, mean);
+        var normalized = scratch + dim;
+        Ops.ZeroCenteredRms(mean, finalNorm, dim, normalized);
+        Quant.FakeA8(normalized, dim);
+        Quant.Prepare(normalized, 1, dim, 4, headAct);
+    }
+
+    internal static void ExecuteDecodeTeam(void* context, int member)
+    {
+        ref var job = ref Unsafe.AsRef<DecodeJob>(context);
+        var members = job.Members;
+        const int lead = 0;
+        var g = job.Geometry;
+        var dim = g.Dim;
+        var layers = g.Layers;
+        var streamWidth = Lanes * dim;
+        var hpre = stackalloc float[Lanes];
+        var mixLogits = stackalloc float[Lanes * Lanes];
+        var unitA = stackalloc float[dim];
+        var unitB = stackalloc float[dim];
+        if (job.Confidence != null && member == lead)
+            PoolRow(ref job, job.Stream, 0, true);
+        for (var l = 0; l < layers; l++)
+        {
+            var w = job.Blocks + l;
+            var s = (l & 1) == 0 ? job.Stream : job.Next;
+            var next = (l & 1) == 0 ? job.Next : job.Stream;
+            var qkvBase = job.QkvBase + (long)l * job.HistoryPerLayer;
+            var qkvLive = job.QkvLive + (long)l * job.HistoryPerLayer;
+            var site = g.SiteOf(l);
+            var hasEngram = site >= 0;
+            if (member == lead)
+            {
+                job.StealCursors[0] = 0;
+                job.StealCursors[16] = 0;
+                job.StealCursors[32] = 0;
+                job.StealCursors[48] = 0;
+                job.StealCursors[64] = 0;
+                job.StealCursors[96] = 0;
+                Quant.PrepareRmsFakeA8(s, job.Normed, streamWidth, 4, job.StreamAct.Slice(0));
+                job.Clock.Lap(Stage.HyperPrepare);
+
+#if NEEDLE_SIMD
+                if (Simd.UseAvx && (void*)Kernels.Active.MatMulRows == null)
+                {
+                    Gemv.RowsPhi(
+                        job.Hyper.PhiPre.Slice(l * Lanes, Lanes), job.PreOut,
+                        job.Hyper.PhiPost.Slice(l * Lanes, Lanes), job.PostOut,
+                        job.Hyper.PhiRes.Slice(l * Lanes * Lanes, Lanes * Lanes), job.ResOut,
+                        job.StreamAct);
+                }
+                else
+#endif
+                {
+                    var phi = new MatMulBatch(job.StreamAct, 1);
+                    phi.Add(job.Hyper.PhiPre.Slice(l * Lanes, Lanes), job.PreOut, Lanes);
+                    phi.Add(job.Hyper.PhiPost.Slice(l * Lanes, Lanes), job.PostOut, Lanes);
+                    phi.Add(job.Hyper.PhiRes.Slice(l * Lanes * Lanes, Lanes * Lanes), job.ResOut, Lanes * Lanes);
+                    MatMulBatch.RunShard(&phi, 0, 1);
+                }
+                job.Clock.Lap(Stage.HyperPhi);
+                PrepareMixAndPrep(w, ref job, l, site, hasEngram, s, hpre, mixLogits);
+            }
+            Pool.Barrier(job.Barrier);
+            if (hasEngram)
+            {
+                var engram = job.Sites + site;
+                var eb = new MatMulBatch(job.DimAct, 1);
+                eb.Add(engram->Key, job.EngramKey, dim);
+                eb.Add(engram->Value, job.EngramValueBuffer + EngramHistory * dim, dim);
+                MatMulBatch.RunSteal(&eb, job.StealCursors, member, members);
+                Pool.Barrier(job.Barrier);
+                if (member == lead)
+                {
+                    var o = job.EngramConv;
+                    Ops.Zero(o, dim);
+                    for (var j = 0; j < EngramTaps; j++)
+                        Ops.MultiplyAccumulate(o, engram->Taps + j * dim, job.EngramValueBuffer + (long)(EngramHistory - j * g.EngramDilation) * dim, dim);
+                    Buffer.MemoryCopy(job.EngramValueBuffer + dim, job.EngramLive + (long)site * EngramHistory * dim, EngramHistory * dim * 4, EngramHistory * dim * 4);
+                    Ops.RmsUnit(job.Input, dim, unitA);
+                    Ops.RmsUnit(job.EngramKey, dim, unitB);
+                    var alpha = Ops.Sigmoid(Ops.Dot(unitA, unitB, dim) * (1f / MathF.Sqrt(dim)));
+                    Ops.AddScaled(job.Residual, o, alpha, dim);
+                    job.Clock.Lap(Stage.Engram);
+                    Quant.PrepareCenteredRmsFakeA8(job.Residual, w->NormIn, job.Quantized, dim, 2, job.DimAct.Slice(0));
+                    for (var kv = 0; kv < g.KvHeads; kv++) job.AttnArrivals[kv] = 0;
+                    job.Clock.Lap(Stage.AttentionPrep);
+                }
+                Pool.Barrier(job.Barrier);
+            }
+
+            var qWidth = g.QueryWidth;
+            var kWidth = g.KeyWidth;
+            var vWidth = g.ValueWidth;
+            var qkvg = new MatMulBatch(job.DimAct, 1);
+            qkvg.Add(w->Q, job.QRaw + (ConvTaps - 1) * qWidth, qWidth);
+            qkvg.Add(w->K, job.KRaw + (ConvTaps - 1) * kWidth, kWidth);
+            qkvg.Add(w->V, job.VRaw + (ConvTaps - 1) * vWidth, vWidth);
+            qkvg.Add(w->Gate, job.GateOut, g.OutputWidth);
+            MatMulBatch.RunSteal(&qkvg, job.StealCursors + 16, member, members);
+            if (member == lead) job.Clock.Lap(Stage.AttentionQkvg);
+            Pool.Barrier(job.Barrier);
+
+            TapsAndAttentionHeadsSingle(w, ref job, l, qkvBase, qkvLive, member, members);
+            if (member == lead) job.Clock.Lap(Stage.AttentionPostProjection);
+            Pool.Barrier(job.Barrier);
+
+            var attnBatch = new AttentionBatch
+            {
+                Queries = job.QueryInt8,
+                QueryScales = job.QueryScale,
+                Keys = job.KeyCache + (long)l * job.Capacity * kWidth,
+                KeyScales = job.KeyScale + (long)l * job.Capacity * g.KvHeads,
+                Values = job.ValueCache + (long)l * job.Capacity * vWidth,
+                ValueScales = job.ValueScale + (long)l * job.Capacity * g.KvHeads,
+                Output = job.AttnOut,
+                Heads = g.Heads,
+                KvHeads = g.KvHeads,
+                QkDim = g.QkDim,
+                VDim = g.VDim,
+                Position = job.Position,
+                Window = g.IsGlobal(l) ? 0 : g.SlidingWindow,
+                Capacity = job.Capacity,
+            };
+            attnBatch.Plan(members, 1, job.AttnPartials, job.AttnArrivals);
+            RunAttentionTasks(&attnBatch, job.StealCursors + 96, member, members);
+            if (member == lead) job.Clock.Lap(Stage.AttentionCore);
+            Pool.Barrier(job.Barrier);
+
+            if (member == lead)
+            {
+                Quant.PrepareGateFakeA8(job.AttnOut, job.GateOut, g.OutputWidth, 2, job.DimAct.Slice(0));
+                job.Clock.Lap(Stage.AttentionGate);
+            }
+            Pool.Barrier(job.Barrier);
+
+            var outBatch = new MatMulBatch(job.DimAct, 1);
+            outBatch.Add(w->Out, job.AttnProj, dim);
+            MatMulBatch.RunSteal(&outBatch, job.StealCursors + 32, member, members);
+            if (member == lead) job.Clock.Lap(Stage.AttentionOut);
+            Pool.Barrier(job.Barrier);
+
+            if (job.Cross.Frames > 0)
+            {
+                var c = job.CrossLayers + l;
+                var frames = job.Cross.Frames;
+                if (member == lead)
+                {
+                    Ops.PostNormAdd(job.Residual, job.AttnProj, w->PostNorm, w->AttnGate, dim);
+                    job.Clock.Lap(Stage.AttentionPostNorm);
+                    Quant.PrepareCenteredRmsFakeA8(job.Residual, c->Norm, job.Quantized, dim, 2, job.DimAct.Slice(0));
+                }
+                Pool.Barrier(job.Barrier);
+                var crossQGate = new MatMulBatch(job.DimAct, 1);
+                crossQGate.Add(c->Q, job.QConv, g.Heads * g.QkDim);
+                crossQGate.Add(c->Gate, job.GateOut, g.OutputWidth);
+                MatMulBatch.RunSteal(&crossQGate, job.StealCursors + 48, member, members);
+                Pool.Barrier(job.Barrier);
+                Shard(g.Heads, member, members, out var cFirst, out var cCount);
+                for (var h = cFirst; h < cFirst + cCount; h++)
+                {
+                    var q = job.QConv + h * g.QkDim;
+                    Ops.ZeroCenteredRms(q, c->QNorm, g.QkDim, q);
+                    job.QueryScale[h] = Quant.QuantizeInt8(q, g.QkDim, job.QueryInt8 + h * g.QkDim);
+                }
+                Pool.Barrier(job.Barrier);
+                var crossBatch = new AttentionBatch
+                {
+                    Queries = job.QueryInt8,
+                    QueryScales = job.QueryScale,
+                    Keys = job.Cross.Keys + (long)l * frames * g.Heads * g.QkDim,
+                    KeyScales = job.Cross.KeyScales + (long)l * frames * g.Heads,
+                    Values = job.Cross.Values + (long)l * frames * g.Heads * g.VDim,
+                    ValueScales = job.Cross.ValueScales + (long)l * frames * g.Heads,
+                    Output = job.AttnOut,
+                    Heads = g.Heads,
+                    KvHeads = g.Heads,
+                    QkDim = g.QkDim,
+                    VDim = g.VDim,
+                    Position = 0,
+                    Window = 0,
+                    Capacity = Math.Max(frames, job.Capacity),
+                    Frames = frames,
+                };
+                crossBatch.Plan(members, 1, job.AttnPartials, job.AttnArrivals);
+                Shard(crossBatch.TeamTasks, member, members, out var caFirst, out var caCount);
+                for (var i = caFirst; i < caFirst + caCount; i++) AttentionBatch.RunTask(&crossBatch, i);
+                Pool.Barrier(job.Barrier);
+                if (member == lead)
+                    Quant.PrepareGateFakeA8(job.AttnOut, job.GateOut, g.OutputWidth, 2, job.DimAct.Slice(0));
+                Pool.Barrier(job.Barrier);
+                var crossOut = new MatMulBatch(job.DimAct, 1);
+                crossOut.Add(c->Out, job.AttnProj, dim);
+                MatMulBatch.RunSteal(&crossOut, job.StealCursors + 64, member, members);
+                Pool.Barrier(job.Barrier);
+                if (member == lead)
+                {
+                    Ops.PostNormAdd(job.Residual, job.AttnProj, c->PostNorm, c->Mix, dim);
+                    job.Clock.Lap(Stage.Cross);
+                }
+            }
+
+            if (member == lead)
+            {
+                if (job.Cross.Frames == 0)
+                {
+                    Ops.PostNormAdd(job.Residual, job.AttnProj, w->PostNorm, w->AttnGate, dim);
+                    job.Clock.Lap(Stage.AttentionPostNorm);
+                }
+                var mlp = new MlpBatch
+                {
+                    Weights = &w->Mlp,
+                    PreNorm = w->PreHada,
+                    PermA = job.Hyper.PermA,
+                    PermB = job.Hyper.PermB,
+                    Residual = job.Residual,
+                    Dim = dim,
+                    Rows = g.HadaRows,
+                    Cols = g.HadaCols,
+                    Scale = 1f,
+                };
+                HadamardMlp.Apply(&mlp, job.Residual, job.MlpScratch);
+                job.Clock.Lap(Stage.Mlp);
+                Ops.CombineDiff4x4(s, dim, job.ResidualMix, job.Residual, job.Input, job.PostGate, next);
+                if (job.Confidence != null) PoolRow(ref job, next, l + 1, false);
+                job.Clock.Lap(Stage.Combine);
+            }
+        }
+        if (job.WantLogits != 0)
+        {
+            if (member == lead)
+            {
+                var finalStream = (layers & 1) == 0 ? job.Stream : job.Next;
+                PrepareHeadVectors(finalStream, job.FinalNorm, dim, job.Scratch, job.HeadAct);
+                job.StealCursors[80] = 0;
+            }
+            Pool.Barrier(job.Barrier);
+            var head = new MatMulBatch(job.HeadAct, 1);
+            head.Add(job.Embedding, job.Logits, job.Embedding.Rows);
+            MatMulBatch.RunSteal(&head, job.StealCursors + 80, member, members);
+            if (member == lead) job.Clock.Lap(Stage.Logits);
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    static void PrepareMixAndPrep(LayerWeights* w, ref DecodeJob job, int l, int site, bool hasEngram, float* s, float* hpre, float* mixLogits)
+    {
+        var g = job.Geometry;
+        var dim = g.Dim;
+        var lane = l % Lanes;
+        for (var i = 0; i < Lanes; i++)
+        {
+            hpre[i] = Ops.Sigmoid(job.Hyper.APre[l] * job.PreOut[i] + job.Hyper.BPre[l * Lanes + i] + (i == lane ? 4f : -4f));
+            job.PostGate[i] = 2f * Ops.Sigmoid(job.Hyper.APost[l] * job.PostOut[i] + job.Hyper.BPost[l * Lanes + i] + (i == lane ? 0f : -4f));
+        }
+        Ops.Mix4(s, dim, hpre[0], hpre[1], hpre[2], hpre[3], job.Input);
+        for (var i = 0; i < Lanes * Lanes; i++) mixLogits[i] = job.Hyper.ARes[l] * job.ResOut[i] + job.Hyper.BRes[l * Lanes * Lanes + i];
+        Ops.Sinkhorn4x4(mixLogits, job.ResidualMix);
+        Buffer.MemoryCopy(job.Input, job.Residual, dim * 4, dim * 4);
+        job.Clock.Lap(Stage.HyperMix);
+
+        if (hasEngram)
+        {
+            var tables = g.EngramTables;
+            var sub = g.EngramSub;
+            var e = job.EngramInput;
+            var engram = job.Sites + site;
+            for (var table = 0; table < tables; table++)
+            {
+                var row = job.EngramRows[table];
+                if (row < 0) Ops.Zero(e + table * sub, sub);
+                else Quant.GatherRow(engram->Tables, row, e + table * sub);
+            }
+            Buffer.MemoryCopy(job.EngramBase + (long)site * EngramHistory * dim, job.EngramValueBuffer, EngramHistory * dim * 4, EngramHistory * dim * 4);
+            Quant.FakeA8(e, dim);
+            Quant.Prepare(e, 1, dim, 2, job.DimAct.Slice(0));
+        }
+        else
+        {
+            job.Clock.Lap(Stage.Engram);
+            Quant.PrepareCenteredRmsFakeA8(job.Residual, w->NormIn, job.Quantized, dim, 2, job.DimAct.Slice(0));
+            for (var kv = 0; kv < g.KvHeads; kv++) job.AttnArrivals[kv] = 0;
+            job.Clock.Lap(Stage.AttentionPrep);
+        }
+    }
+
+    static void PoolRow(ref DecodeJob job, float* s, int row, bool initial)
+    {
+        var head = job.Confidence;
+        var dim = job.Geometry.Dim;
+        var probes = head->Probes;
+        var cell = job.Cell;
+        if (initial) Buffer.MemoryCopy(s, cell, dim * 4, dim * 4);
+        else Ops.Mix4(s, dim, 0.25f, 0.25f, 0.25f, 0.25f, cell);
+        for (var p = 0; p < probes; p++)
+        {
+            var index = row * probes + p;
+            var score = Ops.Dot(cell, head->ProbeVectors + (long)index * dim, dim) * job.InverseRootDim;
+            var acc = job.PoolAcc + (long)index * dim;
+            if (score > job.PoolMax[index])
+            {
+                var rescale = MathF.Exp(job.PoolMax[index] - score);
+                job.PoolSum[index] = job.PoolSum[index] * rescale + 1f;
+                Ops.ScaleAdd(acc, rescale, cell, 1f, dim);
+                job.PoolMax[index] = score;
+            }
+            else
+            {
+                var weight = MathF.Exp(score - job.PoolMax[index]);
+                job.PoolSum[index] += weight;
+                Ops.AddScaled(acc, cell, weight, dim);
+            }
+        }
+    }
+
+    static void TapsHead(float* taps, int stride, float* h0, float* h1, float* h2, float* dst, float* live0, float* live1, int n)
+    {
+#if NEEDLE_SIMD
+        if ((void*)Kernels.Active.Taps3 == null && Simd.Enabled && !Simd.UseNeon && Avx.IsSupported && Fma.IsSupported)
+        {
+            for (var c = 0; c < n; c += 8)
+            {
+                var x2 = Avx.LoadVector256(h2 + c);
+                var x1 = Avx.LoadVector256(h1 + c);
+                var x0 = Avx.LoadVector256(h0 + c);
+                var acc = Avx.Multiply(Avx.LoadVector256(taps + c), x2);
+                acc = Fma.MultiplyAdd(Avx.LoadVector256(taps + stride + c), x1, acc);
+                acc = Fma.MultiplyAdd(Avx.LoadVector256(taps + 2 * stride + c), x0, acc);
+                Avx.Store(dst + c, acc);
+                Avx.Store(live0 + c, x1);
+                Avx.Store(live1 + c, x2);
+            }
+            return;
+        }
+#endif
+        for (var c = 0; c < n; c++)
+        {
+            var x2 = h2[c];
+            var x1 = h1[c];
+            dst[c] = taps[c] * x2 + taps[stride + c] * x1 + taps[2 * stride + c] * h0[c];
+            live0[c] = x1;
+            live1[c] = x2;
+        }
+    }
+
+    static void TapsAndAttentionHeadsSingle(LayerWeights* w, ref DecodeJob job, int l, float* qkvBase, float* qkvLive, int member, int members)
+    {
+        var g = job.Geometry;
+        var heads = g.Heads;
+        var kvHeads = g.KvHeads;
+        var qkDim = g.QkDim;
+        var vDim = g.VDim;
+        var qWidth = g.QueryWidth;
+        var kWidth = g.KeyWidth;
+        var vWidth = g.ValueWidth;
+        var half = qkDim / 2;
+        var p = job.Position;
+        var cos = job.RopeCos + (long)p * half;
+        var sin = job.RopeSin + (long)p * half;
+        var qHistory = qkvBase;
+        var kHistory = qHistory + (ConvTaps - 1) * qWidth;
+        var vHistory = kHistory + (ConvTaps - 1) * kWidth;
+        var qLive = qkvLive;
+        var kLive = qLive + (ConvTaps - 1) * qWidth;
+        var vLive = kLive + (ConvTaps - 1) * kWidth;
+        var layerKeys = job.KeyCache + (long)l * job.Capacity * kWidth;
+        var layerValues = job.ValueCache + (long)l * job.Capacity * vWidth;
+        var layerKeyScales = job.KeyScale + (long)l * job.Capacity * kvHeads;
+        var layerValueScales = job.ValueScale + (long)l * job.Capacity * kvHeads;
+        Shard(heads + 2 * kvHeads, member, members, out var first, out var count);
+        for (var h = first; h < first + count; h++)
+        {
+            if (h < heads)
+            {
+                var off = h * qkDim;
+                var q = job.QConv + off;
+                TapsHead(w->QTaps + off, qWidth, qHistory + off, qHistory + qWidth + off, job.QRaw + 2 * qWidth + off, q, qLive + off, qLive + qWidth + off, qkDim);
+                Ops.ZeroCenteredRms(q, w->QNorm, qkDim, q);
+                Ops.Rope(q, 1, qkDim, cos, sin);
+                job.QueryScale[h] = Quant.QuantizeInt8(q, qkDim, job.QueryInt8 + off);
+            }
+            else if (h < heads + kvHeads)
+            {
+                var k = h - heads;
+                var kOff = k * qkDim;
+                var kv = job.KConv + kOff;
+                TapsHead(w->KTaps + kOff, kWidth, kHistory + kOff, kHistory + kWidth + kOff, job.KRaw + 2 * kWidth + kOff, kv, kLive + kOff, kLive + kWidth + kOff, qkDim);
+                Ops.ZeroCenteredRms(kv, w->KNorm, qkDim, kv);
+                Ops.Rope(kv, 1, qkDim, cos, sin);
+                layerKeyScales[(long)p * kvHeads + k] = Quant.QuantizeInt8(kv, qkDim, layerKeys + (long)p * kWidth + kOff);
+            }
+            else
+            {
+                var k = h - heads - kvHeads;
+                var vOff = k * vDim;
+                var v = job.VConv + vOff;
+                TapsHead(w->VTaps + vOff, vWidth, vHistory + vOff, vHistory + vWidth + vOff, job.VRaw + 2 * vWidth + vOff, v, vLive + vOff, vLive + vWidth + vOff, vDim);
+                layerValueScales[(long)p * kvHeads + k] = Quant.QuantizeInt8(v, vDim, layerValues + (long)p * vWidth + vOff);
+            }
+        }
     }
 
     void RunLayerTeam(int l, int count, int position)
@@ -711,6 +1364,7 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
             ValueCache = valueCache,
             EngramRows = engramRows,
             Mlp = &model.Blocks[l].Mlp,
+            MlpScratch = mlpScratch,
         };
         if (site >= 0) job.Engram = model.Sites[site];
         clock.PoolRun();
@@ -722,7 +1376,19 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
     static void ExecuteLayer(void* context, int member)
     {
         ref var job = ref System.Runtime.CompilerServices.Unsafe.AsRef<LayerJob>(context);
-        var members = job.Members;
+        ExecuteLayerBody(in job, member, job.Members, null);
+    }
+
+    static void ExecuteLayerBody(in LayerJob job, int member, int members, int* stealCursors)
+    {
+        if (stealCursors != null && member == 0)
+        {
+            stealCursors[0] = 0;
+            stealCursors[16] = 0;
+            stealCursors[32] = 0;
+            stealCursors[48] = 0;
+            stealCursors[96] = 0;
+        }
         HyperNorm(in job, member, members);
         Pool.Barrier(job.Barrier);
         HyperPhi(in job, member, members);
@@ -732,38 +1398,51 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         {
             EngramGather(in job, member, members);
             Pool.Barrier(job.Barrier);
-            EngramMatMul(in job, member, members);
+            EngramMatMul(in job, stealCursors, member, members);
             Pool.Barrier(job.Barrier);
             EngramBlend(in job, member, members);
         }
         if (member == 0) job.Clock.Lap(Stage.Engram);
         AttentionPrepare(in job, member, members);
         Pool.Barrier(job.Barrier);
-        AttentionQkvg(in job, member, members);
+        AttentionQkvg(in job, stealCursors != null ? stealCursors + 16 : null, member, members);
         Pool.Barrier(job.Barrier);
         TapsHistory(in job, member, members);
         AttentionHeads(in job, member, members);
         Pool.Barrier(job.Barrier);
-        AttentionCore(in job, member, members);
+        AttentionCore(in job, stealCursors != null ? stealCursors + 96 : null, member, members);
         Pool.Barrier(job.Barrier);
         AttentionGate(in job, member, members);
         Pool.Barrier(job.Barrier);
-        AttentionOut(in job, member, members);
+        AttentionOut(in job, stealCursors != null ? stealCursors + 32 : null, member, members);
         Pool.Barrier(job.Barrier);
         PostNorm(in job, member, members);
-        Mlp(in job, member, members);
+        if (stealCursors != null && members > 1 && job.Count >= members * 2) Pool.Barrier(job.Barrier);
+        Mlp(in job, stealCursors != null ? stealCursors + 48 : null, member, members);
+        if (stealCursors != null && members > 1 && job.Count >= members * 2) Pool.Barrier(job.Barrier);
         Combine(in job, member, members);
+    }
+
+    static void ParallelPrepare(TeamBarrier* barrier, float* source, int groups, int bits, in Activations act, int member, int members)
+    {
+        Pool.Barrier(barrier);
+        Shard(groups, member, members, out var firstGroup, out var groupCount);
+        Quant.PrepareGroups(source, firstGroup, groupCount, bits, act);
     }
 
     static void HyperNorm(in LayerJob job, int member, int members)
     {
         var streamWidth = Lanes * job.Geometry.Dim;
-        Shard(job.Count, member, members, out var first, out var count);
-        for (var t = first; t < first + count; t++)
+        if (job.Count == 1 && members > 1)
         {
-            Ops.RmsFakeA8(job.Stream + (long)t * streamWidth, streamWidth, job.Normed + (long)t * streamWidth);
-            var slice = job.StreamAct.Slice(t);
-            Quant.Prepare(job.Normed + (long)t * streamWidth, 1, streamWidth, 4, slice);
+            if (member == 0) Ops.RmsFakeA8(job.Stream, streamWidth, job.Normed);
+            ParallelPrepare(job.Barrier, job.Normed, job.StreamAct.Groups, 4, job.StreamAct.Slice(0), member, members);
+        }
+        else
+        {
+            Shard(job.Count, member, members, out var first, out var count);
+            for (var t = first; t < first + count; t++)
+                Quant.PrepareRmsFakeA8(job.Stream + (long)t * streamWidth, job.Normed + (long)t * streamWidth, streamWidth, 4, job.StreamAct.Slice(t));
         }
         if (member == 0) job.Clock.Lap(Stage.HyperPrepare);
     }
@@ -775,9 +1454,7 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         batch.Add(job.Hyper.PhiPre.Slice(l * Lanes, Lanes), job.PreOut, Lanes);
         batch.Add(job.Hyper.PhiPost.Slice(l * Lanes, Lanes), job.PostOut, Lanes);
         batch.Add(job.Hyper.PhiRes.Slice(l * Lanes * Lanes, Lanes * Lanes), job.ResOut, Lanes * Lanes);
-        batch.Plan(members);
-        Shard(batch.TaskCount, member, members, out var first, out var count);
-        for (var i = first; i < first + count; i++) MatMulBatch.RunTask(&batch, i);
+        MatMulBatch.RunShard(&batch, member, members);
         if (member == 0) job.Clock.Lap(Stage.HyperPhi);
     }
 
@@ -811,6 +1488,28 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         var dim = job.Geometry.Dim;
         var tables = job.Geometry.EngramTables;
         var sub = job.Geometry.EngramSub;
+        if (job.Count == 1 && members > 1)
+        {
+            var e = job.EngramInput;
+            Shard(tables + 1, member, members, out var firstTask, out var taskCount);
+            for (var i = firstTask; i < firstTask + taskCount; i++)
+            {
+                if (i < tables)
+                {
+                    var row = job.EngramRows[i];
+                    if (row < 0) Ops.Zero(e + i * sub, sub);
+                    else Quant.GatherRow(job.Engram.Tables, row, e + i * sub);
+                }
+                else
+                {
+                    Buffer.MemoryCopy(job.EngramBase, job.EngramValueBuffer, EngramHistory * dim * 4, EngramHistory * dim * 4);
+                }
+            }
+            Pool.Barrier(job.Barrier);
+            if (member == 0) Quant.FakeA8(e, dim);
+            ParallelPrepare(job.Barrier, e, job.DimAct.Groups, 2, job.DimAct.Slice(0), member, members);
+            return;
+        }
         Shard(job.Count, member, members, out var first, out var count);
         for (var t = first; t < first + count; t++)
         {
@@ -828,14 +1527,12 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         if (member == 0) Buffer.MemoryCopy(job.EngramBase, job.EngramValueBuffer, EngramHistory * dim * 4, EngramHistory * dim * 4);
     }
 
-    static void EngramMatMul(in LayerJob job, int member, int members)
+    static void EngramMatMul(in LayerJob job, int* cursor, int member, int members)
     {
         var batch = new MatMulBatch(job.DimAct, job.Count);
         batch.Add(job.Engram.Key, job.EngramKey, job.Geometry.Dim);
         batch.Add(job.Engram.Value, job.EngramValueBuffer + EngramHistory * job.Geometry.Dim, job.Geometry.Dim);
-        batch.Plan(members);
-        Shard(batch.TaskCount, member, members, out var first, out var count);
-        for (var i = first; i < first + count; i++) MatMulBatch.RunTask(&batch, i);
+        MatMulBatch.RunSteal(&batch, cursor, member, members);
     }
 
     static void EngramBlend(in LayerJob job, int member, int members)
@@ -865,17 +1562,29 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
     static void AttentionPrepare(in LayerJob job, int member, int members)
     {
         var dim = job.Geometry.Dim;
-        Shard(job.Count, member, members, out var first, out var count);
-        for (var t = first; t < first + count; t++)
+        var kvHeads = job.Geometry.KvHeads;
+        if (job.Count == 1 && members > 1)
         {
-            Ops.CenteredRmsFakeA8(job.Residual + (long)t * dim, job.Weights.NormIn, dim, job.Quantized + (long)t * dim);
-            var slice = job.DimAct.Slice(t);
-            Quant.Prepare(job.Quantized + (long)t * dim, 1, dim, 2, slice);
+            if (member == 0)
+            {
+                Ops.CenteredRmsFakeA8(job.Residual, job.Weights.NormIn, dim, job.Quantized);
+                for (var g = 0; g < kvHeads; g++) job.AttnArrivals[g] = 0;
+            }
+            ParallelPrepare(job.Barrier, job.Quantized, job.DimAct.Groups, 2, job.DimAct.Slice(0), member, members);
+        }
+        else
+        {
+            Shard(job.Count, member, members, out var first, out var count);
+            for (var t = first; t < first + count; t++)
+            {
+                Quant.PrepareCenteredRmsFakeA8(job.Residual + (long)t * dim, job.Weights.NormIn, job.Quantized + (long)t * dim, dim, 2, job.DimAct.Slice(t));
+                for (var g = 0; g < kvHeads; g++) job.AttnArrivals[t * kvHeads + g] = 0;
+            }
         }
         if (member == 0) job.Clock.Lap(Stage.AttentionPrep);
     }
 
-    static void AttentionQkvg(in LayerJob job, int member, int members)
+    static void AttentionQkvg(in LayerJob job, int* cursor, int member, int members)
     {
         var qWidth = job.Geometry.QueryWidth;
         var kWidth = job.Geometry.KeyWidth;
@@ -885,9 +1594,7 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         batch.Add(job.Weights.K, job.KRaw + (ConvTaps - 1) * kWidth, kWidth);
         batch.Add(job.Weights.V, job.VRaw + (ConvTaps - 1) * vWidth, vWidth);
         batch.Add(job.Weights.Gate, job.GateOut, job.Geometry.OutputWidth);
-        batch.Plan(members);
-        Shard(batch.TaskCount, member, members, out var first, out var count);
-        for (var i = first; i < first + count; i++) MatMulBatch.RunTask(&batch, i);
+        MatMulBatch.RunSteal(&batch, cursor, member, members);
         if (member == 0) job.Clock.Lap(Stage.AttentionQkvg);
     }
 
@@ -902,6 +1609,30 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         var qLive = job.QkvLive;
         var kLive = qLive + (ConvTaps - 1) * qWidth;
         var vLive = kLive + (ConvTaps - 1) * kWidth;
+        if (job.Count == 1 && members > 1)
+        {
+            var runV = members >= 3 ? 2 : 1;
+            if (member == 0)
+            {
+                LoadHistory(qHistory, job.QRaw, qWidth);
+                Ops.Taps3(job.Weights.QTaps, qWidth, job.QRaw + (long)(ConvTaps - 1) * qWidth, job.QConv);
+                SaveHistory(qLive, job.QRaw, 1, qWidth);
+            }
+            if (member == 1)
+            {
+                LoadHistory(kHistory, job.KRaw, kWidth);
+                Ops.Taps3(job.Weights.KTaps, kWidth, job.KRaw + (long)(ConvTaps - 1) * kWidth, job.KConv);
+                SaveHistory(kLive, job.KRaw, 1, kWidth);
+            }
+            if (member == runV)
+            {
+                LoadHistory(vHistory, job.VRaw, vWidth);
+                Ops.Taps3(job.Weights.VTaps, vWidth, job.VRaw + (long)(ConvTaps - 1) * vWidth, job.VConv);
+                SaveHistory(vLive, job.VRaw, 1, vWidth);
+            }
+            Pool.Barrier(job.Barrier);
+            return;
+        }
         if (member == 0)
         {
             LoadHistory(qHistory, job.QRaw, qWidth);
@@ -965,7 +1696,25 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         if (member == 0) job.Clock.Lap(Stage.AttentionPostProjection);
     }
 
-    static void AttentionCore(in LayerJob job, int member, int members)
+    static void RunAttentionTasks(AttentionBatch* batch, int* cursor, int member, int members)
+    {
+        var tasks = batch->TeamTasks;
+        if (cursor != null && members > 1 && tasks > members)
+        {
+            AttentionBatch.RunTask(batch, member);
+            while (true)
+            {
+                var t = members + (Interlocked.Increment(ref *cursor) - 1);
+                if (t >= tasks) break;
+                AttentionBatch.RunTask(batch, t);
+            }
+            return;
+        }
+        Shard(tasks, member, members, out var first, out var count);
+        for (var i = first; i < first + count; i++) AttentionBatch.RunTask(batch, i);
+    }
+
+    static void AttentionCore(in LayerJob job, int* cursor, int member, int members)
     {
         var kvHeads = job.Geometry.KvHeads;
         var batch = new AttentionBatch
@@ -986,33 +1735,32 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
             Capacity = job.Capacity,
         };
         batch.Plan(members, job.Count, job.AttnPartials, job.AttnArrivals);
-        if (member == 0) for (var g = 0; g < job.Count * kvHeads; g++) job.AttnArrivals[g] = 0;
-        Pool.Barrier(job.Barrier);
-        Shard(batch.TeamTasks, member, members, out var first, out var count);
-        for (var i = first; i < first + count; i++) AttentionBatch.RunTask(&batch, i);
+        RunAttentionTasks(&batch, cursor, member, members);
         if (member == 0) job.Clock.Lap(Stage.AttentionCore);
     }
 
     static void AttentionGate(in LayerJob job, int member, int members)
     {
         var outWidth = job.Geometry.OutputWidth;
-        Shard(job.Count, member, members, out var first, out var count);
-        for (var t = first; t < first + count; t++)
+        if (job.Count == 1 && members > 1)
         {
-            Ops.GateFakeA8(job.AttnOut + (long)t * outWidth, job.GateOut + (long)t * outWidth, outWidth);
-            var slice = job.DimAct.Slice(t);
-            Quant.Prepare(job.AttnOut + (long)t * outWidth, 1, outWidth, 2, slice);
+            if (member == 0) Ops.GateFakeA8(job.AttnOut, job.GateOut, outWidth);
+            ParallelPrepare(job.Barrier, job.AttnOut, outWidth / Cq.GroupSize, 2, job.DimAct.Slice(0), member, members);
+        }
+        else
+        {
+            Shard(job.Count, member, members, out var first, out var count);
+            for (var t = first; t < first + count; t++)
+                Quant.PrepareGateFakeA8(job.AttnOut + (long)t * outWidth, job.GateOut + (long)t * outWidth, outWidth, 2, job.DimAct.Slice(t));
         }
         if (member == 0) job.Clock.Lap(Stage.AttentionGate);
     }
 
-    static void AttentionOut(in LayerJob job, int member, int members)
+    static void AttentionOut(in LayerJob job, int* cursor, int member, int members)
     {
         var batch = new MatMulBatch(job.DimAct, job.Count);
         batch.Add(job.Weights.Out, job.AttnProj, job.Geometry.Dim);
-        batch.Plan(members);
-        Shard(batch.TaskCount, member, members, out var first, out var count);
-        for (var i = first; i < first + count; i++) MatMulBatch.RunTask(&batch, i);
+        MatMulBatch.RunSteal(&batch, cursor, member, members);
         if (member == 0) job.Clock.Lap(Stage.AttentionOut);
     }
 
@@ -1025,7 +1773,7 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         if (member == 0) job.Clock.Lap(Stage.AttentionPostNorm);
     }
 
-    static void Mlp(in LayerJob job, int member, int members)
+    static void Mlp(in LayerJob job, int* cursor, int member, int members)
     {
         var batch = new MlpBatch
         {
@@ -1039,8 +1787,22 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
             Cols = job.Geometry.HadaCols,
             Scale = 1f,
         };
-        Shard(job.Count, member, members, out var first, out var count);
-        for (var t = first; t < first + count; t++) MlpBatch.RunToken(&batch, t);
+        if (cursor != null && members > 1 && job.Count >= members * 2)
+        {
+            var baseOffset = members - 1;
+            if (member < baseOffset) MlpBatch.RunToken(&batch, member);
+            while (true)
+            {
+                var t = baseOffset + (Interlocked.Increment(ref *cursor) - 1);
+                if (t >= job.Count) break;
+                MlpBatch.RunToken(&batch, t);
+            }
+        }
+        else
+        {
+            Shard(job.Count, member, members, out var first, out var count);
+            for (var t = first; t < first + count; t++) MlpBatch.RunToken(&batch, t);
+        }
         if (member == 0) job.Clock.Lap(Stage.Mlp);
     }
 
@@ -1055,8 +1817,7 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
             var x = job.Residual + (long)t * dim;
             var u = job.Input + (long)t * dim;
             var mix = job.ResidualMix + (long)t * Lanes * Lanes;
-            for (var i = 0; i < Lanes; i++)
-                Ops.CombineDiff4(s, dim, mix[i * 4], mix[i * 4 + 1], mix[i * 4 + 2], mix[i * 4 + 3], x, u, job.PostGate[t * Lanes + i], n + (long)i * dim);
+            Ops.CombineDiff4x4(s, dim, mix, x, u, job.PostGate + t * Lanes, n);
         }
         if (member == 0) job.Clock.Lap(Stage.Combine);
     }
@@ -1068,12 +1829,7 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         var lane = l % Lanes;
 
         for (var t = 0; t < count; t++)
-        {
-            var normalized = normalizedStream + (long)t * streamWidth;
-            Ops.RmsUnit(stream + (long)t * streamWidth, streamWidth, normalized);
-            Quant.FakeA8(normalized, streamWidth);
-        }
-        Quant.Prepare(normalizedStream, count, streamWidth, 4, streamAct);
+            Quant.PrepareRmsFakeA8(stream + (long)t * streamWidth, normalizedStream + (long)t * streamWidth, streamWidth, 4, streamAct.Slice(t));
         clock.Lap(Stage.HyperPrepare);
         Quant.MatMul(hyper.PhiPre.Slice(l * Lanes, Lanes), streamAct, count, preOut, Lanes);
         Quant.MatMul(hyper.PhiPost.Slice(l * Lanes, Lanes), streamAct, count, postOut, Lanes);
@@ -1241,12 +1997,7 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         clock.Lap(Stage.AttentionCore);
 
         for (var t = 0; t < count; t++)
-        {
-            var o = attnOut + (long)t * g.OutputWidth;
-            Ops.MultiplyBySigmoid(o, gateOut + (long)t * g.OutputWidth, g.OutputWidth);
-            Quant.FakeA8(o, g.OutputWidth);
-        }
-        Quant.Prepare(attnOut, count, g.OutputWidth, 2, dimAct);
+            Quant.PrepareGateFakeA8(attnOut + (long)t * g.OutputWidth, gateOut + (long)t * g.OutputWidth, g.OutputWidth, 2, dimAct.Slice(t));
         clock.Lap(Stage.AttentionGate);
         var output = new MatMulBatch(dimAct, count);
         output.Add(w.Out, attnProj, dim);
@@ -1254,10 +2005,7 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         MatMulBatch.Run(pool, &output);
         clock.Lap(Stage.AttentionOut);
         for (var t = 0; t < count; t++)
-        {
-            Ops.ZeroCenteredRms(attnProj + (long)t * dim, w.PostNorm, dim, normalized);
-            Ops.AddScaled(residual + (long)t * dim, normalized, w.AttnGate, dim);
-        }
+            Ops.PostNormAdd(residual + (long)t * dim, attnProj + (long)t * dim, w.PostNorm, w.AttnGate, dim);
         clock.Lap(Stage.AttentionPostNorm);
     }
 
@@ -1267,12 +2015,7 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         var heads = g.Heads;
         var frames = cross.Frames;
         for (var t = 0; t < count; t++)
-        {
-            var r = quantizedInput + (long)t * dim;
-            Ops.ZeroCenteredRms(residual + (long)t * dim, c->Norm, dim, r);
-            Quant.FakeA8(r, dim);
-        }
-        Quant.Prepare(quantizedInput, count, dim, 2, dimAct);
+            Quant.PrepareCenteredRmsFakeA8(residual + (long)t * dim, c->Norm, quantizedInput + (long)t * dim, dim, 2, dimAct.Slice(t));
         var projections = new MatMulBatch(dimAct, count);
         projections.Add(c->Q, qConv, heads * g.QkDim);
         projections.Add(c->Gate, gateOut, g.OutputWidth);
@@ -1309,21 +2052,13 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
                     Ops.AddScaled(Alignment + (long)(position + t) * frames, captureBuffer + ((long)t * heads + h) * frames, share, frames);
         }
         for (var t = 0; t < count; t++)
-        {
-            var o = attnOut + (long)t * g.OutputWidth;
-            Ops.MultiplyBySigmoid(o, gateOut + (long)t * g.OutputWidth, g.OutputWidth);
-            Quant.FakeA8(o, g.OutputWidth);
-        }
-        Quant.Prepare(attnOut, count, g.OutputWidth, 2, dimAct);
+            Quant.PrepareGateFakeA8(attnOut + (long)t * g.OutputWidth, gateOut + (long)t * g.OutputWidth, g.OutputWidth, 2, dimAct.Slice(t));
         var output = new MatMulBatch(dimAct, count);
         output.Add(c->Out, attnProj, dim);
         clock.PoolRun();
         MatMulBatch.Run(pool, &output);
         for (var t = 0; t < count; t++)
-        {
-            Ops.ZeroCenteredRms(attnProj + (long)t * dim, c->PostNorm, dim, scratch);
-            Ops.AddScaled(residual + (long)t * dim, scratch, c->Mix, dim);
-        }
+            Ops.PostNormAdd(residual + (long)t * dim, attnProj + (long)t * dim, c->PostNorm, c->Mix, dim);
         clock.Lap(Stage.Cross);
     }
 
@@ -1357,11 +2092,6 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
 
     void ComputeLogits(int last) => ComputeLogitsAt(last);
 
-    // Full-vocabulary logits for one row of the last forwarded chunk,
-    // written to the shared `logits` buffer. Lets prompt-lookup speculation
-    // (issue #17) verify each draft position from a single chunk pass: the
-    // stream rows persist until the next Forward overwrites them. Callers
-    // that need the last row afterwards use RefreshLastLogits.
     internal void ComputeLogitsAt(int row)
     {
         PrepareHead(row);
@@ -1372,47 +2102,17 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         clock.Lap(Stage.Logits);
     }
 
-    // Recomputes full-vocabulary logits for the last row of the last
-    // forwarded chunk (per-row verification overwrites the shared buffer).
     internal void RefreshLastLogits() => ComputeLogitsAt(lastForwardCount - 1);
 
-    // Builds the quantized head input for one forwarded token. Shared by the
-    // full head and LogitsForRows so both see the exact same normalization.
-    void PrepareHead(int last)
-    {
-        var s = stream + (long)last * streamWidth;
-        var mean = scratch;
-        for (var c = 0; c < dim; c++) mean[c] = 0.25f * (s[c] + s[dim + c] + s[2 * dim + c] + s[3 * dim + c]);
-        var normalized = scratch + dim;
-        Ops.ZeroCenteredRms(mean, model.FinalNorm, dim, normalized);
-        Quant.FakeA8(normalized, dim);
-        Quant.Prepare(normalized, 1, dim, 4, headAct);
-    }
+    void PrepareHead(int last) =>
+        PrepareHeadVectors(stream + (long)last * streamWidth, model.FinalNorm, dim, scratch, headAct);
 
-    // Logits for an explicit row subset of the embedding head, read from the
-    // last forwarded token. Ascending `rows` (mask-extraction order) lets
-    // contiguous ids merge into runs; each run is extended to a multiple of 4
-    // to match the full head's AVX block alignment, so gathered values equal
-    // the full head's bit-for-bit. `destination[0..count)` aligns with `rows`.
-    // No pool work happens here, hence no clock.PoolRun; the logits stage is
-    // still attributed through Lap.
     internal void LogitsForRows(int* rows, int count, float* destination) =>
         LogitsForRowsAt(lastForwardCount - 1, rows, count, destination);
 
-    // Sparse-head read for one row of the last forwarded chunk. Same
-    // run-merging alignment as the full head, so values equal the full head
-    // bit-for-bit at every row; used to verify draft positions whose mask
-    // fits the sparse threshold. Like the full head it borrows the shared
-    // logits buffer as run scratch, so the last-row logits are recomputed
-    // afterwards (LogitsForRows or RefreshLastLogits).
     internal void LogitsForRowsAt(int row, int* rows, int count, float* destination) =>
         LogitsForBatchRow(row, rows, count, destination);
 
-    // W26 multi-sequence batched decode. One forward over rows from N slots
-    // shares the weight reads (projections, hyper phi, MLP, head) while
-    // attention, convolution history, engram state, pooling and the KV cache
-    // stay per sequence. Rows from one slot are contiguous; row positions
-    // derive from slot lengths, so callers pass only tokens and slot ids.
     unsafe struct SlotView
     {
         public float* State;
@@ -1501,9 +2201,6 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         RewindView(ref view);
     }
 
-    // Single-sequence-equivalent chunked prefill into one slot. Decode rows
-    // fed through ForwardBatch chain histories the same way, so prefill and
-    // batched decode compose bit-identically with Feed.
     internal void FeedSlot(int slot, ReadOnlySpan<int> tokens, bool computeLogits = true)
     {
         ref var view = ref slotViews![slot];
@@ -1522,11 +2219,6 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
             }
     }
 
-    // One decode step over rows from several slots. Rows from one slot are
-    // contiguous; each run starts at its slot's length. `headRows` holds row
-    // indices whose full-vocabulary head is needed; their logits land
-    // compactly in batchLogits. Sparse and logit-free rows are handled by
-    // the caller after the pass.
     internal void ForwardBatch(int* tokens, int* rowSlots, int count, int* headRows, int headCount)
     {
         if (slotViews == null) throw new InvalidOperationException("batched decode needs an engine constructed with slots");
@@ -1583,12 +2275,7 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         var lane = l % Lanes;
 
         for (var t = 0; t < count; t++)
-        {
-            var normalized = normalizedStream + (long)t * streamWidth;
-            Ops.RmsUnit(stream + (long)t * streamWidth, streamWidth, normalized);
-            Quant.FakeA8(normalized, streamWidth);
-        }
-        Quant.Prepare(normalizedStream, count, streamWidth, 4, streamAct);
+            Quant.PrepareRmsFakeA8(stream + (long)t * streamWidth, normalizedStream + (long)t * streamWidth, streamWidth, 4, streamAct.Slice(t));
         clock.Lap(Stage.HyperPrepare);
         Quant.MatMul(hyper.PhiPre.Slice(l * Lanes, Lanes), streamAct, count, preOut, Lanes);
         Quant.MatMul(hyper.PhiPost.Slice(l * Lanes, Lanes), streamAct, count, postOut, Lanes);
@@ -1608,7 +2295,7 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
             }
             Ops.Mix4(s, dim, hpre[0], hpre[1], hpre[2], hpre[3], u);
             for (var i = 0; i < Lanes * Lanes; i++) mixLogits[i] = hyper.ARes[l] * resOut[t * Lanes * Lanes + i] + hyper.BRes[l * Lanes * Lanes + i];
-            Sinkhorn.Normalize(mixLogits, residualMix + t * Lanes * Lanes);
+            Ops.Sinkhorn4x4(mixLogits, residualMix + t * Lanes * Lanes);
             Buffer.MemoryCopy(u, residual + (long)t * dim, dim * 4, dim * 4);
         }
         clock.Lap(Stage.HyperMix);
@@ -1624,13 +2311,10 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         {
             var s = stream + (long)t * streamWidth;
             var n = nextStream + (long)t * streamWidth;
-            var y = scratch;
             var x = residual + (long)t * dim;
             var u = input + (long)t * dim;
-            Ops.Subtract(x, u, dim, y);
             var mix = residualMix + t * Lanes * Lanes;
-            for (var i = 0; i < Lanes; i++)
-                Ops.Combine4(s, dim, mix[i * 4], mix[i * 4 + 1], mix[i * 4 + 2], mix[i * 4 + 3], y, postGate[t * Lanes + i], n + i * dim);
+            Ops.CombineDiff4x4(s, dim, mix, x, u, postGate + t * Lanes, n);
         }
         clock.Lap(Stage.Combine);
         var swap = stream;
@@ -1705,8 +2389,6 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
 
     static void ChainTriple(float* triple, int t, int k, float* slotHist, int width)
     {
-        // triple[t] is [history, history, current]; chained rows reuse the
-        // previous rows' projected values, the run head the slot tail.
         var cur = triple + (long)t * 3 * width;
         var second = k >= 2 ? triple + (long)(t - 2) * 3 * width + 2 * width : slotHist + width;
         var first = triple + (long)(t - 1) * 3 * width + 2 * width;
@@ -1716,14 +2398,8 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
 
     void RunAttentionBatch(int l, in LayerWeights w, int* rowSlots, int count)
     {
-        var normalized = scratch;
         for (var t = 0; t < count; t++)
-        {
-            var r = quantizedInput + (long)t * dim;
-            Ops.ZeroCenteredRms(residual + (long)t * dim, w.NormIn, dim, r);
-            Quant.FakeA8(r, dim);
-        }
-        Quant.Prepare(quantizedInput, count, dim, 2, dimAct);
+            Quant.PrepareCenteredRmsFakeA8(residual + (long)t * dim, w.NormIn, quantizedInput + (long)t * dim, dim, 2, dimAct.Slice(t));
         clock.Lap(Stage.AttentionPrep);
 
         for (var rs = 0; rs < count;)
@@ -1755,8 +2431,6 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
             while (rk + 1 < count && rowSlots[rk + 1] == slot) rk++;
             ref var view = ref slotViews![slot];
             var live = QkvOf(view.State, l);
-            // Chained rows reuse the slot tail when the run head does; after
-            // a rewind that tail lives in the snapshot, like the run head.
             var histBase = view.HistPending ? QkvOf(view.Snapshot, l) : live;
             var liveK = live + (ConvTaps - 1) * qWidth;
             var liveV = liveK + (ConvTaps - 1) * kWidth;
@@ -1812,10 +2486,6 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
                     layerValueScales[(long)p * g.KvHeads + h] = Quant.QuantizeInt8(v + h * g.VDim, g.VDim, layerValues + (long)p * vWidth + h * g.VDim);
                 }
             }
-            // One attention batch per slot run: the core reads only that
-            // sequence's KV, so sharing the pass would save nothing, while a
-            // shared span would change tiling and break bit-identity with the
-            // single-sequence path.
             var attention = new AttentionBatch
             {
                 Queries = queryInt8 + (long)rs * qWidth, QueryScales = queryScale + rs * g.Heads,
@@ -1832,12 +2502,7 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         }
 
         for (var t = 0; t < count; t++)
-        {
-            var o = attnOut + (long)t * g.OutputWidth;
-            Ops.MultiplyBySigmoid(o, gateOut + (long)t * g.OutputWidth, g.OutputWidth);
-            Quant.FakeA8(o, g.OutputWidth);
-        }
-        Quant.Prepare(attnOut, count, g.OutputWidth, 2, dimAct);
+            Quant.PrepareGateFakeA8(attnOut + (long)t * g.OutputWidth, gateOut + (long)t * g.OutputWidth, g.OutputWidth, 2, dimAct.Slice(t));
         clock.Lap(Stage.AttentionGate);
         var output = new MatMulBatch(dimAct, count);
         output.Add(w.Out, attnProj, dim);
@@ -1845,18 +2510,12 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         MatMulBatch.Run(pool, &output);
         clock.Lap(Stage.AttentionOut);
         for (var t = 0; t < count; t++)
-        {
-            Ops.ZeroCenteredRms(attnProj + (long)t * dim, w.PostNorm, dim, normalized);
-            Ops.AddScaled(residual + (long)t * dim, normalized, w.AttnGate, dim);
-        }
+            Ops.PostNormAdd(residual + (long)t * dim, attnProj + (long)t * dim, w.PostNorm, w.AttnGate, dim);
         clock.Lap(Stage.AttentionPostNorm);
     }
 
     void PoolTokensBatch(int row, int* rowSlots, int count, bool initial)
     {
-        // The pooling cell carries the running mixture across rows and
-        // layers, so each slot run swaps in its own cell around the shared
-        // per-row updates below.
         var head = model.Confidence;
         var probes = head->Probes;
         var inverseRoot = 1f / MathF.Sqrt(dim);
@@ -1881,9 +2540,6 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
                 for (var p = 0; p < probes; p++)
                 {
                     var index = row * probes + p;
-                    // Lazy per-row restore from the slot snapshot, mirroring
-                    // the single-sequence path: each layer owns its rows, so
-                    // a whole-block copy here would wipe other layers.
                     if (restore && t == rs)
                     {
                         liveMax[index] = snapMax[index];
@@ -1943,8 +2599,6 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         }
     }
 
-    // Full-head logits are computed per row into the single head activation,
-    // so the sparse gather sees the exact normalization the dense head does.
     internal void LogitsForBatchRow(int row, int* rows, int count, float* destination)
     {
         PrepareHead(row);

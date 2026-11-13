@@ -64,7 +64,6 @@ public sealed unsafe class TypedHostTests
 
         var firstConfidence = 0f;
         var firstCommand = default(GameCommand);
-        // An unrelated order in between must not leak into the repeat of the first one.
         foreach (var query in new[] { "what's it like in Lagos right now?"u8.ToArray(), "set a timer for 12 minutes"u8.ToArray(), "what's it like in Lagos right now?"u8.ToArray() })
         {
             Assert.True(channel.TrySubmitQuery(query, out var ticket));

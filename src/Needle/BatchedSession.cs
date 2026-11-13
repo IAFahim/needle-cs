@@ -7,23 +7,6 @@ using System.Threading;
 
 namespace Needle;
 
-// W26 multi-sequence batched decode: many NPCs for roughly the cost of one.
-// Each lane owns one engine slot (KV, histories, pooling, position) plus its
-// grammar state, masks and text buffers; one ForwardBatch per step feeds one
-// token run per unfinished lane through the shared weight reads. Grammar
-// masks differ per lane, so after each shared pass every lane applies its own
-// mask and argmax serially — that is where the sharing stops, by architecture
-// (per-sequence argmax, trie walk and token bookkeeping stay serial CPU work).
-//
-// The turn driver mirrors NeedleSession phase for phase (reason, decision,
-// call, respond) with identical token feeds, feeds-per-token and logits
-// requests, so every lane's output is identical to decoding it alone. What
-// batching does NOT cover: prefill stays per sequence (FeedSlot); jump-forward
-// chunking is dormant (every lane steps token by token, which equals the
-// per-token greedy sequence either way); tool retrieval is rejected at Open
-// (lanes decode with fixed tool sets); typed sinks and cross attention are
-// unsupported. BatchedSession is not thread-safe: one thread drives steps,
-// RequestCancel excepted.
 public sealed unsafe class BatchedSession : IDisposable
 {
     const int ImStart = 4, ImEnd = 5, ThinkStart = 6, ThinkEnd = 7, ToolCallStart = 10, ToolCallEnd = 11, EndOfText = 1;
@@ -153,9 +136,6 @@ public sealed unsafe class BatchedSession : IDisposable
 
     public int MaxSequences => lanes.Length;
 
-    // Opens a lane with its own tool set and primes its slot. Tool retrieval
-    // would re-prime mid-turn, so lanes whose catalog exceeds RetrievalTopK
-    // are rejected: decode with the narrowed set instead.
     public int Open(string toolsJson)
     {
         if (laneCount >= lanes.Length) throw new InvalidOperationException("all batch lanes are open");
@@ -306,8 +286,6 @@ public sealed unsafe class BatchedSession : IDisposable
         lane.First = true;
         lane.Finished = false;
         System.Threading.Volatile.Write(ref lane.CancelRequested, 0);
-        // Every turn starts from the shared primed prefix with first-turn
-        // prompt heads: lanes are stateless across turns by design.
         lane.TurnOne = true;
         engine.RewindSlot(lane.Slot);
         if (!toolResult && input.Length == 0) { FailLane(ref lane, ReplyStatus.Failed, FailureReason.EmptyInput); return; }
@@ -426,8 +404,6 @@ public sealed unsafe class BatchedSession : IDisposable
         if (FrameBudgetHit(ref lane)) return;
         if (Grammar.Complete(lane.State))
         {
-            // The pick and the closing span are separate shared passes, like
-            // the reference path's two feeds, so pooling sees identical rows.
             lane.Phase = Phase.CallClosingFeed;
             SetPending(ref lane, pick, Want.None);
             return;
@@ -477,8 +453,6 @@ public sealed unsafe class BatchedSession : IDisposable
 
     void FinishCall(ref Lane lane)
     {
-        // The closing rows were fed by the shared pass just before this
-        // advance; only local materialization remains.
         lane.PendingCount = 0;
         var head = HeadProbability(ref lane);
         var decode = Math.Exp(lane.LogProb / Math.Max(1, lane.Steps));
@@ -633,31 +607,8 @@ public sealed unsafe class BatchedSession : IDisposable
 
     int ArgMax(uint* allowed, float* logits) => Ops.ArgMaxMasked(logits, allowed, maskWords, vocabSize);
 
-    int ArgMaxWithProbability(float* logits, uint* allowed, float* scratch, out float probability)
-    {
-        var best = -1;
-        var count = 0;
-        var peak = float.NegativeInfinity;
-        for (var word = 0; word < maskWords; word++)
-        {
-            var bits = allowed[word];
-            while (bits != 0)
-            {
-                var id = word * 32 + Bits.TrailingZeros(bits);
-                bits &= bits - 1;
-                var value = logits[id];
-                scratch[count++] = value;
-                if (value > peak) { peak = value; best = id; }
-            }
-        }
-        if (best < 0)
-        {
-            probability = 0f;
-            return -1;
-        }
-        probability = Ops.BestProbability(scratch, count, peak);
-        return best;
-    }
+    int ArgMaxWithProbability(float* logits, uint* allowed, float* scratch, out float probability) =>
+        Ops.ArgMaxMaskedWithProbability(logits, allowed, maskWords, vocabSize, scratch, out probability);
 
     static int ArgMaxSparse(float* values, int* rows, int count, out float probability)
     {

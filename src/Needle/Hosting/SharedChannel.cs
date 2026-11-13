@@ -6,20 +6,6 @@ using System.Threading;
 
 namespace Needle;
 
-// N71: cross-process view of a NeedleChannel block. The rings are
-// offset-based (cells follow their headers, cancel words follow the reply
-// ring), so two processes mapping the same file each build a NeedleChannel
-// over their own base address and read/write the same cells. The only
-// process-local state in the block was the wake function pointer, which a
-// foreign process must never call: shared blocks set the Shared flag in the
-// block header, SignalWake becomes a no-op, and both sides poll with
-// TryClaim/TryReceive (or the WaitFor* helpers below, which spin-then-yield
-// and never sleep).
-//
-// Game-side code is unchanged: submit and receive through
-// SharedChannel.Channel exactly as with NeedleHost.Start's channel.
-// Never call Free() on a shared view; disposing this handle releases the
-// mapping. Free() on a shared view would corrupt the owner's allocator.
 public sealed unsafe class SharedChannel : IDisposable
 {
     readonly MemoryMappedFile file;
@@ -36,7 +22,6 @@ public sealed unsafe class SharedChannel : IDisposable
 
     public NeedleChannel Channel { get; }
 
-    /// <summary>Backing file path: hand this to the other process (argv, env, inspector) for <see cref="Open"/>.</summary>
     public string Path { get; }
 
     public static string NewPath(string prefix = "needle-channel")
@@ -49,9 +34,6 @@ public sealed unsafe class SharedChannel : IDisposable
     {
         if (string.IsNullOrEmpty(path)) throw new ArgumentNullException(nameof(path));
         NeedleChannel.ComputeLayout(requestCapacity, replyCapacity, out var requestCells, out var replyCells, out var words, out var total);
-        // N71: file-backed, not named: named maps throw
-        // PlatformNotSupportedException on Linux/macOS. The path travels
-        // out-of-band; the last side out deletes it.
         var file = MemoryMappedFile.CreateFromFile(path, FileMode.Create, null, total, MemoryMappedFileAccess.ReadWrite);
         try
         {
@@ -92,8 +74,6 @@ public sealed unsafe class SharedChannel : IDisposable
             try
             {
                 view.SafeMemoryMappedViewHandle.AcquirePointer(ref pointer);
-                // Validates the magic and rebuilds ring pointers over this
-                // process's base address; the live rings are never cleared.
                 var channel = NeedleChannel.Attach(pointer + view.PointerOffset);
                 if (!channel.IsShared)
                     throw new InvalidDataException($"Shared channel file \"{path}\" is not a shared channel block.");
@@ -113,10 +93,6 @@ public sealed unsafe class SharedChannel : IDisposable
         }
     }
 
-    // Polls until any reply arrives (single-worker hosts publish in
-    // submission order, so the first reply is the caller's; multi-flight
-    // callers match reply.Ticket themselves as in ChannelTests.WaitForReply).
-    // Zero allocation; never sleeps.
     public static bool WaitForReply(in NeedleChannel channel, out ChannelReply reply, int timeoutMilliseconds = 5000)
     {
         var start = Stopwatch.GetTimestamp();
@@ -139,8 +115,6 @@ public sealed unsafe class SharedChannel : IDisposable
         return false;
     }
 
-    // Server-side poll: waits until a request is queued, then the caller
-    // drains with TryClaim. Zero allocation; never sleeps.
     public static bool WaitForRequest(in NeedleChannel channel, int timeoutMilliseconds = 5000)
     {
         var start = Stopwatch.GetTimestamp();

@@ -37,8 +37,6 @@ public sealed class VoiceSession : IDisposable
         vocabulary = EnumKeywords(toolsJson);
     }
 
-    // Startup-only convenience: accepts the UTF-8 schema bytes (for example the bytes
-    // of a W10 generated tool set's Schema) and decodes them once here.
     public VoiceSession(Model needleModel, Model whistleModel, ReadOnlySpan<byte> toolsJson, NeedleOptions? options = null)
         : this(needleModel, whistleModel, System.Text.Encoding.UTF8.GetString(toolsJson), options)
     {
@@ -49,8 +47,6 @@ public sealed class VoiceSession : IDisposable
     public SpeechSpan TranscribeSpan(ReadOnlySpan<float> pcm, Span<byte> utf8, Span<WordSlice> words, string? language = null) =>
         whistle.TranscribeUtf8(pcm, utf8, words, language, vocabulary);
 
-    // Zero-allocation voice-to-call: span transcription with enum-literal keyword bias,
-    // then one span request through the session. Silence yields an EmptyInput reply.
     public (Reply Reply, SpeechSpan Speech) CompleteSpan(ReadOnlySpan<float> pcm, Span<byte> calls, Span<byte> reasoning, Span<byte> response, Span<byte> transcriptUtf8, Span<WordSlice> transcriptWords, string? language = null)
     {
         var speech = TranscribeSpan(pcm, transcriptUtf8, transcriptWords, language);
@@ -66,7 +62,6 @@ public sealed class VoiceSession : IDisposable
             : needle.Complete(speech.Text);
         return new VoiceResult { Speech = speech, Call = call };
     }
-
 
     internal static System.Collections.Generic.List<string> EnumKeywords(string toolsJson) => EnumValues(new ToolSet(toolsJson));
 

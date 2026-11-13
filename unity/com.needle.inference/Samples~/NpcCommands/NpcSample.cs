@@ -33,7 +33,6 @@ namespace Needle.Samples
             if (!File.Exists(path)) { Debug.LogError($"Needle model missing: {path}"); enabled = false; return; }
             host = new NeedleHost();
             var tools = System.Text.Encoding.UTF8.GetString(NpcCommands.Schema.ToArray());
-            // Thread budget (see Documentation~/thread-budget.md): Game workers run BelowNormal and park after 50 us, and never pin cores. Threads = 0 means half the logical cores capped at 4.
             channel = host.StartTyped<NpcSink, NpcCommand>(new HostOptions { ModelPath = path, ToolsJson = tools, Session = new NeedleOptions { Threading = ThreadPolicy.Game.WithThreads(ResolveThreads()) } });
             var manager = World.DefaultGameObjectInjectionWorld.EntityManager;
             singleton = manager.CreateSingleton(new NeedleChannelHandle { Channel = channel, Identity = channel.Identity });
@@ -42,12 +41,6 @@ namespace Needle.Samples
         }
         int ResolveThreads() => Threads > 0 ? System.Math.Max(1, System.Math.Min(4, Threads)) : DefaultThreads();
 
-        // Slow runtimes get 2 threads, roomy boxes 4 (N25). Deliberately NOT
-        // cores-minus-Unity-job-workers: JobWorkerCount counts parked threads, not
-        // busy cores — this 32-core Editor reports 31 workers, which would collapse
-        // the default to 1 thread. Coexistence with Unity comes from the Game policy
-        // instead: BelowNormal priority, 50 us park, no pinning. Measured frame
-        // impact is identical at 2 and 4 threads; see thread-budget.md.
         static int DefaultThreads()
         {
             int cores = System.Math.Max(1, System.Environment.ProcessorCount);

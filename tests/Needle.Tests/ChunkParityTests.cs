@@ -4,16 +4,6 @@ using Xunit.Abstractions;
 
 namespace Needle.Tests;
 
-// Engine chunk/sequential parity (issue #17 precondition). Prompt-lookup
-// speculation feeds pick+drafts as one chunk and verifies each position
-// against the chunk logits; that is only lossless when a chunk feed computes
-// the same per-row logits as sequential single-token feeds. Single-threaded
-// this holds bit-for-bit (all T=1..5 rows, every layer stream, argmax).
-// Multi-threaded it does not (measured ~0.36 abs logit drift from layer 0 at
-// 4 threads, same binaries, deterministic): distributing rows across workers
-// changes the computed values, so a borderline argmax can flip. Until the
-// kernel work (W13/W20) closes that gap, the W17 identity gate runs
-// single-threaded and speculation stays default-off.
 public sealed class ChunkParityTests : IDisposable
 {
     readonly Model model;

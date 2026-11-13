@@ -716,22 +716,12 @@ internal sealed unsafe class Grammar : IDisposable
         return Reprocess;
     }
 
-    // Appends the unique grammar-forced byte continuation to `destination`,
-    // advancing `*state` past each forced byte. Stops when zero or more than
-    // one byte is admissible, when the state completes, or when `destination`
-    // fills. Returns the number of bytes written. W16 (jump-forward) consumes
-    // this to skip decode steps over forced spans: each returned byte is the
-    // only admissible continuation, so feeding it cannot change the outcome.
     public static int ForcedBytes(GrammarProgram* g, GrammarState* state, Span<byte> destination)
     {
         var sink = new Tools.NoSink();
         return ForcedBytes(g, state, destination, ref sink);
     }
 
-    // Sink-reporting overload: forced bytes pass through `sink` (tool and
-    // property events fire exactly as if each byte had arrived individually),
-    // so typed decoding can fast-forward without losing events. Probing uses
-    // a discard sink; sinks only observe and never affect admissibility.
     public static int ForcedBytes<TSink>(GrammarProgram* g, GrammarState* state, Span<byte> destination, ref TSink sink)
         where TSink : struct, Tools.IGrammarSink
     {

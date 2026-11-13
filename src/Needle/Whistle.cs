@@ -43,7 +43,7 @@ public sealed unsafe partial class Whistle : IDisposable
     float* preOut, postOut, resOut, postGate, residualMix, rowScratch, quantizedRows;
     sbyte* qInt8, kInt8, vInt8;
     float* qScale, kScale, vScale, qRaw, kRaw, vRaw;
-    float* ropeCos, ropeSin;
+    float* ropeCos, ropeSin, crossPosSin, crossPosCos;
     float* stage0, stage1, stageDepthwise, stagePointwise, zeroRow, stemFlat;
     Activations streamAct, dimAct, stemAct, flatAct, memoryAct;
     float* encoderOutput, crossKRaw, crossVRaw;
@@ -138,6 +138,20 @@ public sealed unsafe partial class Whistle : IDisposable
                 ropeCos[p * (g.QkDim / 2) + i] = MathF.Cos(angle);
                 ropeSin[p * (g.QkDim / 2) + i] = MathF.Sin(angle);
             }
+        var halfDim = dim / 2;
+        crossPosSin = arena.TakeUncleared<float>((nuint)(f * halfDim));
+        crossPosCos = arena.TakeUncleared<float>((nuint)(f * halfDim));
+        var angleStep = -Math.Log(10000.0) / (halfDim - 1);
+        for (var i = 0; i < halfDim; i++)
+        {
+            var invFreq = Math.Exp(angleStep * i);
+            for (var p = 0; p < f; p++)
+            {
+                var angle = p * invFreq;
+                crossPosSin[p * halfDim + i] = (float)Math.Sin(angle);
+                crossPosCos[p * halfDim + i] = (float)Math.Cos(angle);
+            }
+        }
         streamAct = new Activations(ref arena, f, streamWidth);
         dimAct = new Activations(ref arena, f, dim);
         memoryAct = new Activations(ref arena, f, dim);
@@ -184,23 +198,88 @@ public sealed unsafe partial class Whistle : IDisposable
         return frames;
     }
 
-    static void Normalize(float* x, int rows, int cols)
+    static void SliceRange(int task, int tasks, int total, out int first, out int end)
     {
-        for (var c = 0; c < cols; c++)
+        first = task * total / tasks;
+        end = (task + 1) * total / tasks;
+    }
+
+    struct NormalizeJob
+    {
+        public float* X;
+        public int Rows, Cols, Tasks;
+    }
+
+    static void ExecuteNormalize(void* context, int task)
+    {
+        var j = (NormalizeJob*)context;
+        SliceRange(task, j->Tasks, j->Cols, out var first, out var end);
+        var rows = j->Rows;
+        var cols = j->Cols;
+        var denom = Math.Max(rows - 1, 1);
+        var c = first;
+#if NEEDLE_SIMD
+        if (Simd.UseAvx && rows > 0)
+        {
+            var invRows = System.Runtime.Intrinsics.Vector256.Create(1.0 / rows);
+            var invDenom = System.Runtime.Intrinsics.Vector256.Create(1.0 / denom);
+            var eps = System.Runtime.Intrinsics.Vector256.Create(1e-5);
+            for (; c + 8 <= end; c += 8)
+            {
+                var sum0 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var sum1 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var p = j->X + c;
+                for (var r = 0; r < rows; r++, p += cols)
+                {
+                    sum0 = System.Runtime.Intrinsics.X86.Avx.Add(sum0, System.Runtime.Intrinsics.X86.Avx.ConvertToVector256Double(System.Runtime.Intrinsics.X86.Sse.LoadVector128(p)));
+                    sum1 = System.Runtime.Intrinsics.X86.Avx.Add(sum1, System.Runtime.Intrinsics.X86.Avx.ConvertToVector256Double(System.Runtime.Intrinsics.X86.Sse.LoadVector128(p + 4)));
+                }
+                var mean0 = System.Runtime.Intrinsics.X86.Avx.Multiply(sum0, invRows);
+                var mean1 = System.Runtime.Intrinsics.X86.Avx.Multiply(sum1, invRows);
+                var sq0 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                var sq1 = System.Runtime.Intrinsics.Vector256<double>.Zero;
+                p = j->X + c;
+                for (var r = 0; r < rows; r++, p += cols)
+                {
+                    var d0 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.ConvertToVector256Double(System.Runtime.Intrinsics.X86.Sse.LoadVector128(p)), mean0);
+                    var d1 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.ConvertToVector256Double(System.Runtime.Intrinsics.X86.Sse.LoadVector128(p + 4)), mean1);
+                    sq0 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(d0, d0, sq0);
+                    sq1 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(d1, d1, sq1);
+                }
+                var invStd0 = System.Runtime.Intrinsics.X86.Avx.Divide(System.Runtime.Intrinsics.Vector256.Create(1.0), System.Runtime.Intrinsics.X86.Avx.Add(System.Runtime.Intrinsics.X86.Avx.Sqrt(System.Runtime.Intrinsics.X86.Avx.Multiply(sq0, invDenom)), eps));
+                var invStd1 = System.Runtime.Intrinsics.X86.Avx.Divide(System.Runtime.Intrinsics.Vector256.Create(1.0), System.Runtime.Intrinsics.X86.Avx.Add(System.Runtime.Intrinsics.X86.Avx.Sqrt(System.Runtime.Intrinsics.X86.Avx.Multiply(sq1, invDenom)), eps));
+                p = j->X + c;
+                for (var r = 0; r < rows; r++, p += cols)
+                {
+                    var n0 = System.Runtime.Intrinsics.X86.Avx.Multiply(System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.ConvertToVector256Double(System.Runtime.Intrinsics.X86.Sse.LoadVector128(p)), mean0), invStd0);
+                    var n1 = System.Runtime.Intrinsics.X86.Avx.Multiply(System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.ConvertToVector256Double(System.Runtime.Intrinsics.X86.Sse.LoadVector128(p + 4)), mean1), invStd1);
+                    System.Runtime.Intrinsics.X86.Sse.Store(p, System.Runtime.Intrinsics.X86.Avx.ConvertToVector128Single(n0));
+                    System.Runtime.Intrinsics.X86.Sse.Store(p + 4, System.Runtime.Intrinsics.X86.Avx.ConvertToVector128Single(n1));
+                }
+            }
+        }
+#endif
+        for (; c < end; c++)
         {
             double sum = 0;
-            for (var r = 0; r < rows; r++) sum += x[r * cols + c];
+            for (var r = 0; r < rows; r++) sum += j->X[r * cols + c];
             var mean = sum / rows;
             double squares = 0;
-            for (var r = 0; r < rows; r++) squares += (x[r * cols + c] - mean) * (x[r * cols + c] - mean);
-            var std = Math.Sqrt(squares / Math.Max(rows - 1, 1));
-            for (var r = 0; r < rows; r++) x[r * cols + c] = (float)((x[r * cols + c] - mean) / (std + 1e-5));
+            for (var r = 0; r < rows; r++) squares += (j->X[r * cols + c] - mean) * (j->X[r * cols + c] - mean);
+            var std = Math.Sqrt(squares / denom);
+            for (var r = 0; r < rows; r++) j->X[r * cols + c] = (float)((j->X[r * cols + c] - mean) / (std + 1e-5));
         }
+    }
+
+    void Normalize(float* x, int rows, int cols)
+    {
+        var tasks = pool.Members <= 1 ? 1 : Math.Min(cols, pool.Members * 4);
+        var job = new NormalizeJob { X = x, Rows = rows, Cols = cols, Tasks = tasks };
+        pool.Run(&ExecuteNormalize, &job, tasks);
     }
 
     int Stem(int l0)
     {
-        var s = audio->StemWidth;
         var l1 = (l0 + 1) / 2;
         var l2 = (l1 + 1) / 2;
         var l3 = (l2 + 1) / 2;
@@ -218,36 +297,33 @@ public sealed unsafe partial class Whistle : IDisposable
         return l3;
     }
 
-    float* Row0(int row, int length) => row >= 0 && row < length ? features + (long)row * audio->Mels : zeroRow;
-
-    void StageFirst(int l0, int l1, int p0, int p1)
+    struct StemJob
     {
-        var s = audio->StemWidth;
-        for (var p = p0; p < p1; p++)
-        {
-            var o = stage0 + (long)(p - p0) * 40 * s;
-            if (p < 0 || p >= l1) { Mem.Clear(o, (nuint)(40 * s * 4)); continue; }
-            for (var f = 0; f < 40; f++)
-            {
-                Ops.Zero(o + f * s, s);
-                for (var dt = 0; dt < 3; dt++)
-                {
-                    var row = Row0(2 * p - 1 + dt, l0);
-                    for (var df = 0; df < 3; df++)
-                    {
-                        var freq = 2 * f - 1 + df;
-                        if (freq < 0 || freq >= audio->Mels) continue;
-                        Ops.AddScaled(o + f * s, audio->StemFirst + (dt * 3 + df) * s, row[freq], s);
-                    }
-                }
-            }
-            Ops.Silu(o, 40 * s);
-        }
+        public AudioWeights* Audio;
+        public float* Features, ZeroRow, Stage0, Stage1, StageDepthwise, StagePointwise, StemFlat;
+        public int L0, L1, L2, L3, P0, Q0, R0, TotalCount, Tasks;
     }
 
-    void Depthwise(float* weights, float* r0, float* r1, float* r2, int freqIn, int freqOut, float* output)
+    void RunStem(delegate*<void*, int, void> fn, int l0, int l1, int l2, int l3, int p0, int q0, int r0, int count)
     {
-        var s = audio->StemWidth;
+        var tasks = pool.Members <= 1 ? 1 : Math.Min(count, pool.Members * 4);
+        var job = new StemJob
+        {
+            Audio = audio, Features = features, ZeroRow = zeroRow,
+            Stage0 = stage0, Stage1 = stage1, StageDepthwise = stageDepthwise,
+            StagePointwise = stagePointwise, StemFlat = stemFlat,
+            L0 = l0, L1 = l1, L2 = l2, L3 = l3, P0 = p0, Q0 = q0, R0 = r0,
+            TotalCount = count, Tasks = tasks,
+        };
+        pool.Run(fn, &job, tasks);
+    }
+
+    static float* Stage(float* buffer, int first, int row, int length, int rowFloats, float* zero) =>
+        row >= 0 && row < length && row >= first ? buffer + (long)(row - first) * rowFloats : zero;
+
+    [System.Runtime.CompilerServices.SkipLocalsInit]
+    static void Depthwise(int s, float* zero, float* weights, float* r0, float* r1, float* r2, int freqIn, int freqOut, float* output)
+    {
         var rows = stackalloc float*[3];
         rows[0] = r0;
         rows[1] = r1;
@@ -266,13 +342,109 @@ public sealed unsafe partial class Whistle : IDisposable
         }
     }
 
-    float* Stage(float* buffer, int first, int row, int length, int rowFloats) =>
-        row >= 0 && row < length && row >= first ? buffer + (long)(row - first) * rowFloats : zeroRow;
+    static void ExecuteStageFirst(void* context, int task)
+    {
+        var j = (StemJob*)context;
+        var a = j->Audio;
+        var s = a->StemWidth;
+        var mels = a->Mels;
+        SliceRange(task, j->Tasks, j->TotalCount, out var first, out var end);
+        for (var idx = first; idx < end; idx++)
+        {
+            var p = j->P0 + idx;
+            var o = j->Stage0 + (long)idx * 40 * s;
+            if (p < 0 || p >= j->L1) { Mem.Clear(o, (nuint)(40 * s * 4)); continue; }
+            for (var f = 0; f < 40; f++)
+            {
+                Ops.Zero(o + f * s, s);
+                for (var dt = 0; dt < 3; dt++)
+                {
+                    var r = 2 * p - 1 + dt;
+                    var row = r >= 0 && r < j->L0 ? j->Features + (long)r * mels : j->ZeroRow;
+                    for (var df = 0; df < 3; df++)
+                    {
+                        var freq = 2 * f - 1 + df;
+                        if (freq < 0 || freq >= mels) continue;
+                        Ops.AddScaled(o + f * s, a->StemFirst + (dt * 3 + df) * s, row[freq], s);
+                    }
+                }
+            }
+            Ops.Silu(o, 40 * s);
+        }
+    }
+
+    static void ExecuteStageSecondDepthwise(void* context, int task)
+    {
+        var j = (StemJob*)context;
+        var s = j->Audio->StemWidth;
+        var rowFloats = 40 * s;
+        SliceRange(task, j->Tasks, j->TotalCount, out var first, out var end);
+        for (var idx = first; idx < end; idx++)
+        {
+            var q = j->Q0 + idx;
+            var o = j->StageDepthwise + (long)idx * 20 * s;
+            if (q < 0 || q >= j->L2) { Mem.Clear(o, (nuint)(20 * s * 4)); continue; }
+            Depthwise(s, j->ZeroRow, j->Audio->StemDepthwise1,
+                Stage(j->Stage0, j->P0, 2 * q - 1, j->L1, rowFloats, j->ZeroRow),
+                Stage(j->Stage0, j->P0, 2 * q, j->L1, rowFloats, j->ZeroRow),
+                Stage(j->Stage0, j->P0, 2 * q + 1, j->L1, rowFloats, j->ZeroRow), 40, 20, o);
+        }
+    }
+
+    static void ExecuteStageSecondSilu(void* context, int task)
+    {
+        var j = (StemJob*)context;
+        var s = j->Audio->StemWidth;
+        SliceRange(task, j->Tasks, j->TotalCount, out var first, out var end);
+        for (var idx = first; idx < end; idx++)
+        {
+            var q = j->Q0 + idx;
+            var o = j->Stage1 + (long)idx * 20 * s;
+            if (q < 0 || q >= j->L2) { Mem.Clear(o, (nuint)(20 * s * 4)); continue; }
+            Buffer.MemoryCopy(j->StagePointwise + (long)idx * 20 * s, o, 20 * s * 4, 20 * s * 4);
+            Ops.Silu(o, 20 * s);
+        }
+    }
+
+    static void ExecuteStageThirdDepthwise(void* context, int task)
+    {
+        var j = (StemJob*)context;
+        var s = j->Audio->StemWidth;
+        var rowFloats = 20 * s;
+        SliceRange(task, j->Tasks, j->TotalCount, out var first, out var end);
+        for (var idx = first; idx < end; idx++)
+        {
+            var r = j->R0 + idx;
+            Depthwise(s, j->ZeroRow, j->Audio->StemDepthwise2,
+                Stage(j->Stage1, j->Q0, 2 * r - 1, j->L2, rowFloats, j->ZeroRow),
+                Stage(j->Stage1, j->Q0, 2 * r, j->L2, rowFloats, j->ZeroRow),
+                Stage(j->Stage1, j->Q0, 2 * r + 1, j->L2, rowFloats, j->ZeroRow),
+                20, 10, j->StageDepthwise + (long)idx * 10 * s);
+        }
+    }
+
+    static void ExecuteStageThirdTranspose(void* context, int task)
+    {
+        var j = (StemJob*)context;
+        var s = j->Audio->StemWidth;
+        SliceRange(task, j->Tasks, j->TotalCount, out var first, out var end);
+        for (var r = first; r < end; r++)
+        {
+            var row = j->StagePointwise + (long)r * 10 * s;
+            Ops.Silu(row, 10 * s);
+            var flat = j->StemFlat + (long)r * 10 * s;
+            for (var f = 0; f < 10; f++)
+                for (var c = 0; c < s; c++) flat[c * 10 + f] = row[f * s + c];
+        }
+    }
+
+    void StageFirst(int l0, int l1, int p0, int p1) =>
+        RunStem(&ExecuteStageFirst, l0, l1, 0, 0, p0, 0, 0, p1 - p0);
 
     void Pointwise(in Cq weights, float* source, int tokens, float* destination)
     {
         var s = audio->StemWidth;
-        Quant.Prepare(source, tokens, s, 2, stemAct);
+        Quant.Prepare(pool, source, tokens, s, 2, stemAct);
         var batch = new MatMulBatch(stemAct, tokens);
         batch.Add(weights, destination, s);
         MatMulBatch.Run(pool, &batch);
@@ -281,103 +453,376 @@ public sealed unsafe partial class Whistle : IDisposable
     void StageSecond(int p0, int l1, int l2, int q0, int q1)
     {
         var s = audio->StemWidth;
-        var rowFloats = 40 * s;
-        for (var q = q0; q < q1; q++)
-        {
-            var o = stageDepthwise + (long)(q - q0) * 20 * s;
-            if (q < 0 || q >= l2) { Mem.Clear(o, (nuint)(20 * s * 4)); continue; }
-            Depthwise(audio->StemDepthwise1, Stage(stage0, p0, 2 * q - 1, l1, rowFloats), Stage(stage0, p0, 2 * q, l1, rowFloats), Stage(stage0, p0, 2 * q + 1, l1, rowFloats), 40, 20, o);
-        }
-        Pointwise(audio->StemPointwise1, stageDepthwise, (q1 - q0) * 20, stagePointwise);
-        for (var q = q0; q < q1; q++)
-        {
-            var o = stage1 + (long)(q - q0) * 20 * s;
-            if (q < 0 || q >= l2) { Mem.Clear(o, (nuint)(20 * s * 4)); continue; }
-            Buffer.MemoryCopy(stagePointwise + (long)(q - q0) * 20 * s, o, 20 * s * 4, 20 * s * 4);
-            Ops.Silu(o, 20 * s);
-        }
+        var rows = q1 - q0;
+        RunStem(&ExecuteStageSecondDepthwise, 0, l1, l2, 0, p0, q0, 0, rows);
+        Pointwise(audio->StemPointwise1, stageDepthwise, rows * 20, stagePointwise);
+        RunStem(&ExecuteStageSecondSilu, 0, l1, l2, 0, p0, q0, 0, rows);
     }
 
     void StageThird(int q0, int l2, int l3, int r0, int r1)
     {
         var s = audio->StemWidth;
-        var rowFloats = 20 * s;
         var rows = r1 - r0;
-        for (var r = r0; r < r1; r++)
-            Depthwise(audio->StemDepthwise2, Stage(stage1, q0, 2 * r - 1, l2, rowFloats), Stage(stage1, q0, 2 * r, l2, rowFloats), Stage(stage1, q0, 2 * r + 1, l2, rowFloats), 20, 10, stageDepthwise + (long)(r - r0) * 10 * s);
+        RunStem(&ExecuteStageThirdDepthwise, 0, 0, l2, l3, 0, q0, r0, rows);
         Pointwise(audio->StemPointwise2, stageDepthwise, rows * 10, stagePointwise);
-        for (var r = 0; r < rows; r++)
-        {
-            var row = stagePointwise + (long)r * 10 * s;
-            Ops.Silu(row, 10 * s);
-            var flat = stemFlat + (long)r * 10 * s;
-            for (var f = 0; f < 10; f++)
-                for (var c = 0; c < s; c++) flat[c * 10 + f] = row[f * s + c];
-        }
-        Quant.Prepare(stemFlat, rows, 10 * s, 2, flatAct);
+        RunStem(&ExecuteStageThirdTranspose, 0, 0, l2, l3, 0, q0, r0, rows);
+        Quant.Prepare(pool, stemFlat, rows, 10 * s, 2, flatAct);
         var batch = new MatMulBatch(flatAct, rows);
         batch.Add(audio->StemOut, stemOut + (long)r0 * dim, dim);
         MatMulBatch.Run(pool, &batch);
     }
 
+    struct FrameJob
+    {
+        public AudioWeights* Audio;
+        public EncoderLayer* Encoder;
+        public CrossMemory* Memory;
+        public Activations StreamAct, DimAct, MemoryAct;
+        public float* StemOut, Stream, Next, Normalized, Residual, Input, Hidden, AttnOut, GateOut, AttnProj, Glu, Conv;
+        public float* PreOut, PostOut, ResOut, PostGate, ResidualMix, QuantizedRows, EncoderOutput;
+        public float* QRaw, KRaw, VRaw, QScale, KScale, VScale, RopeCos, RopeSin;
+        public sbyte* QInt8, KInt8, VInt8;
+        public float* CrossPosSin, CrossPosCos, CrossKRaw, CrossVRaw;
+        public int Dim, Width, Heads, KvHeads, QkDim, VDim, OutputWidth, QueryWidth, KeyWidth, ValueWidth, ConvKernel;
+        public int Layer, Layers, Count, Tasks;
+    }
+
+    FrameJob CreateFrameJob(int count) => new()
+    {
+        Audio = audio,
+        StreamAct = streamAct,
+        DimAct = dimAct,
+        MemoryAct = memoryAct,
+        StemOut = stemOut,
+        Normalized = normalized,
+        Residual = residual,
+        Input = input,
+        Hidden = hidden,
+        AttnOut = attnOut,
+        GateOut = gateOut,
+        AttnProj = attnProj,
+        Glu = glu,
+        Conv = conv,
+        PreOut = preOut,
+        PostOut = postOut,
+        ResOut = resOut,
+        PostGate = postGate,
+        ResidualMix = residualMix,
+        QuantizedRows = quantizedRows,
+        EncoderOutput = encoderOutput,
+        QRaw = qRaw,
+        KRaw = kRaw,
+        VRaw = vRaw,
+        QInt8 = qInt8,
+        KInt8 = kInt8,
+        VInt8 = vInt8,
+        QScale = qScale,
+        KScale = kScale,
+        VScale = vScale,
+        RopeCos = ropeCos,
+        RopeSin = ropeSin,
+        CrossPosSin = crossPosSin,
+        CrossPosCos = crossPosCos,
+        CrossKRaw = crossKRaw,
+        CrossVRaw = crossVRaw,
+        Dim = dim,
+        Width = 4 * dim,
+        Heads = g.Heads,
+        KvHeads = g.KvHeads,
+        QkDim = g.QkDim,
+        VDim = g.VDim,
+        OutputWidth = g.OutputWidth,
+        QueryWidth = g.QueryWidth,
+        KeyWidth = g.KeyWidth,
+        ValueWidth = g.ValueWidth,
+        ConvKernel = audio->ConvKernel,
+        Layers = g.Layers,
+        Count = count,
+    };
+
+    void RunFrames(delegate*<void*, int, void> fn, ref FrameJob job, int count)
+    {
+        var tasks = pool.Members <= 1 ? 1 : Math.Min(count, pool.Members * 4);
+        job.Count = count;
+        job.Tasks = tasks;
+        fixed (FrameJob* jp = &job)
+            pool.Run(fn, jp, tasks);
+    }
+
+    static void ExecuteCopyLanes(void* context, int task)
+    {
+        var j = (FrameJob*)context;
+        SliceRange(task, j->Tasks, j->Count, out var first, out var end);
+        var dim = j->Dim;
+        var width = j->Width;
+        for (var t = first; t < end; t++)
+            for (var lane = 0; lane < 4; lane++)
+                Buffer.MemoryCopy(j->StemOut + (long)t * dim, j->Stream + (long)t * width + lane * dim, dim * 4, dim * 4);
+    }
+
+    static void ExecuteRmsAndPrepareStream(void* context, int task)
+    {
+        var j = (FrameJob*)context;
+        SliceRange(task, j->Tasks, j->Count, out var first, out var end);
+        var width = j->Width;
+        for (var t = first; t < end; t++)
+        {
+            var dst = j->Normalized + (long)t * width;
+            Ops.RmsUnit(j->Stream + (long)t * width, width, dst);
+            Quant.Prepare(dst, 1, width, 4, j->StreamAct.Slice(t));
+        }
+    }
+
+    [System.Runtime.CompilerServices.SkipLocalsInit]
+    static void ExecutePreHyper(void* context, int task)
+    {
+        var j = (FrameJob*)context;
+        SliceRange(task, j->Tasks, j->Count, out var first, out var end);
+        var l = j->Layer;
+        var lane = l % 4;
+        var dim = j->Dim;
+        var width = j->Width;
+        ref readonly var hyper = ref j->Audio->EncoderHyper;
+        var logits = stackalloc float[16];
+        var hpre = stackalloc float[4];
+        for (var t = first; t < end; t++)
+        {
+            for (var i = 0; i < 4; i++)
+            {
+                hpre[i] = Ops.Sigmoid(hyper.APre[l] * j->PreOut[t * 4 + i] + hyper.BPre[l * 4 + i] + (i == lane ? 4f : -4f));
+                j->PostGate[t * 4 + i] = 2f * Ops.Sigmoid(hyper.APost[l] * j->PostOut[t * 4 + i] + hyper.BPost[l * 4 + i] + (i == lane ? 0f : -4f));
+            }
+            Ops.Mix4(j->Stream + (long)t * width, dim, hpre[0], hpre[1], hpre[2], hpre[3], j->Input + (long)t * dim);
+            for (var i = 0; i < 16; i++) logits[i] = hyper.ARes[l] * j->ResOut[t * 16 + i] + hyper.BRes[l * 16 + i];
+            Ops.Sinkhorn4x4(logits, j->ResidualMix + t * 16);
+            Buffer.MemoryCopy(j->Input + (long)t * dim, j->Residual + (long)t * dim, dim * 4, dim * 4);
+        }
+    }
+
+    static void ExecuteCombine(void* context, int task)
+    {
+        var j = (FrameJob*)context;
+        SliceRange(task, j->Tasks, j->Count, out var first, out var end);
+        var dim = j->Dim;
+        var width = j->Width;
+        for (var t = first; t < end; t++)
+            Ops.CombineDiff4x4(j->Stream + (long)t * width, dim, j->ResidualMix + t * 16, j->Residual + (long)t * dim, j->Input + (long)t * dim, j->PostGate + t * 4, j->Next + (long)t * width);
+    }
+
+    [System.Runtime.CompilerServices.SkipLocalsInit]
+    static void ExecuteEncoderFinal(void* context, int task)
+    {
+        var j = (FrameJob*)context;
+        SliceRange(task, j->Tasks, j->Count, out var first, out var end);
+        var dim = j->Dim;
+        var width = j->Width;
+        var scratch = stackalloc float[dim];
+        for (var t = first; t < end; t++)
+        {
+            Ops.Mix4(j->Stream + (long)t * width, dim, 0.25f, 0.25f, 0.25f, 0.25f, scratch);
+            Ops.ZeroCenteredRms(scratch, j->Audio->EncoderFinalNorm, dim, j->EncoderOutput + (long)t * dim);
+        }
+    }
+
+    static void ExecuteAttnNormPrepare(void* context, int task)
+    {
+        var j = (FrameJob*)context;
+        SliceRange(task, j->Tasks, j->Count, out var first, out var end);
+        var dim = j->Dim;
+        var norm = j->Encoder->AttnNorm;
+        for (var t = first; t < end; t++)
+        {
+            var r = j->QuantizedRows + (long)t * dim;
+            Ops.ZeroCenteredRms(j->Residual + (long)t * dim, norm, dim, r);
+            Quant.Prepare(r, 1, dim, 2, j->DimAct.Slice(t));
+        }
+    }
+
+    static void ExecuteAttnRopeQuantize(void* context, int task)
+    {
+        var j = (FrameJob*)context;
+        SliceRange(task, j->Tasks, j->Count, out var first, out var end);
+        var heads = j->Heads;
+        var kvHeads = j->KvHeads;
+        var qkDim = j->QkDim;
+        var vDim = j->VDim;
+        var half = qkDim / 2;
+        var w = j->Encoder;
+        for (var t = first; t < end; t++)
+        {
+            var q = j->QRaw + (long)t * j->QueryWidth;
+            var k = j->KRaw + (long)t * j->KeyWidth;
+            var v = j->VRaw + (long)t * j->ValueWidth;
+            for (var h = 0; h < heads; h++) Ops.ZeroCenteredRms(q + h * qkDim, w->QNorm, qkDim, q + h * qkDim);
+            for (var h = 0; h < kvHeads; h++) Ops.ZeroCenteredRms(k + h * qkDim, w->KNorm, qkDim, k + h * qkDim);
+            Ops.Rope(q, heads, qkDim, j->RopeCos + (long)t * half, j->RopeSin + (long)t * half);
+            Ops.Rope(k, kvHeads, qkDim, j->RopeCos + (long)t * half, j->RopeSin + (long)t * half);
+            for (var h = 0; h < heads; h++)
+                j->QScale[t * heads + h] = Quant.QuantizeInt8(q + h * qkDim, qkDim, j->QInt8 + (long)t * j->QueryWidth + h * qkDim);
+            for (var h = 0; h < kvHeads; h++)
+            {
+                j->KScale[t * kvHeads + h] = Quant.QuantizeInt8(k + h * qkDim, qkDim, j->KInt8 + (long)t * j->KeyWidth + h * qkDim);
+                j->VScale[t * kvHeads + h] = Quant.QuantizeInt8(v + h * vDim, vDim, j->VInt8 + (long)t * j->ValueWidth + h * vDim);
+            }
+        }
+    }
+
+    static void ExecuteAttnGatePrepare(void* context, int task)
+    {
+        var j = (FrameJob*)context;
+        SliceRange(task, j->Tasks, j->Count, out var first, out var end);
+        var width = j->OutputWidth;
+        for (var t = first; t < end; t++)
+        {
+            var o = j->AttnOut + (long)t * width;
+            Ops.MultiplyBySigmoid(o, j->GateOut + (long)t * width, width);
+            Quant.Prepare(o, 1, width, 2, j->DimAct.Slice(t));
+        }
+    }
+
+    static void ExecuteAttnPostNorm(void* context, int task)
+    {
+        var j = (FrameJob*)context;
+        SliceRange(task, j->Tasks, j->Count, out var first, out var end);
+        var dim = j->Dim;
+        var w = j->Encoder;
+        for (var t = first; t < end; t++)
+            Ops.PostNormAdd(j->Residual + (long)t * dim, j->AttnProj + (long)t * dim, w->PostAttnNorm, w->AttnGate, dim);
+    }
+
+    static void ExecuteConvNormPrepare(void* context, int task)
+    {
+        var j = (FrameJob*)context;
+        SliceRange(task, j->Tasks, j->Count, out var first, out var end);
+        var dim = j->Dim;
+        var norm = j->Encoder->ConvNorm;
+        for (var t = first; t < end; t++)
+        {
+            var r = j->QuantizedRows + (long)t * dim;
+            Ops.ZeroCenteredRms(j->Residual + (long)t * dim, norm, dim, r);
+            Quant.Prepare(r, 1, dim, 2, j->DimAct.Slice(t));
+        }
+    }
+
+    static void ExecuteConvGlu(void* context, int task)
+    {
+        var j = (FrameJob*)context;
+        SliceRange(task, j->Tasks, j->Count, out var first, out var end);
+        var dim = j->Dim;
+        for (var t = first; t < end; t++)
+        {
+            var row = j->Glu + (long)t * 2 * dim;
+            Ops.Glu(row, row + dim, j->Hidden + (long)t * dim, dim);
+        }
+    }
+
+    static void ExecuteConvDepthwisePrepare(void* context, int task)
+    {
+        var j = (FrameJob*)context;
+        SliceRange(task, j->Tasks, j->Count, out var first, out var end);
+        var dim = j->Dim;
+        var kernel = j->ConvKernel;
+        var pad = kernel / 2;
+        var count = j->Count;
+        var w = j->Encoder;
+        for (var t = first; t < end; t++)
+        {
+            var o = j->Conv + (long)t * dim;
+            Ops.Zero(o, dim);
+            for (var k = 0; k < kernel; k++)
+            {
+                var source = t + k - pad;
+                if (source < 0 || source >= count) continue;
+                Ops.MultiplyAccumulate(o, w->Depthwise + k * dim, j->Hidden + (long)source * dim, dim);
+            }
+            var r = j->QuantizedRows + (long)t * dim;
+            Ops.ZeroCenteredRms(o, w->ConvOutNorm, dim, r);
+            Ops.Silu(r, dim);
+            Quant.Prepare(r, 1, dim, 2, j->DimAct.Slice(t));
+        }
+    }
+
+    static void ExecuteConvAdd(void* context, int task)
+    {
+        var j = (FrameJob*)context;
+        SliceRange(task, j->Tasks, j->Count, out var first, out var end);
+        var dim = j->Dim;
+        for (var t = first; t < end; t++)
+            Ops.AddScaled(j->Residual + (long)t * dim, j->AttnProj + (long)t * dim, 1f, dim);
+    }
+
+    static void ExecuteCrossPrepare(void* context, int task)
+    {
+        var j = (FrameJob*)context;
+        SliceRange(task, j->Tasks, j->Count, out var first, out var end);
+        var dim = j->Dim;
+        var half = dim / 2;
+        var mix = j->Audio->PositionMix;
+        for (var t = first; t < end; t++)
+        {
+            var row = j->QuantizedRows + (long)t * dim;
+            Buffer.MemoryCopy(j->EncoderOutput + (long)t * dim, row, dim * 4, dim * 4);
+            Ops.AddScaled(row, j->CrossPosSin + (long)t * half, mix, half);
+            Ops.AddScaled(row + half, j->CrossPosCos + (long)t * half, mix, half);
+            Quant.FakeA8(row, dim);
+            Quant.Prepare(row, 1, dim, 2, j->MemoryAct.Slice(t));
+        }
+    }
+
+    static void ExecuteCrossQuantize(void* context, int task)
+    {
+        var j = (FrameJob*)context;
+        SliceRange(task, j->Tasks, j->Count, out var first, out var end);
+        var count = j->Count;
+        var heads = j->Heads;
+        var qkDim = j->QkDim;
+        var vDim = j->VDim;
+        var c = j->Audio->Cross + j->Layer;
+        var mem = j->Memory;
+        for (var t = first; t < end; t++)
+            for (var h = 0; h < heads; h++)
+            {
+                var k = j->CrossKRaw + (long)t * heads * qkDim + h * qkDim;
+                Ops.ZeroCenteredRms(k, c->KNorm, qkDim, k);
+                var slot = (long)j->Layer * count * heads + (long)t * heads + h;
+                mem->KeyScales[slot] = Quant.QuantizeInt8(k, qkDim, mem->Keys + slot * qkDim);
+                mem->ValueScales[slot] = Quant.QuantizeInt8(j->CrossVRaw + (long)t * heads * vDim + h * vDim, vDim, mem->Values + slot * vDim);
+            }
+    }
+
     void RunEncoder(int count)
     {
         var width = 4 * dim;
-        for (var t = 0; t < count; t++)
-            for (var lane = 0; lane < 4; lane++) Buffer.MemoryCopy(stemOut + (long)t * dim, streamA + (long)t * width + lane * dim, dim * 4, dim * 4);
-        var stream = streamA;
-        var next = streamB;
-        var logits = stackalloc float[16];
-        var hpre = stackalloc float[4];
+        var job = CreateFrameJob(count);
+        job.Stream = streamA;
+        job.Next = streamB;
+        RunFrames(&ExecuteCopyLanes, ref job, count);
         for (var l = 0; l < audio->EncoderLayers; l++)
         {
             EncoderLayer* w = audio->Encoder + l;
+            job.Layer = l;
+            job.Encoder = w;
+            RunFrames(&ExecuteRmsAndPrepareStream, ref job, count);
             ref readonly var hyper = ref audio->EncoderHyper;
-            var lane = l % 4;
-            for (var t = 0; t < count; t++)
-            {
-                Ops.RmsUnit(stream + (long)t * width, width, normalized + (long)t * width);
-            }
-            Quant.Prepare(normalized, count, width, 4, streamAct);
             var mix = new MatMulBatch(streamAct, count);
             mix.Add(hyper.PhiPre.Slice(l * 4, 4), preOut, 4);
             mix.Add(hyper.PhiPost.Slice(l * 4, 4), postOut, 4);
             mix.Add(hyper.PhiRes.Slice(l * 16, 16), resOut, 16);
             MatMulBatch.Run(pool, &mix);
-            for (var t = 0; t < count; t++)
-            {
-                for (var i = 0; i < 4; i++)
-                {
-                    hpre[i] = Ops.Sigmoid(hyper.APre[l] * preOut[t * 4 + i] + hyper.BPre[l * 4 + i] + (i == lane ? 4f : -4f));
-                    postGate[t * 4 + i] = 2f * Ops.Sigmoid(hyper.APost[l] * postOut[t * 4 + i] + hyper.BPost[l * 4 + i] + (i == lane ? 0f : -4f));
-                }
-                Ops.Mix4(stream + (long)t * width, dim, hpre[0], hpre[1], hpre[2], hpre[3], input + (long)t * dim);
-                for (var i = 0; i < 16; i++) logits[i] = hyper.ARes[l] * resOut[t * 16 + i] + hyper.BRes[l * 16 + i];
-                Sinkhorn.Normalize(logits, residualMix + t * 16);
-                Buffer.MemoryCopy(input + (long)t * dim, residual + (long)t * dim, dim * 4, dim * 4);
-            }
+            RunFrames(&ExecutePreHyper, ref job, count);
 
             RunMlp(&w->Mlp0, w->PreMlpNorm0, count);
-            RunSelfAttention(w, count);
-            RunConvolution(w, count);
+            RunSelfAttention(w, ref job, count);
+            RunConvolution(w, ref job, count);
             RunMlp(&w->Mlp, w->PreMlpNorm, count);
 
-            for (var t = 0; t < count; t++)
-            {
-                Ops.Subtract(residual + (long)t * dim, input + (long)t * dim, dim, rowScratch);
-                for (var i = 0; i < 4; i++)
-                    Ops.Combine4(stream + (long)t * width, dim, residualMix[t * 16 + i * 4], residualMix[t * 16 + i * 4 + 1], residualMix[t * 16 + i * 4 + 2], residualMix[t * 16 + i * 4 + 3], rowScratch, postGate[t * 4 + i], next + (long)t * width + i * dim);
-            }
-            var swap = stream;
-            stream = next;
-            next = swap;
-            Observer?.Invoke("layer" + l, new ReadOnlySpan<float>(stream, count * width));
+            RunFrames(&ExecuteCombine, ref job, count);
+            var swap = job.Stream;
+            job.Stream = job.Next;
+            job.Next = swap;
+            Observer?.Invoke("layer" + l, new ReadOnlySpan<float>(job.Stream, count * width));
         }
-        for (var t = 0; t < count; t++)
-        {
-            Ops.Mix4(stream + (long)t * width, dim, 0.25f, 0.25f, 0.25f, 0.25f, rowScratch);
-            Ops.ZeroCenteredRms(rowScratch, audio->EncoderFinalNorm, dim, encoderOutput + (long)t * dim);
-        }
+        RunFrames(&ExecuteEncoderFinal, ref job, count);
         Observer?.Invoke("encoder", new ReadOnlySpan<float>(encoderOutput, count * dim));
     }
 
@@ -391,37 +836,16 @@ public sealed unsafe partial class Whistle : IDisposable
         MlpBatch.Run(pool, &batch, count);
     }
 
-    void RunSelfAttention(EncoderLayer* w, int count)
+    void RunSelfAttention(EncoderLayer* w, ref FrameJob job, int count)
     {
-        for (var t = 0; t < count; t++)
-        {
-            var r = quantizedRows + (long)t * dim;
-            Ops.ZeroCenteredRms(residual + (long)t * dim, w->AttnNorm, dim, r);
-        }
-        Quant.Prepare(quantizedRows, count, dim, 2, dimAct);
+        RunFrames(&ExecuteAttnNormPrepare, ref job, count);
         var projections = new MatMulBatch(dimAct, count);
         projections.Add(w->Q, qRaw, g.QueryWidth);
         projections.Add(w->K, kRaw, g.KeyWidth);
         projections.Add(w->V, vRaw, g.ValueWidth);
         projections.Add(w->Gate, gateOut, g.OutputWidth);
         MatMulBatch.Run(pool, &projections);
-        var half = g.QkDim / 2;
-        for (var t = 0; t < count; t++)
-        {
-            var q = qRaw + (long)t * g.QueryWidth;
-            var k = kRaw + (long)t * g.KeyWidth;
-            var v = vRaw + (long)t * g.ValueWidth;
-            for (var h = 0; h < g.Heads; h++) Ops.ZeroCenteredRms(q + h * g.QkDim, w->QNorm, g.QkDim, q + h * g.QkDim);
-            for (var h = 0; h < g.KvHeads; h++) Ops.ZeroCenteredRms(k + h * g.QkDim, w->KNorm, g.QkDim, k + h * g.QkDim);
-            Ops.Rope(q, g.Heads, g.QkDim, ropeCos + t * half, ropeSin + t * half);
-            Ops.Rope(k, g.KvHeads, g.QkDim, ropeCos + t * half, ropeSin + t * half);
-            for (var h = 0; h < g.Heads; h++) qScale[t * g.Heads + h] = Quant.QuantizeInt8(q + h * g.QkDim, g.QkDim, qInt8 + (long)t * g.QueryWidth + h * g.QkDim);
-            for (var h = 0; h < g.KvHeads; h++)
-            {
-                kScale[t * g.KvHeads + h] = Quant.QuantizeInt8(k + h * g.QkDim, g.QkDim, kInt8 + (long)t * g.KeyWidth + h * g.QkDim);
-                vScale[t * g.KvHeads + h] = Quant.QuantizeInt8(v + h * g.VDim, g.VDim, vInt8 + (long)t * g.ValueWidth + h * g.VDim);
-            }
-        }
+        RunFrames(&ExecuteAttnRopeQuantize, ref job, count);
         var attention = new AttentionBatch
         {
             Queries = qInt8, QueryScales = qScale, Keys = kInt8, KeyScales = kScale, Values = vInt8, ValueScales = vScale,
@@ -429,60 +853,25 @@ public sealed unsafe partial class Whistle : IDisposable
             Capacity = count, Frames = count,
         };
         AttentionBatch.Run(pool, &attention, count);
-        for (var t = 0; t < count; t++)
-        {
-            var o = attnOut + (long)t * g.OutputWidth;
-            Ops.MultiplyBySigmoid(o, gateOut + (long)t * g.OutputWidth, g.OutputWidth);
-        }
-        Quant.Prepare(attnOut, count, g.OutputWidth, 2, dimAct);
+        RunFrames(&ExecuteAttnGatePrepare, ref job, count);
         var output = new MatMulBatch(dimAct, count);
         output.Add(w->Out, attnProj, dim);
         MatMulBatch.Run(pool, &output);
-        for (var t = 0; t < count; t++)
-        {
-            Ops.ZeroCenteredRms(attnProj + (long)t * dim, w->PostAttnNorm, dim, rowScratch);
-            Ops.AddScaled(residual + (long)t * dim, rowScratch, w->AttnGate, dim);
-        }
+        RunFrames(&ExecuteAttnPostNorm, ref job, count);
     }
 
-    void RunConvolution(EncoderLayer* w, int count)
+    void RunConvolution(EncoderLayer* w, ref FrameJob job, int count)
     {
-        for (var t = 0; t < count; t++)
-        {
-            var r = quantizedRows + (long)t * dim;
-            Ops.ZeroCenteredRms(residual + (long)t * dim, w->ConvNorm, dim, r);
-        }
-        Quant.Prepare(quantizedRows, count, dim, 2, dimAct);
+        RunFrames(&ExecuteConvNormPrepare, ref job, count);
         var expand = new MatMulBatch(dimAct, count);
         expand.Add(w->Pw1, glu, 2 * dim);
         MatMulBatch.Run(pool, &expand);
-        for (var t = 0; t < count; t++)
-        {
-            var row = glu + (long)t * 2 * dim;
-            var o = hidden + (long)t * dim;
-            Ops.Glu(row, row + dim, o, dim);
-        }
-        var kernel = audio->ConvKernel;
-        var pad = kernel / 2;
-        for (var t = 0; t < count; t++)
-        {
-            var o = conv + (long)t * dim;
-            Ops.Zero(o, dim);
-            for (var j = 0; j < kernel; j++)
-            {
-                var source = t + j - pad;
-                if (source < 0 || source >= count) continue;
-                Ops.MultiplyAccumulate(o, w->Depthwise + j * dim, hidden + (long)source * dim, dim);
-            }
-            var r = quantizedRows + (long)t * dim;
-            Ops.ZeroCenteredRms(o, w->ConvOutNorm, dim, r);
-            Ops.Silu(r, dim);
-        }
-        Quant.Prepare(quantizedRows, count, dim, 2, dimAct);
+        RunFrames(&ExecuteConvGlu, ref job, count);
+        RunFrames(&ExecuteConvDepthwisePrepare, ref job, count);
         var project = new MatMulBatch(dimAct, count);
         project.Add(w->Pw2, attnProj, dim);
         MatMulBatch.Run(pool, &project);
-        for (var t = 0; t < count; t++) Ops.AddScaled(residual + (long)t * dim, attnProj + (long)t * dim, 1f, dim);
+        RunFrames(&ExecuteConvAdd, ref job, count);
     }
 
     public float[] Embed(ReadOnlySpan<float> pcm)
@@ -497,36 +886,22 @@ public sealed unsafe partial class Whistle : IDisposable
     {
         var count = frames;
         var heads = g.Heads;
-        var angleStep = -Math.Log(10000.0) / (dim / 2 - 1);
-        for (var t = 0; t < count; t++)
+        var job = CreateFrameJob(count);
+        fixed (CrossMemory* mp = &memory)
         {
-            var row = quantizedRows + (long)t * dim;
-            for (var i = 0; i < dim / 2; i++)
+            job.Memory = mp;
+            RunFrames(&ExecuteCrossPrepare, ref job, count);
+            Observer?.Invoke("memory", new ReadOnlySpan<float>(quantizedRows, count * dim));
+            for (var l = 0; l < g.Layers; l++)
             {
-                var angle = t * Math.Exp(angleStep * i);
-                row[i] = encoderOutput[(long)t * dim + i] + audio->PositionMix * (float)Math.Sin(angle);
-                row[dim / 2 + i] = encoderOutput[(long)t * dim + dim / 2 + i] + audio->PositionMix * (float)Math.Cos(angle);
+                var c = audio->Cross + l;
+                var batch = new MatMulBatch(memoryAct, count);
+                batch.Add(c->K, crossKRaw, heads * g.QkDim);
+                batch.Add(c->V, crossVRaw, heads * g.VDim);
+                MatMulBatch.Run(pool, &batch);
+                job.Layer = l;
+                RunFrames(&ExecuteCrossQuantize, ref job, count);
             }
-            Quant.FakeA8(row, dim);
-        }
-        Observer?.Invoke("memory", new ReadOnlySpan<float>(quantizedRows, count * dim));
-        Quant.Prepare(quantizedRows, count, dim, 2, memoryAct);
-        for (var l = 0; l < g.Layers; l++)
-        {
-            var c = audio->Cross + l;
-            var batch = new MatMulBatch(memoryAct, count);
-            batch.Add(c->K, crossKRaw, heads * g.QkDim);
-            batch.Add(c->V, crossVRaw, heads * g.VDim);
-            MatMulBatch.Run(pool, &batch);
-            for (var t = 0; t < count; t++)
-                for (var h = 0; h < heads; h++)
-                {
-                    var k = crossKRaw + (long)t * heads * g.QkDim + h * g.QkDim;
-                    Ops.ZeroCenteredRms(k, c->KNorm, g.QkDim, k);
-                    var slot = (long)l * count * heads + (long)t * heads + h;
-                    memory.KeyScales[slot] = Quant.QuantizeInt8(k, g.QkDim, memory.Keys + slot * g.QkDim);
-                    memory.ValueScales[slot] = Quant.QuantizeInt8(crossVRaw + (long)t * heads * g.VDim + h * g.VDim, g.VDim, memory.Values + slot * g.VDim);
-                }
         }
         memory.Frames = count;
         decoder.Attach(memory);

@@ -1,29 +1,8 @@
 namespace Needle;
 
-// N53: portable register-blocked Kron (scalar, netstandard2.1-safe).
-//
-// Mirrors W12's KronAvx2/KronAvx512 layout (Blocks.cs): result rows blocked by
-// four, two phases through a 4 x cols tile, columns unrolled. The SIMD kernels
-// hold 4 rows x 2 vectors of accumulators; here each vector is replaced by
-// four scalar accumulators (4 rows x 4 columns = 16 live accumulators), which
-// keeps four independent FMA chains per row and hides FMA latency the same
-// way. Every z element is loaded once per four k rows (phase 1) and every
-// right element once per four k rows (phase 2): a quarter of Scalar.Kron's
-// loads, with the same FMA count.
-//
-// Contract: identical to Scalar.Kron for any non-negative geometry, including
-// odd column counts (scalar c tail) and short/ragged inputs. Only a ragged
-// row count (resultRows % 4 != 0, which W12's Blocked() gate also rejects)
-// delegates to Scalar.Kron.
-//
-// Wiring (N30 owns the table while it is in flight, so this file installs
-// nothing): the future dispatch is one line in HadamardMlp.Kron or the N30
-// HadamardMlp entry — PortableMlp.Kron takes exactly Scalar.Kron's arguments.
 internal static unsafe class PortableMlp
 {
-    // Must match HadamardMlp.TileRows: four result rows per tile.
     const int BlockRows = 4;
-    // Scalar columns per unroll step: BlockRows x UnrollCols accumulators.
     const int UnrollCols = 4;
 
     [System.Runtime.CompilerServices.SkipLocalsInit]
@@ -32,12 +11,9 @@ internal static unsafe class PortableMlp
         if (resultRows <= 0 || cols <= 0) return;
         if ((resultRows & 3) != 0)
         {
-            // Ragged row count: same fallback W12's Blocked() gate takes.
             Scalar.Kron(z, activeRows, left, right, rows, cols, resultRows, result);
             return;
         }
-        // One tile row per k row; every element is written in phase 1 before
-        // phase 2 reads it, so skipping zero-init is safe.
         var tile = stackalloc float[BlockRows * cols];
         var mainCols = cols & ~3;
         nint tileStride = cols;
@@ -45,7 +21,6 @@ internal static unsafe class PortableMlp
         nint tileStride3 = 3 * cols;
         for (var k = 0; k < resultRows; k += BlockRows)
         {
-            // Phase 1: tile[r][c] = sum_i left[i * rows + k + r] * z[i * cols + c].
             for (var c = 0; c < mainCols; c += UnrollCols)
             {
                 float a00 = 0, a01 = 0, a02 = 0, a03 = 0;
@@ -88,7 +63,6 @@ internal static unsafe class PortableMlp
                 tile[tileStride2 + c] = s2;
                 tile[tileStride3 + c] = s3;
             }
-            // Phase 2: result[k + r][c] = sum_j tile[r][j] * right[j * cols + c].
             var output = result + k * cols;
             for (var c = 0; c < mainCols; c += UnrollCols)
             {

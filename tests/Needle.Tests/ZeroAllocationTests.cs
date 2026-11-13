@@ -22,8 +22,6 @@ internal static unsafe class MallocProbe
 internal static class AllocationProbe
 {
     public const string Variable = "NEEDLE_ALLOCATION_PROBE";
-    // The scalar backend is an order of magnitude slower, so the NEEDLE_SCALAR=1 rerun would blow
-    // the probe's 5 minute budget; a handful of warm rounds shows the same allocation behavior.
     static int WarmUpRounds => Tiers.Active == CpuTier.Scalar ? 4 : 20;
     static int MeasuredRounds => Tiers.Active == CpuTier.Scalar ? 20 : 100;
 
@@ -35,8 +33,6 @@ internal static class AllocationProbe
         using var model = Model.Open(Assets.Model);
         var retrieval = mode == "retrieval";
         var tools = retrieval ? SessionCases.Catalog() : SessionCases.DefaultTools();
-        // The jumpforward mode decodes with token-forced chunking on the same
-        // prompts: the chunk buffers are stack-owned, so the 0 B bar holds.
         using var session = new NeedleSession(model, tools, new NeedleOptions { Threads = Assets.ThreadsFor(threads), AutoDate = false, RetrievalTopK = 5, JumpForward = mode == "jumpforward" });
         var calls = new byte[4096];
         var reasoning = new byte[4096];

@@ -6,35 +6,6 @@ using Needle;
 
 namespace Needle.Cli;
 
-/// <summary>
-/// N70: `needle serve &lt;model.cact&gt; &lt;tools.json&gt; [options]`.
-///
-/// NativeAOT inference child for runtimes with nothing fast (Mono-only Unity
-/// LTS users until the Burst provider lands). One JSON request per stdin line,
-/// one JSON reply per stdout line; diagnostics go to stderr so stdout stays a
-/// clean reply stream. The parent (Unity) kills the child on exit; the child
-/// also exits on its own when stdin closes (EOF).
-///
-/// Request line: {"id":1,"type":"query","text":"..."}
-///   type: "query" (or "q"), "tool_result" (or "tool"), "reset", "ping".
-///   "text" aliases "query"/"result" are accepted. Missing type means query.
-/// Reply line: {"id":1,&lt;CallResult.ToJson() fields...&gt;} for query/tool_result,
-///   {"id":N,"success":true,"error":null,"type":"pong"} for ping,
-///   {"id":N,"success":true,"error":null,"type":"reset"} for reset,
-///   {"id":&lt;id|null&gt;,"success":false,"error":"...","type":"error",
-///     "function_calls":[]} for malformed requests.
-/// Unknown "id" shape echoes as null; numeric and string ids round-trip.
-///
-/// Overhead budget (acceptance): steady-state round trip (client wall clock
-/// minus the server "total_time_ms" field) must stay within 1 ms of in-process
-/// net10 latency. Measure with: ping for pure pipe cost, then a warm query
-/// and subtract its total_time_ms. Keep per-request work to one parse, one
-/// session turn on the already-primed session, and one emit: no per-request
-/// allocation beyond the reply string itself.
-///
-/// Wiring (Program.cs, one line): ["serve", var model, var tools, .. var rest]
-///   =&gt; Serve.Run(model, tools, rest), plus a usage line.
-/// </summary>
 internal static class Serve
 {
     public static int Run(string modelPath, string toolsPath, string[] options)
@@ -134,8 +105,6 @@ internal static class Serve
         byte[]? prefix = null;
         if (prefixPath != null)
         {
-            // A shipped prefix bakes a date-free system prompt (AutoDate=false,
-            // plan.md §10.5); fail fast instead of tripping prefix validation.
             if (autoDate) { model.Dispose(); Console.Error.WriteLine("cannot use --prefix without --no-date (primed prefixes bake AutoDate=false)"); return 1; }
             try { prefix = File.ReadAllBytes(prefixPath); }
             catch (Exception e) { model.Dispose(); Console.Error.WriteLine($"cannot read prefix {prefixPath}: {e.Message}"); return 1; }
@@ -234,7 +203,6 @@ internal static class Serve
 
     static string WithId(string idJson, string callJson)
     {
-        // CallResult.ToJson emits {"success":...}; splice the id in front.
         if (callJson.Length > 0 && callJson[0] == '{') return "{\"id\":" + idJson + "," + callJson.Substring(1);
         return "{\"id\":" + idJson + ",\"success\":false,\"error\":\"internal reply\",\"type\":\"error\",\"function_calls\":[]}";
     }

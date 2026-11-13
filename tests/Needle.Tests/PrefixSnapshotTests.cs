@@ -7,13 +7,6 @@ using Xunit.Abstractions;
 
 namespace Needle.Tests;
 
-// MEM-21: prefix snapshot/rollback as a readonly struct token (O(1), no
-// recompute). Mark/CheckpointSpec snapshot once into preallocated buffers;
-// Rewind(token)/RestoreSpec(token) validate the capture and roll back by
-// assignment. These tests pin: token rollback is bit-identical to replay
-// from scratch, matches the Export/Import byte round-trip, mirrors the
-// parameterless paths exactly, rejects stale/foreign tokens, and allocates
-// nothing.
 public sealed unsafe class PrefixSnapshotTests : IDisposable
 {
     const int PrefixLength = 100;
@@ -47,8 +40,6 @@ public sealed unsafe class PrefixSnapshotTests : IDisposable
         return engine;
     }
 
-    // Rollback-bit-equality vs recompute: rewind-to-token plus re-feed must
-    // reproduce the exact state of a fresh engine fed the same rows.
     [Fact]
     public void TokenRollbackIsBitIdenticalToReplay()
     {
@@ -69,8 +60,6 @@ public sealed unsafe class PrefixSnapshotTests : IDisposable
         Assert.Equal(Observe(replay), Observe(engine));
     }
 
-    // The persisted prefix must carry the same state the token pins:
-    // export/import round-trip, then the same query, equals token rollback.
     [Fact]
     public void TokenRollbackMatchesExportImportRoundTrip()
     {
@@ -90,8 +79,6 @@ public sealed unsafe class PrefixSnapshotTests : IDisposable
         Assert.Equal(viaBytes, Observe(engine));
     }
 
-    // Speculative token path mirrors the parameterless checkpoint/restore
-    // bit-for-bit (logits and pooled confidence).
     [Fact]
     public void SpecTokenRollbackIsBitExact()
     {
@@ -115,8 +102,6 @@ public sealed unsafe class PrefixSnapshotTests : IDisposable
         Assert.Equal(PooledConfidence(viaBare), PooledConfidence(viaToken));
     }
 
-    // A re-Mark (prefix edit) retires the earlier token; rolling back to it
-    // throws, while the current token still works.
     [Fact]
     public void StalePrefixTokenThrows()
     {
@@ -128,8 +113,6 @@ public sealed unsafe class PrefixSnapshotTests : IDisposable
         Assert.Equal(PrefixLength + 8, engine.Length);
     }
 
-    // Tokens never cross domains: a speculative token is not a prefix
-    // rewind point and vice versa. A re-Checkpoint retires the old draft.
     [Fact]
     public void ForeignAndStaleSpecTokensThrow()
     {
@@ -146,7 +129,6 @@ public sealed unsafe class PrefixSnapshotTests : IDisposable
         Assert.Equal(PrefixLength, engine.Length);
     }
 
-    // Token capture and rollback allocate nothing (O(1) assignment path).
     [Fact]
     public void TokenRollbackAllocatesNothing()
     {

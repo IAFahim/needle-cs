@@ -7,7 +7,6 @@ using Needle;
 
 namespace Needle.Cli;
 
-/// <summary>`needle cpu`: which kernel tier this process picked and why, for bug reports and CI logs.</summary>
 internal static class CpuInfo
 {
     public static int Run()

@@ -1,8 +1,3 @@
-// N11c: EditMode bench (CoreCLR Editor + ns2.1 DLL). Reads the model and tools
-// paths from the environment (set by tools/bench-ns21.sh editmode) so the
-// test stays hermetic: NEEDLE_MODEL, NEEDLE_TOOLS, NEEDLE_GAME_TOOLS
-// (optional), NEEDLE_THREADS (default "4"), NEEDLE_REPS (default 2),
-// NEEDLE_WARMUPS (default 1), NEEDLE_SETS (default "golden").
 using System;
 using System.IO;
 using NUnit.Framework;

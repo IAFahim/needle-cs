@@ -102,8 +102,6 @@ public sealed unsafe class MaskedDecodingTests : IDisposable
                 fixed (float* v = values)
                     actual = Ops.BestProbability(v, count, best);
                 Assert.InRange(Math.Abs(actual - expected), 0.0, 1e-6);
-                // The legacy path normalizes the whole allowed set; the best
-                // slot must agree with the log-sum-exp shortcut.
                 var legacy = new float[count];
                 Array.Copy(values, legacy, count);
                 var bestSlot = 0;
@@ -158,14 +156,11 @@ public sealed unsafe class MaskedDecodingTests : IDisposable
         using var grammar = new Grammar(set.Tools);
         var program = grammar.Program;
         var destination = new byte[256];
-        // From a fresh state only '[' opens a call list.
         var state = Grammar.Start(program);
         int count;
         fixed (byte* d = destination)
             count = Grammar.ForcedBytes(program, &state, new Span<byte>(d, destination.Length));
         Assert.Equal(new byte[] { (byte)'[' }, destination.AsSpan(0, count).ToArray());
-        // After '[' the grammar branches (']' or '{'), so nothing is forced
-        // and the state must be untouched.
         state = Grammar.Start(program);
         AdvancePrefix(program, &state, "[");
         var depth = state.Depth;
@@ -173,17 +168,12 @@ public sealed unsafe class MaskedDecodingTests : IDisposable
             count = Grammar.ForcedBytes(program, &state, new Span<byte>(d, destination.Length));
         Assert.Equal(0, count);
         Assert.Equal(depth, state.Depth);
-        // After "[{" the call head `"name":"` is fixed; the tool name that
-        // follows is a choice, so the run stops there.
         state = Grammar.Start(program);
         AdvancePrefix(program, &state, "[{");
         fixed (byte* d = destination)
             count = Grammar.ForcedBytes(program, &state, new Span<byte>(d, destination.Length));
         Assert.Equal(Encoding.UTF8.GetBytes("\"name\":\""), destination.AsSpan(0, count).ToArray());
         Assert.NotEqual(1, AdmissibleCount(program, state));
-        // The sink overload reports the same bytes and leaves an equivalent
-        // state: same admissibility profile plus identical sink events to
-        // feeding the bytes one by one.
         var plain = Grammar.Start(program);
         AdvancePrefix(program, &plain, "[{");
         var sink = new EventCounter();
@@ -219,7 +209,6 @@ public sealed unsafe class MaskedDecodingTests : IDisposable
         var mask = new uint[trie.Words];
         var scratch = new byte[256];
         var random = new Random(5);
-        // A mid-string state exercises the string fast path (unbounded text).
         var text = Grammar.Start(program);
         AdvancePrefix(program, &text, "[{\"name\":\"say\",\"arguments\":{\"text\":\"hello");
         states.Add(text);
@@ -240,9 +229,6 @@ public sealed unsafe class MaskedDecodingTests : IDisposable
         return states;
     }
 
-    // Mirrors TokenTrie.Allow's string fast-path gate: an unbounded string
-    // value whose top frame is mid-literal. Passed by value; the struct copy
-    // keeps the address-of below legal for an iteration variable.
     static bool IsStringFastPath(GrammarProgram* program, GrammarState state)
     {
         if (state.Depth == 0) return false;
@@ -268,11 +254,6 @@ public sealed unsafe class MaskedDecodingTests : IDisposable
             fixed (uint* f = first) trie.Allow(grammar.Program, state, f);
             fixed (uint* s = second) trie.Allow(grammar.Program, state, s);
             Assert.Equal(first, second);
-            // The unbounded-string fast path is a conservative approximation:
-            // it admits plain and quoted pieces only, while the grammar also
-            // accepts bytes like DEL inside strings. There the memoized mask
-            // must be a subset of the brute-force set (every bit is genuine);
-            // everywhere else the trie walk is exact.
             var exact = !IsStringFastPath(grammar.Program, state);
             for (var id = 0; id < model.VocabSize; id++)
             {
@@ -298,14 +279,6 @@ public sealed unsafe class MaskedDecodingTests : IDisposable
     [Fact]
     public void TokenStepMasksMatchBruteForceAndReportColdVsWarm()
     {
-        // Issue #39: the bench harness times Allow per byte position with a
-        // warm mask cache (repeated rounds over the same states turn every
-        // structural state into a cache hit), and byte positions dilute the
-        // structural states with cheap mid-string fast-path states. Real call
-        // generation calls Allow once per token at token-boundary states,
-        // each visited once. This replays a genuine greedy walk token by
-        // token and reports the true cold cost per call step next to the
-        // warm cost, so the plan's per-step figure stays honest.
         var tools = new ToolSet(BenchPrompts.GameToolsJson);
         using var grammar = new Grammar(tools.Tools);
         using var tokenizer = new Tokenizer(model);
@@ -363,8 +336,6 @@ public sealed unsafe class MaskedDecodingTests : IDisposable
             state = cursor;
         }
         Assert.True(states.Count > 0, "walk produced no steps");
-        // Cold pass on a fresh trie: every token state is a first visit, as
-        // in real generation. Masks are saved for the brute-force check.
         using var trie = new TokenTrie(tokenizer, model.VocabSize);
         var saved = new uint[states.Count * words];
         var tick = Stopwatch.GetTimestamp();
@@ -398,8 +369,6 @@ public sealed unsafe class MaskedDecodingTests : IDisposable
                 compared++;
             }
         }
-        // Every token must fit the trie walker's byte budget, otherwise Walk
-        // silently drops it from the mask.
         var longest = 0;
         for (var id = 0; id < model.VocabSize; id++)
         {
@@ -408,7 +377,6 @@ public sealed unsafe class MaskedDecodingTests : IDisposable
             longest = Math.Max(longest, length);
         }
         Assert.True(longest <= 63, $"token spans {longest} bytes, beyond the trie walk budget");
-        // Warm pass on the same trie: structural states are now cache hits.
         tick = Stopwatch.GetTimestamp();
         foreach (var tokenState in states)
         {
@@ -447,8 +415,6 @@ public sealed unsafe class MaskedDecodingTests : IDisposable
             fixed (float* d = sparse)
                 engine.LogitsForRows(r, rows.Length, d);
             for (var i = 0; i < rows.Length; i++) Assert.Equal(full[rows[i]], sparse[i]);
-            // The sparse argmax path must pick the same token with a
-            // log-sum-exp probability matching the dense masked path.
             var mask = new uint[(model.VocabSize + 31) / 32];
             foreach (var id in rows) mask[id / 32] |= 1u << (id % 32);
             int denseBest, sparseBest;
@@ -547,15 +513,9 @@ public sealed unsafe class MaskedDecodingTests : IDisposable
             var allowed = 0;
             for (var w = 0; w < words; w++) allowed += System.Numerics.BitOperations.PopCount(mask[w]);
             Assert.True(allowed > 0, "grammar dead end on the full walk");
-            // The raw greedy walk would end immediately with an empty call
-            // list (']'); force the call branch once so the walk exercises a
-            // realistic multi-step call. The singleton still flows through
-            // both argmax paths, so equality still verifies them.
             uint[] effective = mask;
             if (steps == 2)
             {
-                // The trie admits every tokenization of a forced span, so no
-                // single token spells '{'; take the shortest '{'-leading one.
                 Array.Clear(single, 0, words);
                 var forced = -1;
                 var forcedLength = int.MaxValue;
@@ -571,9 +531,6 @@ public sealed unsafe class MaskedDecodingTests : IDisposable
                 effective = single;
                 allowed = 1;
             }
-            // Reference: masked gather over the full head plus a log-sum-exp
-            // probability over the allowed set only. full.Logits is valid for
-            // the current state: the previous feed computed it.
             int pick;
             float probability;
             tick = Stopwatch.GetTimestamp();
@@ -583,10 +540,6 @@ public sealed unsafe class MaskedDecodingTests : IDisposable
             fixed (uint* m = effective)
                 pick = ArgMaxWithProbabilityReference(c, m, words, g, out probability);
             argmaxTicks += Stopwatch.GetTimestamp() - tick;
-            // Sparse twin: the sparse engine's last feed is the same token
-            // the full engine fed last, so its hidden state matches and
-            // LogitsForRows must reproduce the current full logits. It runs
-            // before either engine feeds the new pick.
             var extracted = 0;
             var useSparse = allowed <= 256;
             if (useSparse)
@@ -601,8 +554,6 @@ public sealed unsafe class MaskedDecodingTests : IDisposable
                     }
                 }
             }
-            // Timed head comparison: full Feed(true) covers forward+head while
-            // the sparse side covers forward-without-logits plus LogitsForRows.
             int spick;
             float sprob;
             if (useSparse)
@@ -630,8 +581,6 @@ public sealed unsafe class MaskedDecodingTests : IDisposable
             Assert.InRange(Math.Abs(probability - sprob), 0f, 1e-6f);
             picks.Add(pick);
             probs.Add(probability);
-            // Advance first so the feed flag matches the session: no logits
-            // are needed once the new state completes.
             var cursor = state;
             AdvanceToken(grammar.Program, tokenizer, &cursor, pick, bytes);
             var done = Grammar.Complete(cursor);

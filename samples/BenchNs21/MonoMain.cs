@@ -1,7 +1,3 @@
-// N11b entry point: Unity's bundled Mono 6.13 running the ns2.1 build.
-// Compiled by tools/bench-ns21.sh mono with the bundled csc against the
-// netstandard facade; keep this file at C#-7 level (no top-level statements,
-// no target-typed new, no switch expressions).
 using System;
 
 namespace Needle.Bench

@@ -3,11 +3,6 @@ using Xunit;
 
 namespace Needle.Tests;
 
-// SIMD-04: stencil kernels use negative-offset unaligned loads
-// (Taps3 reads current[c-width], current[c-2*width]; RoPE walks lo/hi pairs).
-// These canary tests prove the vector loops never read or write past their
-// arrays: guard lanes around every buffer must survive, and the AVX2 output
-// must match the scalar reference.
 public sealed unsafe class SimdCanaryTests
 {
     const float Guard = 12345.678f;

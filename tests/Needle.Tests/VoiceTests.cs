@@ -98,8 +98,6 @@ public sealed class VoiceTests : IDisposable
     [Fact]
     public void SpanTranscriptionAllocatesNothing()
     {
-        // Process-wide GC bytes include background host threads, so measure in a quiet
-        // child process exactly like ZeroAllocationTests does.
         var measurement = RunVoiceProbe(4);
         Assert.Equal(0, measurement.Unexpected);
         Assert.Equal(0, measurement.CallerThread);
@@ -157,12 +155,10 @@ public sealed class VoiceTests : IDisposable
         Assert.False(talk.IsHeld);
         Assert.Equal(expected, Encoding.UTF8.GetString(utf8, 0, released.Utf8Length));
 
-        // Empty release transcribes nothing.
         var empty = talk.Release(whistle, utf8, slices);
         Assert.Equal(0, empty.Utf8Length);
         Assert.Null(empty.Language);
 
-        // Overflow is reported, never grown.
         var small = new PushToTalk(maxSeconds: 1);
         Assert.True(small.Write(pcm.AsSpan(0, 8000)));
         Assert.False(small.Write(pcm.AsSpan(0, 8001)));
@@ -255,7 +251,6 @@ public sealed class VoiceTests : IDisposable
             WhistleThreads = 2,
         });
 
-        // Leg A: audio in, transcribed reply out.
         var pcm = Clip("record.wav");
         const int Chunk = 4800;
         for (var at = 0; at < pcm.Length; at += Chunk)
@@ -269,7 +264,6 @@ public sealed class VoiceTests : IDisposable
         Assert.False(voiceReply.QueryTruncated);
         Assert.NotEqual(ReplyStatus.Failed, voiceReply.Reply.Status);
 
-        // Leg B: command text through the same hub channel, typed dispatch at the caller.
         Assert.True(host.Channel.TrySubmitQuery("set a timer for 12 minutes and play some Miles Davis"u8, out _));
         var direct = WaitForDirect(ref channel, TimeSpan.FromSeconds(180));
         Assert.Equal(ReplyStatus.Called, direct.Reply.Status);
@@ -442,19 +436,12 @@ internal static class VoiceProbe
         var utf8 = new byte[whistle.MaxTranscriptTokens * 64];
         var words = new WordSlice[whistle.MaxTranscriptTokens + 1];
         for (var round = 0; round < 5; round++) whistle.TranscribeUtf8(pcm, utf8, words);
-        // The contract is that steady-state calls allocate nothing. A one-off allocation by the
-        // runtime or another process thread (finalizers, tiering, diagnostics) can land in any
-        // single window but cannot land in all of them, whereas a per-call allocation would.
-        // So: the caller thread must stay at zero in every window, and the whole process must
-        // reach zero in at least one.
         var silence = new float[3 * Wav.SampleRate];
         var unexpected = 0;
         long callerWorst = 0, processBest = long.MaxValue, nativeWorst = 0;
         var longest = 0L;
         for (var window = 0; window < Windows; window++)
         {
-            // Finalizers of earlier garbage allocate on the finalizer thread, which the
-            // whole-process counter would blame on the measured loop.
             GC.Collect();
             GC.WaitForPendingFinalizers();
             GC.Collect();
@@ -478,10 +465,6 @@ internal static class VoiceProbe
             nativeWorst = Math.Max(nativeWorst, nativeAfter - nativeBefore);
         }
 
-        // Ambient allocation: what the rest of the process (runtime diagnostics, thread pool, the
-        // host's own services) allocates over an equally long period with the library idle.
-        // Some hosts show a steady few hundred bytes there; the contract is that the library adds
-        // nothing on top of it.
         long ambient = 0;
         for (var window = 0; window < Windows; window++)
         {

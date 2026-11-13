@@ -1,5 +1,6 @@
 using System;
 using System.Runtime.CompilerServices;
+using System.Threading;
 #if NEEDLE_SIMD
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -40,6 +41,7 @@ internal readonly unsafe struct Activations
     }
 }
 
+[SkipLocalsInit]
 internal static unsafe class Quant
 {
     const float HadamardScale = 0.08838834764831845f;
@@ -108,7 +110,11 @@ internal static unsafe class Quant
         var peak = AbsMax(x, n);
         var scale = peak > 0f ? peak / 127f : 1f;
         var inv = Vector256.Create(1f / scale);
-        for (var i = 0; i < n; i += 8)
+        var i = 0;
+        var interleave = Vector256.Create(0, 4, 1, 5, 2, 6, 3, 7);
+        for (; i + 32 <= n; i += 32)
+            Avx.Store(destination + i, Pack32(x + i, inv, interleave));
+        for (; i < n; i += 8)
         {
             var q = Avx.ConvertToVector256Int32(Avx.Multiply(Avx.LoadVector256(x + i), inv));
             var packed = Sse2.PackSignedSaturate(q.GetLower(), q.GetUpper());
@@ -116,6 +122,260 @@ internal static unsafe class Quant
         }
         return scale;
 #endif
+    }
+
+#if NEEDLE_SIMD
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    static Vector256<sbyte> Pack32(float* source, Vector256<float> inv, Vector256<int> interleave)
+    {
+        var c0 = Avx.ConvertToVector256Int32(Avx.Multiply(Avx.LoadVector256(source), inv));
+        var c1 = Avx.ConvertToVector256Int32(Avx.Multiply(Avx.LoadVector256(source + 8), inv));
+        var c2 = Avx.ConvertToVector256Int32(Avx.Multiply(Avx.LoadVector256(source + 16), inv));
+        var c3 = Avx.ConvertToVector256Int32(Avx.Multiply(Avx.LoadVector256(source + 24), inv));
+        var p01 = Avx2.PackSignedSaturate(c0, c1);
+        var p23 = Avx2.PackSignedSaturate(c2, c3);
+        var packed = Avx2.PackSignedSaturate(p01, p23);
+        return Avx2.PermuteVar8x32(packed.AsInt32(), interleave).AsSByte();
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    static Vector256<float> Intra8Scale(
+        Vector256<float> v,
+        Vector256<float> pairSign,
+        Vector256<float> quadSign,
+        Vector256<float> halfSign,
+        Vector256<float> scale)
+    {
+        v = Fma.MultiplyAdd(v, pairSign, Avx.Permute(v, 0b10_11_00_01));
+        v = Fma.MultiplyAdd(v, quadSign, Avx.Permute(v, 0b01_00_11_10));
+        v = Fma.MultiplyAdd(v, halfSign, Avx.Permute2x128(v, v, 0x01));
+        return Avx.Multiply(v, scale);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    static float HadamardTailAvx2(float* p)
+    {
+        var pairSign = Vector256.Create(1f, -1f, 1f, -1f, 1f, -1f, 1f, -1f);
+        var quadSign = Vector256.Create(1f, 1f, -1f, -1f, 1f, 1f, -1f, -1f);
+        var halfSign = Vector256.Create(1f, 1f, 1f, 1f, -1f, -1f, -1f, -1f);
+        var scale = Vector256.Create(HadamardScale);
+        var peak = Vector256<float>.Zero;
+        for (var b = 0; b < Cq.GroupSize; b += 32)
+        {
+            var r0 = Avx.LoadVector256(p + b);
+            var r1 = Avx.LoadVector256(p + b + 8);
+            var r2 = Avx.LoadVector256(p + b + 16);
+            var r3 = Avx.LoadVector256(p + b + 24);
+            var p0 = Avx.Add(r0, r2);
+            var p1 = Avx.Subtract(r0, r2);
+            var p2 = Avx.Add(r1, r3);
+            var p3 = Avx.Subtract(r1, r3);
+            var v0 = Intra8Scale(Avx.Add(p0, p2), pairSign, quadSign, halfSign, scale);
+            var v1 = Intra8Scale(Avx.Subtract(p0, p2), pairSign, quadSign, halfSign, scale);
+            var v2 = Intra8Scale(Avx.Add(p1, p3), pairSign, quadSign, halfSign, scale);
+            var v3 = Intra8Scale(Avx.Subtract(p1, p3), pairSign, quadSign, halfSign, scale);
+            Avx.Store(p + b, v0);
+            Avx.Store(p + b + 8, v1);
+            Avx.Store(p + b + 16, v2);
+            Avx.Store(p + b + 24, v3);
+            var m01 = Avx.Max(Vector256.Abs(v0), Vector256.Abs(v1));
+            var m23 = Avx.Max(Vector256.Abs(v2), Vector256.Abs(v3));
+            peak = Avx.Max(peak, Avx.Max(m01, m23));
+        }
+        var folded = Sse.Max(peak.GetLower(), peak.GetUpper());
+        folded = Sse.Max(folded, Sse.Shuffle(folded, folded, 0b01_00_11_10));
+        return Sse.Max(folded, Sse.Shuffle(folded, folded, 0b10_11_00_01)).ToScalar();
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    static float HadamardPeakAvx2(float* source, float* p)
+    {
+        for (var i = 0; i < 32; i += 8)
+        {
+            var a = Avx.LoadVector256(source + i);
+            var b = Avx.LoadVector256(source + i + 32);
+            var c = Avx.LoadVector256(source + i + 64);
+            var d = Avx.LoadVector256(source + i + 96);
+            var ab0 = Avx.Add(a, c);
+            var ab1 = Avx.Subtract(a, c);
+            var cd0 = Avx.Add(b, d);
+            var cd1 = Avx.Subtract(b, d);
+            Avx.Store(p + i, Avx.Add(ab0, cd0));
+            Avx.Store(p + i + 32, Avx.Subtract(ab0, cd0));
+            Avx.Store(p + i + 64, Avx.Add(ab1, cd1));
+            Avx.Store(p + i + 96, Avx.Subtract(ab1, cd1));
+        }
+        return HadamardTailAvx2(p);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    static Vector256<float> QuantFake(Vector256<float> value, Vector256<float> a8Inv, Vector256<float> a8Scale, Vector256<float> low, Vector256<float> high) =>
+        Avx.Multiply(Avx.Min(Avx.Max(Avx.RoundToNearestInteger(Avx.Multiply(value, a8Inv)), low), high), a8Scale);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    static float HadamardPeakRmsFakeAvx2(float* source, float* p, Vector256<float> rmsInv, Vector256<float> a8Inv, Vector256<float> a8Scale, Vector256<float> low, Vector256<float> high)
+    {
+        for (var i = 0; i < 32; i += 8)
+        {
+            var a = QuantFake(Avx.Multiply(Avx.LoadVector256(source + i), rmsInv), a8Inv, a8Scale, low, high);
+            var b = QuantFake(Avx.Multiply(Avx.LoadVector256(source + i + 32), rmsInv), a8Inv, a8Scale, low, high);
+            var c = QuantFake(Avx.Multiply(Avx.LoadVector256(source + i + 64), rmsInv), a8Inv, a8Scale, low, high);
+            var d = QuantFake(Avx.Multiply(Avx.LoadVector256(source + i + 96), rmsInv), a8Inv, a8Scale, low, high);
+            var ab0 = Avx.Add(a, c);
+            var ab1 = Avx.Subtract(a, c);
+            var cd0 = Avx.Add(b, d);
+            var cd1 = Avx.Subtract(b, d);
+            Avx.Store(p + i, Avx.Add(ab0, cd0));
+            Avx.Store(p + i + 32, Avx.Subtract(ab0, cd0));
+            Avx.Store(p + i + 64, Avx.Add(ab1, cd1));
+            Avx.Store(p + i + 96, Avx.Subtract(ab1, cd1));
+        }
+        return HadamardTailAvx2(p);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    static float HadamardPeakCenteredRmsFakeAvx2(float* source, float* scalePtr, float* p, Vector256<float> one, Vector256<float> rmsInv, Vector256<float> a8Inv, Vector256<float> a8Scale, Vector256<float> low, Vector256<float> high)
+    {
+        for (var i = 0; i < 32; i += 8)
+        {
+            var a = QuantFake(Avx.Multiply(Avx.Multiply(Avx.Add(one, Avx.LoadVector256(scalePtr + i)), Avx.LoadVector256(source + i)), rmsInv), a8Inv, a8Scale, low, high);
+            var b = QuantFake(Avx.Multiply(Avx.Multiply(Avx.Add(one, Avx.LoadVector256(scalePtr + i + 32)), Avx.LoadVector256(source + i + 32)), rmsInv), a8Inv, a8Scale, low, high);
+            var c = QuantFake(Avx.Multiply(Avx.Multiply(Avx.Add(one, Avx.LoadVector256(scalePtr + i + 64)), Avx.LoadVector256(source + i + 64)), rmsInv), a8Inv, a8Scale, low, high);
+            var d = QuantFake(Avx.Multiply(Avx.Multiply(Avx.Add(one, Avx.LoadVector256(scalePtr + i + 96)), Avx.LoadVector256(source + i + 96)), rmsInv), a8Inv, a8Scale, low, high);
+            var ab0 = Avx.Add(a, c);
+            var ab1 = Avx.Subtract(a, c);
+            var cd0 = Avx.Add(b, d);
+            var cd1 = Avx.Subtract(b, d);
+            Avx.Store(p + i, Avx.Add(ab0, cd0));
+            Avx.Store(p + i + 32, Avx.Subtract(ab0, cd0));
+            Avx.Store(p + i + 64, Avx.Add(ab1, cd1));
+            Avx.Store(p + i + 96, Avx.Subtract(ab1, cd1));
+        }
+        return HadamardTailAvx2(p);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    static void PackGroup(float* rotated, float peak, int bits, in Activations a, int token, int g, Vector256<byte> ones, Vector256<int> interleave)
+    {
+        var slot = token * a.Stride + g;
+        var scale = peak > 0f ? peak / 127f : 1f;
+        a.Scales[slot] = scale;
+        var inv = Vector256.Create(1f / scale);
+        var q0 = Pack32(rotated, inv, interleave);
+        var q1 = Pack32(rotated + 32, inv, interleave);
+        var q2 = Pack32(rotated + 64, inv, interleave);
+        var q3 = Pack32(rotated + 96, inv, interleave);
+        var sum = Accumulate(Accumulate(Accumulate(Accumulate(Vector256<int>.Zero, ones, q0), ones, q1), ones, q2), ones, q3);
+        a.Offsets[slot] = Codebook.Bias * (float)Vector256.Sum(sum);
+        var destination = a.Values + ((long)token * a.Groups + g) * Cq.GroupSize;
+        if (bits == 2) Planes2(q0, q1, q2, q3, destination);
+        else Planes4(q0, q1, q2, q3, destination);
+    }
+#endif
+
+#if NEEDLE_SIMD
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    static void PrepareFakeGroups(float* x, float a8Peak, float rmsInv, int bits, in Activations a) =>
+        PrepareFakeGroupsRange(x, a8Peak, rmsInv, bits, a, 0, a.Groups);
+
+    [SkipLocalsInit]
+    internal static void PrepareFakeGroupsRange(float* x, float a8Peak, float rmsInv, int bits, in Activations a, int groupStart, int groupEnd)
+    {
+        var a8Scale = a8Peak > 0f ? a8Peak / 127f : 1f;
+        var vRmsInv = Vector256.Create(rmsInv);
+        var vA8Inv = Vector256.Create(1f / a8Scale);
+        var vA8Scale = Vector256.Create(a8Scale);
+        var low = Vector256.Create(-128f);
+        var high = Vector256.Create(127f);
+        var raw = stackalloc float[Cq.GroupSize + 16];
+        var rotated = (float*)(((nuint)raw + 63) & ~(nuint)63);
+        var ones = Vector256.Create((byte)1);
+        var interleave = Vector256.Create(0, 4, 1, 5, 2, 6, 3, 7);
+        for (var g = groupStart; g < groupEnd; g++)
+        {
+            var peak = HadamardPeakRmsFakeAvx2(x + g * Cq.GroupSize, rotated, vRmsInv, vA8Inv, vA8Scale, low, high);
+            PackGroup(rotated, peak, bits, a, 0, g, ones, interleave);
+        }
+    }
+#endif
+
+    [SkipLocalsInit]
+    public static void PrepareRmsFakeA8(float* x, float* scratchNormed, int cols, int bits, in Activations a)
+    {
+#if NEEDLE_SIMD
+        if (Simd.UseAvx && (void*)Kernels.Active.Prepare == null && (void*)Kernels.Active.RmsFakeA8 == null)
+        {
+            Ops.RmsStats(x, cols, out var inv, out var rawPeak);
+            PrepareFakeGroups(x, rawPeak * inv, inv, bits, a);
+            return;
+        }
+#endif
+        Ops.RmsFakeA8(x, cols, scratchNormed);
+        Prepare(scratchNormed, 1, cols, bits, a);
+    }
+
+    [SkipLocalsInit]
+    public static void PrepareGateFakeA8(float* x, float* gate, int cols, int bits, in Activations a)
+    {
+#if NEEDLE_SIMD
+        if (Simd.UseAvx && (void*)Kernels.Active.Prepare == null && (void*)Kernels.Active.GateFakeA8 == null)
+        {
+            var peak0 = Vector256<float>.Zero;
+            var peak1 = Vector256<float>.Zero;
+            var i = 0;
+            for (; i + 16 <= cols; i += 16)
+            {
+                var v0 = Avx.Multiply(Avx.LoadVector256(x + i), Ops.Sigmoid(Avx.LoadVector256(gate + i)));
+                var v1 = Avx.Multiply(Avx.LoadVector256(x + i + 8), Ops.Sigmoid(Avx.LoadVector256(gate + i + 8)));
+                Avx.Store(x + i, v0);
+                Avx.Store(x + i + 8, v1);
+                peak0 = Avx.Max(peak0, Vector256.Abs(v0));
+                peak1 = Avx.Max(peak1, Vector256.Abs(v1));
+            }
+            for (; i < cols; i += 8)
+            {
+                var v = Avx.Multiply(Avx.LoadVector256(x + i), Ops.Sigmoid(Avx.LoadVector256(gate + i)));
+                Avx.Store(x + i, v);
+                peak0 = Avx.Max(peak0, Vector256.Abs(v));
+            }
+            PrepareFakeGroups(x, Ops.FoldPeak(Avx.Max(peak0, peak1)), 1f, bits, a);
+            return;
+        }
+#endif
+        Ops.GateFakeA8(x, gate, cols);
+        Prepare(x, 1, cols, bits, a);
+    }
+
+    [SkipLocalsInit]
+    public static void PrepareCenteredRmsFakeA8(float* x, float* normScale, float* scratchNormed, int cols, int bits, in Activations a)
+    {
+#if NEEDLE_SIMD
+        if (Simd.UseAvx && (void*)Kernels.Active.Prepare == null && (void*)Kernels.Active.CenteredRmsFakeA8 == null)
+        {
+            Ops.CenteredRmsStats(x, normScale, cols, out var inv, out var rawPeak);
+            var a8Peak = rawPeak * inv;
+            var a8Scale = a8Peak > 0f ? a8Peak / 127f : 1f;
+            var one = Vector256.Create(1f);
+            var vRmsInv = Vector256.Create(inv);
+            var vA8Inv = Vector256.Create(1f / a8Scale);
+            var vA8Scale = Vector256.Create(a8Scale);
+            var low = Vector256.Create(-128f);
+            var high = Vector256.Create(127f);
+            var raw = stackalloc float[Cq.GroupSize + 16];
+            var rotated = (float*)(((nuint)raw + 63) & ~(nuint)63);
+            var ones = Vector256.Create((byte)1);
+            var interleave = Vector256.Create(0, 4, 1, 5, 2, 6, 3, 7);
+            for (var g = 0; g < a.Groups; g++)
+            {
+                var offset = g * Cq.GroupSize;
+                var peak = HadamardPeakCenteredRmsFakeAvx2(x + offset, normScale + offset, rotated, one, vRmsInv, vA8Inv, vA8Scale, low, high);
+                PackGroup(rotated, peak, bits, a, 0, g, ones, interleave);
+            }
+            return;
+        }
+#endif
+        Ops.CenteredRmsFakeA8(x, normScale, cols, scratchNormed);
+        Prepare(scratchNormed, 1, cols, bits, a);
     }
 
     public static void Hadamard(float* p) => Hadamard(p, p);
@@ -127,80 +387,115 @@ internal static unsafe class Quant
 #endif
         if (!Simd.Enabled) { Scalar.Hadamard(source, p); return; }
 #if NEEDLE_SIMD
-        for (var i = 0; i < 64; i += 8)
-        {
-            var a = Avx.LoadVector256(source + i);
-            var b = Avx.LoadVector256(source + i + 64);
-            Avx.Store(p + i, Avx.Add(a, b));
-            Avx.Store(p + i + 64, Avx.Subtract(a, b));
-        }
-        for (var stride = 32; stride >= 8; stride >>= 1)
-            for (var block = 0; block < Cq.GroupSize; block += stride * 2)
-                for (var i = block; i < block + stride; i += 8)
-                {
-                    var a = Avx.LoadVector256(p + i);
-                    var b = Avx.LoadVector256(p + i + stride);
-                    Avx.Store(p + i, Avx.Add(a, b));
-                    Avx.Store(p + i + stride, Avx.Subtract(a, b));
-                }
-        var pairSign = Vector256.Create(1f, -1f, 1f, -1f, 1f, -1f, 1f, -1f);
-        var quadSign = Vector256.Create(1f, 1f, -1f, -1f, 1f, 1f, -1f, -1f);
-        var halfSign = Vector256.Create(1f, 1f, 1f, 1f, -1f, -1f, -1f, -1f);
-        var scale = Vector256.Create(HadamardScale);
-        for (var i = 0; i < Cq.GroupSize; i += 8)
-        {
-            var v = Avx.LoadVector256(p + i);
-            v = Fma.MultiplyAdd(v, pairSign, Avx.Permute(v, 0b10_11_00_01));
-            v = Fma.MultiplyAdd(v, quadSign, Avx.Permute(v, 0b01_00_11_10));
-            v = Fma.MultiplyAdd(v, halfSign, Avx.Permute2x128(v, v, 0x01));
-            Avx.Store(p + i, Avx.Multiply(v, scale));
-        }
+        HadamardPeakAvx2(source, p);
 #endif
     }
 
-    public static void Prepare(float* x, int tokens, int cols, int bits, in Activations a)
+    struct PrepareJob
     {
+        public float* X;
+        public int Tokens, Cols, Bits, Tasks;
+        public Activations Act;
+    }
+
+    public static void Prepare(Pool pool, float* x, int tokens, int cols, int bits, in Activations a)
+    {
+        if (tokens <= 0 || a.Groups <= 0) return;
+        if (pool.Threads <= 1 || (tokens == 1 && a.Groups <= 1))
+        {
+            Prepare(x, tokens, cols, bits, a);
+            return;
+        }
+        var tasks = tokens == 1 ? Math.Min(pool.Members, a.Groups) : Math.Min(tokens, pool.Members * 4);
+        var job = new PrepareJob { X = x, Tokens = tokens, Cols = cols, Bits = bits, Tasks = tasks, Act = a };
+        if (tokens == 1) pool.Run(&PrepareGroupsTask, &job, tasks);
+        else pool.Run(&PrepareTokensTask, &job, tasks);
+    }
+
+    static void PrepareTokensTask(void* context, int task)
+    {
+        var job = (PrepareJob*)context;
+        var start = task * job->Tokens / job->Tasks;
+        var end = (task + 1) * job->Tokens / job->Tasks;
+        for (var t = start; t < end; t++)
+            PrepareRange(job->X + (long)t * job->Cols, 1, job->Cols, job->Bits, job->Act.Slice(t), 0, job->Act.Groups);
+    }
+
+    static void PrepareGroupsTask(void* context, int task)
+    {
+        var job = (PrepareJob*)context;
+        var start = task * job->Act.Groups / job->Tasks;
+        var count = (task + 1) * job->Act.Groups / job->Tasks - start;
+        PrepareRange(job->X, 1, job->Cols, job->Bits, job->Act, start, count);
+    }
+
+    public static void Prepare(float* x, int tokens, int cols, int bits, in Activations a) =>
+        PrepareRange(x, tokens, cols, bits, a, 0, a.Groups);
+
+    public static void PrepareGroups(float* x, int groupStart, int groupCount, int bits, in Activations a) =>
+        PrepareRange(x, 1, a.Cols, bits, a, groupStart, groupCount);
+
+    [SkipLocalsInit]
+    static void PrepareRange(float* x, int tokens, int cols, int bits, in Activations a, int groupStart, int groupCount)
+    {
+        if (groupCount <= 0 || tokens <= 0) return;
         #if NEEDLE_SIMD
-        if (Simd.UseNeon) { Neon.Prepare(x, tokens, cols, bits, a); return; }
+        if (Simd.UseNeon)
+        {
+            if (groupStart == 0 && groupCount == a.Groups) Neon.Prepare(x, tokens, cols, bits, a);
+            else if (tokens == 1)
+            {
+                var slice = new Activations(a.Values + groupStart * Cq.GroupSize, a.Scales + groupStart, a.Offsets + groupStart, groupCount * Cq.GroupSize);
+                Neon.Prepare(x + groupStart * Cq.GroupSize, 1, groupCount * Cq.GroupSize, bits, slice);
+            }
+            return;
+        }
 #endif
         var kernelFp = Kernels.Active.Prepare;
         if ((void*)kernelFp != null)
         {
-            InvokePrepare(kernelFp, x, tokens, cols, bits, a);
+            if (groupStart == 0 && groupCount == a.Groups)
+                InvokePrepare(kernelFp, x, tokens, cols, bits, a);
+            else if (tokens == 1)
+            {
+                var slice = new Activations(a.Values + groupStart * Cq.GroupSize, a.Scales + groupStart, a.Offsets + groupStart, groupCount * Cq.GroupSize);
+                InvokePrepare(kernelFp, x + groupStart * Cq.GroupSize, 1, groupCount * Cq.GroupSize, bits, slice);
+            }
             return;
         }
-        var rotated = stackalloc float[Cq.GroupSize];
-        var quantized = stackalloc sbyte[Cq.GroupSize];
-#if NEEDLE_SIMD
-        var ones = Vector256.Create((byte)1);
-#endif
-        for (var t = 0; t < tokens; t++)
-            for (var g = 0; g < a.Groups; g++)
-            {
-                var slot = t * a.Stride + g;
-                Hadamard(x + (long)t * cols + g * Cq.GroupSize, rotated);
-                a.Scales[slot] = QuantizeInt8(rotated, Cq.GroupSize, quantized);
-                if (!Simd.Enabled)
+        if (!Simd.Enabled)
+        {
+            var rotatedScalar = stackalloc float[Cq.GroupSize];
+            var quantizedScalar = stackalloc sbyte[Cq.GroupSize];
+            var end = groupStart + groupCount;
+            for (var t = 0; t < tokens; t++)
+                for (var g = groupStart; g < end; g++)
                 {
-                    Scalar.Planes(quantized, bits, a.Values + ((long)t * a.Groups + g) * Cq.GroupSize, out var scalarSum);
+                    var slot = t * a.Stride + g;
+                    Scalar.Hadamard(x + (long)t * cols + g * Cq.GroupSize, rotatedScalar);
+                    a.Scales[slot] = Scalar.QuantizeInt8(rotatedScalar, Cq.GroupSize, quantizedScalar);
+                    Scalar.Planes(quantizedScalar, bits, a.Values + ((long)t * a.Groups + g) * Cq.GroupSize, out var scalarSum);
                     a.Offsets[slot] = Codebook.Bias * (float)scalarSum;
-                    continue;
                 }
+            return;
+        }
 #if NEEDLE_SIMD
-                var q0 = Avx.LoadVector256(quantized);
-                var q1 = Avx.LoadVector256(quantized + 32);
-                var q2 = Avx.LoadVector256(quantized + 64);
-                var q3 = Avx.LoadVector256(quantized + 96);
-                var sum = Accumulate(Accumulate(Accumulate(Accumulate(Vector256<int>.Zero, ones, q0), ones, q1), ones, q2), ones, q3);
-                a.Offsets[slot] = Codebook.Bias * (float)Vector256.Sum(sum);
-                var destination = a.Values + ((long)t * a.Groups + g) * Cq.GroupSize;
-                if (bits == 2) Planes2(q0, q1, q2, q3, destination);
-                else Planes4(q0, q1, q2, q3, destination);
-#endif
+        var raw = stackalloc float[Cq.GroupSize + 16];
+        var rotated = (float*)(((nuint)raw + 63) & ~(nuint)63);
+        var ones = Vector256.Create((byte)1);
+        var interleave = Vector256.Create(0, 4, 1, 5, 2, 6, 3, 7);
+        var groupEnd = groupStart + groupCount;
+        for (var t = 0; t < tokens; t++)
+            for (var g = groupStart; g < groupEnd; g++)
+            {
+                var peak = HadamardPeakAvx2(x + (long)t * cols + g * Cq.GroupSize, rotated);
+                PackGroup(rotated, peak, bits, a, t, g, ones, interleave);
             }
+#endif
     }
 
 #if NEEDLE_SIMD
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     static void Planes2(Vector256<sbyte> q0, Vector256<sbyte> q1, Vector256<sbyte> q2, Vector256<sbyte> q3, sbyte* destination)
     {
         var gather = Vector256.Create((byte)0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15, 0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15);
@@ -221,6 +516,7 @@ internal static unsafe class Quant
 #endif
 
 #if NEEDLE_SIMD
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     static void Planes4(Vector256<sbyte> q0, Vector256<sbyte> q1, Vector256<sbyte> q2, Vector256<sbyte> q3, sbyte* destination)
     {
         var gather = Vector256.Create((byte)0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15, 0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15);
@@ -328,8 +624,6 @@ internal static unsafe class Quant
         for (var t = tiledTokens; t < tokens; t++) Gemv.Rows(w, a, t, y + (long)t * ldy, rowStart, rowEnd);
 #endif
     }
-    // N30: outlined table invokers; see the note on the Ops.cs set. The
-    // `fixed` pins live here so the dispatch methods stay branch-only.
     [MethodImpl(MethodImplOptions.NoInlining)]
     static float InvokeFakeA8(nint fp, float* x, int n) =>
         ((delegate* unmanaged[Cdecl]<float*, int, float>)(void*)fp)(x, n);
@@ -395,9 +689,81 @@ internal unsafe struct MatMulBatch
 
     public static void Run(Pool pool, MatMulBatch* batch)
     {
-        batch->Plan(pool.Threads);
-        pool.Run(&Execute, batch, batch->TaskCount);
+        var totalBlocks = batch->TotalRowBlocks();
+        var members = Math.Min(pool.Members, totalBlocks);
+        if (members <= 1)
+        {
+            RunShard(batch, 0, 1);
+            return;
+        }
+        batch->Members = members;
+        pool.Run(&ExecuteRange, batch, members);
     }
+
+    public int TotalRowBlocks()
+    {
+        var total = 0;
+        for (var j = 0; j < Count; j++) total += (Jobs.At(j)->W.Rows + Quant.RowBlock - 1) / Quant.RowBlock;
+        return total;
+    }
+
+    public static void RunShard(MatMulBatch* batch, int member, int members)
+    {
+        var totalBlocks = batch->TotalRowBlocks();
+        var firstBlock = member * totalBlocks / members;
+        var endBlock = (member + 1) * totalBlocks / members;
+        RunRange(batch, firstBlock, endBlock);
+    }
+
+    public static void RunSteal(MatMulBatch* batch, int* cursor, int member, int members)
+    {
+        if (members <= 1 || cursor == null)
+        {
+            RunShard(batch, member, members);
+            return;
+        }
+        var totalBlocks = batch->TotalRowBlocks();
+        if (totalBlocks < members * 8)
+        {
+            RunShard(batch, member, members);
+            return;
+        }
+        var workerInit = batch->Tokens == 1 ? (totalBlocks * 3) / (4 * members) : (totalBlocks * 2) / (3 * members);
+        var initTotal = (members - 1) * workerInit;
+        if (member < members - 1 && workerInit > 0)
+            RunRange(batch, member * workerInit, (member + 1) * workerInit);
+        var remain = totalBlocks - initTotal;
+        var chunk = batch->Tokens == 1 ? Math.Clamp(remain / (members * 4), 8, 64) : Math.Clamp(remain / (members * 8), 2, 16);
+        while (true)
+        {
+            var taken = Interlocked.Add(ref *cursor, chunk) - chunk;
+            var start = initTotal + taken;
+            if (start >= totalBlocks) break;
+            RunRange(batch, start, Math.Min(totalBlocks, start + chunk));
+        }
+    }
+
+    static void RunRange(MatMulBatch* batch, int firstBlock, int endBlock)
+    {
+        if (firstBlock >= endBlock) return;
+        var cursor = 0;
+        for (var j = 0; j < batch->Count; j++)
+        {
+            var job = batch->Jobs.At(j);
+            var jobBlocks = (job->W.Rows + Quant.RowBlock - 1) / Quant.RowBlock;
+            var jobEnd = cursor + jobBlocks;
+            if (jobEnd > firstBlock && cursor < endBlock)
+            {
+                var localStart = Math.Max(0, firstBlock - cursor) * Quant.RowBlock;
+                var localEnd = Math.Min(job->W.Rows, (endBlock - cursor) * Quant.RowBlock);
+                if (localEnd > localStart)
+                    Quant.MatMulRows(job->W, batch->Activations, batch->Tokens, job->Y, job->Ldy, localStart, localEnd);
+            }
+            cursor = jobEnd;
+        }
+    }
+
+    public int Members;
 
     public void Plan(int threads)
     {
@@ -432,7 +798,11 @@ internal unsafe struct MatMulBatch
 
     static int JobTasks(MatMulBatch* batch, int job) => (batch->Jobs.At(job)->W.Rows + batch->RowsPerTask - 1) / batch->RowsPerTask;
 
-    static void Execute(void* context, int index) => RunTask((MatMulBatch*)context, index);
+    static void ExecuteRange(void* context, int member)
+    {
+        var batch = (MatMulBatch*)context;
+        RunShard(batch, member, batch->Members);
+    }
 
     const int TasksPerThread = 3;
     const int MinimumRowsPerTask = 8;

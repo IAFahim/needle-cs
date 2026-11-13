@@ -3,11 +3,6 @@ using Xunit;
 
 namespace Needle.Tests;
 
-// MATH-M7: hoisted RoPE frequency schedule (Engine.RopeFrequencies).
-// The schedule is deliberately bit-identical to the historical per-entry
-// formula, not a log-domain exp reformulation: ~1e-7 exp-vs-Pow noise flips
-// the documented 'attack the watchtower near the river' knife-edge between
-// native-refuse and managed-call (NativeParityTests). This pins that contract.
 public sealed unsafe class RopeScheduleTests
 {
     [Fact]

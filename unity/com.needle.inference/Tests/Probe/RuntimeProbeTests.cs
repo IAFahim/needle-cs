@@ -1,8 +1,3 @@
-// N10 EditMode probe test: collects the needle.probe/1 report in the Editor
-// and logs the JSON so `unity test` output captures the runtime facts that
-// settle H3 (Vector<T> acceleration on CoreCLR) and H4 (IL2CPP reports
-// Avx2.IsSupported == false, measured via the player scene on device).
-// C# 9 safe: block namespaces, no target-typed new.
 using NUnit.Framework;
 using UnityEngine;
 

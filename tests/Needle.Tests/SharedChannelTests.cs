@@ -7,9 +7,6 @@ using Xunit.Abstractions;
 
 namespace Needle.Tests;
 
-// N71: shared-memory NeedleChannel. Two mappings of one backing file act as
-// two processes (each view rebuilds ring pointers over its own base
-// address); the ping-pong test measures the zero-copy round trip.
 public sealed unsafe class SharedChannelTests
 {
     readonly ITestOutputHelper output;
@@ -56,8 +53,6 @@ public sealed unsafe class SharedChannelTests
         {
             using var server = SharedChannel.Create(path, 4, 4);
             using var client = SharedChannel.Open(path);
-            // Simulate the foreign address space: the wake slots hold garbage
-            // that must never be called. (On a local channel this would crash.)
             client.Channel.SetWake((delegate*<void*, void>)unchecked((nint)0xDEADBEEFu), (void*)0x1234);
             Assert.True(client.Channel.TrySubmitQuery("no wake"u8, out _));
             Assert.True(server.Channel.TryClaim(out _, out _));

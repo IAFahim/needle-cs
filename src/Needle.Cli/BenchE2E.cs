@@ -167,9 +167,6 @@ internal static class BenchE2E
         return measurement;
     }
 
-    // Zero-allocation API path: queries are encoded once and the same scratch
-    // buffers serve every rep, so --max-managed-bytes 0 --max-native-allocs 0
-    // gates the session itself instead of the string wrapper.
     const int SpanCallsBytes = 65536;
     const int SpanReasoningBytes = 8192;
     const int SpanResponseBytes = 32768;
@@ -241,7 +238,6 @@ internal static class BenchE2E
             prompt.Failures++;
             return;
         }
-        // Display decoding happens outside the measured region.
         prompt.Calls = reply.HasCalls ? CallNames(calls, reply.Utf8Length) : "respond";
         prompt.PrefillTokens = reply.PromptTokens;
         prompt.DecodeTokens = reply.DecodeTokens;

@@ -1,5 +1,3 @@
-// N11a entry point: CoreCLR + ns2.1. Prints needle.bench-e2e/1 JSON to stdout,
-// progress to stderr, exit code = failure count (golden calls not reproduced).
 using System;
 
 namespace Needle.Bench

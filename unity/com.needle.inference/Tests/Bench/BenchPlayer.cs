@@ -1,7 +1,3 @@
-// N11d: IL2CPP player bench scene behaviour. Lives on a GameObject in
-// BenchPlayerScene.unity; on Start it runs BenchDriver with the paths from
-// the player command line, logs the needle.bench-e2e/1 JSON, writes it to
-// --out (and always to persistentDataPath), then quits.
 using System;
 using System.Reflection;
 using System.Text;
@@ -28,18 +24,18 @@ namespace Needle.Bench
             string json = "";
             try
             {
-                // N41b: hard reference keeping Needle.Kernels.Burst in the
-                // player link. An asmdef-only reference is pruned when no
-                // Bench source names a Burst type, so IL2CPP drops the
-                // assembly and its BeforeSceneLoad AutoInstall roots fire
-                // nowhere (provider "none", silent). Naming the installers
-                // here forces the link and logs the compiled lane — the
-                // only truthful lane source — into the player log.
-                Needle.BurstKernels.BurstKernelInstaller.EnsureInstalled();
-                Needle.BurstKernels.BurstMlpInstaller.EnsureInstalled();
-                Needle.BurstKernels.BurstAttention.Install();
-                Needle.BurstKernels.BurstGemvNeon.Install();
-                Debug.Log("[needle] " + Needle.BurstKernels.BurstKernelInstaller.Describe());
+                if (!Needle.Kernels.TryInstallSidecar())
+                {
+                    Needle.BurstKernels.BurstKernelInstaller.EnsureInstalled();
+                    Needle.BurstKernels.BurstMlpInstaller.EnsureInstalled();
+                    Needle.BurstKernels.BurstAttention.Install();
+                    Needle.BurstKernels.BurstGemvNeon.Install();
+                    Debug.Log("[needle] " + Needle.BurstKernels.BurstKernelInstaller.Describe());
+                }
+                else
+                {
+                    Debug.Log("[needle] " + Needle.NeedleRuntime.Describe());
+                }
             }
             catch (Exception e)
             {
@@ -101,10 +97,6 @@ namespace Needle.Bench
                 ModelPath = Path.Combine(Application.streamingAssetsPath, "needle3.cact");
         }
 
-        // N41: self-contained needle.probe/1 dump (mirrors Samples~/Probe and
-        // Tests/Probe field for field) so the IL2CPP bench player settles H4
-        // without a second player build. Reflection-only for intrinsics/Burst
-        // lookups; never throws.
         void WriteProbe(string benchOutPath)
         {
             try

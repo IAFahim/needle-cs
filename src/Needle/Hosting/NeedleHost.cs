@@ -14,45 +14,15 @@ public readonly struct HostOptions
     public string ModelPath { get; init; }
     public string ToolsJson { get; init; }
     public NeedleOptions? Session { get; init; }
-    /// <summary>
-    /// Path to a baked primed-prefix file (<c>needle prime</c> output or the
-    /// Editor <c>Needle/Bake Primed Prefix</c> menu, N64). When set, the
-    /// session is constructed from the snapshot instead of running the
-    /// tool-prompt prefill, so the host is ready in milliseconds. Requires
-    /// <c>Session.AutoDate == false</c> (the bake is date-free, plan.md
-    /// §10.5) and <c>Session.RetrievalTopK</c> at or above the tool count (a
-    /// prefix cannot combine with tool retrieval). Leave null to prime at
-    /// startup as before. No default flip: existing hosts behave unchanged.
-    /// </summary>
     public string? PrimedPrefixPath { get; init; }
     public int RequestCapacity { get; init; }
     public int ReplyCapacity { get; init; }
-    /// <summary>
-    /// Treat every <see cref="ChannelRequestKind.Query"/> as a fresh conversation: the session is
-    /// rewound to the primed tool prefix first, so unrelated orders never see each other and the
-    /// context never fills up. <see cref="ChannelRequestKind.ToolResult"/> still continues the
-    /// turn it answers. Leave off for chat-style use where each query builds on the last.
-    /// </summary>
     public bool StatelessQueries { get; init; }
-    /// <summary>
-    /// Batch ceiling: the worker drains up to this many queued requests and
-    /// decodes the stateless queries among them as one <c>BatchedSession</c>
-    /// turn (N63). Decode is weight-bandwidth-bound, so the lanes share the
-    /// stream. Unset or below 1 means 16; the value is clamped to 1–16 (the
-    /// batched session's lane limit). 1 disables batching: every request
-    /// takes the single-lane path exactly as before. Batching only applies
-    /// to stateless query bursts on the untyped (<c>Start</c>) host; typed
-    /// hosts, stateful hosts and <c>ToolResult</c> turns stay single-lane.
-    /// The lanes prime once at <c>Start</c> (one tool-prefix prefill each),
-    /// so a batching host starts slower but no drain ever pays a prime.
-    /// </summary>
     public int MaxBatchSize { get; init; }
 }
 
 public sealed unsafe class NeedleHost : IDisposable
 {
-    // N63: the drain width. BatchedSession caps lanes at 16, so the scratch
-    // staging below holds one single-lane-sized region per possible claim.
     const int MaxBatchCeiling = 16;
     const int LaneBytes = ChannelLimits.CallsCapacity + 2 * ChannelLimits.TextCapacity;
 
@@ -106,10 +76,6 @@ public sealed unsafe class NeedleHost : IDisposable
             statelessQueries = options.StatelessQueries;
             maxBatch = options.MaxBatchSize < 1 ? MaxBatchCeiling : Math.Min(MaxBatchCeiling, options.MaxBatchSize);
             var sessionOptions = options.Session ?? new NeedleOptions();
-            // N62: stateless queries rewind before every Query, so a deferred
-            // turn-closing is always dropped, never replayed: one engine pass
-            // fewer per call. Continuations (ToolResult) replay it first, so
-            // their history is unchanged. Explicit Session.Stateless wins.
             if (options.StatelessQueries && !sessionOptions.Stateless)
                 sessionOptions = sessionOptions.WithStateless(true);
             batchOptions = sessionOptions;
@@ -119,17 +85,12 @@ public sealed unsafe class NeedleHost : IDisposable
             byte[]? primedPrefix = null;
             if (!string.IsNullOrEmpty(options.PrimedPrefixPath))
             {
-                // The bake is date-free; a dated system prompt would fail
-                // prefix validation, so fail fast with the rule attached.
                 if (sessionOptions.AutoDate) throw new ArgumentException("PrimedPrefixPath requires Session.AutoDate == false (plan.md §10.5).");
                 primedPrefix = File.ReadAllBytes(options.PrimedPrefixPath);
             }
             session = primedPrefix != null
                 ? new NeedleSession(model, options.ToolsJson, primedPrefix, batchOptions)
                 : new NeedleSession(model, options.ToolsJson, batchOptions);
-            // Lanes prime once here, up front: every later batch reuses them,
-            // so no drain ever pays a prime mid-burst. Stateless untyped
-            // hosts only; typed/stateful hosts and MaxBatchSize 1 never batch.
             if (!typedHost && batchOptions.Stateless && maxBatch >= 2) CreateBatchSession();
             channel = NeedleChannel.Allocate(
                 options.RequestCapacity == 0 ? NeedleChannel.DefaultCapacity : options.RequestCapacity,
@@ -153,10 +114,6 @@ public sealed unsafe class NeedleHost : IDisposable
     {
         channel.Cancel(ticket);
         if (Interlocked.Read(ref runningTicket) == (long)ticket) session!.RequestCancel();
-        // A lane in a running batch stops at the next shared step; its lane
-        // then reports Cancelled, exactly like the single lane. RequestCancel
-        // touches one managed int per lane, so this is safe at any time; the
-        // flags are cleared at the next turn start.
         var active = batch;
         if (active == null) return;
         var count = Volatile.Read(ref inFlightCount);
@@ -174,11 +131,6 @@ public sealed unsafe class NeedleHost : IDisposable
         if (self.IsAllocated) self.Free();
     }
 
-    // N63: serve the whole drain, not one claim. One queued request takes the
-    // exact single-lane path as before (latency parity by construction);
-    // two or more stateless queries share one batched turn and split the
-    // weight reads. Replies always publish in claim order: the ring is FIFO
-    // and callers match tickets, so batching must not reorder them.
     bool TryProcessBatch()
     {
         Span<ChannelRequest> requests = stackalloc ChannelRequest[MaxBatchCeiling];
@@ -213,12 +165,6 @@ public sealed unsafe class NeedleHost : IDisposable
         }
         if (queries >= 2 && batch != null && !batchRetired)
         {
-            // Singles first in claim order, then the shared turn: the single
-            // session's lineage stays FIFO among the turns it actually serves.
-            // The batch runs on its own engine, so re-prime the single
-            // session afterwards: a later ToolResult then continues from the
-            // primed prefix, the same lineage every batch lane starts from,
-            // instead of an arbitrarily old single turn.
             for (var s = 0; s < singles; s++)
             {
                 var i = singleAt[s];
@@ -242,11 +188,6 @@ public sealed unsafe class NeedleHost : IDisposable
         Volatile.Write(ref runningTicket, -1);
     }
 
-    // All lanes open with the host's single tool set and prime once here; a
-    // lane whose catalog exceeds RetrievalTopK throws there, which can only
-    // happen when the single session is in retrieval mode — batching would
-    // then narrow per query while lanes stay fixed, so retire instead and
-    // serve everything single-lane.
     void CreateBatchSession()
     {
         BatchedSession? next = null;
@@ -257,8 +198,6 @@ public sealed unsafe class NeedleHost : IDisposable
         }
         catch (Exception)
         {
-            // Batching is an optimization: it must never fail a request the
-            // single lane can serve. Retire it for the host's lifetime.
             next?.Dispose();
             batchRetired = true;
             return;
@@ -277,10 +216,6 @@ public sealed unsafe class NeedleHost : IDisposable
         CallResult[] laneResults;
         try
         {
-            // Every turn needs one query per open lane; lanes past the drain
-            // get empty input, which fails fast before any engine work, so a
-            // partial drain costs nothing extra. Lanes are stateless across
-            // turns by design, matching one stateless single turn each.
             var inputs = new string[width];
             for (var j = 0; j < lanes.Length; j++)
             {
@@ -298,10 +233,6 @@ public sealed unsafe class NeedleHost : IDisposable
             ConvertResult(laneResults[j], Lane(lanes[j]), ref results[lanes[j]]);
     }
 
-    // The batched session reports strings and parsed calls; the channel
-    // speaks Reply plus byte blobs in CallRestorer layout, so re-render here.
-    // Calls re-render byte-identically (same escaping, verbatim arguments);
-    // reasoning/response are trimmed by CallResult, so compare trimmed.
     void ConvertResult(CallResult lane, byte* bottom, ref Reply result)
     {
         var calls = new Span<byte>(bottom, ChannelLimits.CallsCapacity);
@@ -342,8 +273,6 @@ public sealed unsafe class NeedleHost : IDisposable
             callBytes = RenderCalls(source, calls);
             if (callBytes < 0)
             {
-                // The lane buffer dwarfs the channel's; mirror the single
-                // lane, which reports CallsBufferTooSmall with no call bytes.
                 result = new Reply(ReplyStatus.Failed, FailureReason.CallsBufferTooSmall, flags,
                     lane.Confidence ?? float.NaN, lane.HeadConfidence ?? float.NaN, lane.DecodeConfidence ?? float.NaN,
                     source.Count, 0, reasoningLength, 0,

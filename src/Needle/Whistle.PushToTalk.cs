@@ -5,10 +5,6 @@ using System.Threading;
 
 namespace Needle;
 
-// Push-to-talk capture: the game audio thread appends PCM lock-free while the key is
-// held; the game thread transcribes on release, or previews incrementally mid-hold.
-// Single writer (audio), single reader (game). Transcription itself reuses Whistle's
-// zero-allocation span path, so steady-state capture plus release allocates nothing.
 public sealed class PushToTalk
 {
     readonly float[] buffer;
@@ -30,7 +26,6 @@ public sealed class PushToTalk
 
     public void Hold() => Volatile.Write(ref count, 0);
 
-    // Audio thread: appends a chunk. Returns false when the buffer is full (chunk dropped).
     public bool Write(ReadOnlySpan<float> pcm)
     {
         var current = Volatile.Read(ref count);
@@ -47,7 +42,6 @@ public sealed class PushToTalk
         return whistle.TranscribeUtf8(buffer.AsSpan(0, n), utf8, words, language, keywords);
     }
 
-    // Game thread: transcribes whatever was captured and clears the buffer.
     public SpeechSpan Release(Whistle whistle, Span<byte> utf8, Span<WordSlice> words, string? language = null, IReadOnlyList<string>? keywords = null)
     {
         var speech = Preview(whistle, utf8, words, language, keywords);
@@ -56,9 +50,6 @@ public sealed class PushToTalk
     }
 }
 
-// Incremental game-loop streaming over the zero-allocation span path. The caller pushes
-// audio with Write, then calls Update once per frame: newly firmed words arrive in the
-// committed spans (delta since the last Update), the unstable tail in the pending spans.
 public readonly struct StreamDelta
 {
     public readonly int CommittedUtf8;
@@ -115,7 +106,6 @@ public sealed class VoiceStream
 
     public double BufferedSeconds => count / (double)Wav.SampleRate;
 
-    // Returns false when the buffer is full (chunk dropped).
     public bool Write(ReadOnlySpan<float> chunk)
     {
         if (chunk.Length == 0) return true;
@@ -217,7 +207,6 @@ public sealed class VoiceStream
         return i >= a.Length && j >= b.Length;
     }
 
-    // Next ASCII alphanumeric folded to lowercase, -1 for anything skipped, -2 at end.
     static int FoldStep(ReadOnlySpan<byte> s, ref int i)
     {
         while (i < s.Length)

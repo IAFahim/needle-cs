@@ -1,21 +1,3 @@
-// N31/N13: Burst Softmax conformance (EditMode).
-//
-// Exercises the installed KernelTable.Softmax entry end to end through the
-// raw Cdecl function pointer, the same path every Ops.Softmax dispatch on
-// an ns2.1 build takes once the provider installs itself. Public API only
-// (Kernels, KernelTable, installer); no InternalsVisibleTo needed.
-//
-//   - Golden values + edge shapes (n=1, ties, clamp range, odd tails).
-//   - N13 parity bound on random inputs: cosine >= 0.99995, same argmax.
-//   - H7 probe: max abs difference vs the Scalar reference, logged. The
-//     x86/Neon lanes mirror the net10 instruction order, so fixtures land
-//     bitwise; the assert stays on the parity bound per the plan's
-//     fallback rule (bitwise or bound, PR says which).
-//   - H5: FP call-overhead microbench, logged with the 100ns verdict.
-//   - H6/H8: installer report, logged (source-compiled pointer + lane).
-//
-// C# 9 safe: block namespace, no target-typed new. Unsafe (raw pointers,
-// function pointers) under allowUnsafeCode.
 using System;
 using System.IO;
 using System.Reflection;
@@ -43,7 +25,6 @@ namespace Needle.BurstKernels.Tests
             }
         }
 
-        // Mirrors Scalar.Softmax exactly (the N13 reference for this entry).
         static void ReferenceSoftmax(float[] s)
         {
             float peak = float.NegativeInfinity;
@@ -108,16 +89,13 @@ namespace Needle.BurstKernels.Tests
         [Test]
         public void SoftmaxEdgeShapes()
         {
-            // n=1 normalizes to exactly 1.
             float[] one = new float[] { -4f };
             RunThroughTable(one);
             Assert.AreEqual(1f, one[0], 1e-7f);
-            // Uniform input stays uniform; ties keep index 0.
             float[] tied = new float[] { 2f, 2f, 2f, 2f, 2f, 2f, 2f };
             RunThroughTable(tied);
             for (int i = 0; i < tied.Length; i++) Assert.AreEqual(1f / 7f, tied[i], 1e-6f);
             Assert.AreEqual(0, ArgMax(tied));
-            // Deep negatives hit the Exp clamp; output stays finite and sums to 1.
             float[] cold = new float[] { -100f, -101f, -99f, -100.5f, -98f, -102f, -100f, -99.5f, -100.25f };
             RunThroughTable(cold);
             float sum = 0f;
@@ -145,11 +123,6 @@ namespace Needle.BurstKernels.Tests
             }
         }
 
-        // True H7 oracle: the net10 AVX2 kernel itself, loaded from the
-        // sibling net10.0 plugin DLL (Editor is CoreCLR, so it loads) and
-        // invoked by reflection. LoadFile, not LoadFrom: the ns2.1 plugin
-        // is already loaded under the same simple name/version, and
-        // LoadFrom would hand back the loaded copy instead of the file.
         static unsafe class Net10Oracle
         {
             static MethodInfo softmax;
@@ -216,14 +189,6 @@ namespace Needle.BurstKernels.Tests
         [Test]
         public void SoftmaxMatchesNet10BitwiseProbe()
         {
-            // H7 probe for Softmax. The compiled-lane gate comes first: a
-            // managed IsSupported read always says False (probed), so an
-            // earlier maxAbsDiff=0 proved nothing until the vector lane is
-            // confirmed. The oracle is the net10 kernel when loadable,
-            // scalar-sequential otherwise (logged). Adversarial fixtures
-            // use the N33 order (Sum128(lower)+Sum128(upper)); any nonzero
-            // diff adopts the N38 spill+tree pattern. Parity is asserted
-            // per the plan fallback rule.
             int lane = BurstKernels.BurstKernelInstaller.CompiledLane();
             Debug.Log("[needle] H7-softmax lane=" + lane + " (2=x86-avx2-fma,1=arm-neon,0=scalar)");
             Assert.AreNotEqual(0, lane, "H7 probe must exercise a compiled vector lane; a scalar run proves nothing about reduction order.");
@@ -246,9 +211,6 @@ namespace Needle.BurstKernels.Tests
                     Assert.GreaterOrEqual(Cosine(a, b), 0.99995, "parity at n=" + n);
                 }
             }
-            // Adversarial dynamic range: moderate-span random over many lanes
-            // (every term contributes at ulp level, no single-term
-            // dominance), plus alternating extremes and the denormal edge.
             foreach (int n in new int[] { 8, 33, 257 })
             {
                 float[] a = new float[n];
@@ -283,10 +245,6 @@ namespace Needle.BurstKernels.Tests
         [Test]
         public void SoftmaxCallOverheadReport()
         {
-            // H5: a Burst function-pointer call from a non-Unity thread
-            // costs < 100ns. The bench measures the installed FP on tiny
-            // inputs (one vector of work), so ns/call is an upper bound on
-            // the overhead itself.
             double ns = BurstKernels.BurstKernelInstaller.MeasureSoftmaxCallOverheadNs(8, 200000);
             Debug.Log("[needle] H5-softmax-fp nsPerCall=" + ns.ToString("F1")
                 + " verdict=" + (ns < 100.0 ? "HOLDS(<100ns)" : "FAIL(>=100ns)"));
@@ -296,7 +254,6 @@ namespace Needle.BurstKernels.Tests
         [Test]
         public void BurstProviderReport()
         {
-            // H6/H8 evidence line for the run log.
             BurstKernels.BurstKernelInstaller.EnsureInstalled();
             string report = BurstKernels.BurstKernelInstaller.Describe();
             Debug.Log("[needle] " + report);

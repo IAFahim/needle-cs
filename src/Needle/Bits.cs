@@ -18,6 +18,13 @@ internal static class Bits
         return (int)(((value + (value >> 4)) & 0x0F0F0F0Fu) * 0x01010101u >> 24);
     }
 
+    public static int PopCount(ulong value)
+    {
+        value -= (value >> 1) & 0x5555555555555555ul;
+        value = (value & 0x3333333333333333ul) + ((value >> 2) & 0x3333333333333333ul);
+        return (int)(((value + (value >> 4)) & 0x0F0F0F0F0F0F0F0Ful) * 0x0101010101010101ul >> 56);
+    }
+
     public static int Log2(ulong value)
     {
         var high = (uint)(value >> 32);
@@ -39,6 +46,8 @@ internal static class Bits
     public static int TrailingZeros(uint value) => System.Numerics.BitOperations.TrailingZeroCount(value);
 
     public static int PopCount(uint value) => System.Numerics.BitOperations.PopCount(value);
+
+    public static int PopCount(ulong value) => System.Numerics.BitOperations.PopCount(value);
 
     public static int Log2(ulong value) => System.Numerics.BitOperations.Log2(value);
 

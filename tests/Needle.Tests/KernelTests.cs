@@ -31,10 +31,6 @@ public sealed unsafe class KernelTests
         Assert.Equal(127, Math.Round(Math.Abs(x[0]) / scale));
     }
 
-    // Ops.Exp(Vector256) is the x86 AVX/FMA path (mirrors Neon.Exp on ARM,
-    // covered by NeonTests.ExpMatchesMathF). It faults on platforms without
-    // AVX, so gate on the same predicate the engine uses (CI evidence: run
-    // 41030471519 linux-arm64/macos-arm64 PlatformNotSupportedException).
     [Fact]
     public void ExpMatchesLibmWithinSingleRounding()
     {
@@ -340,9 +336,6 @@ public sealed unsafe class HadamardMlpTests : IDisposable
         var width = rows * cols;
         var weights = (float**)Mem.AllocZeroed(13 * (nuint)sizeof(float*));
         allocations.Add((nint)weights);
-        // MlpWeights order: D1(dim), D2/B2/D3(width), D4(dim), WxA(rows*rows), WxB(cols*cols), CondV(dim*8), CondU(8*width).
-        // Kron indexes left as i*rows+k and right as j*cols+c, so W factors MUST be rows*rows / cols*cols.
-        // Sizing them as rows*cols overreads the heap for non-square shapes (8x16 W*B needs 256 floats, not 128).
         weights[0] = Allocate(dim, random, 0.5f, 1f);
         weights[1] = Allocate(width, random, 0.5f, 1f);
         weights[2] = Allocate(width, random, 0.2f);
@@ -470,10 +463,6 @@ public sealed unsafe class HadamardMlpTests : IDisposable
     [Fact]
     public void NonSquareHadamardMatchesReferenceRepeatedly()
     {
-        // Regression for #45: Batch() sized every Kron factor as rows*cols, so the only
-        // non-square shape (8x16) overread the W*B heap blocks by 128 floats and failed
-        // intermittently with NaN/Inf (~1-2/10 under load). Hammer the failing tuple plus
-        // a thread/token sweep and the mirrored rectangle (16x8, scalar Kron path).
         foreach (var (dim, rows, cols) in new[] { (96, 8, 16), (48, 16, 8) })
             foreach (var threads in new[] { 1, 2, 3, 4 })
                 foreach (var tokens in new[] { 1, 2 })
@@ -694,9 +683,6 @@ public sealed unsafe class FusedKernelTests
 #if NEEDLE_SIMD
 public sealed unsafe class Avx512OpsTests
 {
-    // Callers pad to 16 floats (the AVX2 reductions step by 16), so lengths that are
-    // multiples of 16 but not 32 must work. Everything past n is NaN: a read beyond n
-    // poisons the result, a write beyond n shows up as a changed canary.
     const int Guard = 64;
 
     static bool Supported => System.Runtime.Intrinsics.X86.Avx512F.IsSupported && System.Runtime.Intrinsics.Vector512.IsHardwareAccelerated;

@@ -54,9 +54,6 @@ internal static unsafe class Mem
 
     public static void Clear(void* p, nuint bytes)
     {
-        // InitBlockUnaligned lowers to memset. The Unsafe assembly is already a hard
-        // dependency of the ns2.1 build (Engine/Utf8Text paths), so this ships nothing new.
-        // Slice: the count parameter is uint.
         var b = (byte*)p;
         while (bytes > 0)
         {
@@ -117,12 +114,9 @@ internal static unsafe partial class Paging
     const int AdviceWillNeed = 3;
     const int AdviceHugePage = 14;
 
-    // LibraryImport needs the .NET 7+ source generator; netstandard2.1 (Unity) uses DllImport.
-    // A missing libc degrades to false via the catch below, so unsupported players just skip advice.
     [DllImport("libc", EntryPoint = "madvise")]
     static extern int Madvise(nint address, nuint length, int advice);
 
-    // OperatingSystem.Is* is .NET 5+; netstandard2.1 reports via RuntimeInformation instead.
     static bool HasMadvise =>
         RuntimeInformation.IsOSPlatform(OSPlatform.Linux) ||
         RuntimeInformation.IsOSPlatform(OSPlatform.OSX) ||

@@ -1,19 +1,44 @@
 using System;
+using System.Runtime.CompilerServices;
+#if NEEDLE_SIMD
+using System.Runtime.Intrinsics.Arm;
+using System.Runtime.Intrinsics.X86;
+#endif
 
 namespace Needle;
 
 internal static class Simd
 {
 #if NEEDLE_SIMD
-    public static bool Avx => Tiers.HasAvx;
+    public static bool Avx
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => Tiers.HasAvx;
+    }
 
-    public static bool Neon => System.Runtime.Intrinsics.Arm.AdvSimd.IsSupported;
+    public static bool Neon
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => AdvSimd.IsSupported;
+    }
 
-    public static bool Enabled => Tiers.Active != CpuTier.Scalar;
+    public static bool Enabled
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => Tiers.Active != CpuTier.Scalar;
+    }
 
-    public static bool UseAvx => Tiers.Active is CpuTier.Avx2 or CpuTier.AvxVnni or CpuTier.AvxVnniInt8 or CpuTier.Avx512Bw;
+    public static bool UseAvx
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => Avx2.IsSupported && Fma.IsSupported && Sse41.IsSupported && Tiers.Active is CpuTier.Avx2 or CpuTier.AvxVnni or CpuTier.AvxVnniInt8 or CpuTier.Avx512Bw;
+    }
 
-    public static bool UseNeon => Tiers.Active is CpuTier.Neon or CpuTier.NeonDot;
+    public static bool UseNeon
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => AdvSimd.IsSupported && Tiers.Active is CpuTier.Neon or CpuTier.NeonDot;
+    }
 #else
     public const bool Enabled = false;
 #endif
@@ -23,10 +48,7 @@ internal static unsafe class Scalar
 {
     const float HadamardScale = 0.08838834764831845f;
     const float InverseSqrtQkDim = 0.14433756729740643f;
-    // N23: magic-constant round-to-nearest-even. Exact for |x| < 2^22; all
-    // quantized inputs here are pre-scaled to |x| <= 128. Avoids MathF.Round
-    // calls in scalar hot loops on every Unity runtime.
-    const float RoundBias = 12582912f; // 1.5 * (1 << 23)
+    const float RoundBias = 12582912f;
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     static float RoundEven(float x) => (x + RoundBias) - RoundBias;
 

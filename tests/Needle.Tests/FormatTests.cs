@@ -38,16 +38,8 @@ public sealed class FormatTests
         return new LockFile(revisions, files);
     }
 
-    // fetch.sh runs under Git bash on Windows, where backslash separators in
-    // the script path ($0 dirname/cd) and in NEEDLE_REF_DIR/NEEDLE_REF_LOCK
-    // break file lookup, so hand bash forward-slash paths on every platform
-    // (no-op on Unix). CI evidence: run 41030471519 windows-x64, every
-    // fetch.sh invocation exited 1 with empty output.
     static string ForBash(string path) => path.Replace(Path.DirectorySeparatorChar, '/');
 
-    // A bare "bash" on Windows resolves to System32\bash.exe (the WSL launcher)
-    // or the WindowsApps stub before Git bash, and either one exits 1 with no
-    // output when no distro is installed, so look for a real bash first.
     static readonly Lazy<string> Bash = new(() =>
     {
         if (!OperatingSystem.IsWindows()) return "bash";

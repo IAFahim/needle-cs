@@ -295,8 +295,6 @@ public sealed class SpanApiTests : IDisposable
     {
         using var session = new NeedleSession(model, SessionCases.DefaultTools(), new NeedleOptions { Threads = 1, AutoDate = false });
         var calls = new byte[4096];
-        // A single 30 ms timer can lose to a fast call, so retry until a cancel
-        // lands mid-flight; a broken RequestCancel still fails by never winning.
         var reply = default(Reply);
         for (var attempt = 0; attempt < 5 && reply.Status != ReplyStatus.Cancelled; attempt++)
         {

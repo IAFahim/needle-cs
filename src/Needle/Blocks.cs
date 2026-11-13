@@ -57,7 +57,7 @@ internal static unsafe class Attention
 #if NEEDLE_SIMD
         Simd.UseAvx;
 #else
-        false;
+        Kernels.Active.MergePartials != 0;
 #endif
 
     public static int ScoreFloats(int count) => (count + PositionBlock) * Lanes;
@@ -98,10 +98,39 @@ internal static unsafe class Attention
     {
         var count = last - first + 1;
         var scale = queryScale * InverseSqrtQkDim;
-        for (var s = 0; s < count; s++)
-            scores[s] = DotInt8x48(query, keys + (long)(first + s) * keyStride) * keyScales[(long)(first + s) * scaleStride] * scale;
+        var qLo0 = Avx2.ConvertToVector256Int16(Sse2.LoadVector128(query));
+        var qLo1 = Avx2.ConvertToVector256Int16(Sse2.LoadVector128(query + 16));
+        var qHi = Avx2.ConvertToVector256Int16(Sse2.LoadVector128(query + 32));
+        var scale4 = Vector128.Create(scale);
+        var keysBase = keys + (long)first * keyStride;
+        var keyScalesBase = keyScales + (long)first * scaleStride;
+        var s = 0;
+        for (; s + 4 <= count; s += 4)
+        {
+            if (s + 8 <= count) Sse.Prefetch0(keysBase + (long)(s + 8) * keyStride);
+            var kp0 = keysBase + (long)s * keyStride;
+            var kp1 = kp0 + keyStride;
+            var kp2 = kp1 + keyStride;
+            var kp3 = kp2 + keyStride;
+            var d0 = Avx2.Add(Avx2.MultiplyAddAdjacent(qLo0, Avx2.ConvertToVector256Int16(Sse2.LoadVector128(kp0))), Avx2.MultiplyAddAdjacent(qLo1, Avx2.ConvertToVector256Int16(Sse2.LoadVector128(kp0 + 16))));
+            d0 = Avx2.Add(d0, Avx2.MultiplyAddAdjacent(qHi, Avx2.ConvertToVector256Int16(Sse2.LoadVector128(kp0 + 32))));
+            var d1 = Avx2.Add(Avx2.MultiplyAddAdjacent(qLo0, Avx2.ConvertToVector256Int16(Sse2.LoadVector128(kp1))), Avx2.MultiplyAddAdjacent(qLo1, Avx2.ConvertToVector256Int16(Sse2.LoadVector128(kp1 + 16))));
+            d1 = Avx2.Add(d1, Avx2.MultiplyAddAdjacent(qHi, Avx2.ConvertToVector256Int16(Sse2.LoadVector128(kp1 + 32))));
+            var d2 = Avx2.Add(Avx2.MultiplyAddAdjacent(qLo0, Avx2.ConvertToVector256Int16(Sse2.LoadVector128(kp2))), Avx2.MultiplyAddAdjacent(qLo1, Avx2.ConvertToVector256Int16(Sse2.LoadVector128(kp2 + 16))));
+            d2 = Avx2.Add(d2, Avx2.MultiplyAddAdjacent(qHi, Avx2.ConvertToVector256Int16(Sse2.LoadVector128(kp2 + 32))));
+            var d3 = Avx2.Add(Avx2.MultiplyAddAdjacent(qLo0, Avx2.ConvertToVector256Int16(Sse2.LoadVector128(kp3))), Avx2.MultiplyAddAdjacent(qLo1, Avx2.ConvertToVector256Int16(Sse2.LoadVector128(kp3 + 16))));
+            d3 = Avx2.Add(d3, Avx2.MultiplyAddAdjacent(qHi, Avx2.ConvertToVector256Int16(Sse2.LoadVector128(kp3 + 32))));
+            var h01 = Avx2.HorizontalAdd(d0, d1);
+            var h23 = Avx2.HorizontalAdd(d2, d3);
+            var h = Avx2.HorizontalAdd(h01, h23);
+            var dots = Sse2.Add(h.GetLower(), h.GetUpper());
+            var ks = Vector128.Create(keyScalesBase[(long)s * scaleStride], keyScalesBase[(long)(s + 1) * scaleStride], keyScalesBase[(long)(s + 2) * scaleStride], keyScalesBase[(long)(s + 3) * scaleStride]);
+            Sse.Store(scores + s, Sse.Multiply(Sse2.ConvertToVector128Single(dots), Sse.Multiply(ks, scale4)));
+        }
+        for (; s < count; s++)
+            scores[s] = DotInt8x48(query, keysBase + (long)s * keyStride) * keyScalesBase[(long)s * scaleStride] * scale;
         Ops.Softmax(scores, count);
-        if (probabilities != null) for (var s = 0; s < count; s++) probabilities[first + s] = scores[s];
+        if (probabilities != null) for (s = 0; s < count; s++) probabilities[first + s] = scores[s];
 
         var a0 = Vector256<float>.Zero;
         var a1 = Vector256<float>.Zero;
@@ -111,9 +140,10 @@ internal static unsafe class Attention
         var a5 = Vector256<float>.Zero;
         var a6 = Vector256<float>.Zero;
         var a7 = Vector256<float>.Zero;
-        for (var s = 0; s < count; s++)
+        for (s = 0; s < count; s++)
         {
             var row = values + (long)(first + s) * valueStride;
+            if (s + 4 < count) Sse.Prefetch0(values + (long)(first + s + 4) * valueStride);
             var weight = Vector256.Create(scores[s] * valueScales[(long)(first + s) * scaleStride]);
             a0 = Fma.MultiplyAdd(weight, Avx.ConvertToVector256Single(Avx2.ConvertToVector256Int32(row)), a0);
             a1 = Fma.MultiplyAdd(weight, Avx.ConvertToVector256Single(Avx2.ConvertToVector256Int32(row + 8)), a1);
@@ -167,60 +197,36 @@ internal static unsafe class Attention
         Avx.Store(inverse, Vector256.Create(1f));
     }
 
-    [SkipLocalsInit]
-    public static void MergePartials(float* partials, int count, int heads, float* output)
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    static void Score4Vnni(
+        byte* queries, int* row0, int* row1, int* row2, int* row3,
+        Vector256<int> biasLane, float s0, float s1, float s2, float s3, Vector256<float> scale, float* dst)
     {
-        var kernelFp = Kernels.Active.MergePartials;
-        if ((void*)kernelFp != null)
+        var even0 = Vector256<int>.Zero;
+        var even1 = even0;
+        var even2 = even0;
+        var even3 = even0;
+        var odd0 = even0;
+        var odd1 = even0;
+        var odd2 = even0;
+        var odd3 = even0;
+        for (var j = 0; j < QkDim / 4; j += 2)
         {
-            InvokeMergePartials(kernelFp, partials, count, heads, output);
-            return;
+            var queryEven = Avx.LoadVector256(queries + j * 32);
+            var queryOdd = Avx.LoadVector256(queries + (j + 1) * 32);
+            even0 = AvxVnni.MultiplyWideningAndAdd(even0, queryEven, Vector256.Create(row0[j]).AsSByte());
+            even1 = AvxVnni.MultiplyWideningAndAdd(even1, queryEven, Vector256.Create(row1[j]).AsSByte());
+            even2 = AvxVnni.MultiplyWideningAndAdd(even2, queryEven, Vector256.Create(row2[j]).AsSByte());
+            even3 = AvxVnni.MultiplyWideningAndAdd(even3, queryEven, Vector256.Create(row3[j]).AsSByte());
+            odd0 = AvxVnni.MultiplyWideningAndAdd(odd0, queryOdd, Vector256.Create(row0[j + 1]).AsSByte());
+            odd1 = AvxVnni.MultiplyWideningAndAdd(odd1, queryOdd, Vector256.Create(row1[j + 1]).AsSByte());
+            odd2 = AvxVnni.MultiplyWideningAndAdd(odd2, queryOdd, Vector256.Create(row2[j + 1]).AsSByte());
+            odd3 = AvxVnni.MultiplyWideningAndAdd(odd3, queryOdd, Vector256.Create(row3[j + 1]).AsSByte());
         }
-        // Decode always lands on count == 2: same accumulation order as the
-        // generic loop (identical bits), with the weight broadcasts hoisted
-        // out of the dim loop.
-        var weights = stackalloc float[Lanes];
-        for (var h = 0; h < heads; h++)
-        {
-            if (count == 2)
-            {
-                var peak0 = partials[MaxTileHeads * VDim + h];
-                var peak1 = partials[PartialFloats + MaxTileHeads * VDim + h];
-                var pk = MathF.Max(peak0, peak1);
-                var w0 = MathF.Exp(peak0 - pk);
-                var w1 = MathF.Exp(peak1 - pk);
-                var tot = 0f;
-                tot += w0 * partials[MaxTileHeads * VDim + Lanes + h];
-                tot += w1 * partials[PartialFloats + MaxTileHeads * VDim + Lanes + h];
-                var inv = Vector256.Create(1f / tot);
-                var w0v = Vector256.Create(w0);
-                var w1v = Vector256.Create(w1);
-                for (var d = 0; d < VDim; d += Lanes)
-                {
-                    var sum = Vector256<float>.Zero;
-                    sum = Fma.MultiplyAdd(w0v, Avx.LoadVector256(partials + h * VDim + d), sum);
-                    sum = Fma.MultiplyAdd(w1v, Avx.LoadVector256(partials + PartialFloats + h * VDim + d), sum);
-                    Avx.Store(output + h * VDim + d, Avx.Multiply(sum, inv));
-                }
-                continue;
-            }
-            var peak = float.NegativeInfinity;
-            for (var c = 0; c < count; c++) peak = MathF.Max(peak, partials[c * PartialFloats + MaxTileHeads * VDim + h]);
-            var total = 0f;
-            for (var c = 0; c < count; c++)
-            {
-                weights[c] = MathF.Exp(partials[c * PartialFloats + MaxTileHeads * VDim + h] - peak);
-                total += weights[c] * partials[c * PartialFloats + MaxTileHeads * VDim + Lanes + h];
-            }
-            var inverse = Vector256.Create(1f / total);
-            for (var d = 0; d < VDim; d += Lanes)
-            {
-                var sum = Vector256<float>.Zero;
-                for (var c = 0; c < count; c++)
-                    sum = Fma.MultiplyAdd(Vector256.Create(weights[c]), Avx.LoadVector256(partials + c * PartialFloats + h * VDim + d), sum);
-                Avx.Store(output + h * VDim + d, Avx.Multiply(sum, inverse));
-            }
-        }
+        Avx.Store(dst, Score(Debias(Avx2.Add(even0, odd0), biasLane), s0, scale));
+        Avx.Store(dst + Lanes, Score(Debias(Avx2.Add(even1, odd1), biasLane), s1, scale));
+        Avx.Store(dst + 2 * Lanes, Score(Debias(Avx2.Add(even2, odd2), biasLane), s2, scale));
+        Avx.Store(dst + 3 * Lanes, Score(Debias(Avx2.Add(even3, odd3), biasLane), s3, scale));
     }
 
     [SkipLocalsInit]
@@ -234,40 +240,32 @@ internal static unsafe class Attention
         var last = count - 1;
         var keys = tile.Keys + (long)tile.First * tile.KeyStride;
         var keyStride = tile.KeyStride;
+        var keyStrideInts = keyStride >> 2;
         var keyScales = tile.KeyScales + (long)tile.First * tile.ScaleStride;
         var scaleStride = tile.ScaleStride;
         var scores = tile.Scores;
-        for (var s = 0; s < count; s += PositionBlock)
+        var bulk = count & ~3;
+        var s = 0;
+        for (; s < bulk; s += PositionBlock)
+        {
+            var row0 = (int*)(keys + (long)s * keyStride);
+            var row1 = row0 + keyStrideInts;
+            var row2 = row1 + keyStrideInts;
+            var row3 = row2 + keyStrideInts;
+            var ks = keyScales + (long)s * scaleStride;
+            Score4Vnni(queries, row0, row1, row2, row3, biasLane, ks[0], ks[scaleStride], ks[2 * scaleStride], ks[3 * scaleStride], scale, scores + s * Lanes);
+        }
+        if (s < count)
         {
             var row0 = (int*)(keys + (long)s * keyStride);
             var row1 = (int*)(keys + (long)Math.Min(s + 1, last) * keyStride);
             var row2 = (int*)(keys + (long)Math.Min(s + 2, last) * keyStride);
             var row3 = (int*)(keys + (long)Math.Min(s + 3, last) * keyStride);
-            var even0 = Vector256<int>.Zero;
-            var even1 = even0;
-            var even2 = even0;
-            var even3 = even0;
-            var odd0 = even0;
-            var odd1 = even0;
-            var odd2 = even0;
-            var odd3 = even0;
-            for (var j = 0; j < QkDim / 4; j += 2)
-            {
-                var queryEven = Avx.LoadVector256(queries + j * 32);
-                var queryOdd = Avx.LoadVector256(queries + (j + 1) * 32);
-                even0 = AvxVnni.MultiplyWideningAndAdd(even0, queryEven, Vector256.Create(row0[j]).AsSByte());
-                even1 = AvxVnni.MultiplyWideningAndAdd(even1, queryEven, Vector256.Create(row1[j]).AsSByte());
-                even2 = AvxVnni.MultiplyWideningAndAdd(even2, queryEven, Vector256.Create(row2[j]).AsSByte());
-                even3 = AvxVnni.MultiplyWideningAndAdd(even3, queryEven, Vector256.Create(row3[j]).AsSByte());
-                odd0 = AvxVnni.MultiplyWideningAndAdd(odd0, queryOdd, Vector256.Create(row0[j + 1]).AsSByte());
-                odd1 = AvxVnni.MultiplyWideningAndAdd(odd1, queryOdd, Vector256.Create(row1[j + 1]).AsSByte());
-                odd2 = AvxVnni.MultiplyWideningAndAdd(odd2, queryOdd, Vector256.Create(row2[j + 1]).AsSByte());
-                odd3 = AvxVnni.MultiplyWideningAndAdd(odd3, queryOdd, Vector256.Create(row3[j + 1]).AsSByte());
-            }
-            Avx.Store(scores + s * Lanes, Score(Debias(Avx2.Add(even0, odd0), biasLane), keyScales[(long)s * scaleStride], scale));
-            Avx.Store(scores + (s + 1) * Lanes, Score(Debias(Avx2.Add(even1, odd1), biasLane), keyScales[(long)Math.Min(s + 1, last) * scaleStride], scale));
-            Avx.Store(scores + (s + 2) * Lanes, Score(Debias(Avx2.Add(even2, odd2), biasLane), keyScales[(long)Math.Min(s + 2, last) * scaleStride], scale));
-            Avx.Store(scores + (s + 3) * Lanes, Score(Debias(Avx2.Add(even3, odd3), biasLane), keyScales[(long)Math.Min(s + 3, last) * scaleStride], scale));
+            Score4Vnni(queries, row0, row1, row2, row3, biasLane,
+                keyScales[(long)s * scaleStride],
+                keyScales[(long)Math.Min(s + 1, last) * scaleStride],
+                keyScales[(long)Math.Min(s + 2, last) * scaleStride],
+                keyScales[(long)Math.Min(s + 3, last) * scaleStride], scale, scores + s * Lanes);
         }
     }
 
@@ -324,9 +322,6 @@ internal static unsafe class Attention
 
     static void PackVnniQueries(sbyte* queries, int heads, uint* packed)
     {
-        // Branchless: clear once with vector stores, pack only live heads,
-        // then stamp the ones-lane used by Debias. Zeroed lanes contribute
-        // nothing downstream (their scale lane is 0 in ScaleVector).
         for (var j = 0; j < QkDim / 4; j++) Avx.Store(packed + j * Lanes, Vector256<uint>.Zero);
         for (var j = 0; j < QkDim / 4; j++)
         {
@@ -438,12 +433,6 @@ internal static unsafe class Attention
                 }
     }
 
-    // One V-row read feeds all six query heads of a GQA group. The 3-head
-    // chunked path above loads and converts every V row twice per group;
-    // here the six heads accumulate side by side over 16-wide dim slices
-    // (6 heads x 2 vectors = 12 chains, inside the 16-register budget), so
-    // the byte traffic halves while the per-head sum order over s is
-    // unchanged.
     static void AccumulateFloatSix(in AttentionTile tile, float* inverse, int firstDim)
     {
         var a00 = Vector256<float>.Zero;
@@ -582,13 +571,32 @@ internal static unsafe class Attention
         var peak1 = peak0;
         var peak2 = peak0;
         var peak3 = peak0;
-        for (var s = 0; s < blocks * PositionBlock; s += PositionBlock)
+        var bulk = count & ~3;
+        var pPos = 0;
+        for (; pPos < bulk; pPos += PositionBlock)
         {
-            var at = scores + s * Lanes;
-            var w0 = Avx.Multiply(Avx.LoadVector256(at), Vector256.Create(valueScales[(long)s * scaleStride]));
-            var w1 = Avx.Multiply(Avx.LoadVector256(at + Lanes), Vector256.Create(valueScales[(long)Math.Min(s + 1, last) * scaleStride]));
-            var w2 = Avx.Multiply(Avx.LoadVector256(at + 2 * Lanes), Vector256.Create(valueScales[(long)Math.Min(s + 2, last) * scaleStride]));
-            var w3 = Avx.Multiply(Avx.LoadVector256(at + 3 * Lanes), Vector256.Create(valueScales[(long)Math.Min(s + 3, last) * scaleStride]));
+            var at = scores + pPos * Lanes;
+            var vs = valueScales + (long)pPos * scaleStride;
+            var w0 = Avx.Multiply(Avx.LoadVector256(at), Vector256.Create(vs[0]));
+            var w1 = Avx.Multiply(Avx.LoadVector256(at + Lanes), Vector256.Create(vs[scaleStride]));
+            var w2 = Avx.Multiply(Avx.LoadVector256(at + 2 * Lanes), Vector256.Create(vs[2 * scaleStride]));
+            var w3 = Avx.Multiply(Avx.LoadVector256(at + 3 * Lanes), Vector256.Create(vs[3 * scaleStride]));
+            Avx.Store(at, w0);
+            Avx.Store(at + Lanes, w1);
+            Avx.Store(at + 2 * Lanes, w2);
+            Avx.Store(at + 3 * Lanes, w3);
+            peak0 = Avx.Max(peak0, w0);
+            peak1 = Avx.Max(peak1, w1);
+            peak2 = Avx.Max(peak2, w2);
+            peak3 = Avx.Max(peak3, w3);
+        }
+        if (pPos < blocks * PositionBlock)
+        {
+            var at = scores + pPos * Lanes;
+            var w0 = Avx.Multiply(Avx.LoadVector256(at), Vector256.Create(valueScales[(long)pPos * scaleStride]));
+            var w1 = Avx.Multiply(Avx.LoadVector256(at + Lanes), Vector256.Create(valueScales[(long)Math.Min(pPos + 1, last) * scaleStride]));
+            var w2 = Avx.Multiply(Avx.LoadVector256(at + 2 * Lanes), Vector256.Create(valueScales[(long)Math.Min(pPos + 2, last) * scaleStride]));
+            var w3 = Avx.Multiply(Avx.LoadVector256(at + 3 * Lanes), Vector256.Create(valueScales[(long)Math.Min(pPos + 3, last) * scaleStride]));
             Avx.Store(at, w0);
             Avx.Store(at + Lanes, w1);
             Avx.Store(at + 2 * Lanes, w2);
@@ -659,8 +667,8 @@ internal static unsafe class Attention
         var l22 = h00;
         var l23 = h00;
         var last = tile.Count - 1;
-        var rows = tile.Values + (long)tile.First * tile.ValueStride + firstDim;
         var rowStride = tile.ValueStride;
+        var rows = tile.Values + (long)tile.First * rowStride + firstDim;
         for (var b = 0; b < blocks; b++)
         {
             var s = b * PositionBlock;
@@ -737,8 +745,75 @@ internal static unsafe class Attention
         Avx.Store(output + 24, Avx.Permute2x128(f2, f3, 0x31));
     }
 #endif
-    // N30: outlined table invokers; see the note on the Ops.cs set. The
-    // `fixed` pin lives in the tile helper so Run stays branch-only.
+    [SkipLocalsInit]
+    public static void MergePartials(float* partials, int count, int heads, float* output)
+    {
+        var kernelFp = Kernels.Active.MergePartials;
+        if ((void*)kernelFp != null)
+        {
+            InvokeMergePartials(kernelFp, partials, count, heads, output);
+            return;
+        }
+        var weights = stackalloc float[Lanes];
+        for (var h = 0; h < heads; h++)
+        {
+            if (count == 2)
+            {
+                var peak0 = partials[MaxTileHeads * VDim + h];
+                var peak1 = partials[PartialFloats + MaxTileHeads * VDim + h];
+                var pk = MathF.Max(peak0, peak1);
+                var w0 = MathF.Exp(peak0 - pk);
+                var w1 = MathF.Exp(peak1 - pk);
+                var tot = 0f;
+                tot += w0 * partials[MaxTileHeads * VDim + Lanes + h];
+                tot += w1 * partials[PartialFloats + MaxTileHeads * VDim + Lanes + h];
+#if NEEDLE_SIMD
+                var inv = Vector256.Create(1f / tot);
+                var w0v = Vector256.Create(w0);
+                var w1v = Vector256.Create(w1);
+                for (var d = 0; d < VDim; d += Lanes)
+                {
+                    var sum = Vector256<float>.Zero;
+                    sum = Fma.MultiplyAdd(w0v, Avx.LoadVector256(partials + h * VDim + d), sum);
+                    sum = Fma.MultiplyAdd(w1v, Avx.LoadVector256(partials + PartialFloats + h * VDim + d), sum);
+                    Avx.Store(output + h * VDim + d, Avx.Multiply(sum, inv));
+                }
+#else
+                var inv = 1f / tot;
+                for (var d = 0; d < VDim; d++)
+                    output[h * VDim + d] = (w0 * partials[h * VDim + d] + w1 * partials[PartialFloats + h * VDim + d]) * inv;
+#endif
+                continue;
+            }
+            var peak = float.NegativeInfinity;
+            for (var c = 0; c < count; c++) peak = MathF.Max(peak, partials[c * PartialFloats + MaxTileHeads * VDim + h]);
+            var total = 0f;
+            for (var c = 0; c < count; c++)
+            {
+                weights[c] = MathF.Exp(partials[c * PartialFloats + MaxTileHeads * VDim + h] - peak);
+                total += weights[c] * partials[c * PartialFloats + MaxTileHeads * VDim + Lanes + h];
+            }
+#if NEEDLE_SIMD
+            var inverse = Vector256.Create(1f / total);
+            for (var d = 0; d < VDim; d += Lanes)
+            {
+                var sum = Vector256<float>.Zero;
+                for (var c = 0; c < count; c++)
+                    sum = Fma.MultiplyAdd(Vector256.Create(weights[c]), Avx.LoadVector256(partials + c * PartialFloats + h * VDim + d), sum);
+                Avx.Store(output + h * VDim + d, Avx.Multiply(sum, inverse));
+            }
+#else
+            var inverse = 1f / total;
+            for (var d = 0; d < VDim; d++)
+            {
+                var sum = 0f;
+                for (var c = 0; c < count; c++)
+                    sum += weights[c] * partials[c * PartialFloats + h * VDim + d];
+                output[h * VDim + d] = sum * inverse;
+            }
+#endif
+        }
+    }
     [MethodImpl(MethodImplOptions.NoInlining)]
     static void InvokeAttentionTile(nint fp, in AttentionTile tile)
     {
@@ -754,7 +829,7 @@ internal static unsafe class Attention
 internal unsafe struct AttentionBatch
 {
     const int MaxChunks = 8;
-    const int MinChunkPositions = 48;
+    const int MinChunkPositions = 20;
 
     public sbyte* Queries;
     public float* QueryScales;
@@ -764,6 +839,8 @@ internal unsafe struct AttentionBatch
     public float* ValueScales;
     public float* Output;
     public float* Probabilities;
+    public float* Gate;
+    public float* GatePeaks;
     public int Heads, KvHeads, QkDim, VDim, Position, Window, Capacity, Frames;
     float* partials;
     int* arrivals;
@@ -780,14 +857,35 @@ internal unsafe struct AttentionBatch
         RunChunked(pool, batch);
     }
 
+    public bool UsesChunks => chunks > 1;
+
     public void Plan(int threads, int tokens, float* partials, int* arrivals)
     {
         var group = Heads / KvHeads;
-        tilesPerGroup = (group + Attention.MaxTileHeads - 1) / Attention.MaxTileHeads;
-        tileHeads = (group + tilesPerGroup - 1) / tilesPerGroup;
-        planGroups = tokens * KvHeads;
-        var splittable = Attention.CanSplitPositions && tilesPerGroup == 1 && group > 1 && Probabilities == null;
-        chunks = splittable ? Math.Clamp((threads + planGroups - 1) / planGroups, 1, MaxChunks) : 1;
+        Span(0, out _, out var firstCount);
+        var splittable = Attention.CanSplitPositions && group > 1 && Probabilities == null;
+        var chunkByPos = splittable && (tokens > 1 || firstCount >= 2 * MinChunkPositions);
+        if (chunkByPos)
+        {
+            tilesPerGroup = (group + Attention.MaxTileHeads - 1) / Attention.MaxTileHeads;
+            tileHeads = (group + tilesPerGroup - 1) / tilesPerGroup;
+            planGroups = tokens * KvHeads;
+            chunks = tilesPerGroup == 1 ? Math.Clamp((threads + planGroups - 1) / planGroups, 1, MaxChunks) : 1;
+            if (chunks > 1 && tokens == 1)
+                chunks = Math.Min(chunks, Math.Max(1, firstCount / MinChunkPositions));
+        }
+        else
+        {
+            chunks = 1;
+            planGroups = tokens * KvHeads;
+            var desiredTiles = Probabilities == null && tokens == 1 && threads > planGroups
+                ? Math.Clamp((threads + planGroups - 1) / planGroups, 1, group)
+                : 1;
+            var minTiles = (group + Attention.MaxTileHeads - 1) / Attention.MaxTileHeads;
+            var targetTiles = Math.Max(minTiles, desiredTiles);
+            tileHeads = Math.Max(1, (group + targetTiles - 1) / targetTiles);
+            tilesPerGroup = (group + tileHeads - 1) / tileHeads;
+        }
         if (chunks == 1 || partials == null || arrivals == null) return;
         this.partials = partials;
         this.arrivals = arrivals;
@@ -822,9 +920,10 @@ internal unsafe struct AttentionBatch
         var token = task / (b->KvHeads * b->tilesPerGroup);
         var kv = task / b->tilesPerGroup % b->KvHeads;
         var firstHead = kv * group + task % b->tilesPerGroup * b->tileHeads;
+        var countHeads = Math.Min(b->tileHeads, (kv + 1) * group - firstHead);
         b->Span(token, out var first, out var count);
         var scores = stackalloc float[Attention.ScoreFloats(count)];
-        var work = b->Tile(token, kv, firstHead, Math.Min(b->tileHeads, (kv + 1) * group - firstHead), first, count, scores);
+        var work = b->Tile(token, kv, firstHead, countHeads, first, count, scores);
         work.Output = b->Output + (long)token * b->Heads * b->VDim + firstHead * b->VDim;
         work.Probabilities = b->Probabilities == null ? null : b->Probabilities + ((long)token * b->Heads + firstHead) * b->Frames;
         work.ProbabilityStride = b->Frames;
@@ -852,10 +951,11 @@ internal unsafe struct AttentionBatch
         work.Peaks = slot + Attention.MaxTileHeads * 64;
         work.Sums = work.Peaks + 8;
         Attention.Run(work);
-#if NEEDLE_SIMD
         if (Interlocked.Increment(ref b->arrivals[groupIndex]) == needed)
-            Attention.MergePartials(b->partials + (long)groupIndex * b->chunks * Attention.PartialFloats, needed, group, b->Output + (long)token * b->Heads * b->VDim + kv * group * b->VDim);
-#endif
+        {
+            var merged = b->Output + (long)token * b->Heads * b->VDim + kv * group * b->VDim;
+            Attention.MergePartials(b->partials + (long)groupIndex * b->chunks * Attention.PartialFloats, needed, group, merged);
+        }
     }
 
     void Span(int token, out int first, out int count)
@@ -910,13 +1010,44 @@ internal static unsafe class HadamardMlp
     const int TileRows = 4;
     const int TileColumns = 16;
 
-    // +8 floats of headroom so Apply can align the base to 32 bytes: every
-    // partition offset (Conditions, dim, width) is a multiple of 8 floats on
-    // supported geometries, so one alignment keeps weights/normalized/front/back
-    // 32-byte aligned and avoids split AVX loads on 16-byte stackalloc scratch.
     public static int ScratchFloats(int dim, int width) => Conditions + dim + 2 * width + 8;
 
+    public const int TileRowBlock = TileRows;
+
     static bool Blocked(int rows, int cols) => Simd.Enabled && rows % TileRows == 0 && cols % TileColumns == 0;
+
+    public static bool CanParallelize(int rows, int cols) =>
+#if NEEDLE_SIMD
+        !Simd.UseNeon && Blocked(rows, cols) && (void*)Kernels.Active.HadamardMlp == null;
+#else
+        false;
+#endif
+
+    public static void Layout(float* scratch, int dim, int width, out float* weights, out float* normalized, out float* front, out float* back)
+    {
+        weights = (float*)(((nuint)scratch + 31) & ~(nuint)31);
+        normalized = weights + Conditions;
+        front = normalized + dim;
+        back = front + width;
+    }
+
+    public static void BeginToken(MlpBatch* b, float* residual, float* scratch)
+    {
+        var w = b->Weights;
+        var dim = b->Dim;
+        var cols = b->Cols;
+        var inputRows = (dim + cols - 1) / cols;
+        Layout(scratch, dim, b->Width, out var weights, out var normalized, out var front, out _);
+        Ops.ZeroCenteredRms(residual, b->PreNorm, dim, normalized);
+        ConditionWeights(w->CondV, normalized, dim, weights);
+        ScaleInput(normalized, w->D1, dim, inputRows * cols, front);
+    }
+
+    public static void FinishToken(MlpBatch* b, float* residual, float* scratch)
+    {
+        Layout(scratch, b->Dim, b->Width, out _, out _, out _, out var back);
+        AccumulateOutput(residual, back, b->Weights->D4, b->Scale, b->Dim);
+    }
 
     public static void Apply(MlpBatch* b, float* residual, float* scratch)
     {
@@ -933,19 +1064,15 @@ internal static unsafe class HadamardMlp
         var width = b->Width;
         var inputRows = (dim + cols - 1) / cols;
         var outputRows = Math.Min(rows, (inputRows + TileRows - 1) / TileRows * TileRows);
-        var aligned = (float*)(((nuint)scratch + 31) & ~(nuint)31);
-        var weights = aligned;
-        var normalized = weights + Conditions;
-        var front = normalized + dim;
-        var back = front + width;
+        Layout(scratch, dim, width, out var weights, out var normalized, out var front, out var back);
 
         Ops.ZeroCenteredRms(residual, b->PreNorm, dim, normalized);
         ConditionWeights(w->CondV, normalized, dim, weights);
         ScaleInput(normalized, w->D1, dim, inputRows * cols, front);
         Kron(front, inputRows, w->W1A, w->W1B, rows, cols, rows, back);
-        PermuteModulateActivate(b->PermA, back, w->D2, weights, w->CondU, w->B2, width, front);
+        PermuteModulateActivateRange(b->PermA, back, w->D2, weights, w->CondU, w->B2, width, front, 0, width);
         Kron(front, rows, w->W2A, w->W2B, rows, cols, rows, back);
-        PermuteScale(b->PermB, back, w->D3, width, front);
+        PermuteScaleRange(b->PermB, back, w->D3, front, 0, width);
         Kron(front, rows, w->W3A, w->W3B, rows, cols, outputRows, back);
         AccumulateOutput(residual, back, w->D4, b->Scale, dim);
     }
@@ -995,12 +1122,20 @@ internal static unsafe class HadamardMlp
 #endif
     }
 
-    static void PermuteModulateActivate(int* permutation, float* source, float* d2, float* weights, float* condU, float* b2, int width, float* destination)
+    public static void PermuteModulateActivateRange(int* permutation, float* source, float* d2, float* weights, float* condU, float* b2, int width, float* destination, int offsetStart, int offsetEnd)
     {
 #if NEEDLE_SIMD
-        if (Simd.UseNeon) { Neon.PermuteModulateActivate(permutation, source, d2, weights, condU, b2, width, destination); return; }
+        if (Simd.UseNeon)
+        {
+            if (offsetStart == 0 && offsetEnd == width) Neon.PermuteModulateActivate(permutation, source, d2, weights, condU, b2, width, destination);
+            return;
+        }
 #endif
-        if (!Simd.Enabled) { Scalar.PermuteModulateActivate(permutation, source, d2, weights, condU, b2, width, destination); return; }
+        if (!Simd.Enabled)
+        {
+            if (offsetStart == 0 && offsetEnd == width) Scalar.PermuteModulateActivate(permutation, source, d2, weights, condU, b2, width, destination);
+            return;
+        }
 #if NEEDLE_SIMD
         var w0 = Vector256.Create(weights[0]);
         var w1 = Vector256.Create(weights[1]);
@@ -1018,7 +1153,7 @@ internal static unsafe class HadamardMlp
         var u5 = u4 + width;
         var u6 = u5 + width;
         var u7 = u6 + width;
-        for (var i = 0; i < width; i += 8)
+        for (var i = offsetStart; i < offsetEnd; i += 8)
         {
             var condition = Fma.MultiplyAdd(w0, Avx.LoadVector256(condU + i), one);
             condition = Fma.MultiplyAdd(w1, Avx.LoadVector256(u1 + i), condition);
@@ -1032,19 +1167,33 @@ internal static unsafe class HadamardMlp
                 Avx.Multiply(Avx.LoadVector256(d2 + i), condition),
                 Gather(source, permutation + i),
                 Avx.LoadVector256(b2 + i));
-            Avx.Store(destination + i, Avx.Multiply(v, Ops.Sigmoid(v)));
+            Avx.Store(destination + i, Avx.Multiply(v, Ops.FastSigmoid(v)));
         }
 #endif
     }
 
-    static void PermuteScale(int* permutation, float* source, float* scale, int width, float* destination)
+    public static void PermuteScaleRange(int* permutation, float* source, float* scale, float* destination, int offsetStart, int offsetEnd)
     {
 #if NEEDLE_SIMD
-        if (Simd.UseNeon) { Neon.PermuteScale(permutation, source, scale, width, destination); return; }
+        if (Simd.UseNeon)
+        {
+            if (offsetStart == 0) Neon.PermuteScale(permutation, source, scale, offsetEnd, destination);
+            return;
+        }
 #endif
-        if (!Simd.Enabled) { Scalar.PermuteScale(permutation, source, scale, width, destination); return; }
+        if (!Simd.Enabled)
+        {
+            if (offsetStart == 0) Scalar.PermuteScale(permutation, source, scale, offsetEnd, destination);
+            return;
+        }
 #if NEEDLE_SIMD
-        for (var i = 0; i < width; i += 8)
+        var i = offsetStart;
+        for (; i + 16 <= offsetEnd; i += 16)
+        {
+            Avx.Store(destination + i, Avx.Multiply(Gather(source, permutation + i), Avx.LoadVector256(scale + i)));
+            Avx.Store(destination + i + 8, Avx.Multiply(Gather(source, permutation + i + 8), Avx.LoadVector256(scale + i + 8)));
+        }
+        for (; i < offsetEnd; i += 8)
             Avx.Store(destination + i, Avx.Multiply(Gather(source, permutation + i), Avx.LoadVector256(scale + i)));
 #endif
     }
@@ -1066,17 +1215,18 @@ internal static unsafe class HadamardMlp
     public static readonly bool Wide = Simd.UseAvx && Avx512F.IsSupported && Vector512.IsHardwareAccelerated && Environment.GetEnvironmentVariable("NEEDLE_NOAVX512") == null;
 
     [System.Runtime.CompilerServices.SkipLocalsInit]
-    public static void KronAvx512(float* z, int activeRows, float* left, float* right, int rows, int cols, int resultRows, float* result)
+    public static void KronAvx512(float* z, int activeRows, float* left, float* right, int rows, int cols, int resultRows, float* result) =>
+        KronAvx512Range(z, activeRows, left, right, rows, cols, 0, resultRows, result);
+
+    [System.Runtime.CompilerServices.SkipLocalsInit]
+    public static void KronAvx512Range(float* z, int activeRows, float* left, float* right, int rows, int cols, int rowStart, int rowEnd, float* result)
     {
-        // Over-allocate so the tile stays 64-byte aligned when the stack slot is
-        // only 16-byte aligned; every phase fully writes the tile before reading
-        // it, so skipping zero-init is safe.
         var raw = stackalloc float[TileRows * cols + 16];
         var tile = (float*)(((nuint)raw + 63) & ~(nuint)63);
         nint stride1 = cols;
         nint stride2 = 2 * cols;
         nint stride3 = 3 * cols;
-        for (var k = 0; k < resultRows; k += TileRows)
+        for (var k = rowStart; k < rowEnd; k += TileRows)
         {
             for (var c = 0; c < cols; c += 32)
             {
@@ -1173,19 +1323,251 @@ internal static unsafe class HadamardMlp
 #endif
     }
 
+    public static void KronRange(float* z, int activeRows, float* left, float* right, int rows, int cols, int rowStart, int rowEnd, float* result)
+    {
+        if (rowStart >= rowEnd) return;
+#if NEEDLE_SIMD
+        if (Wide && cols % 32 == 0) { KronAvx512Range(z, activeRows, left, right, rows, cols, rowStart, rowEnd, result); return; }
+        KronAvx2Range(z, activeRows, left, right, rows, cols, rowStart, rowEnd, result);
+#endif
+    }
+
 #if NEEDLE_SIMD
     [System.Runtime.CompilerServices.SkipLocalsInit]
-    public static void KronAvx2(float* z, int activeRows, float* left, float* right, int rows, int cols, int resultRows, float* result)
+    public static void KronAvx2(float* z, int activeRows, float* left, float* right, int rows, int cols, int resultRows, float* result) =>
+        KronAvx2Range(z, activeRows, left, right, rows, cols, 0, resultRows, result);
+
+    [System.Runtime.CompilerServices.SkipLocalsInit]
+    static void Kron32Avx2Range(float* z, int activeRows, float* left, float* right, int rows, int rowStart, int rowEnd, float* result)
     {
-        // Over-allocate so the tile stays 32-byte aligned when the stack slot is
-        // only 16-byte aligned; every phase fully writes the tile before reading
-        // it, so skipping zero-init is safe.
+        var raw = stackalloc float[64 + 8];
+        var tile = (float*)(((nuint)raw + 31) & ~(nuint)31);
+        for (var k = rowStart; k < rowEnd; k += 2)
+        {
+            var a00 = Vector256<float>.Zero;
+            var a01 = Vector256<float>.Zero;
+            var a02 = Vector256<float>.Zero;
+            var a03 = Vector256<float>.Zero;
+            var a10 = Vector256<float>.Zero;
+            var a11 = Vector256<float>.Zero;
+            var a12 = Vector256<float>.Zero;
+            var a13 = Vector256<float>.Zero;
+            var column = z;
+            var factor = left + k;
+            for (var i = 0; i < activeRows; i++)
+            {
+                var z0 = Avx.LoadVector256(column);
+                var z1 = Avx.LoadVector256(column + 8);
+                var z2 = Avx.LoadVector256(column + 16);
+                var z3 = Avx.LoadVector256(column + 24);
+                var l0 = Avx.BroadcastScalarToVector256(factor);
+                var l1 = Avx.BroadcastScalarToVector256(factor + 1);
+                a00 = Fma.MultiplyAdd(l0, z0, a00);
+                a01 = Fma.MultiplyAdd(l0, z1, a01);
+                a02 = Fma.MultiplyAdd(l0, z2, a02);
+                a03 = Fma.MultiplyAdd(l0, z3, a03);
+                a10 = Fma.MultiplyAdd(l1, z0, a10);
+                a11 = Fma.MultiplyAdd(l1, z1, a11);
+                a12 = Fma.MultiplyAdd(l1, z2, a12);
+                a13 = Fma.MultiplyAdd(l1, z3, a13);
+                column += 32;
+                factor += rows;
+            }
+            Avx.Store(tile, a00);
+            Avx.Store(tile + 8, a01);
+            Avx.Store(tile + 16, a02);
+            Avx.Store(tile + 24, a03);
+            Avx.Store(tile + 32, a10);
+            Avx.Store(tile + 40, a11);
+            Avx.Store(tile + 48, a12);
+            Avx.Store(tile + 56, a13);
+
+            a00 = Vector256<float>.Zero;
+            a01 = Vector256<float>.Zero;
+            a02 = Vector256<float>.Zero;
+            a03 = Vector256<float>.Zero;
+            a10 = Vector256<float>.Zero;
+            a11 = Vector256<float>.Zero;
+            a12 = Vector256<float>.Zero;
+            a13 = Vector256<float>.Zero;
+            var row = right;
+            var scalars = tile;
+            for (var j = 0; j < 32; j += 2)
+            {
+                var r0 = Avx.LoadVector256(row);
+                var r1 = Avx.LoadVector256(row + 8);
+                var r2 = Avx.LoadVector256(row + 16);
+                var r3 = Avx.LoadVector256(row + 24);
+                var s0 = Avx.BroadcastScalarToVector256(scalars);
+                var s1 = Avx.BroadcastScalarToVector256(scalars + 32);
+                a00 = Fma.MultiplyAdd(s0, r0, a00);
+                a01 = Fma.MultiplyAdd(s0, r1, a01);
+                a02 = Fma.MultiplyAdd(s0, r2, a02);
+                a03 = Fma.MultiplyAdd(s0, r3, a03);
+                a10 = Fma.MultiplyAdd(s1, r0, a10);
+                a11 = Fma.MultiplyAdd(s1, r1, a11);
+                a12 = Fma.MultiplyAdd(s1, r2, a12);
+                a13 = Fma.MultiplyAdd(s1, r3, a13);
+
+                r0 = Avx.LoadVector256(row + 32);
+                r1 = Avx.LoadVector256(row + 40);
+                r2 = Avx.LoadVector256(row + 48);
+                r3 = Avx.LoadVector256(row + 56);
+                s0 = Avx.BroadcastScalarToVector256(scalars + 1);
+                s1 = Avx.BroadcastScalarToVector256(scalars + 33);
+                a00 = Fma.MultiplyAdd(s0, r0, a00);
+                a01 = Fma.MultiplyAdd(s0, r1, a01);
+                a02 = Fma.MultiplyAdd(s0, r2, a02);
+                a03 = Fma.MultiplyAdd(s0, r3, a03);
+                a10 = Fma.MultiplyAdd(s1, r0, a10);
+                a11 = Fma.MultiplyAdd(s1, r1, a11);
+                a12 = Fma.MultiplyAdd(s1, r2, a12);
+                a13 = Fma.MultiplyAdd(s1, r3, a13);
+
+                row += 64;
+                scalars += 2;
+            }
+            var output = result + k * 32;
+            Avx.Store(output, a00);
+            Avx.Store(output + 8, a01);
+            Avx.Store(output + 16, a02);
+            Avx.Store(output + 24, a03);
+            Avx.Store(output + 32, a10);
+            Avx.Store(output + 40, a11);
+            Avx.Store(output + 48, a12);
+            Avx.Store(output + 56, a13);
+        }
+    }
+
+    [System.Runtime.CompilerServices.SkipLocalsInit]
+    static void Kron32Avx2Range4(float* z, int activeRows, float* left, float* right, int rows, int rowStart, int rowEnd, float* result)
+    {
+        var raw = stackalloc float[128 + 8];
+        var tile = (float*)(((nuint)raw + 31) & ~(nuint)31);
+        for (var k = rowStart; k < rowEnd; k += 4)
+        {
+            for (var c = 0; c < 32; c += 16)
+            {
+                var a00 = Vector256<float>.Zero;
+                var a01 = Vector256<float>.Zero;
+                var a10 = Vector256<float>.Zero;
+                var a11 = Vector256<float>.Zero;
+                var a20 = Vector256<float>.Zero;
+                var a21 = Vector256<float>.Zero;
+                var a30 = Vector256<float>.Zero;
+                var a31 = Vector256<float>.Zero;
+                var column = z + c;
+                var factor = left + k;
+                for (var i = 0; i < activeRows; i++)
+                {
+                    var z0 = Avx.LoadVector256(column);
+                    var z1 = Avx.LoadVector256(column + 8);
+                    var l0 = Avx.BroadcastScalarToVector256(factor);
+                    var l1 = Avx.BroadcastScalarToVector256(factor + 1);
+                    var l2 = Avx.BroadcastScalarToVector256(factor + 2);
+                    var l3 = Avx.BroadcastScalarToVector256(factor + 3);
+                    a00 = Fma.MultiplyAdd(l0, z0, a00);
+                    a01 = Fma.MultiplyAdd(l0, z1, a01);
+                    a10 = Fma.MultiplyAdd(l1, z0, a10);
+                    a11 = Fma.MultiplyAdd(l1, z1, a11);
+                    a20 = Fma.MultiplyAdd(l2, z0, a20);
+                    a21 = Fma.MultiplyAdd(l2, z1, a21);
+                    a30 = Fma.MultiplyAdd(l3, z0, a30);
+                    a31 = Fma.MultiplyAdd(l3, z1, a31);
+                    column += 32;
+                    factor += rows;
+                }
+                Avx.Store(tile + c, a00);
+                Avx.Store(tile + c + 8, a01);
+                Avx.Store(tile + 32 + c, a10);
+                Avx.Store(tile + 32 + c + 8, a11);
+                Avx.Store(tile + 64 + c, a20);
+                Avx.Store(tile + 64 + c + 8, a21);
+                Avx.Store(tile + 96 + c, a30);
+                Avx.Store(tile + 96 + c + 8, a31);
+            }
+            for (var c = 0; c < 32; c += 16)
+            {
+                var a00 = Vector256<float>.Zero;
+                var a01 = Vector256<float>.Zero;
+                var a10 = Vector256<float>.Zero;
+                var a11 = Vector256<float>.Zero;
+                var a20 = Vector256<float>.Zero;
+                var a21 = Vector256<float>.Zero;
+                var a30 = Vector256<float>.Zero;
+                var a31 = Vector256<float>.Zero;
+                var row = right + c;
+                var scalars = tile;
+                for (var j = 0; j < 32; j += 2)
+                {
+                    var r0 = Avx.LoadVector256(row);
+                    var r1 = Avx.LoadVector256(row + 8);
+                    var s0 = Avx.BroadcastScalarToVector256(scalars);
+                    var s1 = Avx.BroadcastScalarToVector256(scalars + 32);
+                    var s2 = Avx.BroadcastScalarToVector256(scalars + 64);
+                    var s3 = Avx.BroadcastScalarToVector256(scalars + 96);
+                    a00 = Fma.MultiplyAdd(s0, r0, a00);
+                    a01 = Fma.MultiplyAdd(s0, r1, a01);
+                    a10 = Fma.MultiplyAdd(s1, r0, a10);
+                    a11 = Fma.MultiplyAdd(s1, r1, a11);
+                    a20 = Fma.MultiplyAdd(s2, r0, a20);
+                    a21 = Fma.MultiplyAdd(s2, r1, a21);
+                    a30 = Fma.MultiplyAdd(s3, r0, a30);
+                    a31 = Fma.MultiplyAdd(s3, r1, a31);
+
+                    r0 = Avx.LoadVector256(row + 32);
+                    r1 = Avx.LoadVector256(row + 40);
+                    s0 = Avx.BroadcastScalarToVector256(scalars + 1);
+                    s1 = Avx.BroadcastScalarToVector256(scalars + 33);
+                    s2 = Avx.BroadcastScalarToVector256(scalars + 65);
+                    s3 = Avx.BroadcastScalarToVector256(scalars + 97);
+                    a00 = Fma.MultiplyAdd(s0, r0, a00);
+                    a01 = Fma.MultiplyAdd(s0, r1, a01);
+                    a10 = Fma.MultiplyAdd(s1, r0, a10);
+                    a11 = Fma.MultiplyAdd(s1, r1, a11);
+                    a20 = Fma.MultiplyAdd(s2, r0, a20);
+                    a21 = Fma.MultiplyAdd(s2, r1, a21);
+                    a30 = Fma.MultiplyAdd(s3, r0, a30);
+                    a31 = Fma.MultiplyAdd(s3, r1, a31);
+
+                    row += 64;
+                    scalars += 2;
+                }
+                var output = result + k * 32 + c;
+                Avx.Store(output, a00);
+                Avx.Store(output + 8, a01);
+                Avx.Store(output + 32, a10);
+                Avx.Store(output + 40, a11);
+                Avx.Store(output + 64, a20);
+                Avx.Store(output + 72, a21);
+                Avx.Store(output + 96, a30);
+                Avx.Store(output + 104, a31);
+            }
+        }
+    }
+
+    [System.Runtime.CompilerServices.SkipLocalsInit]
+    public static void KronAvx2Range(float* z, int activeRows, float* left, float* right, int rows, int cols, int rowStart, int rowEnd, float* result)
+    {
+        if (cols == 32)
+        {
+            if (((rowEnd - rowStart) & 3) == 0)
+            {
+                Kron32Avx2Range4(z, activeRows, left, right, rows, rowStart, rowEnd, result);
+                return;
+            }
+            if (((rowEnd - rowStart) & 1) == 0)
+            {
+                Kron32Avx2Range(z, activeRows, left, right, rows, rowStart, rowEnd, result);
+                return;
+            }
+        }
         var raw = stackalloc float[TileRows * cols + 8];
         var tile = (float*)(((nuint)raw + 31) & ~(nuint)31);
         nint stride1 = cols;
         nint stride2 = 2 * cols;
         nint stride3 = 3 * cols;
-        for (var k = 0; k < resultRows; k += TileRows)
+        for (var k = rowStart; k < rowEnd; k += TileRows)
         {
             for (var c = 0; c < cols; c += TileColumns)
             {
@@ -1271,7 +1653,6 @@ internal static unsafe class HadamardMlp
         }
     }
 #endif
-    // N30: outlined table invoker; see the note on the Ops.cs set.
     [MethodImpl(MethodImplOptions.NoInlining)]
     static void InvokeHadamardMlp(nint fp, MlpBatch* b, float* residual, float* scratch) =>
         ((delegate* unmanaged[Cdecl]<MlpBatch*, float*, float*, void>)(void*)fp)(b, residual, scratch);

@@ -12,12 +12,6 @@ using Xunit.Abstractions;
 
 namespace Needle.Tests;
 
-// Issue #26: multi-sequence batched decode. One shared forward per step must
-// leave every sequence's output identical to decoding it alone: same tokens,
-// calls, reasoning, confidence and token counts. The tests below pin that
-// identity at the engine level (bit-exact logits) and at the session level
-// (game prompts, mixed grammars, ragged finishes, per-lane cancel), then
-// report the throughput scaling the issue asks for.
 public sealed unsafe class BatchedDecodeTests : IDisposable
 {
     readonly Model model;
@@ -105,7 +99,6 @@ public sealed unsafe class BatchedDecodeTests : IDisposable
         batched.FeedSlot(1, queryB);
         AssertLogitsEqual(LogitsOf(singleB), BatchRow(batched, 0), "prefill slot 1");
 
-        // One shared step over rows from both slots.
         var tokens = stackalloc int[2] { queryA[^1], queryB[^1] };
         var rowSlots = stackalloc int[2] { 0, 1 };
         var heads = stackalloc int[2] { 0, 1 };
@@ -125,7 +118,6 @@ public sealed unsafe class BatchedDecodeTests : IDisposable
         Assert.True(PooledConfidence(singleA, pooledA, scratchA) == PooledConfidence(batched, 0, pooledB, scratchB), "confidence slot 0 differs");
         Assert.True(pooledA.SequenceEqual(pooledB), "pooled embeddings slot 0 differ");
 
-        // Rewind on both paths, then decode in the opposite slot order.
         singleA.Rewind();
         singleB.Rewind();
         batched.RewindSlot(0);
@@ -230,9 +222,6 @@ public sealed unsafe class BatchedDecodeTests : IDisposable
         var expected = RunSequential(tools, queries, options);
         using var batch = new BatchedSession(model, options, queries.Length);
         foreach (var _ in queries) batch.Open(tools);
-        // A pre-turn cancel is cleared at turn start, exactly like the
-        // single-sequence session clears RequestCancel on entry: the lane
-        // runs normally and identically.
         batch.RequestCancel(1);
         var actual = batch.Complete(queries);
         for (var i = 0; i < queries.Length; i++) AssertSameCallResult($"lane {i}", expected[i], actual[i]);

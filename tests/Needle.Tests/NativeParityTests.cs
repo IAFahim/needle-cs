@@ -42,11 +42,6 @@ public sealed class NativeParityTests : IDisposable
         return false;
     }
 
-    // Scalar kernels match AVX2 (and the numpy golden) to cosine 0.9999977 on
-    // prefill logits with the same argmax, but that ~1e-6-level realization
-    // noise flips near-tied argmaxes and moves head confidence on some
-    // prompts (F11 measurement, NEEDLE_SCALAR=1). Bounds below are tier
-    // specific; each scalar number cites the measured worst case.
     static bool IsScalar => Tiers.Active == CpuTier.Scalar;
 
     [Fact]
@@ -94,11 +89,6 @@ public sealed class NativeParityTests : IDisposable
                     Report(query, system, expected, actual);
                     if (expected.CallNames != actual.CallNames())
                     {
-                        // Whether a borderline answer clears RefuseBelow is decided by ~1e-6 noise, so one
-                        // side may refuse where the other calls. That is only acceptable right at the
-                        // boundary (scalar tie flips move confidence by up to ~0.25, e.g. 'attack the watchtower near
-                        // the river' with the date system: native ~0.14, scalar 0.2541); any other disagreement
-                        // about the call is a real difference.
                         var boundary = new NeedleOptions().RefuseBelow;
                         var oneRefused = expected.CallNames == "" || actual.CallNames() == "";
                         Assert.True(oneRefused && Math.Abs((actual.Confidence ?? 1) - boundary) <= (IsScalar ? 0.3 : 0.1),
@@ -114,13 +104,6 @@ public sealed class NativeParityTests : IDisposable
         AssertConfidenceAgreement(deltas);
     }
 
-    // Typical prompts agree with native to ~0.01. A few move more because ~1e-6 realization noise
-    // can flip a near-tied token in the reasoning path, and which ones depends on the CPU, so the
-    // maximum is bounded by the worst measured tie flip instead of a per-machine fit: scalar
-    // 0.1126 ('attack the watchtower near the river' + date system: native 0.1415, scalar 0.2541),
-    // AVX 0.0557 locally, 0.0611 and 0.0739 on CI runners, 0.1245 after SIMD-01 4-accumulator
-    // reorder on AVX2 (kernels bit-agree via ForwardMatchesReferenceLogits; same calls). The median
-    // keeps the bulk tight.
     static void AssertConfidenceAgreement(List<(double Delta, string Query)> deltas)
     {
         var sorted = deltas.Select(d => d.Delta).OrderBy(d => d).ToArray();
@@ -129,12 +112,6 @@ public sealed class NativeParityTests : IDisposable
         Assert.True(sorted[sorted.Length / 2] <= 0.02, $"median confidence delta {sorted[sorted.Length / 2]:F4}");
     }
 
-    // These prompts sit on an exact argmax tie: which side wins is decided by
-    // ~1e-6 realization noise, so it varies with the CPU tier, the thread
-    // count and even the native wheel's own kernels (CI runners: native says
-    // `say` where a desktop AVX2 host says give_item). The contract is not
-    // "which side", but that the outcome stays inside the tie and that the
-    // managed engine is repeatable.
     [Fact]
     public void KnifeEdgeTiesStayInsideTheTieAndAreRepeatable()
     {
@@ -163,12 +140,10 @@ public sealed class NativeParityTests : IDisposable
             using var session = Fresh(tools, "", threads, 64);
             var reply = session.Complete("attack the watchtower near the river");
             Assert.Contains(reply.CallNames(), AttackOrRefusal);
-            // A refusal keeps the call it declined, so the tie stays observable.
             if (reply.CallNames() == "") Assert.Equal("attack", reply.SuppressedCalls.CallNames());
         }
     }
 
-    // What the model meant: a refusal (confidence below RefuseBelow) keeps the call it declined.
     static string Intent(CallResult result) => result.CallNames() is { Length: > 0 } names ? names : result.SuppressedCalls.CallNames();
 
     static readonly string[] GiveOrSay = { "give_item", "say" };
@@ -190,42 +165,12 @@ public sealed class NativeParityTests : IDisposable
         var turn = new[] { "set a timer for 5 minutes", "what's it like in Lagos right now?", "play some Miles Davis", "set a timer for 3 minutes" };
         var index = 0;
         var drift = 0.0;
-        var forked = false; // native and managed trajectories have diverged after a reasoning flip
+        var forked = false;
         while (session.ContextUsed < 1500 && index < 64)
         {
             var query = turn[index % turn.Length];
             var expected = native.Continue(query, MaxNewTokens);
             var actual = session.Complete(query);
-            // Scalar drifts from native as context grows (both tiers sag while
-            // native stays ~0.90; scalar leads AVX by ~100 tokens through the
-            // transition, then both sit ~0.75): measured NEEDLE_SCALAR=1 maxima
-            // 0.1365 below 1300 tokens (timer3 at tokens~1258) and 0.1538 above
-            // (Miles at tokens~1439). AVX maxima are 0.0521/0.1317 locally and 0.081 below 1300
-            // tokens on a CI runner. The mean below keeps
-            // typical turns tight: native sags to ~0.72 on an EPYC 7763 while managed holds ~0.83,
-            // a steady 0.0648 mean offset there (0.01 to 0.03 elsewhere). The Avx512Bw tier reduces in
-            // 16-lane order, so its rounding differs from the 8-lane tiers: one turn moved 0.227 on an
-            // EPYC 9V74 (0.5887 against native ~0.82). A scalar tie flip moved one
-            // turn by 0.256 on that CPU (0.1365 locally), an early example of the flip the gate keys on.
-            // Ryzen 5 8500G (AvxVnni=False, AVX-512 BW/VL/VBMI, default Avx2): the first Miles Davis
-            // turn (tokens~301) flips a near-tied reasoning token and moves head confidence while the
-            // calls still match. Prefix is identical entering the turn (timer + Lagos reasoning match
-            // exactly); at reasoning position 3 managed picks ' done' (3011, logit 5.608763) over 'ed'
-            // (328) by 0.0669 logits (~51.7/48.3), native takes 'ed' ("weather checked;" vs "weather
-            // check done;..."). Decode stays ~0.9999 (call tokens confident), so confidence==head:
-            // native 0.8656 vs managed 0.5998 (Avx2, delta 0.2658) and 0.5887 (Avx512Bw, delta 0.2769,
-            // matching the EPYC 9V74 worst case). Model SHA matches ref.lock (c9d915...), golden
-            // provenance is clean, and ForwardMatchesReferenceLogits still holds cosine > 0.99995 with
-            // the same argmax, so this is tie amplification, not a kernel bug.
-            // Tie-aware per-turn bound: while native and managed reasoning agree, both engines walk the
-            // same trajectory and 0.15 holds (typical agreement there is ~0.01). Once a reasoning token
-            // flips, the contexts differ for good and later turns compare confounded prefixes, so the
-            // flip turn and everything after it gets the 0.30 tie allowance. The allowance is keyed to
-            // the flip signature (reasoning divergence), calibrated by the measured 0.0669-logit top-2
-            // gap at the flip — native logits are not exposed to the test, and kernel accuracy on
-            // identical inputs is guarded separately by ForwardMatchesReferenceLogits. This covers the
-            // worst observed tie flip on every tier (0.277 Avx512Bw here, 0.256 scalar on EPYC 7763)
-            // while keeping pre-flip turns at full sensitivity to real regressions.
             if (expected.Reasoning != actual.Reasoning) forked = true;
             var bound = forked ? 0.30 : 0.15;
             drift += Math.Abs((actual.Confidence ?? double.NaN) - (expected.Confidence ?? 0));
@@ -235,11 +180,6 @@ public sealed class NativeParityTests : IDisposable
             index++;
         }
         output.WriteLine($"reached {session.ContextUsed} context tokens in {index} turns, mean confidence drift {drift / Math.Max(1, index):F4}");
-        // Mean stays tight on typical runs (0.01-0.03, 0.0648 on EPYC 7763) but tie clusters inflate it:
-        // on this 8500G box Avx2 averages 0.0535 (one 0.266 early flip) while Avx512Bw averages 0.0816
-        // (the same early 0.277 flip plus a late ~0.12 cluster at tokens~1438-1540 that persists for three
-        // turns after the reasoning path diverges; calls match throughout). One 0.10 mean bound covers
-        // the worst observed tier average on every tier.
         Assert.True(drift / Math.Max(1, index) <= 0.10, $"mean confidence drift {drift / Math.Max(1, index):F4}");
         Assert.True(session.ContextUsed >= 1500, $"only reached {session.ContextUsed} tokens");
     }
@@ -340,12 +280,6 @@ public sealed class NativeParityTests : IDisposable
         T Proc<T>(string name) where T : Delegate =>
             Marshal.GetDelegateForFunctionPointer<T>(NativeLibrary.GetExport(handle, name));
 
-        // The upstream wheel only ships a manylinux x86-64 build, so on
-        // Windows, macOS, or arm64 there is deliberately nothing loadable and
-        // the parity tests skip via Ready(). TryLoad must therefore never
-        // throw for a platform-mismatched library (CI evidence: DllNotFound on
-        // macos-arm64/linux-arm64, BadImageFormat on windows-x64); only a
-        // genuinely broken linux-x64 setup should still surface.
         static string NativeLibraryName() =>
             RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "needle3.dll"
             : RuntimeInformation.IsOSPlatform(OSPlatform.OSX) ? "libneedle3.dylib"

@@ -1,17 +1,3 @@
-// N64: build-time primed-prefix baker (Editor menu for `needle prime`).
-// Bakes the post-prefill KV snapshot for a (model, tool set, system prompt,
-// context) tuple and writes it to a .prefix file. Ship the file (for example
-// in StreamingAssets) and load it with the NeedleSession(model, tools,
-// prefixBytes, options) constructor or HostOptions.PrimedPrefixPath to skip
-// the tool-prompt prefill at startup: session ready in milliseconds.
-//
-// The bake is date-free (AutoDate=false, plan.md section 10.5): a dated
-// system prompt would hash differently the next day and the load would fail
-// validation. The load validates model geometry, vocab, context, tool set
-// and system prompt and throws on mismatch; rebake when any of those change.
-// Retrieval stays off (full tool set is primed): loading hosts need
-// RetrievalTopK at or above the tool count.
-// C# 9 safe: block namespaces, no target-typed new, no u8 literals.
 using System;
 using System.Diagnostics;
 using System.IO;
@@ -68,10 +54,8 @@ namespace Needle.Editor
                 throw new ArgumentOutOfRangeException("context");
             }
 
-            // Retrieval stays off for the bake: the full tool set is primed,
-            // and a primed prefix cannot be combined with tool retrieval.
             NeedleOptions options = new NeedleOptions
-            { // full tool-set prime; retrieval stays off
+            {
                 Context = context,
                 System = system,
                 AutoDate = false,
@@ -92,8 +76,6 @@ namespace Needle.Editor
                 }
                 File.WriteAllBytes(outputPath, bytes);
 
-                // Validate the file: a fresh session must restore it and agree
-                // on the primed length. Timed as the N64 ready measurement.
                 Stopwatch restore = Stopwatch.StartNew();
                 using (NeedleSession revived = new NeedleSession(model, toolsJson, bytes, options))
                 {

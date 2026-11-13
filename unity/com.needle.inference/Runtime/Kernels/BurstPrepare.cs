@@ -1,59 +1,12 @@
-// N35: Burst Prepare + Hadamard + QuantizeInt8 + Planes2/4, x86 and Neon.
-//
-// Ports Quant.Prepare 1:1 to Unity.Burst.Intrinsics: the x86 lane mirrors the
-// net10 AVX2+FMA path (same op order, same constants, same FMA use), the Neon
-// lane mirrors Neon.Prepare (same op order, same truncation/narrowing, same
-// table permutations). Anything else falls back to a scalar lane that mirrors
-// Scalar.* exactly. All three lanes are exact-ops kernels (integer sums,
-// byte permutes, round/clamp), so fixtures compare bitwise (H7); there is no
-// parity fallback in this file.
-//
-// Burst rules (plan §2.1 cookbook) this file follows:
-//   - FloatMode.Strict on both entry points, never Fast: no reassociation.
-//   - Explicit FMA only on x86 (mm256_fmadd_ps, matching Fma.MultiplyAdd);
-//     the Neon Hadamard has no FMA in the reference either.
-//   - Blittable arguments only; no allocation, no static mutable state; safe
-//     to call from any thread (pool workers call via the table).
-//   - H8: no AVX-VNNI anywhere. The Prepare offset sum uses the Avx2Dot
-//     sequence (maddubs + madd + add, Tiers.Avx2Dot) exactly like the
-//     non-VNNI tier of Tiers.Accumulate.
-//
-// Exactness arguments (each is a bit-identity, not a bound):
-//   - QuantizeInt8 x86: the net10 packs_epi32/packs_epi16 pair saturates each
-//     int32 lane to sbyte range. The Burst lane spills the cvtps output and
-//     clamps each lane in scalar: identical bytes for every int32 input,
-//     including the 0x80000000 out-of-range sentinel (clamps to -128, which
-//     is what the saturating pack produces). Rounding itself stays vector
-//     (mm256_cvtps_epi32 = VCVTPS2DQ, round-to-nearest-even, same as BCL).
-//   - QuantizeInt8 Neon: vcvtq_s32_f32 is FCVTZS (round toward zero), then
-//     scalar clamp mirrors the double narrowing saturate lane for lane.
-//   - Prepare offset sum: integer addition is associative, so the spill +
-//     scalar add of the 8 int32 lanes equals the net10 Vector256.Sum, and
-//     the scalar 128-byte sum equals Neon.SumOf (dotprod or widening), bit
-//     for bit. The 63x scale-up is one exact float multiply either way.
-//   - Planes x86: same shuffle/unpack/permute instruction order as
-//     Quant.Planes2/Planes4 (gather/interleave constants rebuilt identically).
-//   - Planes Neon: Burst exposes only single-register TBL (vqtbl1q_u8), so
-//     each 16-byte group is looked up in the four 16-byte sub-tables with
-//     (idx - 16k) and ORed. TBL zeroes out-of-range lanes, so exactly one
-//     lookup hits per lane and the OR equals the 64-byte table result.
-//   - Hadamard Neon tail: the scalar Butterfly8 below reproduces the
-//     Neon.Butterfly8 dataflow op for op (AddPairwise/ZipLow unrolled, same
-//     association), verified against a lane simulation (see N13 fixtures).
-//
-// C# 9 safe: block namespace, no target-typed new, no static lambdas.
 using System;
 using System.Diagnostics;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Unity.Burst;
 using Unity.Burst.Intrinsics;
 
 namespace Needle.BurstKernels
 {
-    // Layout mirror of the internal Needle.Activations (Model-adjacent struct
-    // in Quant.cs: sbyte* Values, float* Scales, float* Offsets, int Cols,
-    // int Groups, int Stride). The table ABI passes a bare pointer, so an
-    // identical layout reads the caller's struct exactly.
     [StructLayout(LayoutKind.Sequential)]
     public unsafe struct BurstActivations
     {
@@ -65,26 +18,22 @@ namespace Needle.BurstKernels
         public int Stride;
     }
 
+    [BurstCompile]
     public static unsafe class BurstPrepare
     {
-        // Cq.GroupSize = 128 (Model.cs); Codebook.Bias = 63 (Model.cs).
         const int GroupSize = 128;
         const float HadamardScale = 0.08838834764831845f;
         const float CodebookBias = 63f;
-        const float RoundBias = 12582912f; // 1.5 * (1 << 23); Scalar.RoundEven
+        const float RoundBias = 12582912f;
 
-        // Table entry: void(float* x, int tokens, int cols, int bits, Activations*).
         [BurstCompile(CompileSynchronously = true, FloatMode = FloatMode.Strict)]
         public static void InvokePrepare(float* x, int tokens, int cols, int bits, BurstActivations* a)
         {
-            // Branches fold at Burst compile time: exactly one lane survives
-            // per target (x64 with AVX2+FMA, arm64 Neon, scalar elsewhere).
             if (X86.Avx2.IsAvx2Supported && X86.Fma.IsFmaSupported) { PrepareX86(x, tokens, cols, bits, a); return; }
             if (Arm.Neon.IsNeonSupported) { PrepareNeon(x, tokens, cols, bits, a); return; }
             PrepareScalar(x, tokens, cols, bits, a);
         }
 
-        // Table entry: float(float* x, int n, sbyte* destination).
         [BurstCompile(CompileSynchronously = true, FloatMode = FloatMode.Strict)]
         public static float InvokeQuantizeInt8(float* x, int n, sbyte* destination)
         {
@@ -93,186 +42,240 @@ namespace Needle.BurstKernels
             return QuantizeInt8Scalar(x, n, destination);
         }
 
-        // Mirrors Quant.AbsMax: peak starts at zero, abs is ANDNOT -0.0 (same
-        // as Vector256.Abs), then the Max(lower, upper) / 0x4E / 0xB1 fold.
         static float AbsMaxX86(float* x, int n)
         {
-            v256 sign = X86.Avx.mm256_set1_ps(-0.0f);
-            v256 peak = X86.Avx.mm256_set1_ps(0f);
-            for (int i = 0; i < n; i += 8)
-                peak = X86.Avx.mm256_max_ps(peak, X86.Avx.mm256_andnot_ps(sign, X86.Avx.mm256_loadu_ps(x + i)));
-            v128 halves = X86.Sse.max_ps(X86.Avx.mm256_castps256_ps128(peak), X86.Avx.mm256_extractf128_ps(peak, 1));
-            v128 pairs = X86.Sse.max_ps(halves, X86.Sse.shuffle_ps(halves, halves, 0x4E));
-            v128 quad = X86.Sse.max_ps(pairs, X86.Sse.shuffle_ps(pairs, pairs, 0xB1));
-            return X86.Sse.cvtss_f32(quad);
+            if (X86.Avx2.IsAvx2Supported && X86.Fma.IsFmaSupported)
+            {
+                v256 sign = X86.Avx.mm256_set1_ps(-0.0f);
+                v256 peak = X86.Avx.mm256_set1_ps(0f);
+                for (int i = 0; i < n; i += 8)
+                    peak = X86.Avx.mm256_max_ps(peak, X86.Avx.mm256_andnot_ps(sign, X86.Avx.mm256_loadu_ps(x + i)));
+                v128 halves = X86.Sse.max_ps(X86.Avx.mm256_castps256_ps128(peak), X86.Avx.mm256_extractf128_ps(peak, 1));
+                v128 pairs = X86.Sse.max_ps(halves, X86.Sse.shuffle_ps(halves, halves, 0x4E));
+                v128 quad = X86.Sse.max_ps(pairs, X86.Sse.shuffle_ps(pairs, pairs, 0xB1));
+                return X86.Sse.cvtss_f32(quad);
+            }
+            return 0f;
         }
 
-        // Mirrors Quant.QuantizeInt8: same peak/scale/inverse, same VCVTPS2DQ
-        // rounding; narrowing is a per-lane clamp over the cvt spill (bit-
-        // identical to the packs_epi32/packs_epi16 pair, see file header).
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static v256 Pack32X86(float* source, v256 inverse, v256 interleave)
+        {
+            if (X86.Avx2.IsAvx2Supported && X86.Fma.IsFmaSupported)
+            {
+                v256 c0 = X86.Avx.mm256_cvtps_epi32(X86.Avx.mm256_mul_ps(X86.Avx.mm256_loadu_ps(source), inverse));
+                v256 c1 = X86.Avx.mm256_cvtps_epi32(X86.Avx.mm256_mul_ps(X86.Avx.mm256_loadu_ps(source + 8), inverse));
+                v256 c2 = X86.Avx.mm256_cvtps_epi32(X86.Avx.mm256_mul_ps(X86.Avx.mm256_loadu_ps(source + 16), inverse));
+                v256 c3 = X86.Avx.mm256_cvtps_epi32(X86.Avx.mm256_mul_ps(X86.Avx.mm256_loadu_ps(source + 24), inverse));
+                v256 p01 = X86.Avx2.mm256_packs_epi32(c0, c1);
+                v256 p23 = X86.Avx2.mm256_packs_epi32(c2, c3);
+                v256 packed = X86.Avx2.mm256_packs_epi16(p01, p23);
+                return X86.Avx2.mm256_permutevar8x32_epi32(packed, interleave);
+            }
+            return default;
+        }
+
         static float QuantizeInt8X86(float* x, int n, sbyte* destination)
         {
-            float peak = AbsMaxX86(x, n);
-            float scale = peak > 0f ? peak / 127f : 1f;
-            v256 inverse = X86.Avx.mm256_set1_ps(1f / scale);
-            int* spill = stackalloc int[8];
-            for (int i = 0; i < n; i += 8)
+            if (X86.Avx2.IsAvx2Supported && X86.Fma.IsFmaSupported)
             {
-                v256 q = X86.Avx.mm256_cvtps_epi32(X86.Avx.mm256_mul_ps(X86.Avx.mm256_loadu_ps(x + i), inverse));
-                X86.Avx.mm256_storeu_si256((v256*)spill, q);
-                for (int k = 0; k < 8; k++)
+                float peak = AbsMaxX86(x, n);
+                float scale = peak > 0f ? peak / 127f : 1f;
+                v256 inverse = X86.Avx.mm256_set1_ps(1f / scale);
+                v256 interleave = new v256(0, 4, 1, 5, 2, 6, 3, 7);
+                int i = 0;
+                for (; i + 32 <= n; i += 32)
+                    X86.Avx.mm256_storeu_si256((v256*)(destination + i), Pack32X86(x + i, inverse, interleave));
+                for (; i < n; i += 8)
                 {
-                    int v = spill[k];
-                    if (v > 127) v = 127;
-                    if (v < -128) v = -128;
-                    destination[i + k] = (sbyte)v;
+                    v256 q = X86.Avx.mm256_cvtps_epi32(X86.Avx.mm256_mul_ps(X86.Avx.mm256_loadu_ps(x + i), inverse));
+                    v128 packed = X86.Sse2.packs_epi32(
+                        X86.Avx.mm256_castsi256_si128(q),
+                        X86.Avx.mm256_extractf128_si256(q, 1));
+                    packed = X86.Sse2.packs_epi16(packed, packed);
+                    *(long*)(destination + i) = X86.Sse2.cvtsi128_si64(packed);
                 }
+                return scale;
             }
-            return scale;
+            return 0f;
         }
 
-        // Mirrors Quant.Hadamard exactly: the 64-wide interleave stage, the
-        // 32..8 stride stages, then the FMA sign triple with the same
-        // 0xB1/0x4E/0x01 permutes and the same scale. In-place safe (each
-        // second-half lane is read before it is written, same iteration).
-        static void HadamardX86(float* source, float* p)
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static v256 Intra8ScaleX86(v256 v, v256 pairSign, v256 quadSign, v256 halfSign, v256 scale)
         {
-            for (int i = 0; i < 64; i += 8)
+            if (X86.Avx2.IsAvx2Supported && X86.Fma.IsFmaSupported)
             {
-                v256 a = X86.Avx.mm256_loadu_ps(source + i);
-                v256 b = X86.Avx.mm256_loadu_ps(source + i + 64);
-                X86.Avx.mm256_storeu_ps(p + i, X86.Avx.mm256_add_ps(a, b));
-                X86.Avx.mm256_storeu_ps(p + i + 64, X86.Avx.mm256_sub_ps(a, b));
-            }
-            for (int stride = 32; stride >= 8; stride >>= 1)
-                for (int block = 0; block < GroupSize; block += stride * 2)
-                    for (int i = block; i < block + stride; i += 8)
-                    {
-                        v256 a = X86.Avx.mm256_loadu_ps(p + i);
-                        v256 b = X86.Avx.mm256_loadu_ps(p + i + stride);
-                        X86.Avx.mm256_storeu_ps(p + i, X86.Avx.mm256_add_ps(a, b));
-                        X86.Avx.mm256_storeu_ps(p + i + stride, X86.Avx.mm256_sub_ps(a, b));
-                    }
-            float* signs = stackalloc float[24];
-            for (int k = 0; k < 8; k++)
-            {
-                signs[k] = (k & 1) == 0 ? 1f : -1f;
-                signs[8 + k] = (k & 2) == 0 ? 1f : -1f;
-                signs[16 + k] = k < 4 ? 1f : -1f;
-            }
-            v256 pairSign = X86.Avx.mm256_loadu_ps(signs);
-            v256 quadSign = X86.Avx.mm256_loadu_ps(signs + 8);
-            v256 halfSign = X86.Avx.mm256_loadu_ps(signs + 16);
-            v256 scale = X86.Avx.mm256_set1_ps(HadamardScale);
-            for (int i = 0; i < GroupSize; i += 8)
-            {
-                v256 v = X86.Avx.mm256_loadu_ps(p + i);
                 v = X86.Fma.mm256_fmadd_ps(v, pairSign, X86.Avx.mm256_permute_ps(v, 0xB1));
                 v = X86.Fma.mm256_fmadd_ps(v, quadSign, X86.Avx.mm256_permute_ps(v, 0x4E));
                 v = X86.Fma.mm256_fmadd_ps(v, halfSign, X86.Avx.mm256_permute2f128_ps(v, v, 0x01));
-                X86.Avx.mm256_storeu_ps(p + i, X86.Avx.mm256_mul_ps(v, scale));
+                return X86.Avx.mm256_mul_ps(v, scale);
             }
+            return default;
         }
 
-        // Mirrors Quant.Planes2: same gather constant, same
-        // shuffle/unpack/permute order, same 0xB1-style interleave.
-        static void Planes2X86(v256 q0, v256 q1, v256 q2, v256 q3, sbyte* destination)
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static float HadamardPeakX86(float* source, float* p)
         {
-            byte* g = stackalloc byte[32];
-            for (int k = 0; k < 16; k++)
+            if (X86.Avx2.IsAvx2Supported && X86.Fma.IsFmaSupported)
             {
-                byte v = (byte)(4 * (k % 4) + k / 4);
-                g[k] = v;
-                g[k + 16] = v;
+                v256 pairSign = new v256(1f, -1f, 1f, -1f, 1f, -1f, 1f, -1f);
+                v256 quadSign = new v256(1f, 1f, -1f, -1f, 1f, 1f, -1f, -1f);
+                v256 halfSign = new v256(1f, 1f, 1f, 1f, -1f, -1f, -1f, -1f);
+                v256 scale = X86.Avx.mm256_set1_ps(HadamardScale);
+                v256 signMask = X86.Avx.mm256_set1_ps(-0.0f);
+                for (int i = 0; i < 32; i += 8)
+                {
+                    v256 a = X86.Avx.mm256_loadu_ps(source + i);
+                    v256 b = X86.Avx.mm256_loadu_ps(source + i + 32);
+                    v256 c = X86.Avx.mm256_loadu_ps(source + i + 64);
+                    v256 d = X86.Avx.mm256_loadu_ps(source + i + 96);
+                    v256 ab0 = X86.Avx.mm256_add_ps(a, c);
+                    v256 ab1 = X86.Avx.mm256_sub_ps(a, c);
+                    v256 cd0 = X86.Avx.mm256_add_ps(b, d);
+                    v256 cd1 = X86.Avx.mm256_sub_ps(b, d);
+                    X86.Avx.mm256_storeu_ps(p + i, X86.Avx.mm256_add_ps(ab0, cd0));
+                    X86.Avx.mm256_storeu_ps(p + i + 32, X86.Avx.mm256_sub_ps(ab0, cd0));
+                    X86.Avx.mm256_storeu_ps(p + i + 64, X86.Avx.mm256_add_ps(ab1, cd1));
+                    X86.Avx.mm256_storeu_ps(p + i + 96, X86.Avx.mm256_sub_ps(ab1, cd1));
+                }
+                v256 peak = X86.Avx.mm256_set1_ps(0f);
+                for (int b = 0; b < GroupSize; b += 32)
+                {
+                    v256 r0 = X86.Avx.mm256_loadu_ps(p + b);
+                    v256 r1 = X86.Avx.mm256_loadu_ps(p + b + 8);
+                    v256 r2 = X86.Avx.mm256_loadu_ps(p + b + 16);
+                    v256 r3 = X86.Avx.mm256_loadu_ps(p + b + 24);
+                    v256 p0 = X86.Avx.mm256_add_ps(r0, r2);
+                    v256 p1 = X86.Avx.mm256_sub_ps(r0, r2);
+                    v256 p2 = X86.Avx.mm256_add_ps(r1, r3);
+                    v256 p3 = X86.Avx.mm256_sub_ps(r1, r3);
+                    v256 v0 = Intra8ScaleX86(X86.Avx.mm256_add_ps(p0, p2), pairSign, quadSign, halfSign, scale);
+                    v256 v1 = Intra8ScaleX86(X86.Avx.mm256_sub_ps(p0, p2), pairSign, quadSign, halfSign, scale);
+                    v256 v2 = Intra8ScaleX86(X86.Avx.mm256_add_ps(p1, p3), pairSign, quadSign, halfSign, scale);
+                    v256 v3 = Intra8ScaleX86(X86.Avx.mm256_sub_ps(p1, p3), pairSign, quadSign, halfSign, scale);
+                    X86.Avx.mm256_storeu_ps(p + b, v0);
+                    X86.Avx.mm256_storeu_ps(p + b + 8, v1);
+                    X86.Avx.mm256_storeu_ps(p + b + 16, v2);
+                    X86.Avx.mm256_storeu_ps(p + b + 24, v3);
+                    v256 m01 = X86.Avx.mm256_max_ps(X86.Avx.mm256_andnot_ps(signMask, v0), X86.Avx.mm256_andnot_ps(signMask, v1));
+                    v256 m23 = X86.Avx.mm256_max_ps(X86.Avx.mm256_andnot_ps(signMask, v2), X86.Avx.mm256_andnot_ps(signMask, v3));
+                    peak = X86.Avx.mm256_max_ps(peak, X86.Avx.mm256_max_ps(m01, m23));
+                }
+                v128 halves = X86.Sse.max_ps(X86.Avx.mm256_castps256_ps128(peak), X86.Avx.mm256_extractf128_ps(peak, 1));
+                v128 pairs = X86.Sse.max_ps(halves, X86.Sse.shuffle_ps(halves, halves, 0x4E));
+                v128 quad = X86.Sse.max_ps(pairs, X86.Sse.shuffle_ps(pairs, pairs, 0xB1));
+                return X86.Sse.cvtss_f32(quad);
             }
-            v256 gather = X86.Avx.mm256_loadu_si256((v256*)g);
-            v256 s0 = X86.Avx2.mm256_shuffle_epi8(q0, gather);
-            v256 s1 = X86.Avx2.mm256_shuffle_epi8(q1, gather);
-            v256 s2 = X86.Avx2.mm256_shuffle_epi8(q2, gather);
-            v256 s3 = X86.Avx2.mm256_shuffle_epi8(q3, gather);
-            v256 low01 = X86.Avx2.mm256_unpacklo_epi32(s0, s1);
-            v256 high01 = X86.Avx2.mm256_unpackhi_epi32(s0, s1);
-            v256 low23 = X86.Avx2.mm256_unpacklo_epi32(s2, s3);
-            v256 high23 = X86.Avx2.mm256_unpackhi_epi32(s2, s3);
-            int* ix = stackalloc int[8];
-            for (int k = 0; k < 8; k++) ix[k] = k / 2 + (k % 2) * 4;
-            v256 interleave = X86.Avx.mm256_loadu_si256((v256*)ix);
-            X86.Avx.mm256_storeu_si256((v256*)(destination), X86.Avx2.mm256_permutevar8x32_epi32(X86.Avx2.mm256_unpacklo_epi64(low01, low23), interleave));
-            X86.Avx.mm256_storeu_si256((v256*)(destination + 32), X86.Avx2.mm256_permutevar8x32_epi32(X86.Avx2.mm256_unpackhi_epi64(low01, low23), interleave));
-            X86.Avx.mm256_storeu_si256((v256*)(destination + 64), X86.Avx2.mm256_permutevar8x32_epi32(X86.Avx2.mm256_unpacklo_epi64(high01, high23), interleave));
-            X86.Avx.mm256_storeu_si256((v256*)(destination + 96), X86.Avx2.mm256_permutevar8x32_epi32(X86.Avx2.mm256_unpackhi_epi64(high01, high23), interleave));
+            return 0f;
         }
 
-        // Mirrors Quant.Planes4: same gather constant, same
-        // shuffle/unpack/permute order (0b11_01_10_00 = 0xD8).
-        static void Planes4X86(v256 q0, v256 q1, v256 q2, v256 q3, sbyte* destination)
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static void Planes2X86(v256 q0, v256 q1, v256 q2, v256 q3, v256 gather, v256 interleave, sbyte* destination)
         {
-            byte* g = stackalloc byte[32];
-            for (int k = 0; k < 16; k++)
+            if (X86.Avx2.IsAvx2Supported && X86.Fma.IsFmaSupported)
             {
-                byte v = (byte)(2 * (k % 8) + k / 8);
-                g[k] = v;
-                g[k + 16] = v;
+                v256 s0 = X86.Avx2.mm256_shuffle_epi8(q0, gather);
+                v256 s1 = X86.Avx2.mm256_shuffle_epi8(q1, gather);
+                v256 s2 = X86.Avx2.mm256_shuffle_epi8(q2, gather);
+                v256 s3 = X86.Avx2.mm256_shuffle_epi8(q3, gather);
+                v256 low01 = X86.Avx2.mm256_unpacklo_epi32(s0, s1);
+                v256 high01 = X86.Avx2.mm256_unpackhi_epi32(s0, s1);
+                v256 low23 = X86.Avx2.mm256_unpacklo_epi32(s2, s3);
+                v256 high23 = X86.Avx2.mm256_unpackhi_epi32(s2, s3);
+                X86.Avx.mm256_storeu_si256((v256*)(destination), X86.Avx2.mm256_permutevar8x32_epi32(X86.Avx2.mm256_unpacklo_epi64(low01, low23), interleave));
+                X86.Avx.mm256_storeu_si256((v256*)(destination + 32), X86.Avx2.mm256_permutevar8x32_epi32(X86.Avx2.mm256_unpackhi_epi64(low01, low23), interleave));
+                X86.Avx.mm256_storeu_si256((v256*)(destination + 64), X86.Avx2.mm256_permutevar8x32_epi32(X86.Avx2.mm256_unpacklo_epi64(high01, high23), interleave));
+                X86.Avx.mm256_storeu_si256((v256*)(destination + 96), X86.Avx2.mm256_permutevar8x32_epi32(X86.Avx2.mm256_unpackhi_epi64(high01, high23), interleave));
             }
-            v256 gather = X86.Avx.mm256_loadu_si256((v256*)g);
-            v256 s0 = X86.Avx2.mm256_shuffle_epi8(q0, gather);
-            v256 s1 = X86.Avx2.mm256_shuffle_epi8(q1, gather);
-            v256 s2 = X86.Avx2.mm256_shuffle_epi8(q2, gather);
-            v256 s3 = X86.Avx2.mm256_shuffle_epi8(q3, gather);
-            X86.Avx.mm256_storeu_si256((v256*)(destination), X86.Avx2.mm256_permute4x64_epi64(X86.Avx2.mm256_unpacklo_epi64(s0, s1), 0xD8));
-            X86.Avx.mm256_storeu_si256((v256*)(destination + 32), X86.Avx2.mm256_permute4x64_epi64(X86.Avx2.mm256_unpackhi_epi64(s0, s1), 0xD8));
-            X86.Avx.mm256_storeu_si256((v256*)(destination + 64), X86.Avx2.mm256_permute4x64_epi64(X86.Avx2.mm256_unpacklo_epi64(s2, s3), 0xD8));
-            X86.Avx.mm256_storeu_si256((v256*)(destination + 96), X86.Avx2.mm256_permute4x64_epi64(X86.Avx2.mm256_unpackhi_epi64(s2, s3), 0xD8));
         }
 
-        // Mirrors Quant.Prepare on the AVX2 tier: same per-group Hadamard,
-        // quantize, Avx2Dot offset sum (H8: the non-VNNI Tiers.Accumulate
-        // sequence) and planes dispatch.
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static void Planes4X86(v256 q0, v256 q1, v256 q2, v256 q3, v256 gather, sbyte* destination)
+        {
+            if (X86.Avx2.IsAvx2Supported && X86.Fma.IsFmaSupported)
+            {
+                v256 s0 = X86.Avx2.mm256_shuffle_epi8(q0, gather);
+                v256 s1 = X86.Avx2.mm256_shuffle_epi8(q1, gather);
+                v256 s2 = X86.Avx2.mm256_shuffle_epi8(q2, gather);
+                v256 s3 = X86.Avx2.mm256_shuffle_epi8(q3, gather);
+                X86.Avx.mm256_storeu_si256((v256*)(destination), X86.Avx2.mm256_permute4x64_epi64(X86.Avx2.mm256_unpacklo_epi64(s0, s1), 0xD8));
+                X86.Avx.mm256_storeu_si256((v256*)(destination + 32), X86.Avx2.mm256_permute4x64_epi64(X86.Avx2.mm256_unpackhi_epi64(s0, s1), 0xD8));
+                X86.Avx.mm256_storeu_si256((v256*)(destination + 64), X86.Avx2.mm256_permute4x64_epi64(X86.Avx2.mm256_unpacklo_epi64(s2, s3), 0xD8));
+                X86.Avx.mm256_storeu_si256((v256*)(destination + 96), X86.Avx2.mm256_permute4x64_epi64(X86.Avx2.mm256_unpackhi_epi64(s2, s3), 0xD8));
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static int Sum8IntX86(v256 v)
+        {
+            if (X86.Avx2.IsAvx2Supported && X86.Fma.IsFmaSupported)
+            {
+                v128 s4 = X86.Sse2.add_epi32(
+                    X86.Avx.mm256_castsi256_si128(v),
+                    X86.Avx.mm256_extractf128_si256(v, 1));
+                v128 s2 = X86.Sse2.add_epi32(s4, X86.Sse2.shuffle_epi32(s4, 0x4E));
+                v128 s1 = X86.Sse2.add_epi32(s2, X86.Sse2.shuffle_epi32(s2, 0xB1));
+                return X86.Sse2.cvtsi128_si32(s1);
+            }
+            return 0;
+        }
+
         static void PrepareX86(float* x, int tokens, int cols, int bits, BurstActivations* a)
         {
-            float* rotated = stackalloc float[GroupSize];
-            sbyte* quantized = stackalloc sbyte[GroupSize];
-            v256 onesByte = X86.Avx.mm256_set1_epi8((byte)1);
-            v256 onesShort = X86.Avx.mm256_set1_epi16((short)1);
-            int* accSpill = stackalloc int[8];
-            for (int t = 0; t < tokens; t++)
-                for (int g = 0; g < a->Groups; g++)
-                {
-                    int slot = t * a->Stride + g;
-                    HadamardX86(x + (long)t * cols + g * GroupSize, rotated);
-                    a->Scales[slot] = QuantizeInt8X86(rotated, GroupSize, quantized);
-                    v256 q0 = X86.Avx.mm256_loadu_si256((v256*)(quantized));
-                    v256 q1 = X86.Avx.mm256_loadu_si256((v256*)(quantized + 32));
-                    v256 q2 = X86.Avx.mm256_loadu_si256((v256*)(quantized + 64));
-                    v256 q3 = X86.Avx.mm256_loadu_si256((v256*)(quantized + 96));
-                    v256 sum = X86.Avx2.mm256_add_epi32(
-                        X86.Avx2.mm256_madd_epi16(X86.Avx2.mm256_maddubs_epi16(onesByte, q0), onesShort),
-                        X86.Avx2.mm256_madd_epi16(X86.Avx2.mm256_maddubs_epi16(onesByte, q1), onesShort));
-                    sum = X86.Avx2.mm256_add_epi32(sum, X86.Avx2.mm256_madd_epi16(X86.Avx2.mm256_maddubs_epi16(onesByte, q2), onesShort));
-                    sum = X86.Avx2.mm256_add_epi32(sum, X86.Avx2.mm256_madd_epi16(X86.Avx2.mm256_maddubs_epi16(onesByte, q3), onesShort));
-                    X86.Avx.mm256_storeu_si256((v256*)accSpill, sum);
-                    int total = 0;
-                    for (int k = 0; k < 8; k++) total += accSpill[k];
-                    a->Offsets[slot] = CodebookBias * (float)total;
-                    sbyte* destination = a->Values + ((long)t * a->Groups + g) * GroupSize;
-                    if (bits == 2) Planes2X86(q0, q1, q2, q3, destination);
-                    else Planes4X86(q0, q1, q2, q3, destination);
-                }
+            if (X86.Avx2.IsAvx2Supported && X86.Fma.IsFmaSupported)
+            {
+                float* rotated = stackalloc float[GroupSize];
+                for (int t = 0; t < tokens; t++)
+                    for (int g = 0; g < a->Groups; g++)
+                    {
+                        int slot = t * a->Stride + g;
+                        float peak = HadamardPeakX86(x + (long)t * cols + g * GroupSize, rotated);
+                        float scale = peak > 0f ? peak / 127f : 1f;
+                        a->Scales[slot] = scale;
+                        v256 inverse = X86.Avx.mm256_set1_ps(1f / scale);
+                        v256 interleave = new v256(0, 4, 1, 5, 2, 6, 3, 7);
+                        v256 q0 = Pack32X86(rotated, inverse, interleave);
+                        v256 q1 = Pack32X86(rotated + 32, inverse, interleave);
+                        v256 q2 = Pack32X86(rotated + 64, inverse, interleave);
+                        v256 q3 = Pack32X86(rotated + 96, inverse, interleave);
+                        v256 onesByte = X86.Avx.mm256_set1_epi8((byte)1);
+                        v256 onesShort = X86.Avx.mm256_set1_epi16((short)1);
+                        v256 sum = X86.Avx2.mm256_add_epi32(
+                            X86.Avx2.mm256_madd_epi16(X86.Avx2.mm256_maddubs_epi16(onesByte, q0), onesShort),
+                            X86.Avx2.mm256_madd_epi16(X86.Avx2.mm256_maddubs_epi16(onesByte, q1), onesShort));
+                        sum = X86.Avx2.mm256_add_epi32(sum, X86.Avx2.mm256_madd_epi16(X86.Avx2.mm256_maddubs_epi16(onesByte, q2), onesShort));
+                        sum = X86.Avx2.mm256_add_epi32(sum, X86.Avx2.mm256_madd_epi16(X86.Avx2.mm256_maddubs_epi16(onesByte, q3), onesShort));
+                        a->Offsets[slot] = CodebookBias * (float)Sum8IntX86(sum);
+                        sbyte* destination = a->Values + ((long)t * a->Groups + g) * GroupSize;
+                        if (bits == 2)
+                        {
+                            v256 gather2 = new v256(
+                                0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15,
+                                0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15);
+                            Planes2X86(q0, q1, q2, q3, gather2, interleave, destination);
+                        }
+                        else
+                        {
+                            v256 gather4 = new v256(
+                                0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15,
+                                0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15);
+                            Planes4X86(q0, q1, q2, q3, gather4, destination);
+                        }
+                    }
+            }
         }
-        // Mirrors Neon.AbsMax: vector max of |x|, then max-across.
         static float AbsMaxNeon(float* x, int n)
         {
+            if (!Arm.Neon.IsNeonSupported) return 0f;
             v128 peak = Arm.Neon.vdupq_n_f32(0f);
             for (int i = 0; i < n; i += 4)
                 peak = Arm.Neon.vmaxq_f32(peak, Arm.Neon.vabsq_f32(Arm.Neon.vld1q_f32(x + i)));
             return Arm.Neon.vmaxvq_f32(peak);
         }
 
-        // Mirrors Neon.QuantizeInt8: same peak/scale/inverse, FCVTZS
-        // truncation, then a per-lane clamp over the convert spill
-        // (bit-identical to the double narrowing saturate).
         static float QuantizeInt8Neon(float* x, int n, sbyte* destination)
         {
+            if (!Arm.Neon.IsNeonSupported) return 0f;
             float peak = AbsMaxNeon(x, n);
             float scale = peak > 0f ? peak / 127f : 1f;
             v128 inverse = Arm.Neon.vdupq_n_f32(1f / scale);
@@ -291,9 +294,6 @@ namespace Needle.BurstKernels
             return scale;
         }
 
-        // Closed-form Neon.Butterfly8 (same association, op for op):
-        // rotated = [t2,t3,t0,t1]; even = low(t+rot) = [t0+t2,t1+t3];
-        // odd = low(t-rot) = [t0-t2,t1-t3]; out = [e0+e1, e0-e1, o0+o1, o0-o1].
         static void Butterfly8Neon(float t0, float t1, float t2, float t3, float scale, float* destination)
         {
             float e0 = t0 + t2;
@@ -306,10 +306,9 @@ namespace Needle.BurstKernels
             destination[3] = (o0 - o1) * scale;
         }
 
-        // Mirrors Neon.Hadamard exactly: the conditional copy, the 64..8
-        // stride stages, then Butterfly8 over each consecutive 8 scaled once.
         static void HadamardNeon(float* source, float* p)
         {
+            if (!Arm.Neon.IsNeonSupported) return;
             if (source != p)
                 for (int i = 0; i < GroupSize; i += 4)
                     Arm.Neon.vst1q_f32(p + i, Arm.Neon.vld1q_f32(source + i));
@@ -329,12 +328,9 @@ namespace Needle.BurstKernels
             }
         }
 
-        // One 16-byte group through the four 16-byte sub-tables. TBL zeroes
-        // out-of-range lanes, so exactly one lookup hits per lane and the OR
-        // equals the 64-byte table result (bit-identical to vqtbl1 over the
-        // (q0,q1,q2,q3) tuple in Neon.StorePlanes2/4).
         static v128 Table64Neon(v128 t0, v128 t1, v128 t2, v128 t3, byte* index)
         {
+            if (!Arm.Neon.IsNeonSupported) return default;
             v128 idx = Arm.Neon.vld1q_u8(index);
             v128 r0 = Arm.Neon.vqtbl1q_u8(t0, idx);
             v128 r1 = Arm.Neon.vqtbl1q_u8(t1, Arm.Neon.vsubq_u8(idx, Arm.Neon.vdupq_n_u8(16)));
@@ -343,12 +339,9 @@ namespace Needle.BurstKernels
             return Arm.Neon.vorrq_u8(Arm.Neon.vorrq_u8(r0, r1), Arm.Neon.vorrq_u8(r2, r3));
         }
 
-        // Mirrors Neon.Planes bit for bit: same input/output permutation for
-        // both bit depths (the index math matches StorePlanes2/StorePlanes4
-        // lane for lane); the offset sum is a scalar 128-byte add, which is
-        // bit-identical to Neon.SumOf because integer addition is associative.
         static int PlanesNeon(sbyte* quantized, int bits, sbyte* destination)
         {
+            if (!Arm.Neon.IsNeonSupported) return 0;
             int total = 0;
             for (int i = 0; i < GroupSize; i++) total += quantized[i];
             byte* index = stackalloc byte[16];
@@ -390,8 +383,6 @@ namespace Needle.BurstKernels
             return total;
         }
 
-        // Mirrors Neon.Prepare: same per-group Hadamard, quantize, planes and
-        // Bias-scaled offset.
         static void PrepareNeon(float* x, int tokens, int cols, int bits, BurstActivations* a)
         {
             float* rotated = stackalloc float[GroupSize];
@@ -407,8 +398,6 @@ namespace Needle.BurstKernels
                 }
         }
 
-        // Scalar lane: mirrors Scalar.* exactly (the !Simd.Enabled path in
-        // Quant), for targets with neither AVX2+FMA nor Neon.
         static float RoundEvenScalar(float x) => (x + RoundBias) - RoundBias;
 
         static float AbsMaxScalar(float* x, int n)
@@ -480,9 +469,6 @@ namespace Needle.BurstKernels
                 }
         }
 
-        // Cdecl delegates for the table slots (KernelTable ABI):
-        // Prepare is void(float*, int, int, int, Activations*),
-        // QuantizeInt8 is float(float*, int, sbyte*).
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         public delegate void PrepareFn(float* x, int tokens, int cols, int bits, BurstActivations* a);
 
@@ -491,8 +477,6 @@ namespace Needle.BurstKernels
 
         public static bool IsInstalled => Kernels.Active.Prepare != 0 && Kernels.Active.QuantizeInt8 != 0;
 
-        // Idempotent: never overwrites an explicit or foreign provider's
-        // entries (plan §2 selection order).
         public static void Install()
         {
             if (IsInstalled)
@@ -514,9 +498,6 @@ namespace Needle.BurstKernels
             Kernels.Install(table, Kernels.IsInstalled ? Kernels.Provider + "+burst-prepare" : "burst-prepare");
         }
 
-        // H5-style microbench for the Prepare entry: one warmed call shape
-        // (tokens=2, cols=256, bits=2), timed through the installed Cdecl
-        // pointer. Returns nanoseconds per call.
         public static double MeasurePrepareCallOverheadNs(int tokens = 2, int cols = 256, int calls = 20000)
         {
             if (tokens < 1 || cols < 128 || calls < 1) throw new ArgumentOutOfRangeException();

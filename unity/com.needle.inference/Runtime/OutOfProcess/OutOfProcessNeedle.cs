@@ -7,32 +7,6 @@ using Debug = UnityEngine.Debug;
 
 namespace Needle
 {
-    /// <summary>
-    /// N70: Unity client for `needle serve` (NativeAOT out-of-process inference).
-    ///
-    /// For runtimes with nothing fast: instead of loading Needle.Inference.dll
-    /// in-process, this spawns the `needle` binary as a child, talks to it over
-    /// stdin/stdout (one JSON request per line, one reply per line), and kills
-    /// the child when the GameObject disables, the application quits, or the
-    /// Unity process exits. Desktop players and the Editor only: WebGL,
-    /// Android and iOS cannot spawn processes, so this component logs an error
-    /// and disables itself there.
-    ///
-    /// Protocol (mirrors src/Needle.Cli/Serve.cs):
-    ///   send {"id":7,"type":"query","text":"..."}      (or "tool_result",
-    ///        "reset", "ping")
-    ///   recv {"id":7,"success":true,"error":null,"type":"call",
-    ///         "function_calls":[...], ... "total_time_ms":91.2}
-    /// Overhead check: client wall-clock round trip minus the reply's
-    /// total_time_ms is the pipe cost; acceptance is &lt;= 1 ms on top of
-    /// in-process net10 latency for a warm query (ping measures pure pipe).
-    ///
-    /// Usage: put on any GameObject, set Executable/ModelFile/Tools, call
-    /// Ask() from UI, read replies in Update() via the Replied event or by
-    /// polling Drain(). Replies arrive on the Unity thread (Update pumps a
-    /// lock-guarded queue fed by a background stdout reader), so handlers may
-    /// touch the scene directly.
-    /// </summary>
     public sealed class OutOfProcessNeedle : MonoBehaviour
     {
         [Header("Server (desktop players and Editor only)")]
@@ -58,19 +32,15 @@ namespace Needle
         [Tooltip("Extra `needle serve` flags, e.g. \"--no-date --max-reasoning 16\".")]
         public string ExtraArgs = string.Empty;
 
-        /// <summary>Raised on the Unity thread for every server reply.</summary>
         public event Action<OutOfProcessReply> Replied;
 
-        /// <summary>True after the child spawned and until it exits or fails.</summary>
         public bool Connected { get; private set; }
 
-        /// <summary>Requests sent minus replies received.</summary>
         public int PendingRequests
         {
             get { lock (_gate) { return _sent - _received; } }
         }
 
-        /// <summary>False on WebGL/Android/iOS, where processes cannot spawn.</summary>
         public static bool IsSupportedPlatform()
         {
             var platform = Application.platform;
@@ -82,25 +52,21 @@ namespace Needle
                 || platform == RuntimePlatform.LinuxPlayer;
         }
 
-        /// <summary>Submit a query. Returns the request id (&gt;0), or -1 when not connected.</summary>
         public int Ask(string query)
         {
             return Send("query", query);
         }
 
-        /// <summary>Feed a tool result back into the turn it answers. Returns the id, or -1.</summary>
         public int SendToolResult(string resultJson)
         {
             return Send("tool_result", resultJson);
         }
 
-        /// <summary>Ask the child to forget the conversation. Returns the id, or -1.</summary>
         public int ResetServer()
         {
             return Send("reset", string.Empty);
         }
 
-        /// <summary>No inference; measures pure pipe cost. Returns the id, or -1.</summary>
         public int Ping()
         {
             return Send("ping", string.Empty);
@@ -397,7 +363,6 @@ namespace Needle
         int MaxQueued = 256;
     }
 
-    /// <summary>One server reply line, parsed. RawJson always carries the full line.</summary>
     [Serializable]
     public struct OutOfProcessReply
     {

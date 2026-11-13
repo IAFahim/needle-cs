@@ -23,8 +23,6 @@ internal sealed unsafe class TokenTrie : IDisposable
     readonly byte** specialBytes;
     readonly int* specialLength;
     byte* pool;
-    // Direct-mapped memo of recent Allow masks keyed by grammar-state
-    // signature (program, depth, frames). The string fast path bypasses it.
     const int MaskCacheSlots = 64;
     readonly nuint* cacheProgram;
     readonly ulong* cacheHash;
@@ -156,44 +154,52 @@ internal sealed unsafe class TokenTrie : IDisposable
         {
             var top = start->Frames + start->Depth - 1;
             var node = g->Nodes + top->Node * Kind.Fields;
-            if (node[0] == Kind.Str && top->Phase == 1 && node[1] < 0)
+            var freeString = node[0] == Kind.Str && top->Phase == 1 && node[1] < 0;
+            GrammarState keyState;
+            var keyPtr = start;
+            if (freeString)
             {
-                for (var i = 0; i < maskWords; i++) mask[i] = safeMask[i];
+                keyState = *start;
+                var kTop = keyState.Frames + keyState.Depth - 1;
+                var minChars = Math.Max(0, node[2]);
+                if (kTop->Aux > minChars) kTop->Aux = minChars;
+                keyPtr = &keyState;
+            }
+            var hash = MaskSignature(g, keyPtr, out var depth);
+            var slot = (int)(hash & (ulong)(MaskCacheSlots - 1));
+            var maskBytes = (nuint)maskWords * 4;
+            if (cacheProgram[slot] == (nuint)g && cacheDepth[slot] == depth && cacheHash[slot] == hash && FramesEqual(slot, keyPtr, depth))
+            {
+                Buffer.MemoryCopy(cacheMasks + (long)slot * maskWords, mask, maskBytes, maskBytes);
+                return;
+            }
+            if (freeString)
+            {
+                Buffer.MemoryCopy(safeMask, mask, maskBytes, maskBytes);
                 for (var i = 0; i < specialCount; i++)
                 {
-                    var copy = *start;
+                    var copy = *keyPtr;
                     var probe = new Tools.NoSink();
                     var ok = true;
                     for (var b = 0; b < specialLength[i] && ok; b++) ok = Grammar.Advance(g, &copy, specialBytes[i][b], ref probe);
                     if (ok) mask[special[i] / 32] |= 1u << (special[i] % 32);
                 }
-                return;
             }
-            var hash = MaskSignature(g, start, out var depth);
-            var slot = (int)(hash & (ulong)(MaskCacheSlots - 1));
-            if (cacheProgram[slot] == (nuint)g && cacheDepth[slot] == depth && cacheHash[slot] == hash && FramesEqual(slot, start, depth))
+            else
             {
-                var hit = cacheMasks + (long)slot * maskWords;
-                for (var i = 0; i < maskWords; i++) mask[i] = hit[i];
-                return;
+                Mem.Clear(mask, maskBytes);
+                Walk(g, keyPtr, mask);
             }
-            Mem.Clear(mask, (nuint)maskWords * 4);
-            Walk(g, start, mask);
             cacheProgram[slot] = (nuint)g;
             cacheDepth[slot] = depth;
             cacheHash[slot] = hash;
-            var frames = (ulong*)start->Frames;
+            var frames = (ulong*)keyPtr->Frames;
             var storedFrames = cacheFrames + (long)slot * GrammarState.MaxDepth * 3;
             for (var i = 0; i < depth * 3; i++) storedFrames[i] = frames[i];
-            var storedMask = cacheMasks + (long)slot * maskWords;
-            for (var i = 0; i < maskWords; i++) storedMask[i] = mask[i];
+            Buffer.MemoryCopy(mask, cacheMasks + (long)slot * maskWords, maskBytes, maskBytes);
         }
     }
 
-    // FNV-1a over the owning program, depth and every frame (node, phase, aux,
-    // aux2, candidate bits). The full stack is hashed: deeper frames decide
-    // what happens after the top frame completes, so a top-frame-only key
-    // would alias distinct masks.
     static ulong MaskSignature(GrammarProgram* g, GrammarState* state, out int depth)
     {
         depth = state->Depth;

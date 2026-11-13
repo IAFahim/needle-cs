@@ -14,79 +14,17 @@ public sealed class NeedleOptions
     public ThreadPolicy? Threading { get; init; }
     public FrameBudget FrameBudget { get; init; }
     public int Context { get; init; } = 2048;
-    /// <summary>
-    /// Cap on generated <c>&lt;think&gt;</c> reasoning tokens per call (N61).
-    /// Reasoning is the largest decode slice (plan.md §2.4), so lowering the
-    /// cap is the largest pass lever that changes model behavior: the eval
-    /// suite under <c>tests/eval</c> is the accuracy gate, and the default
-    /// stays put until it passes (plan.md §8 rule 4). Zero skips reasoning
-    /// entirely: the call/respond decision comes straight from the prefill
-    /// logits because <c>thinkEndForced</c> is folded into the prefill chunk
-    /// (see <c>EncodePrompt</c>), saving one engine pass.
-    /// </summary>
     public int ReasoningBudget { get; init; } = 96;
-    /// <summary>
-    /// Back-compat alias for <see cref="ReasoningBudget"/> (the eval policy
-    /// name and existing hosts). Setting either sets the same budget; when
-    /// both appear in one initializer the last one wins.
-    /// </summary>
     public int MaxReasoningTokens { get => ReasoningBudget; init => ReasoningBudget = value; }
     public int MaxCallTokens { get; init; } = 384;
     public string? System { get; init; }
     public bool AutoDate { get; init; }
     public float RefuseBelow { get; init; } = 0.1f;
     public int RetrievalTopK { get; init; } = 5;
-    /// <summary>
-    /// Lossless jump-forward over token-forced steps (issue #16). After each
-    /// committed call token, every follow-up token the grammar+trie allow
-    /// uniquely (allowed-mask popcount == 1) joins the fed chunk instead of
-    /// costing a decode pass. Each jumped token is what per-token greedy
-    /// would emit (argmax over one candidate is forced), so the chunk is the
-    /// per-token greedy sequence itself: calls, reasoning, responses and
-    /// decode-token counts are byte-identical either way. Jumped tokens
-    /// contribute probability 1 to <see cref="CallResult.DecodeConfidence"/>.
-    /// Off by default: the W16 identity gate proves byte-identical output on
-    /// every SessionCases step and game prompt, but no singleton mask occurs
-    /// on the current grammar/vocab (BPE offers several tokenizations at
-    /// every structural position), so jumping stays dormant with zero pass
-    /// reduction. Revisit if the grammar or vocabulary changes.
-    /// </summary>
     public bool JumpForward { get; init; }
 
-    /// <summary>
-    /// Lossless prompt-lookup speculative decoding (issue #17). At each
-    /// call-decode step, up to four draft continuations are proposed by
-    /// matching the recent token suffix against the prompt and output token
-    /// history, fed as one chunk, and verified against the model: the
-    /// longest prefix whose masked argmax equals the proposal is accepted,
-    /// plus one freshly-picked correction token. Engine state past the
-    /// accepted prefix is rewound (Engine.CheckpointSpec/RestoreSpec) and
-    /// the accepted prefix re-fed, so the committed token/state history is
-    /// exactly what per-token greedy would produce: calls, reasoning,
-    /// responses, confidences and decode-token counts are byte-identical
-    /// either way; only the sequential pass count changes. Typed sinks
-    /// observe events for accepted tokens only (drafts advance a scratch
-    /// grammar copy). Off by default: the W17 identity gate proves
-    /// byte-identical output (single-threaded), but a T=1+k chunk pass costs
-    /// ~2x a T=1 pass until W20 lands, and multi-threaded chunk feeds drift
-    /// from sequential singles (engine chunk/sequential inequivalence,
-    /// W13/W20), so wall-clock only wins once small-T GEMM does.
-    /// </summary>
     public bool PromptLookup { get; init; }
 
-    /// <summary>
-    /// Stateless fast path (N62): defer the trailing <c>callClosing</c> /
-    /// <c>responseClosing</c> feed. Enable only when the caller rewinds the
-    /// session (<see cref="NeedleSession.Reset"/>) after every turn, as
-    /// <c>NeedleHost</c> does for stateless queries and the eval loop does
-    /// before each case. The closing feed is then pure waste: the next rewind
-    /// discards it, so deferring it saves one engine pass per call. A
-    /// continued turn (tool result, chat follow-up) replays the deferred
-    /// feed first, so continued history is bit-identical; only the pooled
-    /// confidence is computed pre-closing, so re-tune
-    /// <see cref="RefuseBelow"/> from the eval curve when enabling this.
-    /// Default off: exact legacy behavior (close every turn inline).
-    /// </summary>
     public bool Stateless { get; init; }
 
     internal ThreadPolicy ResolvedThreading => Threading ?? ThreadPolicy.Default.WithThreads(Threads);
@@ -185,18 +123,8 @@ public sealed unsafe partial class NeedleSession : IDisposable
 {
     const int ImStart = 4, ImEnd = 5, ThinkStart = 6, ThinkEnd = 7, ToolCallStart = 10, ToolCallEnd = 11, EndOfText = 1;
     const int MaxPieceBytes = 64;
-    // Call steps with at most this many allowed tokens use the sparse head
-    // (Engine.LogitsForRows) instead of the full-vocabulary head; §5.3 tunes
-    // it around 256 (76% of call steps allow <= 256 tokens).
     const int SparseHeadThreshold = 256;
-    // Jump-forward (issue #16) batches at most this many call tokens per
-    // engine pass (the committed pick plus token-forced followers). Forced
-    // runs are structural spans of tens of tokens; longer runs simply
-    // continue on later macro-steps.
     const int MaxJumpChunk = 512;
-    // Prompt-lookup speculation (issue #17) proposes at most this many draft
-    // tokens per call-decode step (k=4, the simulated -36% point). The fed
-    // chunk is the pick plus drafts, so T=k+1.
     const int MaxDraftTokens = 4;
     const int InputOverheadBytes = 128;
     const int TokenizerInputBytes = 1 << 16;
@@ -230,7 +158,6 @@ public sealed unsafe partial class NeedleSession : IDisposable
     readonly uint* reasoningMask;
     readonly uint* decisionMask;
     readonly uint* responseMask;
-    // Allowed ids for the current sparse-head step (SparseHeadThreshold ints).
     readonly int* sparseRows;
     readonly uint* mask;
     readonly float* scratchLogits;
@@ -261,24 +188,10 @@ public sealed unsafe partial class NeedleSession : IDisposable
     ToolSet active;
     Grammar grammar;
     bool turnOne = true;
-    // Prompt-lookup history (issue #17): primed-prefix, prompt and committed
-    // output token ids for the n-gram proposer, append-only across turns
-    // (Reset truncates back to the primed length). Ctor-sized; the
-    // speculative path only appends and scans (no allocation).
     readonly int[] specHistory;
-    // One allowed-mask per draft position, recorded at proposal time and
-    // reused for verification (avoids recomputing Allow after the feed).
     readonly uint* specMasks;
     int specHistoryLength;
     int specPrimedLength;
-    // N62 stateless fast path: turn-closing tokens deferred instead of fed.
-    // Non-null only when options.Stateless stashed a closing at the end of a
-    // turn; the next turn replays it first (identical history), while Reset
-    // or a re-prime drops it (the pass is then saved entirely). The flag
-    // records whether the slow path would have fed it through FeedCallChunk
-    // (call closings: a counted pass plus spec history) or plain TryFeed
-    // (response closings: neither), so replay matches each path exactly.
-    // No allocation: both closings are shared readonly arrays.
     int[]? pendingClosing;
     bool pendingClosingCounted;
 
@@ -356,12 +269,6 @@ public sealed unsafe partial class NeedleSession : IDisposable
 
     public int MaxInputBytes => maxInputBytes;
 
-    /// <summary>
-    /// Sequential engine passes used by the last call-decoding section
-    /// (GenerateCalls/GenerateCallsTyped). Without jump-forward this equals
-    /// the decoded call tokens; with it, one pass can cover the committed
-    /// token plus a whole forced span. Test-only gauge for issue #16.
-    /// </summary>
     internal int LastCallPasses { get; private set; }
 
     public void RequestCancel() => System.Threading.Volatile.Write(ref cancelRequested, 1);
@@ -374,7 +281,6 @@ public sealed unsafe partial class NeedleSession : IDisposable
         if (string.IsNullOrWhiteSpace(text)) return fact;
         return text.TrimStart().StartsWith('{') ? text : fact + "; " + text;
     }
-
 
     uint* CopyMask(uint* source, params int[] extraTokens)
     {
@@ -406,14 +312,9 @@ public sealed unsafe partial class NeedleSession : IDisposable
         var ids = new List<int> { tokenizer.BeginId };
         ids.AddRange(Tokens(head, true));
         engine.Reset();
-        // A re-prime replaces the engine lineage (retrieval subset change),
-        // so a deferred closing from the old lineage is dropped, exactly as
-        // the slow path's fed closing is discarded by the Reset here.
         pendingClosing = null;
         engine.Feed(ids.ToArray(), computeLogits: false);
         engine.Mark();
-        // The primed tool-schema tokens seed the prompt-lookup history: tool
-        // names and argument keys are copied from this span most often.
         var primed = Math.Min(ids.Count, specHistory.Length);
         for (var i = 0; i < primed; i++) specHistory[i] = ids[i];
         specPrimedLength = primed;
@@ -426,8 +327,6 @@ public sealed unsafe partial class NeedleSession : IDisposable
         engine.Rewind();
         turnOne = true;
         specHistoryLength = specPrimedLength;
-        // The rewind discards the deferred closing along with everything
-        // past the mark: this is the saved pass of the fast path.
         pendingClosing = null;
     }
 
@@ -474,8 +373,6 @@ public sealed unsafe partial class NeedleSession : IDisposable
             throw new ArgumentException("primed prefix was created for a different model, tool set, system prompt or context");
         engine.ImportPrimedPrefix(primedPrefix.Slice(PrefixHeaderInts * sizeof(int)));
         turnOne = true;
-        // Imported bytes carry no token ids, so lookups use the prompt and
-        // output tokens only until the next Prime.
         specPrimedLength = 0;
         specHistoryLength = 0;
     }
@@ -540,9 +437,6 @@ public sealed unsafe partial class NeedleSession : IDisposable
             var selection = SelectTools(input);
             if (selection != FailureReason.None) return Failed(selection, progress);
         }
-        // N62: a continued turn replays the previous turn's deferred closing
-        // first, so its history matches the slow path token for token. After
-        // a re-prime above the pending closing is already dropped.
         if (!ReplayPendingClosing()) return Failed(FailureReason.ContextExhausted, progress);
         progress.PromptTokens = EncodePrompt(input, toolResult);
         if (engine.Length + progress.PromptTokens > contextCapacity) return Failed(FailureReason.ContextExhausted, progress);
@@ -562,8 +456,6 @@ public sealed unsafe partial class NeedleSession : IDisposable
         if (!toolResult && input.Length == 0) return Failed(FailureReason.EmptyInput, progress);
         if (input.Length > maxInputBytes) return Failed(FailureReason.InputTooLong, progress);
         if (retrieval) return Failed(FailureReason.ToolContextFailed, progress);
-        // N62: same replay as Run: a continued typed turn sees the identical
-        // token history as the slow path.
         if (!ReplayPendingClosing()) return Failed(FailureReason.ContextExhausted, progress);
         progress.PromptTokens = EncodePrompt(input, toolResult);
         if (engine.Length + progress.PromptTokens > contextCapacity) return Failed(FailureReason.ContextExhausted, progress);
@@ -578,9 +470,6 @@ public sealed unsafe partial class NeedleSession : IDisposable
         return GenerateCallsTyped(ref progress, commands, ref sink);
     }
 
-    // True when the last EncodePrompt folded thinkEndForced into the prefill
-    // (ReasoningBudget <= 0 and the ids fit). Reason then skips its separate
-    // feed: the decision ArgMax reads the prefill logits directly.
     bool thinkEndFolded;
 
     int EncodePrompt(ReadOnlySpan<byte> input, bool toolResult)
@@ -594,11 +483,6 @@ public sealed unsafe partial class NeedleSession : IDisposable
         var count = tokenizer.Encode(text[..(head.Length + input.Length + tail.Length)], promptIds, false);
         promptIds[count] = ThinkStart;
         var total = count + 1;
-        // N61: with no reasoning budget the think span is empty, so the forced
-        // tail (ThinkEnd + newline) joins the prefill chunk instead of costing
-        // its own engine pass. The fed token sequence is identical either way;
-        // single-threaded chunk feeds equal split feeds bit-for-bit
-        // (ChunkParityTests), and the eval suite gates any drift otherwise.
         thinkEndFolded = options.ReasoningBudget <= 0 && total + thinkEndForced.Length <= promptIds.Length;
         if (thinkEndFolded)
         {
@@ -661,7 +545,6 @@ public sealed unsafe partial class NeedleSession : IDisposable
         var draftProbs = stackalloc float[MaxDraftTokens];
         callTextLength = 0;
         LastCallPasses = 0;
-        // The prompt/decision feeds left full logits ready for the first mask.
         trie.Allow(grammar.Program, state, mask);
         var allowed = MaskCount(mask, maskWords);
         var full = true;
@@ -674,8 +557,6 @@ public sealed unsafe partial class NeedleSession : IDisposable
             float probability;
             if (jump && allowed == 1)
             {
-                // No choice to sample: per-token greedy must emit this token
-                // (argmax over one candidate), so no logits are consulted.
                 pick = SoleAllowed(mask, maskWords, sparseRows);
                 probability = 1f;
             }
@@ -696,14 +577,6 @@ public sealed unsafe partial class NeedleSession : IDisposable
             progress.DecodeTokens++;
             if (!budget.IsUnlimited && FrameBudgetHit(progress, budget)) return Abandon(ReplyStatus.Failed, FailureReason.FrameBudgetExceeded, progress);
             RecordSpecHistory(pick);
-            // Jump-forward (issue #16): while the grammar+trie allow exactly
-            // one token, per-token greedy would emit that token, so it joins
-            // the chunk instead of costing a decode pass. Each forced token
-            // enters the decode mean with probability 1 and counts toward
-            // MaxCallTokens exactly as a per-token step would. The chunk is
-            // the per-token greedy sequence itself: no canonical
-            // re-tokenization of byte spans, so free choices downstream see
-            // the identical token history.
             chunkIds[0] = pick;
             var chunkCount = 1;
             var maskFresh = false;
@@ -713,16 +586,12 @@ public sealed unsafe partial class NeedleSession : IDisposable
                 {
                     if (CancelRequested) return Abandon(ReplyStatus.Cancelled, FailureReason.None, progress);
                     if (steps >= options.MaxCallTokens) return Abandon(ReplyStatus.Failed, FailureReason.CallTokenBudgetExceeded, progress);
-                    // The next mask depends only on the committed tokens, so
-                    // it is current before the forward pass either way.
                     trie.Allow(grammar.Program, state, mask);
                     maskFresh = true;
                     allowed = MaskCount(mask, maskWords);
                     if (allowed != 1) break;
                     var forced = SoleAllowed(mask, maskWords, sparseRows);
                     var forcedLength = tokenizer.ConstraintBytes(forced, buffer);
-                    // A zero-byte sole token advances nothing; leave it for
-                    // the next macro-step to mirror per-token accounting.
                     if (forcedLength <= 0) break;
                     if (callTextLength + forcedLength > callText.Length) return Abandon(ReplyStatus.Failed, FailureReason.CallTextTooLong, progress);
                     for (var b = 0; b < forcedLength; b++)
@@ -738,11 +607,6 @@ public sealed unsafe partial class NeedleSession : IDisposable
                 }
             }
             if (jump && chunkCount > 1 && CancelRequested) return Abandon(ReplyStatus.Cancelled, FailureReason.None, progress);
-            // Prompt-lookup speculation (issue #17): propose draft continuations
-            // from the token history, feed pick+drafts as one chunk, and keep
-            // the longest verified prefix. Only runs on single-token chunks
-            // (a jump-forced run owns its chunk) and only when a draft was
-            // actually proposed, so non-matching steps cost nothing extra.
             var draftStart = chunkCount;
             var specFed = false;
             if (options.PromptLookup && chunkCount == 1 && !Grammar.Complete(state))
@@ -757,10 +621,6 @@ public sealed unsafe partial class NeedleSession : IDisposable
                     if (!FeedCallChunk(new ReadOnlySpan<int>(chunkIds, chunkCount), computeLogits: false)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
                     var accepted = VerifyDrafts(chunkIds, draftStart, drafts, draftAllowed, draftProbs);
                     if (accepted < drafts) engine.RestoreSpec();
-                    // Committing advances the real grammar state exactly as
-                    // per-token greedy would (verified tokens equal the masked
-                    // argmax at their positions), with per-token history,
-                    // probability, step, token-count and budget accounting.
                     for (var j = 0; j < accepted; j++)
                     {
                         var draft = chunkIds[draftStart + j];
@@ -780,22 +640,15 @@ public sealed unsafe partial class NeedleSession : IDisposable
                     }
                     chunkCount = draftStart + accepted;
                     specFed = accepted == drafts;
-                    // Committed drafts advanced the grammar state past the
-                    // jump block's precomputed mask, so the tail recomputes.
                     if (accepted > 0) maskFresh = false;
                 }
             }
             var chunk = new ReadOnlySpan<int>(chunkIds, chunkCount);
             if (Grammar.Complete(state))
             {
-                // A fully-accepted draft chunk is already fed; a partial one
-                // was rewound, so the accepted prefix still needs its pass.
                 if (!specFed && !FeedCallChunk(chunk, computeLogits: false)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
                 break;
             }
-            // The next mask depends only on the chosen tokens, so compute it
-            // before the forward pass (serial precompute; true overlap needs
-            // pool support owned by the engine scheduler).
             if (!maskFresh)
             {
                 trie.Allow(grammar.Program, state, mask);
@@ -819,9 +672,6 @@ public sealed unsafe partial class NeedleSession : IDisposable
         if (!FinishClosing(callClosing, countPass: true)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
 
         var head = HeadProbability();
-        // Jumped forced tokens contribute probability 1, so the mean below
-        // mixes model probabilities (choice points) with ones (forced steps);
-        // with no forced steps this equals per-token decoding exactly.
         var decode = Math.Exp(logProbability / Math.Max(1, steps));
         var confidence = (float)Math.Min(head, decode);
         if (!CallRestorer.TryRestore(allTools.Aliases, new ReadOnlySpan<byte>(callText, 0, callTextLength), calls, keyScratch, callSpans, out var required, out restoredCallCount))
@@ -849,7 +699,6 @@ public sealed unsafe partial class NeedleSession : IDisposable
         var draftProbs = stackalloc float[MaxDraftTokens];
         var stored = 0;
         LastCallPasses = 0;
-        // The prompt/decision feeds left full logits ready for the first mask.
         trie.Allow(grammar.Program, state, mask);
         var allowed = MaskCount(mask, maskWords);
         var full = true;
@@ -862,8 +711,6 @@ public sealed unsafe partial class NeedleSession : IDisposable
             float probability;
             if (jump && allowed == 1)
             {
-                // No choice to sample: per-token greedy must emit this token
-                // (argmax over one candidate), so no logits are consulted.
                 pick = SoleAllowed(mask, maskWords, sparseRows);
                 probability = 1f;
             }
@@ -882,11 +729,6 @@ public sealed unsafe partial class NeedleSession : IDisposable
             steps++;
             progress.DecodeTokens++;
             RecordSpecHistory(pick);
-            // Jump-forward (issue #16): same token-forced extension as
-            // GenerateCalls. Each forced token advances through the sink
-            // overload, so the sink observes the identical event sequence as
-            // per-token decoding; completed calls are drained per token
-            // below before the chunk is fed.
             chunkIds[0] = pick;
             var chunkCount = 1;
             var maskFresh = false;
@@ -902,8 +744,6 @@ public sealed unsafe partial class NeedleSession : IDisposable
                     if (allowed != 1) break;
                     var forced = SoleAllowed(mask, maskWords, sparseRows);
                     var forcedLength = tokenizer.ConstraintBytes(forced, buffer);
-                    // A zero-byte sole token advances nothing; leave it for
-                    // the next macro-step to mirror per-token accounting.
                     if (forcedLength <= 0) break;
                     for (var b = 0; b < forcedLength; b++)
                     {
@@ -917,10 +757,6 @@ public sealed unsafe partial class NeedleSession : IDisposable
                 }
             }
             if (jump && chunkCount > 1 && CancelRequested) return Abandon(ReplyStatus.Cancelled, FailureReason.None, progress);
-            // Prompt-lookup speculation (issue #17): same propose/feed/verify
-            // as GenerateCalls. Drafts advance only a scratch grammar copy,
-            // so the sink observes events for accepted tokens only, in commit
-            // order, exactly as per-token decoding would emit them.
             var draftStart = chunkCount;
             var specFed = false;
             if (options.PromptLookup && chunkCount == 1 && !Grammar.Complete(state))
@@ -952,22 +788,15 @@ public sealed unsafe partial class NeedleSession : IDisposable
                     }
                     chunkCount = draftStart + accepted;
                     specFed = accepted == drafts;
-                    // Committed drafts advanced the grammar state past the
-                    // jump block's precomputed mask, so the tail recomputes.
                     if (accepted > 0) maskFresh = false;
                 }
             }
             var chunk = new ReadOnlySpan<int>(chunkIds, chunkCount);
             if (Grammar.Complete(state))
             {
-                // A fully-accepted draft chunk is already fed; a partial one
-                // was rewound, so the accepted prefix still needs its pass.
                 if (!specFed && !FeedCallChunk(chunk, computeLogits: false)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
                 break;
             }
-            // The next mask depends only on the chosen tokens, so compute it
-            // before the forward pass (serial precompute; true overlap needs
-            // pool support owned by the engine scheduler).
             if (!maskFresh)
             {
                 trie.Allow(grammar.Program, state, mask);
@@ -991,8 +820,6 @@ public sealed unsafe partial class NeedleSession : IDisposable
         if (!FinishClosing(callClosing, countPass: true)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
 
         var head = HeadProbability();
-        // Jumped forced tokens contribute probability 1, matching
-        // GenerateCalls; see the note on the decode mean there.
         var decode = Math.Exp(logProbability / Math.Max(1, steps));
         var confidence = (float)Math.Min(head, decode);
         var total = sink.CallCount - startCount;
@@ -1056,12 +883,6 @@ public sealed unsafe partial class NeedleSession : IDisposable
         return true;
     }
 
-    // N62 stateless fast path. When options.Stateless is set, the trailing
-    // turn-closing feed is deferred instead of paid: it is replayed at the
-    // start of the next turn (ReplayPendingClosing), so a continued turn sees
-    // the identical token history, while a Reset or re-prime drops it and the
-    // engine pass is saved. Confidence is therefore always computed from the
-    // pre-closing pool when deferred. Zero allocation either way.
     bool FinishClosing(int[] closing, bool countPass)
     {
         if (options.Stateless)
@@ -1090,9 +911,6 @@ public sealed unsafe partial class NeedleSession : IDisposable
         return true;
     }
 
-    // Call-decode feed that also counts sequential engine passes for
-    // LastCallPasses (issue #16 gauge). Zero allocation: the chunk is a
-    // caller-owned span, usually stack.
     bool FeedCallChunk(ReadOnlySpan<int> tokens, bool computeLogits)
     {
         if (engine.Length + tokens.Length > contextCapacity) return false;
@@ -1128,13 +946,20 @@ public sealed unsafe partial class NeedleSession : IDisposable
 
     static int MaskCount(uint* mask, int words)
     {
-        var total = 0;
-        for (var w = 0; w < words; w++) total += Bits.PopCount(mask[w]);
-        return total;
+        int total0 = 0, total1 = 0;
+        var w = 0;
+        var pairs = words >> 1;
+        var q = (ulong*)mask;
+        for (; w + 1 < pairs; w += 2)
+        {
+            total0 += Bits.PopCount(q[w]);
+            total1 += Bits.PopCount(q[w + 1]);
+        }
+        for (; w < pairs; w++) total0 += Bits.PopCount(q[w]);
+        for (w *= 2; w < words; w++) total0 += Bits.PopCount(mask[w]);
+        return total0 + total1;
     }
 
-    // Extracts allowed ids ascending into `rows`, stopping at `limit`.
-    // Callers compare MaskCount first when they need the exact count.
     static int ExtractIds(uint* mask, int words, int* rows, int limit)
     {
         var count = 0;
@@ -1150,19 +975,12 @@ public sealed unsafe partial class NeedleSession : IDisposable
         return count;
     }
 
-    // Returns the single allowed token id; callers guarantee popcount == 1.
-    // Jump-forward (issue #16) uses this for token-forced steps: argmax over
-    // one candidate is forced, so per-token greedy must emit this token.
-    // `scratch` needs room for two ids (SparseHeadThreshold always qualifies).
     static int SoleAllowed(uint* mask, int words, int* scratch)
     {
         ExtractIds(mask, words, scratch, 2);
         return scratch[0];
     }
 
-    // Argmax over a sparse head output: `values[0..count)` aligns with `rows`.
-    // The best probability comes from a log-sum-exp over the allowed set only,
-    // never from a full-vocabulary softmax.
     static int ArgMaxSparse(float* values, int* rows, int count, out float probability)
     {
         var best = -1;
@@ -1179,36 +997,9 @@ public sealed unsafe partial class NeedleSession : IDisposable
     int ArgMaxWithProbability(uint* allowed, out float probability)
     {
         fixed (float* logits = engine.Logits)
-        {
-            var best = -1;
-            var count = 0;
-            var peak = float.NegativeInfinity;
-            for (var word = 0; word < maskWords; word++)
-            {
-                var bits = allowed[word];
-                while (bits != 0)
-                {
-                    var id = word * 32 + Bits.TrailingZeros(bits);
-                    bits &= bits - 1;
-                    var value = logits[id];
-                    scratchLogits[count++] = value;
-                    if (value > peak) { peak = value; best = id; }
-                }
-            }
-            if (best < 0)
-            {
-                probability = 0f;
-                return -1;
-            }
-            probability = Ops.BestProbability(scratchLogits, count, peak);
-            return best;
-        }
+            return Ops.ArgMaxMaskedWithProbability(logits, allowed, maskWords, model.VocabSize, scratchLogits, out probability);
     }
 
-    // Appends committed token ids to the prompt-lookup history (issue #17).
-    // The buffer is ctor-sized and append-only across turns; when full,
-    // recording silently stops and lookups degrade to the recorded prefix.
-    // No allocation: plain array writes.
     void RecordSpecHistory(int id)
     {
         if (specHistoryLength < specHistory.Length) specHistory[specHistoryLength++] = id;
@@ -1221,9 +1012,6 @@ public sealed unsafe partial class NeedleSession : IDisposable
         for (var i = 0; i < count; i++) specHistory[specHistoryLength++] = ids[i];
     }
 
-    // Most-recent occurrence of suffix[0..n) in the committed history;
-    // returns the token that followed it, or -1 when the suffix never
-    // occurred with a successor. Linear scan, no allocation.
     int LookupDraft(int* suffix, int n)
     {
         if (n <= 0) return -1;
@@ -1237,13 +1025,6 @@ public sealed unsafe partial class NeedleSession : IDisposable
         return -1;
     }
 
-    // Proposes up to MaxDraftTokens continuations by prompt lookup (issue
-    // #17). `scratch` starts as the post-pick grammar state and advances
-    // past each draft (the real state is untouched until commit); each draft
-    // position's mask is recorded in specMasks and its popcount in
-    // draftAllowed. Appends drafts to chunkIds[chunkCount..] and returns the
-    // draft count. Stops at the first position with no legal prediction, so
-    // every returned draft is grammar-legal by construction.
     int ProposeDrafts(GrammarState* scratch, int* chunkIds, int chunkCount, int* draftAllowed, int steps, byte* bytes)
     {
         var suffix = stackalloc int[3];
@@ -1261,15 +1042,11 @@ public sealed unsafe partial class NeedleSession : IDisposable
             {
                 var candidate = LookupDraft(suffix + suffixCount - n, n);
                 if (candidate < 0) continue;
-                // Grammar-legal only: illegal predictions stop the draft run
-                // (verification would reject them anyway).
                 var word = candidate / 32;
                 if (word < maskWords && (mask[word] & (1u << (candidate % 32))) != 0) { draft = candidate; break; }
             }
             if (draft < 0) break;
             var length = tokenizer.ConstraintBytes(draft, bytes);
-            // A zero-byte token advances nothing; leave it out exactly like
-            // the jump-forward path leaves zero-byte forced tokens out.
             if (length <= 0) break;
             var cursor = scratch;
             var ok = true;
@@ -1287,12 +1064,6 @@ public sealed unsafe partial class NeedleSession : IDisposable
         return drafts;
     }
 
-    // Verifies drafts against the fed chunk (issue #17): draft j lives at
-    // chunk index draftStart + j and is predicted by the head at row
-    // draftStart + j - 1 under its recorded mask. Returns the accepted
-    // prefix length; probs[0..accepted) holds each accepted draft's masked
-    // probability for the decode mean. The shared logits buffer is clobbered
-    // and must be recomputed for the last row afterwards.
     int VerifyDrafts(int* chunkIds, int draftStart, int draftCount, int* draftAllowed, float* probs)
     {
         for (var j = 0; j < draftCount; j++)
@@ -1320,34 +1091,8 @@ public sealed unsafe partial class NeedleSession : IDisposable
         return draftCount;
     }
 
-    int ArgMaxMaskedWithProbability(uint* allowed, out float probability)
-    {
-        fixed (float* logits = engine.Logits)
-        {
-            var best = -1;
-            var count = 0;
-            var peak = float.NegativeInfinity;
-            for (var word = 0; word < maskWords; word++)
-            {
-                var bits = allowed[word];
-                while (bits != 0)
-                {
-                    var id = word * 32 + Bits.TrailingZeros(bits);
-                    bits &= bits - 1;
-                    var value = logits[id];
-                    scratchLogits[count++] = value;
-                    if (value > peak) { peak = value; best = id; }
-                }
-            }
-            if (best < 0)
-            {
-                probability = 0f;
-                return -1;
-            }
-            probability = Ops.BestProbability(scratchLogits, count, peak);
-            return best;
-        }
-    }
+    int ArgMaxMaskedWithProbability(uint* allowed, out float probability) =>
+        ArgMaxWithProbability(allowed, out probability);
 
     public float[] Embed(string text)
     {

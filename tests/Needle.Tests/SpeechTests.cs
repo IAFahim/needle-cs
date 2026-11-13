@@ -49,10 +49,6 @@ public sealed class SpeechTests : IDisposable
         AssertCloseTo("a new queen in Victoria, the first popular monarch in centuries, and her husband Albert", text, "test_long.wav");
     }
 
-    // Beam search over float logits can pick a slightly different but equally valid decoding on
-    // other hardware (a dropped "you know", one substituted word), so phrases from the upstream
-    // transcript must appear as a near-complete subsequence of the words, not byte for byte.
-    // Exact equality stays asserted where it holds everywhere (RecordMatchesUpstreamExactly).
     static void AssertCloseTo(string expected, string actual, string clip)
     {
         static string[] Words(string text) => text.ToLowerInvariant().Split(new[] { ' ', ',', '.', '?', '!', ';', ':' }, StringSplitOptions.RemoveEmptyEntries);
@@ -82,8 +78,6 @@ public sealed class SpeechTests : IDisposable
     public void TestClipAndHotwordClipKeepUpstreamPhrases()
     {
         var test = whistle.Transcribe(Clip("test.wav")).Text;
-        // Full transcripts in the messages: xUnit truncates long strings, which hides where a
-        // different CPU's beam search diverges.
         Assert.True(test.Contains("creating a way of file"), $"test.wav: {test}");
         Assert.True(test.Contains("Wi-Fi"), $"test.wav: {test}");
         Assert.True(test.Contains("this will transcribe properly"), $"test.wav: {test}");

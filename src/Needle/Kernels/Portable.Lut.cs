@@ -1,93 +1,16 @@
 namespace Needle;
 
-// N52: LUT-GEMV (T-MAC style) integer matmul for the portable provider.
-//
-// Per (token, 128-group) the kernel precomputes byte-indexed tables over the
-// activations and the weight codebook, turning every packed weight byte into
-// one load plus one add instead of four multiply-adds, shifts and masks:
-//
-//   2-bit: T[j][b] = book[(b>>0)&3]*x[j] + book[(b>>2)&3]*x[32+j]
-//                  + book[(b>>4)&3]*x[64+j] + book[(b>>6)&3]*x[96+j]
-//          j in 0..32, b in 0..256: 32*256 int32 = 32 KiB per group.
-//   4-bit: one 32x256 table per nibble half h in {0,1}:
-//          Th[j][b] = book[b&15]*x[2h*32+j] + book[b>>4]*x[(2h+1)*32+j]
-//          (64 KiB per group: lo half then hi half).
-//
-// Integer sums are bit-exact with Scalar.MatMulRows by construction: the dots
-// cannot overflow int32 (about 2M worst case), so every summation order of the
-// same 128 products per (row, group) is identical, and the per-entry sums
-// below add the same four (2-bit) or two (4-bit) products Scalar adds. The
-// float fold keeps Scalar's exact order per (row, group):
-// scaled = HalfToSingle(norm) * byteScale * scale,
-// accumulator += scaled * dot and bias += scaled * offset in group order,
-// finishing with y = accumulator - bias. Row tails (< 4 rows) run Scalar
-// itself, so they are exact trivially.
-//
-// Table build cost is paid once per (token, group) and amortized over rows:
-// the build first forms the plane level products (2-bit: 4 planes x 4 levels;
-// 4-bit: 2 x 16 levels) and then fills entries with one add each, storing
-// sequentially with no per-entry masking (2-bit ~512 IMUL + 26k adds per
-// group). This is aimed at the N51 finding (IMUL-throughput-bound): the dot
-// loop itself does no multiplies at all.
-//
-// Loop order is groups-outer, rows-inner everywhere below: one group's table
-// (32 KiB) stays L1-resident across the whole row slice, while a groups-inner
-// (N51-style) order would cycle groups*32 KiB through L1 per row quad. The
-// float accumulators therefore live in small stack arrays sized by SliceRows.
-//
-// Sharing: the tables depend only on (activations, codebook bytes). The model
-// keeps one global codebook per bit-width (Model.cs Reader: every Cq points
-// at book2 or book4), so Q, K, V and Gate matrices over the same Activations
-// share one build. BuildTables writes the tables once into caller-owned
-// scratch; MatMulRowsWithTables consumes them for any matrix with the same
-// book. The standalone MatMulRows drop-in below owns no scratch: it rebuilds
-// per 1024-row slice (32 KiB table + 8 KiB accumulators on the stack, reused
-// per group) and delegates small row counts and T != 1 to PortableMatMul.
-//
-// Contract (plan section 2 provider rules): pure functions, no heap
-// allocation (only stack scratch in the slice paths), pointer + scalar
-// arguments only, safe from any thread as long as callers give each thread
-// disjoint outputs/scratch.
-//
-// Wiring API (for the N30 owner; this file adds no dispatch itself):
-//   PortableLut.MatMulRows(in Cq, in Activations, int tokens, float* y,
-//     int ldy, int rowStart, int rowEnd) — a drop-in for Scalar.MatMulRows.
-//   int ludInts = PortableLut.TableInts(w.Groups, w.Bits) — scratch ints per
-//     token for the shared path (e.g. DimAct 768 -> 6 groups: 48K/96K ints).
-//   PortableLut.BuildTables(w, a, token, tables) — once per token per
-//     bit-width; tables must be TableInts(w.Groups, w.Bits) ints.
-//   PortableLut.MatMulRowsWithTables(w, a, token, tables, y, ldy, rowStart,
-//     rowEnd) — per matrix consuming the same (a, token, book); y is the base
-//     output pointer (the token offset is applied inside).
-//   Suggested dispatch in Quant.MatMulRows, after the table check and before
-//   the Scalar fallback (or wherever the portable provider slots in):
-//     if (!Simd.Enabled) { PortableLut.MatMulRows(w, a, tokens, y, ldy, rowStart, rowEnd); return; }
 internal static unsafe class PortableLut
 {
     public const int Lanes = 32;
     public const int Values = 256;
-    public const int TableInts2 = 32 * 256; // per group, 2-bit (32 KiB)
-    public const int TableInts4 = 2 * 32 * 256; // per group, 4-bit (64 KiB)
+    public const int TableInts2 = 32 * 256;
+    public const int TableInts4 = 2 * 32 * 256;
     public static int TableInts(int groups, int bits) => groups * (bits == 2 ? TableInts2 : TableInts4);
 
-    // Below these row counts the table build exceeds the lookup savings; the
-    // drop-in delegates to N51 (still bit-exact). N52 bench at T=1:
-    // 2-bit standalone wins from ~192 rows (CoreCLR+ns2.1 2.4x, Mono 1.4x)
-    // up to 3.5-4.2x at 768+ rows; below 192 Mono loses (0.85x at 96 rows).
-    // 4-bit pays a 2x bigger build and 2x the dot loads, so it wins only from
-    // ~576 rows (1.1-1.3x standalone both runtimes; dot-only 1.6-1.9x).
-    // The shared path has no per-matrix build, so the N30 owner may call
-    // WithTables below these cutoffs whenever the tables already exist for a
-    // sibling matrix (dot-only wins from the smallest shapes: 4.3x/3.3x at
-    // 96 rows, 2-bit, CoreCLR/Mono).
     const int MinRowsForLut2 = 192;
     const int MinRowsForLut4 = 576;
 
-    // Row slice for the groups-outer order: accumulators (acc+bias, plus the
-    // 4-bit half-dot staging) live on the stack, the 32 KiB table scratch is
-    // reused per group, so the stack peak stays ~44 KiB regardless of matrix
-    // height. Larger slices rebuild fewer tables; 1024 keeps the peak modest
-    // for small-stack runtimes (IL2CPP workers, Mono threads).
     const int SliceRows = 1024;
 
     public static void MatMulRows(in Cq w, in Activations a, int tokens, float* y, int ldy, int rowStart, int rowEnd)
@@ -151,10 +74,6 @@ internal static unsafe class PortableLut
             Scalar.MatMulRows(w, a.Slice(token), 1, y0, ldy, quadEnd, rowEnd);
     }
 
-    // Bit-identical copy of Scalar.HalfToSingle, forced inline: the group loop
-    // calls this per (row, group) and the JIT leaves cross-class calls
-    // uninlined in these large methods. Must stay bit-for-bit equal to the
-    // Scalar reference (exact conversion, no rounding involved).
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     static float HalfToSingle(ushort half)
     {
@@ -172,10 +91,6 @@ internal static unsafe class PortableLut
         var b1 = book[1];
         var b2 = book[2];
         var b3 = book[3];
-        // Level products per plane, then the 16 low-pair sums: entry
-        // (c0|c1<<2|c2<<4|c3<<6) = lo[c0|c1<<2] + p[8+c2] + p[12+c3].
-        // The inner store runs sequentially over 16 contiguous entries with
-        // no per-entry masking; the 16 lo[] sums are shared by all 16 (c2,c3).
         int* p = stackalloc int[16];
         int* lo = stackalloc int[16];
         for (var j = 0; j < Lanes; j++)
@@ -208,8 +123,6 @@ internal static unsafe class PortableLut
                 p[c] = book[c] * va;
                 p[16 + c] = book[c] * vb;
             }
-            // Entry (lo|hi<<4) = p[lo] + p[16+hi]: hoist the hi term, store
-            // 16 contiguous entries per hi with no per-entry masking.
             var tj = t + j * Values;
             for (var hi = 0; hi < 16; hi++)
             {
@@ -331,9 +244,6 @@ internal static unsafe class PortableLut
         for (var i = 0; i < count; i++) y0[r0 + i] = acc[i] - biz[i];
     }
 
-    // Standalone path: no caller scratch. Rows run in slices; per (slice,
-    // group) the table is rebuilt into 32 KiB of stack scratch and stays
-    // L1-resident across the slice's quads.
     [System.Runtime.CompilerServices.SkipLocalsInit]
     static void Standalone2(in Cq w, in Activations a, float* y, int ldy, int rowStart, int rowEnd)
     {

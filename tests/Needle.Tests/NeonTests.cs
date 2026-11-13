@@ -455,10 +455,6 @@ public sealed unsafe class NeonTests
         AssertClose(actualResidual, expectedResidual, dim, "AccumulateOutput");
     }
 
-    // GEMV-vs-scalar comparison in the MatMulTests convention: the int-domain
-    // dot products accumulate in a different order than Scalar, so outputs can
-    // differ by a few ulps at large magnitudes (e.g. 0.03 at |y| ~ 900). A
-    // global-magnitude 1e-3 band absorbs that without hiding real errors.
     static void AssertMatMulClose(float* actual, float* expected, int n, string what)
     {
         var magnitude = 1f;
@@ -471,9 +467,7 @@ public sealed unsafe class NeonTests
     public static IEnumerable<object[]> MultiRowShapes()
     {
         foreach (var bits in new[] { 2, 4 })
-            // Single row, 2-row pair, 4-row block, block plus 1-3 tail rows, odd counts.
             foreach (var (rows, cols) in new[] { (1, 128), (2, 128), (3, 256), (4, 256), (5, 768), (6, 384), (7, 768), (8, 768), (9, 768), (13, 768), (24, 768), (37, 768) })
-                // 1-3 tokens exercise DotBlock tails, 4+ the DotPair/DotTile tiles.
                 foreach (var tokens in new[] { 1, 2, 3, 4, 5, 7, 8, 9 })
                     yield return new object[] { bits, rows, cols, tokens };
     }

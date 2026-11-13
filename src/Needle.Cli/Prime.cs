@@ -5,24 +5,6 @@ using Needle;
 
 namespace Needle.Cli;
 
-/// <summary>
-/// N64: build-time primed-prefix export (<c>needle prime</c>).
-///
-/// Bakes the post-prefill KV snapshot for a (model, tool set, system prompt,
-/// context) tuple and writes it to a file. Ship the file with the game and
-/// construct sessions with the <c>primedPrefix</c> constructor (or
-/// <c>--prefix</c> on <c>needle serve</c>/<c>needle call</c>, or
-/// <c>HostOptions.PrimedPrefixPath</c>) to skip the tool-prompt prefill at
-/// startup: session ready in milliseconds instead of ~0.3-0.6 s.
-///
-/// The baked system prompt is date-free (<c>AutoDate=false</c>, plan.md
-/// §10.5): a dated prompt would hash differently the next day and the load
-/// would fail validation. The load validates model geometry, vocab, context,
-/// tool set and system prompt and throws on mismatch; rebake instead of
-/// reusing across any of those changing. Retrieval must stay off on the
-/// loading side (<c>RetrievalTopK &gt;=</c> tool count): a primed prefix
-/// cannot be combined with tool retrieval.
-/// </summary>
 internal static class Prime
 {
     public static int Run(string modelPath, string toolsPath, string outPath, string[] options)
@@ -73,8 +55,6 @@ internal static class Prime
             return 1;
         }
 
-        // Retrieval stays off for the bake: the full tool set is primed, and a
-        // primed prefix cannot be combined with tool retrieval on load.
         var sessionOptions = new NeedleOptions
         {
             Threads = threads,
@@ -96,9 +76,6 @@ internal static class Prime
             var bytes = session.ExportPrimedPrefix();
             File.WriteAllBytes(outPath, bytes);
 
-            // Validate the file: a fresh session must restore it and agree on
-            // the primed length. Timed so the bake log doubles as the N64
-            // session-ready measurement for this runtime.
             var restore = Stopwatch.StartNew();
             using var revived = new NeedleSession(model, toolsJson, bytes, sessionOptions);
             restore.Stop();

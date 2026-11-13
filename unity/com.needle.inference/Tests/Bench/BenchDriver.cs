@@ -1,13 +1,3 @@
-// N11 bench driver: one runner core for every Unity runtime, all emitting
-// `needle.bench-e2e/1` JSON with the same shape as `needle bench-e2e`
-// (src/Needle.Cli/BenchE2E.cs). Single source of truth: the CoreCLR host
-// (samples/BenchNs21), the Mono harness (MonoMain), the EditMode test and
-// the IL2CPP player scene all call BenchDriver.Run.
-//
-// Constraints: C# 7-level syntax (Unity 7000 compiles at C# 9, the bundled
-// Mono 6.13 csc is older), netstandard2.1 BCL only, no UnityEngine
-// references (progress flows out through Action<string>), public Needle API
-// only (the test/player assemblies are not in InternalsVisibleTo).
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -19,12 +9,6 @@ using Needle;
 
 namespace Needle.Bench
 {
-    /// <summary>
-    /// Emits <c>needle.bench-e2e/1</c> JSON for the golden + game prompt sets and
-    /// checks the golden-set call outputs. Returns the failure count (0 = every
-    /// call reproduced, every number finite). The JSON string is byte-compatible
-    /// in shape with BenchE2E.ToJson: same object, same fields, same order.
-    /// </summary>
     public static class BenchDriver
     {
         public const string Schema = "needle.bench-e2e/1";
@@ -35,10 +19,6 @@ namespace Needle.Bench
             "set a timer for 12 minutes and play some Miles Davis",
         };
 
-        // Expected FunctionCalls for GoldenQueries under tools/tools.json, taken
-        // from SessionTests (get_weather for Lagos; set_timer + play_music chain).
-        // A golden query is only checked when every expected name is present in
-        // the tools JSON, so custom tools files degrade to record-only.
         public static readonly string[][] GoldenCalls = new string[][]
         {
             new string[] { "get_weather" },
@@ -59,12 +39,6 @@ namespace Needle.Bench
             "form a circle",
         };
 
-        /// <summary>
-        /// Runs the bench. <paramref name="log"/> takes progress lines (stderr /
-        /// Debug.Log at the call site). <paramref name="gameToolsJson"/> may be
-        /// null or empty to skip the game set. <paramref name="sets"/> is one of
-        /// "golden", "game", "all".
-        /// </summary>
         public static int Run(
             Action<string> log,
             string modelPath,
@@ -198,15 +172,9 @@ namespace Needle.Bench
                 failures++;
             }
         }
-        // GC.GetTotalAllocatedBytes is netstandard2.1+; Unity's Mono facade set
-        // (and the NET_Standard_2_0 script profile) only guarantees the 2.0
-        // surface, so gauge the managed heap with GetTotalMemory instead.
-        // Deltas are noisier than per-call counters but stay finite and honest.
         static long ManagedHeap() { return GC.GetTotalMemory(false); }
 
-        // double.IsFinite is netstandard2.1+; spell it out for the 2.0 surface.
         static bool IsFinite(double value) { return !double.IsNaN(value) && !double.IsInfinity(value); }
-
 
         static string CallNames(CallResult result)
         {

@@ -38,7 +38,6 @@ PREFERRED_LIB = os.path.join(ROOT, "ref/native/libneedle3.so")
 CACT = os.path.join(ROOT, "ref/hf/whistle/whistle.cact")
 DIM = 512
 
-
 def locate_library():
     if os.path.isfile(PREFERRED_LIB):
         return PREFERRED_LIB
@@ -52,7 +51,6 @@ def locate_library():
             dst.write(src.read())
     return target
 
-
 def bind(path):
     lib = ctypes.CDLL(os.path.abspath(path))
     lib.needle_load.argtypes = [ctypes.c_char_p, ctypes.c_uint64]
@@ -62,7 +60,6 @@ def bind(path):
                                  ctypes.POINTER(ctypes.c_float), ctypes.c_int]
     lib.needle_embed.restype = ctypes.c_int
     return lib
-
 
 def native_frames(lib, pcm):
     pcm = np.ascontiguousarray(pcm, np.float32)
@@ -75,11 +72,9 @@ def native_frames(lib, pcm):
         sys.exit(f"needle_embed failed (rc={got}) on {len(pcm)} samples")
     return out[:got].reshape(got // DIM, DIM).copy()
 
-
 def frame_cosine(a, b):
     denom = np.sqrt((a * a).sum(-1) * (b * b).sum(-1))
     return (a * b).sum(-1) / np.maximum(denom, 1e-30)
-
 
 def compare(name, ref, nat):
     assert ref.shape == nat.shape, f"{name}: shape {ref.shape} vs {nat.shape}"
@@ -102,7 +97,6 @@ def compare(name, ref, nat):
         "loud_tercile_err_pct": 100.0 * float(per_frame[thirds[2]].mean()),
     }
     return entry
-
 
 def synth_probes(sr, seconds=2, seed=7):
     rng = np.random.default_rng(seed)
@@ -134,9 +128,6 @@ def main():
     if lib.needle_load(blob, len(blob)) < 0:
         sys.exit("needle_load failed on " + CACT)
     cact = Cact(CACT)
-    # Empty quant set == fully float reference: golden_whistle.encode's
-    # `set(self.quant)` path throws on a bare False, and an empty set
-    # disables every fake-quant site identically.
     reference = Whistle(cact, quant=set())
     report = {"clips": {}, "synth": {}, "native_determinism": {}}
     managed = None
@@ -194,7 +185,6 @@ def main():
     if options.out:
         with open(options.out, "w") as handle:
             json.dump(report, handle, indent=2)
-
 
 if __name__ == "__main__":
     main()

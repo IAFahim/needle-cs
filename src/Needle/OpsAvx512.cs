@@ -42,9 +42,6 @@ internal static unsafe class OpsAvx512
             Avx.Store(x + i, Avx.Multiply(Avx.LoadVector256(x + i), Ops.Sigmoid(Avx.LoadVector256(gate + i))));
     }
 
-    // The AVX2 reductions step by 16, so callers pad to 16 (not 32): the main loop
-    // takes 32 floats at a time and one 16-float vector plus an 8-float vector
-    // finish the tail, never reading past n.
     public static float SumOfSquares(float* x, int n)
     {
         var s0 = Vector512<float>.Zero;

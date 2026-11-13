@@ -7,16 +7,6 @@ using Xunit.Abstractions;
 
 namespace Needle.Tests;
 
-// Issue #16: lossless jump-forward over token-forced steps. A token may join
-// the fed chunk only when the grammar+trie allow exactly that one token at
-// the committed state (allowed-mask popcount == 1): per-token greedy would
-// emit it regardless of logits, so the chunk is the per-token greedy sequence
-// itself and free choices downstream see the identical token history. What
-// these tests prove is the losslessness (byte-identical calls/reasoning/
-// tokens/decode counts on every prompt), per-token probability-1 accounting,
-// and typed-sink event parity. Pass counts are reported per prompt with a
-// never-regress guard; on the current grammar/vocab no singleton mask occurs
-// so jumping stays dormant (default off), and these tests pin that behavior.
 public sealed class JumpForwardTests : IDisposable
 {
     readonly Model model;
@@ -70,12 +60,6 @@ public sealed class JumpForwardTests : IDisposable
         Assert.False(new NeedleOptions().JumpForward);
     }
 
-    // Lossless jumping must reproduce the reference path exactly: the same
-    // status, calls, reasoning, response, and decode-token counts. Any
-    // divergence fails the test (it would mean the uniqueness criterion let
-    // a real choice slip into a chunk). Passes can only stay equal or drop:
-    // every macro-step feeds at least one token, so jumping never costs a
-    // sequential pass. Observed reduction is reported, not asserted.
     void ReportPrompt(string label, string tools, string prompt, ref int totalTokens, ref int totalOff, ref int totalOn)
     {
         var options = new NeedleOptions { Threads = 4, AutoDate = false, System = "" };
@@ -169,10 +153,6 @@ public sealed class JumpForwardTests : IDisposable
         const string prompt = "what's it like in Lagos right now?";
         var tools = SessionCases.DefaultTools();
         var input = Encoding.UTF8.GetBytes(prompt);
-        // A two-token call budget starves both paths: the reference path
-        // decodes two choice tokens, the jumping path trips on its first
-        // forced chunk because forced tokens count toward MaxCallTokens even
-        // though they skip sequential passes. Same failure either way.
         var starved = new NeedleOptions { Threads = 4, AutoDate = false, MaxCallTokens = 2 };
         using var plain = new NeedleSession(model, tools, WithJump(starved, false));
         using var jumped = new NeedleSession(model, tools, WithJump(starved, true));
@@ -190,9 +170,6 @@ public sealed class JumpForwardTests : IDisposable
         const string prompt = "what's it like in Lagos right now?";
         var tools = SessionCases.DefaultTools();
         var input = Encoding.UTF8.GetBytes(prompt);
-        // A two-token slice budget fires inside reasoning on both paths, long
-        // before any jump can run: same failure, proving the budget gate is
-        // unaffected by the chunking code.
         var sliced = new NeedleOptions { Threads = 4, AutoDate = false, FrameBudget = FrameBudget.FromTokens(2) };
         using var plain = new NeedleSession(model, tools, WithJump(sliced, false));
         using var jumped = new NeedleSession(model, tools, WithJump(sliced, true));

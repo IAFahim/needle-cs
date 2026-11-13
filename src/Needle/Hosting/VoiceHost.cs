@@ -38,11 +38,6 @@ public struct VoiceReply
     public bool QueryTruncated;
 }
 
-// Audio in, reply out. The audio thread appends PCM with WriteAudio; the game thread
-// snapshots an utterance with TryEndUtterance and polls TryReceive for voice replies.
-// Text queries go through the hub NeedleChannel (VoiceHost.Channel); every reply the
-// hub produces is forwarded here, voice replies with their transcript attached and
-// anything else through TryReceiveDirect, so the game never races the worker.
 public readonly unsafe struct VoiceChannel
 {
     internal const int AudioCap = Whistle.MaxSeconds * Wav.SampleRate;
@@ -122,8 +117,6 @@ public readonly unsafe struct VoiceChannel
 
     internal void SetSleeping(long value) => Volatile.Write(ref *sleeping, value);
 
-    // Audio thread, lock-free. Drops the chunk (false) while a snapshot is in flight
-    // or the FIFO is full.
     public bool WriteAudio(ReadOnlySpan<float> pcm)
     {
         if (pcm.Length == 0) return true;
@@ -141,8 +134,6 @@ public readonly unsafe struct VoiceChannel
         finally { Interlocked.Decrement(ref *writers); }
     }
 
-    // Game thread: snapshots the FIFO into a free utterance slot and queues it for the
-    // worker. Returns false when there is nothing to transcribe or no slot is free.
     public bool TryEndUtterance(out ulong utterance)
     {
         utterance = 0;
@@ -291,8 +282,6 @@ public sealed unsafe class VoiceHost : IDisposable
         }
     }
 
-    // Hub channel for direct text queries. Submit here, receive via
-    // VoiceChannel.TryReceiveDirect (voice replies arrive via TryReceive).
     public NeedleChannel Channel => hubChannel;
 
     bool TryProcessOne()

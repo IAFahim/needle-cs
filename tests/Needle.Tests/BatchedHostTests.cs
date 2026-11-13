@@ -8,10 +8,6 @@ using Xunit.Abstractions;
 using Needle.Cli;
 namespace Needle.Tests;
 
-// N63: the batched host drains queued queries into BatchedSession lanes.
-// Every batched reply must match the single lane exactly (status, calls,
-// text, confidence, token counts); bursts must run faster by sharing the
-// weight stream, and one queued request must cost what it always did.
 public sealed class BatchedHostTests
 {
     readonly ITestOutputHelper output;
@@ -69,13 +65,6 @@ public sealed class BatchedHostTests
         Assert.Equal(CallsOf(expected), CallsOf(actual));
         Assert.Equal(ReasoningOf(expected).Trim(), ReasoningOf(actual).Trim());
         Assert.Equal(ResponseOf(expected).Trim(), ResponseOf(actual).Trim());
-        // Decode confidence is pure token probabilities over identical token
-        // streams, so it must match exactly. Head/confidence come from the
-        // pooled embeddings: the N62 stateless single skips the trailing
-        // closing feed (pre-closing pool) while batch lanes pay it like the
-        // legacy path (post-closing pool). Measured delta <= 0.0011 on the
-        // game prompts; the 0.005 bound pins the mechanism while leaving
-        // headroom. Port the N62 skip to BatchedSession to close it.
         Assert.True(expected.Reply.DecodeConfidence.Equals(actual.Reply.DecodeConfidence),
             $"{label}: decode {expected.Reply.DecodeConfidence} vs {actual.Reply.DecodeConfidence}");
         Assert.True(CloseEnough(expected.Reply.HeadConfidence, actual.Reply.HeadConfidence),
@@ -94,12 +83,6 @@ public sealed class BatchedHostTests
     {
         Assets.Require();
         const int threads = 4;
-        // The trailing empty query pins the EmptyInput failure mapping; the
-        // rest cover calls across the game tools. (A Responded case is
-        // deliberately absent: queries the model answers directly sit on the
-        // call/respond knife-edge, and the decision flips with the calling
-        // thread's reduction order — untestable across host/session contexts.
-        // The Responded branch shares its helpers with the pinned paths.)
         var queries = new List<string>(BenchPrompts.Game) { "" }.ToArray();
         ChannelReply[] expected;
         using (var single = new NeedleHost())
@@ -115,8 +98,6 @@ public sealed class BatchedHostTests
         using (var batched = new NeedleHost())
         {
             var channel = batched.Start(Options(threads, maxBatch: 16));
-            // The blocker keeps the worker inside one turn while the rest
-            // pile up behind it, so the measured drain is one real batch.
             var tickets = new ulong[queries.Length];
             tickets[0] = Submit(channel, queries[0]);
             for (var i = 1; i < queries.Length; i++) tickets[i] = Submit(channel, queries[i]);
@@ -140,11 +121,9 @@ public sealed class BatchedHostTests
         using (var batched = new NeedleHost())
         {
             var channel = batched.Start(Options(threads, maxBatch: 16));
-            ReceiveAll(channel, SubmitAll(channel, queries)); // warm: primes lanes, settles threads
+            ReceiveAll(channel, SubmitAll(channel, queries));
             var tickets = SubmitAll(channel, queries);
             var sw = Stopwatch.StartNew();
-            // Replies must arrive in submission order even though the turn ran
-            // as one shared batch: callers match tickets, and the ring is FIFO.
             var spin = new SpinWait();
             var deadline = Environment.TickCount64 + 120_000;
             for (var i = 0; i < tickets.Length; i++)
@@ -164,7 +143,6 @@ public sealed class BatchedHostTests
         }
         using (var legacy = new NeedleHost())
         {
-            // Legacy single lane: stateful session, closing fed every turn.
             var channel = legacy.Start(new HostOptions
             {
                 ModelPath = Assets.Model,
@@ -201,7 +179,7 @@ public sealed class BatchedHostTests
         using (var batched = new NeedleHost())
         {
             var channel = batched.Start(Options(threads, maxBatch: 16));
-            ReceiveAll(channel, new[] { Submit(channel, query) }); // warm
+            ReceiveAll(channel, new[] { Submit(channel, query) });
             var sw = Stopwatch.StartNew();
             for (var i = 0; i < 3; i++) ReceiveAll(channel, new[] { Submit(channel, query) });
             sw.Stop();

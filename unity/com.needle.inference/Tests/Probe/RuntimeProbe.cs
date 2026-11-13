@@ -1,9 +1,3 @@
-// N10 runtime capability probe: reports the managed runtime, Vector<T>
-// width, hardware-intrinsic availability (via reflection so this file
-// compiles against the netstandard facade), Burst presence, and thread
-// counts. The player scene (Samples~/Probe) carries a copy of this logic so
-// the sample stays importable without the test assembly.
-// C# 9 safe: block namespaces, no target-typed new, no u8 literals.
 using System;
 using System.Reflection;
 using System.Text;
@@ -11,7 +5,6 @@ using UnityEngine;
 
 namespace Needle.Probe
 {
-    /// <summary>A needle.probe/1 report. See <see cref="ToJson"/> for the exact JSON schema.</summary>
     [Serializable]
     public sealed class RuntimeProbeReport
     {
