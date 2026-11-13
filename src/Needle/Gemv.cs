@@ -155,7 +155,6 @@ internal static unsafe class Gemv
         where TPlanes : struct, IPlaneLayout
         where TDot : struct, IInt8Dot
     {
-        var groups = res.Groups;
         var stride = a.Stride;
         var weightedPre = stackalloc float[stride];
         var weightedPost = stackalloc float[stride];

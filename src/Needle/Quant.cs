@@ -56,10 +56,13 @@ internal static unsafe class Quant
         if (!Simd.Enabled) return Scalar.AbsMax(x, n);
 #if NEEDLE_SIMD
         var peak = Vector256<float>.Zero;
-        for (var i = 0; i < n; i += 8) peak = Avx.Max(peak, Vector256.Abs(Avx.LoadVector256(x + i)));
+        var i = 0;
+        for (; i + 8 <= n; i += 8) peak = Avx.Max(peak, Vector256.Abs(Avx.LoadVector256(x + i)));
         var folded = Sse.Max(peak.GetLower(), peak.GetUpper());
         folded = Sse.Max(folded, Sse.Shuffle(folded, folded, 0b01_00_11_10));
-        return Sse.Max(folded, Sse.Shuffle(folded, folded, 0b10_11_00_01)).ToScalar();
+        var best = Sse.Max(folded, Sse.Shuffle(folded, folded, 0b10_11_00_01)).ToScalar();
+        for (; i < n; i++) best = MathF.Max(best, MathF.Abs(x[i]));
+        return best;
 #endif
     }
 
@@ -87,11 +90,13 @@ internal static unsafe class Quant
         var sc = Vector256.Create(scale);
         var low = Vector256.Create(-128f);
         var high = Vector256.Create(127f);
-        for (var i = 0; i < n; i += 8)
+        var i = 0;
+        for (; i + 8 <= n; i += 8)
         {
             var q = Avx.RoundToNearestInteger(Avx.Multiply(Avx.LoadVector256(x + i), inv));
             Avx.Store(x + i, Avx.Multiply(Avx.Min(Avx.Max(q, low), high), sc));
         }
+        for (; i < n; i++) x[i] = MathF.Min(MathF.Max(MathF.Round(x[i] * inverse), -128f), 127f) * scale;
 #endif
     }
 
@@ -109,17 +114,19 @@ internal static unsafe class Quant
 #if NEEDLE_SIMD
         var peak = AbsMax(x, n);
         var scale = peak > 0f ? peak / 127f : 1f;
-        var inv = Vector256.Create(1f / scale);
+        var scalarInv = 1f / scale;
+        var inv = Vector256.Create(scalarInv);
         var i = 0;
         var interleave = Vector256.Create(0, 4, 1, 5, 2, 6, 3, 7);
         for (; i + 32 <= n; i += 32)
             Avx.Store(destination + i, Pack32(x + i, inv, interleave));
-        for (; i < n; i += 8)
+        for (; i + 8 <= n; i += 8)
         {
             var q = Avx.ConvertToVector256Int32(Avx.Multiply(Avx.LoadVector256(x + i), inv));
             var packed = Sse2.PackSignedSaturate(q.GetLower(), q.GetUpper());
             *(long*)(destination + i) = Sse2.PackSignedSaturate(packed, packed).AsInt64().ToScalar();
         }
+        for (; i < n; i++) destination[i] = (sbyte)MathF.Min(MathF.Max(MathF.Round(x[i] * scalarInv), -128f), 127f);
         return scale;
 #endif
     }

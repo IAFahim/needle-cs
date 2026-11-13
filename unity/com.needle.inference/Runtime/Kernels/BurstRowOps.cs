@@ -306,9 +306,12 @@ namespace Needle.BurstKernels
             {
                 v256 sign = X86.Avx.mm256_set1_ps(-0.0f);
                 v256 peak = X86.Avx.mm256_setzero_ps();
-                for (int i = 0; i < n; i += 8)
+                int i = 0;
+                for (; i + 8 <= n; i += 8)
                     peak = X86.Avx.mm256_max_ps(peak, X86.Avx.mm256_andnot_ps(sign, X86.Avx.mm256_loadu_ps(x + i)));
-                return Max8X86(peak);
+                float best = Max8X86(peak);
+                for (; i < n; i++) best = MathF.Max(best, MathF.Abs(x[i]));
+                return best;
             }
             return 0f;
         }
@@ -321,11 +324,13 @@ namespace Needle.BurstKernels
                 v256 sc = X86.Avx.mm256_set1_ps(scale);
                 v256 low = X86.Avx.mm256_set1_ps(-128f);
                 v256 high = X86.Avx.mm256_set1_ps(127f);
-                for (int i = 0; i < n; i += 8)
+                int i = 0;
+                for (; i + 8 <= n; i += 8)
                 {
                     v256 q = X86.Avx.mm256_round_ps(X86.Avx.mm256_mul_ps(X86.Avx.mm256_loadu_ps(x + i), inv), 8);
                     X86.Avx.mm256_storeu_ps(x + i, X86.Avx.mm256_mul_ps(X86.Avx.mm256_min_ps(X86.Avx.mm256_max_ps(q, low), high), sc));
                 }
+                for (; i < n; i++) x[i] = MathF.Min(MathF.Max(RoundEven(x[i] * inverse), -128f), 127f) * scale;
             }
         }
 
@@ -344,9 +349,12 @@ namespace Needle.BurstKernels
         {
             if (X86.Avx2.IsAvx2Supported && X86.Fma.IsFmaSupported)
             {
-                v256 inverse = X86.Avx.mm256_set1_ps(InverseRmsX86(x, n));
-                for (int i = 0; i < n; i += 8)
+                float scalarInv = InverseRmsX86(x, n);
+                v256 inverse = X86.Avx.mm256_set1_ps(scalarInv);
+                int i = 0;
+                for (; i + 8 <= n; i += 8)
                     X86.Avx.mm256_storeu_ps(destination + i, X86.Avx.mm256_mul_ps(X86.Avx.mm256_loadu_ps(x + i), inverse));
+                for (; i < n; i++) destination[i] = x[i] * scalarInv;
             }
         }
 
@@ -354,10 +362,13 @@ namespace Needle.BurstKernels
         {
             if (X86.Avx2.IsAvx2Supported && X86.Fma.IsFmaSupported)
             {
-                v256 inverse = X86.Avx.mm256_set1_ps(InverseRmsX86(x, n));
+                float scalarInv = InverseRmsX86(x, n);
+                v256 inverse = X86.Avx.mm256_set1_ps(scalarInv);
                 v256 one = X86.Avx.mm256_set1_ps(1f);
-                for (int i = 0; i < n; i += 8)
+                int i = 0;
+                for (; i + 8 <= n; i += 8)
                     X86.Avx.mm256_storeu_ps(destination + i, X86.Avx.mm256_mul_ps(X86.Avx.mm256_mul_ps(X86.Avx.mm256_add_ps(one, X86.Avx.mm256_loadu_ps(scale + i)), X86.Avx.mm256_loadu_ps(x + i)), inverse));
+                for (; i < n; i++) destination[i] = (1f + scale[i]) * x[i] * scalarInv;
             }
         }
 
@@ -365,16 +376,25 @@ namespace Needle.BurstKernels
         {
             if (X86.Avx2.IsAvx2Supported && X86.Fma.IsFmaSupported)
             {
-                v256 inverse = X86.Avx.mm256_set1_ps(InverseRmsX86(x, n));
+                float scalarInv = InverseRmsX86(x, n);
+                v256 inverse = X86.Avx.mm256_set1_ps(scalarInv);
                 v256 sign = X86.Avx.mm256_set1_ps(-0.0f);
                 v256 peak = X86.Avx.mm256_setzero_ps();
-                for (int i = 0; i < n; i += 8)
+                int i = 0;
+                for (; i + 8 <= n; i += 8)
                 {
                     v256 v = X86.Avx.mm256_mul_ps(X86.Avx.mm256_loadu_ps(x + i), inverse);
                     X86.Avx.mm256_storeu_ps(destination + i, v);
                     peak = X86.Avx.mm256_max_ps(peak, X86.Avx.mm256_andnot_ps(sign, v));
                 }
-                FinishFakeA8X86(destination, n, FoldPeakX86(peak));
+                float folded = FoldPeakX86(peak);
+                for (; i < n; i++)
+                {
+                    float v = x[i] * scalarInv;
+                    destination[i] = v;
+                    folded = MathF.Max(folded, MathF.Abs(v));
+                }
+                FinishFakeA8X86(destination, n, folded);
             }
         }
 
@@ -382,17 +402,26 @@ namespace Needle.BurstKernels
         {
             if (X86.Avx2.IsAvx2Supported && X86.Fma.IsFmaSupported)
             {
-                v256 inverse = X86.Avx.mm256_set1_ps(InverseRmsX86(x, n));
+                float scalarInv = InverseRmsX86(x, n);
+                v256 inverse = X86.Avx.mm256_set1_ps(scalarInv);
                 v256 one = X86.Avx.mm256_set1_ps(1f);
                 v256 sign = X86.Avx.mm256_set1_ps(-0.0f);
                 v256 peak = X86.Avx.mm256_setzero_ps();
-                for (int i = 0; i < n; i += 8)
+                int i = 0;
+                for (; i + 8 <= n; i += 8)
                 {
                     v256 v = X86.Avx.mm256_mul_ps(X86.Avx.mm256_mul_ps(X86.Avx.mm256_add_ps(one, X86.Avx.mm256_loadu_ps(scale + i)), X86.Avx.mm256_loadu_ps(x + i)), inverse);
                     X86.Avx.mm256_storeu_ps(destination + i, v);
                     peak = X86.Avx.mm256_max_ps(peak, X86.Avx.mm256_andnot_ps(sign, v));
                 }
-                FinishFakeA8X86(destination, n, FoldPeakX86(peak));
+                float folded = FoldPeakX86(peak);
+                for (; i < n; i++)
+                {
+                    float v = (1f + scale[i]) * x[i] * scalarInv;
+                    destination[i] = v;
+                    folded = MathF.Max(folded, MathF.Abs(v));
+                }
+                FinishFakeA8X86(destination, n, folded);
             }
         }
 
@@ -402,13 +431,21 @@ namespace Needle.BurstKernels
             {
                 v256 sign = X86.Avx.mm256_set1_ps(-0.0f);
                 v256 peak = X86.Avx.mm256_setzero_ps();
-                for (int i = 0; i < n; i += 8)
+                int i = 0;
+                for (; i + 8 <= n; i += 8)
                 {
                     v256 v = X86.Avx.mm256_mul_ps(X86.Avx.mm256_loadu_ps(x + i), SigmoidX86(X86.Avx.mm256_loadu_ps(gate + i)));
                     X86.Avx.mm256_storeu_ps(x + i, v);
                     peak = X86.Avx.mm256_max_ps(peak, X86.Avx.mm256_andnot_ps(sign, v));
                 }
-                FinishFakeA8X86(x, n, FoldPeakX86(peak));
+                float folded = FoldPeakX86(peak);
+                for (; i < n; i++)
+                {
+                    float v = x[i] / (1f + MathF.Exp(-gate[i]));
+                    x[i] = v;
+                    folded = MathF.Max(folded, MathF.Abs(v));
+                }
+                FinishFakeA8X86(x, n, folded);
             }
         }
 
@@ -416,13 +453,16 @@ namespace Needle.BurstKernels
         {
             if (X86.Avx2.IsAvx2Supported && X86.Fma.IsFmaSupported)
             {
-                v256 inverse = X86.Avx.mm256_set1_ps(InverseRmsX86(x, n));
+                float scalarInv = InverseRmsX86(x, n);
+                v256 inverse = X86.Avx.mm256_set1_ps(scalarInv);
                 v256 one = X86.Avx.mm256_set1_ps(1f);
                 v256 g = X86.Avx.mm256_set1_ps(gate);
-                for (int i = 0; i < n; i += 8)
+                int i = 0;
+                for (; i + 8 <= n; i += 8)
                     X86.Avx.mm256_storeu_ps(residual + i, X86.Fma.mm256_fmadd_ps(g,
                         X86.Avx.mm256_mul_ps(X86.Avx.mm256_mul_ps(X86.Avx.mm256_add_ps(one, X86.Avx.mm256_loadu_ps(scale + i)), X86.Avx.mm256_loadu_ps(x + i)), inverse),
                         X86.Avx.mm256_loadu_ps(residual + i)));
+                for (; i < n; i++) residual[i] += gate * (1f + scale[i]) * x[i] * scalarInv;
             }
         }
 
@@ -527,8 +567,10 @@ namespace Needle.BurstKernels
         {
             if (X86.Avx2.IsAvx2Supported && X86.Fma.IsFmaSupported)
             {
-                for (int i = 0; i < n; i += 8)
+                int i = 0;
+                for (; i + 8 <= n; i += 8)
                     X86.Avx.mm256_storeu_ps(destination + i, X86.Fma.mm256_fmadd_ps(X86.Avx.mm256_loadu_ps(a + i), X86.Avx.mm256_loadu_ps(b + i), X86.Avx.mm256_loadu_ps(destination + i)));
+                for (; i < n; i++) destination[i] += a[i] * b[i];
             }
         }
 
@@ -538,8 +580,10 @@ namespace Needle.BurstKernels
             {
                 v256 s = X86.Avx.mm256_set1_ps(scale);
                 v256 xs = X86.Avx.mm256_set1_ps(xScale);
-                for (int i = 0; i < n; i += 8)
+                int i = 0;
+                for (; i + 8 <= n; i += 8)
                     X86.Avx.mm256_storeu_ps(destination + i, X86.Fma.mm256_fmadd_ps(xs, X86.Avx.mm256_loadu_ps(x + i), X86.Avx.mm256_mul_ps(s, X86.Avx.mm256_loadu_ps(destination + i))));
+                for (; i < n; i++) destination[i] = scale * destination[i] + xScale * x[i];
             }
         }
 
@@ -548,8 +592,10 @@ namespace Needle.BurstKernels
             if (X86.Avx2.IsAvx2Supported && X86.Fma.IsFmaSupported)
             {
                 v256 s = X86.Avx.mm256_set1_ps(scale);
-                for (int i = 0; i < n; i += 8)
+                int i = 0;
+                for (; i + 8 <= n; i += 8)
                     X86.Avx.mm256_storeu_ps(destination + i, X86.Fma.mm256_fmadd_ps(s, X86.Avx.mm256_loadu_ps(x + i), X86.Avx.mm256_loadu_ps(destination + i)));
+                for (; i < n; i++) destination[i] += scale * x[i];
             }
         }
 
@@ -559,8 +605,10 @@ namespace Needle.BurstKernels
             {
                 float peak = AbsMaxX86(x, n);
                 float scale = peak > 0f ? peak / 127f : 1f;
-                v256 inv = X86.Avx.mm256_set1_ps(1f / scale);
-                for (int i = 0; i < n; i += 8)
+                float inverse = 1f / scale;
+                v256 inv = X86.Avx.mm256_set1_ps(inverse);
+                int i = 0;
+                for (; i + 8 <= n; i += 8)
                 {
                     v256 q = X86.Avx.mm256_cvtps_epi32(X86.Avx.mm256_mul_ps(X86.Avx.mm256_loadu_ps(x + i), inv));
                     v128 packed = X86.Sse2.packs_epi32(
@@ -569,6 +617,7 @@ namespace Needle.BurstKernels
                     packed = X86.Sse2.packs_epi16(packed, packed);
                     *(long*)(destination + i) = X86.Sse2.cvtsi128_si64(packed);
                 }
+                for (; i < n; i++) destination[i] = (sbyte)MathF.Min(MathF.Max(RoundEven(x[i] * inverse), -128f), 127f);
                 return scale;
             }
             return 0f;
@@ -679,14 +728,17 @@ namespace Needle.BurstKernels
             if (!Arm.Neon.IsNeonSupported) return 0f;
             v128 s0 = Arm.Neon.vdupq_n_f32(0f);
             v128 s1 = Arm.Neon.vdupq_n_f32(0f);
-            for (int i = 0; i < n; i += 8)
+            int i = 0;
+            for (; i + 8 <= n; i += 8)
             {
                 v128 a = Arm.Neon.vld1q_f32(x + i);
                 v128 b = Arm.Neon.vld1q_f32(x + i + 4);
                 s0 = Arm.Neon.vfmaq_f32(s0, a, a);
                 s1 = Arm.Neon.vfmaq_f32(s1, b, b);
             }
-            return HorizontalSumNeon(Arm.Neon.vaddq_f32(s0, s1));
+            float tail = 0f;
+            for (; i < n; i++) tail += x[i] * x[i];
+            return HorizontalSumNeon(Arm.Neon.vaddq_f32(s0, s1)) + tail;
         }
 
         static float DotNeon(float* a, float* b, int n)
@@ -694,12 +746,15 @@ namespace Needle.BurstKernels
             if (!Arm.Neon.IsNeonSupported) return 0f;
             v128 s0 = Arm.Neon.vdupq_n_f32(0f);
             v128 s1 = Arm.Neon.vdupq_n_f32(0f);
-            for (int i = 0; i < n; i += 8)
+            int i = 0;
+            for (; i + 8 <= n; i += 8)
             {
                 s0 = Arm.Neon.vfmaq_f32(s0, Arm.Neon.vld1q_f32(a + i), Arm.Neon.vld1q_f32(b + i));
                 s1 = Arm.Neon.vfmaq_f32(s1, Arm.Neon.vld1q_f32(a + i + 4), Arm.Neon.vld1q_f32(b + i + 4));
             }
-            return HorizontalSumNeon(Arm.Neon.vaddq_f32(s0, s1));
+            float tail = 0f;
+            for (; i < n; i++) tail += a[i] * b[i];
+            return HorizontalSumNeon(Arm.Neon.vaddq_f32(s0, s1)) + tail;
         }
 
         static float InverseRmsNeon(float* x, int n)
@@ -710,27 +765,36 @@ namespace Needle.BurstKernels
         static void RmsUnitNeon(float* x, int n, float* destination)
         {
             if (!Arm.Neon.IsNeonSupported) return;
-            v128 inverse = Arm.Neon.vdupq_n_f32(InverseRmsNeon(x, n));
-            for (int i = 0; i < n; i += 4)
+            float scalarInv = InverseRmsNeon(x, n);
+            v128 inverse = Arm.Neon.vdupq_n_f32(scalarInv);
+            int i = 0;
+            for (; i + 4 <= n; i += 4)
                 Arm.Neon.vst1q_f32(destination + i, Arm.Neon.vmulq_f32(Arm.Neon.vld1q_f32(x + i), inverse));
+            for (; i < n; i++) destination[i] = x[i] * scalarInv;
         }
 
         static void ZeroCenteredRmsNeon(float* x, float* scale, int n, float* destination)
         {
             if (!Arm.Neon.IsNeonSupported) return;
-            v128 inverse = Arm.Neon.vdupq_n_f32(InverseRmsNeon(x, n));
+            float scalarInv = InverseRmsNeon(x, n);
+            v128 inverse = Arm.Neon.vdupq_n_f32(scalarInv);
             v128 one = Arm.Neon.vdupq_n_f32(1f);
-            for (int i = 0; i < n; i += 4)
+            int i = 0;
+            for (; i + 4 <= n; i += 4)
                 Arm.Neon.vst1q_f32(destination + i, Arm.Neon.vmulq_f32(Arm.Neon.vmulq_f32(Arm.Neon.vaddq_f32(one, Arm.Neon.vld1q_f32(scale + i)), Arm.Neon.vld1q_f32(x + i)), inverse));
+            for (; i < n; i++) destination[i] = (1f + scale[i]) * x[i] * scalarInv;
         }
 
         static float AbsMaxNeon(float* x, int n)
         {
             if (!Arm.Neon.IsNeonSupported) return 0f;
             v128 peak = Arm.Neon.vdupq_n_f32(0f);
-            for (int i = 0; i < n; i += 4)
+            int i = 0;
+            for (; i + 4 <= n; i += 4)
                 peak = Arm.Neon.vmaxq_f32(peak, Arm.Neon.vabsq_f32(Arm.Neon.vld1q_f32(x + i)));
-            return Arm.Neon.vmaxvq_f32(peak);
+            float best = Arm.Neon.vmaxvq_f32(peak);
+            for (; i < n; i++) best = MathF.Max(best, MathF.Abs(x[i]));
+            return best;
         }
 
         static void RoundTripNeon(float* x, int n, float inverse, float scale)
@@ -740,11 +804,13 @@ namespace Needle.BurstKernels
             v128 sc = Arm.Neon.vdupq_n_f32(scale);
             v128 low = Arm.Neon.vdupq_n_f32(-128f);
             v128 high = Arm.Neon.vdupq_n_f32(127f);
-            for (int i = 0; i < n; i += 4)
+            int i = 0;
+            for (; i + 4 <= n; i += 4)
             {
                 v128 q = Arm.Neon.vrndnq_f32(Arm.Neon.vmulq_f32(Arm.Neon.vld1q_f32(x + i), inv));
                 Arm.Neon.vst1q_f32(x + i, Arm.Neon.vmulq_f32(Arm.Neon.vminq_f32(Arm.Neon.vmaxq_f32(q, low), high), sc));
             }
+            for (; i < n; i++) x[i] = MathF.Min(MathF.Max(RoundEven(x[i] * inverse), -128f), 127f) * scale;
         }
 
         static void FinishFakeA8Neon(float* x, int n, float peak)
@@ -756,54 +822,83 @@ namespace Needle.BurstKernels
         static void RmsFakeA8Neon(float* x, int n, float* destination)
         {
             if (!Arm.Neon.IsNeonSupported) return;
-            v128 inverse = Arm.Neon.vdupq_n_f32(InverseRmsNeon(x, n));
+            float scalarInv = InverseRmsNeon(x, n);
+            v128 inverse = Arm.Neon.vdupq_n_f32(scalarInv);
             v128 peak = Arm.Neon.vdupq_n_f32(0f);
-            for (int i = 0; i < n; i += 4)
+            int i = 0;
+            for (; i + 4 <= n; i += 4)
             {
                 v128 v = Arm.Neon.vmulq_f32(Arm.Neon.vld1q_f32(x + i), inverse);
                 Arm.Neon.vst1q_f32(destination + i, v);
                 peak = Arm.Neon.vmaxq_f32(peak, Arm.Neon.vabsq_f32(v));
             }
-            FinishFakeA8Neon(destination, n, Arm.Neon.vmaxvq_f32(peak));
+            float folded = Arm.Neon.vmaxvq_f32(peak);
+            for (; i < n; i++)
+            {
+                float v = x[i] * scalarInv;
+                destination[i] = v;
+                folded = MathF.Max(folded, MathF.Abs(v));
+            }
+            FinishFakeA8Neon(destination, n, folded);
         }
 
         static void CenteredRmsFakeA8Neon(float* x, float* scale, int n, float* destination)
         {
             if (!Arm.Neon.IsNeonSupported) return;
-            v128 inverse = Arm.Neon.vdupq_n_f32(InverseRmsNeon(x, n));
+            float scalarInv = InverseRmsNeon(x, n);
+            v128 inverse = Arm.Neon.vdupq_n_f32(scalarInv);
             v128 one = Arm.Neon.vdupq_n_f32(1f);
             v128 peak = Arm.Neon.vdupq_n_f32(0f);
-            for (int i = 0; i < n; i += 4)
+            int i = 0;
+            for (; i + 4 <= n; i += 4)
             {
                 v128 v = Arm.Neon.vmulq_f32(Arm.Neon.vmulq_f32(Arm.Neon.vaddq_f32(one, Arm.Neon.vld1q_f32(scale + i)), Arm.Neon.vld1q_f32(x + i)), inverse);
                 Arm.Neon.vst1q_f32(destination + i, v);
                 peak = Arm.Neon.vmaxq_f32(peak, Arm.Neon.vabsq_f32(v));
             }
-            FinishFakeA8Neon(destination, n, Arm.Neon.vmaxvq_f32(peak));
+            float folded = Arm.Neon.vmaxvq_f32(peak);
+            for (; i < n; i++)
+            {
+                float v = (1f + scale[i]) * x[i] * scalarInv;
+                destination[i] = v;
+                folded = MathF.Max(folded, MathF.Abs(v));
+            }
+            FinishFakeA8Neon(destination, n, folded);
         }
 
         static void GateFakeA8Neon(float* x, float* gate, int n)
         {
             if (!Arm.Neon.IsNeonSupported) return;
             v128 peak = Arm.Neon.vdupq_n_f32(0f);
-            for (int i = 0; i < n; i += 4)
+            int i = 0;
+            for (; i + 4 <= n; i += 4)
             {
                 v128 v = Arm.Neon.vmulq_f32(Arm.Neon.vld1q_f32(x + i), SigmoidNeon(Arm.Neon.vld1q_f32(gate + i)));
                 Arm.Neon.vst1q_f32(x + i, v);
                 peak = Arm.Neon.vmaxq_f32(peak, Arm.Neon.vabsq_f32(v));
             }
-            FinishFakeA8Neon(x, n, Arm.Neon.vmaxvq_f32(peak));
+            float folded = Arm.Neon.vmaxvq_f32(peak);
+            for (; i < n; i++)
+            {
+                float v = x[i] / (1f + MathF.Exp(-gate[i]));
+                x[i] = v;
+                folded = MathF.Max(folded, MathF.Abs(v));
+            }
+            FinishFakeA8Neon(x, n, folded);
         }
 
         static void PostNormAddNeon(float* residual, float* x, float* scale, float gate, int n)
         {
             if (!Arm.Neon.IsNeonSupported) return;
-            v128 inverse = Arm.Neon.vdupq_n_f32(InverseRmsNeon(x, n));
+            float scalarInv = InverseRmsNeon(x, n);
+            v128 inverse = Arm.Neon.vdupq_n_f32(scalarInv);
             v128 one = Arm.Neon.vdupq_n_f32(1f);
             v128 g = Arm.Neon.vdupq_n_f32(gate);
-            for (int i = 0; i < n; i += 4)
+            int i = 0;
+            for (; i + 4 <= n; i += 4)
                 Arm.Neon.vst1q_f32(residual + i, Arm.Neon.vfmaq_f32(Arm.Neon.vld1q_f32(residual + i), g,
                     Arm.Neon.vmulq_f32(Arm.Neon.vmulq_f32(Arm.Neon.vaddq_f32(one, Arm.Neon.vld1q_f32(scale + i)), Arm.Neon.vld1q_f32(x + i)), inverse)));
+            for (; i < n; i++) residual[i] += gate * (1f + scale[i]) * x[i] * scalarInv;
         }
 
         static void RopeNeon(float* x, int heads, int headDim, float* cos, float* sin)
@@ -896,8 +991,10 @@ namespace Needle.BurstKernels
         static void MultiplyAccumulateNeon(float* destination, float* a, float* b, int n)
         {
             if (!Arm.Neon.IsNeonSupported) return;
-            for (int i = 0; i < n; i += 4)
+            int i = 0;
+            for (; i + 4 <= n; i += 4)
                 Arm.Neon.vst1q_f32(destination + i, Arm.Neon.vfmaq_f32(Arm.Neon.vld1q_f32(destination + i), Arm.Neon.vld1q_f32(a + i), Arm.Neon.vld1q_f32(b + i)));
+            for (; i < n; i++) destination[i] += a[i] * b[i];
         }
 
         static void ScaleAddNeon(float* destination, float scale, float* x, float xScale, int n)
@@ -905,16 +1002,20 @@ namespace Needle.BurstKernels
             if (!Arm.Neon.IsNeonSupported) return;
             v128 s = Arm.Neon.vdupq_n_f32(scale);
             v128 xs = Arm.Neon.vdupq_n_f32(xScale);
-            for (int i = 0; i < n; i += 4)
+            int i = 0;
+            for (; i + 4 <= n; i += 4)
                 Arm.Neon.vst1q_f32(destination + i, Arm.Neon.vfmaq_f32(Arm.Neon.vmulq_f32(s, Arm.Neon.vld1q_f32(destination + i)), xs, Arm.Neon.vld1q_f32(x + i)));
+            for (; i < n; i++) destination[i] = scale * destination[i] + xScale * x[i];
         }
 
         static void AddScaledNeon(float* destination, float* x, float scale, int n)
         {
             if (!Arm.Neon.IsNeonSupported) return;
             v128 s = Arm.Neon.vdupq_n_f32(scale);
-            for (int i = 0; i < n; i += 4)
+            int i = 0;
+            for (; i + 4 <= n; i += 4)
                 Arm.Neon.vst1q_f32(destination + i, Arm.Neon.vfmaq_f32(Arm.Neon.vld1q_f32(destination + i), s, Arm.Neon.vld1q_f32(x + i)));
+            for (; i < n; i++) destination[i] += scale * x[i];
         }
 
         static float QuantizeInt8Neon(float* x, int n, sbyte* destination)
@@ -922,9 +1023,11 @@ namespace Needle.BurstKernels
             if (!Arm.Neon.IsNeonSupported) return 0f;
             float peak = AbsMaxNeon(x, n);
             float scale = peak > 0f ? peak / 127f : 1f;
-            v128 inv = Arm.Neon.vdupq_n_f32(1f / scale);
+            float scalarInv = 1f / scale;
+            v128 inv = Arm.Neon.vdupq_n_f32(scalarInv);
             sbyte* spill = stackalloc sbyte[8];
-            for (int i = 0; i < n; i += 4)
+            int i = 0;
+            for (; i + 4 <= n; i += 4)
             {
                 v128 wide = Arm.Neon.vcvtq_s32_f32(Arm.Neon.vmulq_f32(Arm.Neon.vld1q_f32(x + i), inv));
                 v64 narrow = Arm.Neon.vqmovn_s32(wide);
@@ -932,6 +1035,7 @@ namespace Needle.BurstKernels
                 Arm.Neon.vst1_s8(spill, bytes);
                 *(int*)(destination + i) = *(int*)spill;
             }
+            for (; i < n; i++) destination[i] = (sbyte)MathF.Min(MathF.Max(RoundEven(x[i] * scalarInv), -128f), 127f);
             return scale;
         }
 

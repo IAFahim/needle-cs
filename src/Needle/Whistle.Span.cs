@@ -230,15 +230,30 @@ public sealed unsafe partial class Whistle
         var one = stackalloc int[1];
         var firstToken = Stopwatch.GetTimestamp();
         var decodeStart = firstToken;
+        var hasKeywords = spanKeywordStrings.Length > 0;
         for (var step = 0; step < g.MaxSeq - 3; step++)
         {
             var logits = decoder.Logits;
-            logits.Slice(0, textVocab).CopyTo(new Span<float>(scores, textVocab));
-            scores[0] = scores[2] = scores[3] = -1e30f;
-            ApplyKeywordBiasSpan(new ReadOnlySpan<int>(tokens, 0, count), scores);
-            var best = Ops.ArgMax(scores, textVocab);
+            int best;
+            float prob;
+            if (!hasKeywords)
+            {
+                var lp = 0f;
+                var p = 0f;
+                fixed (float* src = logits)
+                    Ops.TopKLogSoftmax(src, textVocab, 1, &best, &lp, &p, true);
+                prob = p;
+            }
+            else
+            {
+                logits.Slice(0, textVocab).CopyTo(new Span<float>(scores, textVocab));
+                scores[0] = scores[2] = scores[3] = -1e30f;
+                ApplyKeywordBiasSpan(new ReadOnlySpan<int>(tokens, 0, count), scores);
+                best = Ops.ArgMax(scores, textVocab);
+                prob = Ops.BestProbability(scores, textVocab, scores[best]);
+            }
             if (step == 0) ttftMs = (Stopwatch.GetTimestamp() - started) * 1000.0 / Stopwatch.Frequency;
-            probs[count] = Ops.BestProbability(scores, textVocab, scores[best]);
+            probs[count] = prob;
             if (best == Eos)
             {
                 one[0] = Eos;
@@ -400,12 +415,12 @@ public sealed unsafe partial class Whistle
         for (var j = 0; j < columns; j++)
         {
             double mean = 0;
-            for (var i = 0; i < rows; i++) mean += alignment[(1 + i) * frames + j];
+            for (var i = 0; i < rows; i++) mean += alignment[(long)(1 + i) * frames + j];
             mean /= rows;
             double squares = 0;
-            for (var i = 0; i < rows; i++) { var d = alignment[(1 + i) * frames + j] - mean; squares += d * d; }
+            for (var i = 0; i < rows; i++) { var d = alignment[(long)(1 + i) * frames + j] - mean; squares += d * d; }
             var std = Math.Sqrt(squares / rows) + 1e-9;
-            for (var i = 0; i < rows; i++) total[i * columns + j] = (float)((alignment[(1 + i) * frames + j] - mean) / std);
+            for (var i = 0; i < rows; i++) total[i * columns + j] = (float)((alignment[(long)(1 + i) * frames + j] - mean) / std);
         }
         Span<float> window = stackalloc float[7];
         for (var i = 0; i < rows; i++)
@@ -454,7 +469,8 @@ public sealed unsafe partial class Whistle
             var left = c > 0 ? total[r * columns + c - 1] : float.PositiveInfinity;
             if (diagonal <= up && diagonal <= left) { r--; c--; }
             else if (up <= left) r--;
-            else c--;
+            else if (c > 0) c--;
+            else r--;
         }
         for (var i = rows - 2; i >= 0; i--) if (starts[i] == int.MaxValue) starts[i] = starts[i + 1];
         for (var i = 1; i < rows; i++) if (starts[i] == int.MaxValue) starts[i] = starts[i - 1];

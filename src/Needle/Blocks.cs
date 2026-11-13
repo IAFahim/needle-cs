@@ -130,7 +130,8 @@ internal static unsafe class Attention
         for (; s < count; s++)
             scores[s] = DotInt8x48(query, keysBase + (long)s * keyStride) * keyScalesBase[(long)s * scaleStride] * scale;
         Ops.Softmax(scores, count);
-        if (probabilities != null) for (s = 0; s < count; s++) probabilities[first + s] = scores[s];
+        if (probabilities != null)
+            for (s = 0; s < count; s++) probabilities[first + s] = scores[s];
 
         var a0 = Vector256<float>.Zero;
         var a1 = Vector256<float>.Zero;
@@ -829,7 +830,7 @@ internal static unsafe class Attention
 internal unsafe struct AttentionBatch
 {
     const int MaxChunks = 8;
-    const int MinChunkPositions = 20;
+    const int MinChunkPositions = 16;
 
     public sbyte* Queries;
     public float* QueryScales;
@@ -864,7 +865,7 @@ internal unsafe struct AttentionBatch
         var group = Heads / KvHeads;
         Span(0, out _, out var firstCount);
         var splittable = Attention.CanSplitPositions && group > 1 && Probabilities == null;
-        var chunkByPos = splittable && (tokens > 1 || firstCount >= 2 * MinChunkPositions);
+        var chunkByPos = splittable && (tokens > 1 || firstCount >= 4 * MinChunkPositions);
         if (chunkByPos)
         {
             tilesPerGroup = (group + Attention.MaxTileHeads - 1) / Attention.MaxTileHeads;
@@ -928,6 +929,10 @@ internal unsafe struct AttentionBatch
         work.Probabilities = b->Probabilities == null ? null : b->Probabilities + ((long)token * b->Heads + firstHead) * b->Frames;
         work.ProbabilityStride = b->Frames;
         Attention.Run(work);
+#if NEEDLE_SIMD
+        if (b->Gate != null)
+            Ops.ApplyGateAndHeadPeaks(work.Output, b->Gate + ((long)token * b->Heads + firstHead) * b->VDim, countHeads, b->VDim, b->GatePeaks + ((long)token * b->Heads + firstHead) * 16);
+#endif
     }
 
     [SkipLocalsInit]
@@ -955,6 +960,13 @@ internal unsafe struct AttentionBatch
         {
             var merged = b->Output + (long)token * b->Heads * b->VDim + kv * group * b->VDim;
             Attention.MergePartials(b->partials + (long)groupIndex * b->chunks * Attention.PartialFloats, needed, group, merged);
+#if NEEDLE_SIMD
+            if (b->Gate != null)
+            {
+                var firstHead = kv * group;
+                Ops.ApplyGateAndHeadPeaks(merged, b->Gate + ((long)token * b->Heads + firstHead) * b->VDim, group, b->VDim, b->GatePeaks + ((long)token * b->Heads + firstHead) * 16);
+            }
+#endif
         }
     }
 
@@ -1018,7 +1030,7 @@ internal static unsafe class HadamardMlp
 
     public static bool CanParallelize(int rows, int cols) =>
 #if NEEDLE_SIMD
-        !Simd.UseNeon && Blocked(rows, cols) && (void*)Kernels.Active.HadamardMlp == null;
+        !Simd.UseNeon && Blocked(rows, cols) && (void*)Kernels.Active.HadamardMlp == null && (void*)Kernels.Active.CombineDiff4 == null;
 #else
         false;
 #endif
@@ -1049,7 +1061,7 @@ internal static unsafe class HadamardMlp
         AccumulateOutput(residual, back, b->Weights->D4, b->Scale, b->Dim);
     }
 
-    public static void Apply(MlpBatch* b, float* residual, float* scratch)
+    public static void Apply(MlpBatch* b, float* residual, float* scratch, float* tileScratch = null)
     {
         var kernelFp = Kernels.Active.HadamardMlp;
         if ((void*)kernelFp != null)
@@ -1069,11 +1081,11 @@ internal static unsafe class HadamardMlp
         Ops.ZeroCenteredRms(residual, b->PreNorm, dim, normalized);
         ConditionWeights(w->CondV, normalized, dim, weights);
         ScaleInput(normalized, w->D1, dim, inputRows * cols, front);
-        Kron(front, inputRows, w->W1A, w->W1B, rows, cols, rows, back);
+        Kron(front, inputRows, w->W1A, w->W1B, rows, cols, rows, back, tileScratch);
         PermuteModulateActivateRange(b->PermA, back, w->D2, weights, w->CondU, w->B2, width, front, 0, width);
-        Kron(front, rows, w->W2A, w->W2B, rows, cols, rows, back);
+        Kron(front, rows, w->W2A, w->W2B, rows, cols, rows, back, tileScratch);
         PermuteScaleRange(b->PermB, back, w->D3, front, 0, width);
-        Kron(front, rows, w->W3A, w->W3B, rows, cols, outputRows, back);
+        Kron(front, rows, w->W3A, w->W3B, rows, cols, outputRows, back, tileScratch);
         AccumulateOutput(residual, back, w->D4, b->Scale, dim);
     }
 
@@ -1313,22 +1325,22 @@ internal static unsafe class HadamardMlp
     }
 #endif
 
-    public static void Kron(float* z, int activeRows, float* left, float* right, int rows, int cols, int resultRows, float* result)
+    public static void Kron(float* z, int activeRows, float* left, float* right, int rows, int cols, int resultRows, float* result, float* tileScratch = null)
     {
         if (!Blocked(rows, cols)) { Scalar.Kron(z, activeRows, left, right, rows, cols, resultRows, result); return; }
 #if NEEDLE_SIMD
         if (Simd.UseNeon) { Neon.Kron(z, activeRows, left, right, rows, cols, resultRows, result); return; }
         if (Wide && cols % 32 == 0) { KronAvx512(z, activeRows, left, right, rows, cols, resultRows, result); return; }
-        KronAvx2(z, activeRows, left, right, rows, cols, resultRows, result);
+        KronAvx2Range(z, activeRows, left, right, rows, cols, 0, resultRows, result, tileScratch);
 #endif
     }
 
-    public static void KronRange(float* z, int activeRows, float* left, float* right, int rows, int cols, int rowStart, int rowEnd, float* result)
+    public static void KronRange(float* z, int activeRows, float* left, float* right, int rows, int cols, int rowStart, int rowEnd, float* result, float* tileScratch = null)
     {
         if (rowStart >= rowEnd) return;
 #if NEEDLE_SIMD
         if (Wide && cols % 32 == 0) { KronAvx512Range(z, activeRows, left, right, rows, cols, rowStart, rowEnd, result); return; }
-        KronAvx2Range(z, activeRows, left, right, rows, cols, rowStart, rowEnd, result);
+        KronAvx2Range(z, activeRows, left, right, rows, cols, rowStart, rowEnd, result, tileScratch);
 #endif
     }
 
@@ -1439,11 +1451,52 @@ internal static unsafe class HadamardMlp
         }
     }
 
+    struct KronArgs
+    {
+        public float* Z;
+        public float* Left;
+        public float* Right;
+        public float* Result;
+        public float* Tile;
+        public int ActiveRows;
+        public int Rows;
+        public int Cols;
+        public int RowStart;
+        public int RowEnd;
+    }
+
     [System.Runtime.CompilerServices.SkipLocalsInit]
     static void Kron32Avx2Range4(float* z, int activeRows, float* left, float* right, int rows, int rowStart, int rowEnd, float* result)
     {
         var raw = stackalloc float[128 + 8];
-        var tile = (float*)(((nuint)raw + 31) & ~(nuint)31);
+        var args = new KronArgs
+        {
+            Z = z,
+            Left = left,
+            Right = right,
+            Result = result,
+            Tile = (float*)(((nuint)raw + 31) & ~(nuint)31),
+            ActiveRows = activeRows,
+            Rows = rows,
+            Cols = 32,
+            RowStart = rowStart,
+            RowEnd = rowEnd,
+        };
+        Kron32Avx2Range4NoAlloc(&args);
+    }
+
+    [System.Runtime.CompilerServices.SkipLocalsInit]
+    static void Kron32Avx2Range4NoAlloc(KronArgs* args)
+    {
+        var z = args->Z;
+        var activeRows = args->ActiveRows;
+        var left = args->Left;
+        var right = args->Right;
+        var rows = args->Rows;
+        var rowStart = args->RowStart;
+        var rowEnd = args->RowEnd;
+        var result = args->Result;
+        var tile = args->Tile;
         for (var k = rowStart; k < rowEnd; k += 4)
         {
             for (var c = 0; c < 32; c += 16)
@@ -1547,13 +1600,30 @@ internal static unsafe class HadamardMlp
     }
 
     [System.Runtime.CompilerServices.SkipLocalsInit]
-    public static void KronAvx2Range(float* z, int activeRows, float* left, float* right, int rows, int cols, int rowStart, int rowEnd, float* result)
+    public static void KronAvx2Range(float* z, int activeRows, float* left, float* right, int rows, int cols, int rowStart, int rowEnd, float* result, float* tileScratch = null)
     {
         if (cols == 32)
         {
             if (((rowEnd - rowStart) & 3) == 0)
             {
-                Kron32Avx2Range4(z, activeRows, left, right, rows, rowStart, rowEnd, result);
+                if (tileScratch != null)
+                {
+                    var fastArgs = new KronArgs
+                    {
+                        Z = z,
+                        Left = left,
+                        Right = right,
+                        Result = result,
+                        Tile = tileScratch,
+                        ActiveRows = activeRows,
+                        Rows = rows,
+                        Cols = 32,
+                        RowStart = rowStart,
+                        RowEnd = rowEnd,
+                    };
+                    Kron32Avx2Range4NoAlloc(&fastArgs);
+                }
+                else Kron32Avx2Range4(z, activeRows, left, right, rows, rowStart, rowEnd, result);
                 return;
             }
             if (((rowEnd - rowStart) & 1) == 0)
@@ -1562,8 +1632,42 @@ internal static unsafe class HadamardMlp
                 return;
             }
         }
-        var raw = stackalloc float[TileRows * cols + 8];
-        var tile = (float*)(((nuint)raw + 31) & ~(nuint)31);
+        var args = new KronArgs
+        {
+            Z = z,
+            Left = left,
+            Right = right,
+            Result = result,
+            Tile = tileScratch,
+            ActiveRows = activeRows,
+            Rows = rows,
+            Cols = cols,
+            RowStart = rowStart,
+            RowEnd = rowEnd,
+        };
+        if (tileScratch == null)
+        {
+            var raw = stackalloc float[TileRows * cols + 8];
+            args.Tile = (float*)(((nuint)raw + 31) & ~(nuint)31);
+            KronAvx2RangeNoAlloc(&args);
+            return;
+        }
+        KronAvx2RangeNoAlloc(&args);
+    }
+
+    [System.Runtime.CompilerServices.SkipLocalsInit]
+    static void KronAvx2RangeNoAlloc(KronArgs* args)
+    {
+        var z = args->Z;
+        var activeRows = args->ActiveRows;
+        var left = args->Left;
+        var right = args->Right;
+        var rows = args->Rows;
+        var cols = args->Cols;
+        var rowStart = args->RowStart;
+        var rowEnd = args->RowEnd;
+        var result = args->Result;
+        var tile = args->Tile;
         nint stride1 = cols;
         nint stride2 = 2 * cols;
         nint stride3 = 3 * cols;

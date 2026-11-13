@@ -246,7 +246,7 @@ public sealed unsafe class VoiceHost : IDisposable
             var sessionOptions = options.Session ?? new NeedleOptions();
             policy = sessionOptions.ResolvedThreading;
             whistleModel = Model.Open(options.WhistleModelPath);
-            whistle = new Whistle(whistleModel, Math.Max(1, options.WhistleThreads == 0 ? 4 : options.WhistleThreads));
+            whistle = new Whistle(whistleModel, Math.Max(1, options.WhistleThreads == 0 ? 4 : options.WhistleThreads)) { BeamWidth = 1 };
             textScratch = new byte[whistle.MaxTranscriptTokens * 64];
             wordScratch = new WordSlice[whistle.MaxTranscriptTokens + 1];
             keywords = VoiceSession.EnumKeywords(options.ToolsJson ?? "");

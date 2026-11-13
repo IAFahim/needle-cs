@@ -189,14 +189,17 @@ namespace Needle.BurstKernels
         {
             if (X86.Avx2.IsAvx2Supported && X86.Fma.IsFmaSupported)
             {
-                v256 inverse = X86.Avx.mm256_set1_ps(InverseRmsX86(x, n));
+                float scalarInv = InverseRmsX86(x, n);
+                v256 inverse = X86.Avx.mm256_set1_ps(scalarInv);
                 v256 one = X86.Avx.mm256_set1_ps(1f);
-                for (int i = 0; i < n; i += 8)
+                int i = 0;
+                for (; i + 8 <= n; i += 8)
                     X86.Avx.mm256_storeu_ps(destination + i, X86.Avx.mm256_mul_ps(
                         X86.Avx.mm256_mul_ps(
                             X86.Avx.mm256_add_ps(one, X86.Avx.mm256_loadu_ps(scale + i)),
                             X86.Avx.mm256_loadu_ps(x + i)),
                         inverse));
+                for (; i < n; i++) destination[i] = (1f + scale[i]) * x[i] * scalarInv;
             }
         }
 

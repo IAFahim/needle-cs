@@ -26,11 +26,12 @@ internal static unsafe class OpsAvx512
             var v = Avx512F.LoadVector512(x + i);
             Avx512F.Store(x + i, Avx512F.Multiply(v, Sigmoid(v)));
         }
-        for (; i < n; i += 8)
+        for (; i + 8 <= n; i += 8)
         {
             var v = Avx.LoadVector256(x + i);
             Avx.Store(x + i, Avx.Multiply(v, Ops.Sigmoid(v)));
         }
+        for (; i < n; i++) x[i] *= Ops.Sigmoid(x[i]);
     }
 
     public static void MultiplyBySigmoid(float* x, float* gate, int n)
@@ -38,8 +39,9 @@ internal static unsafe class OpsAvx512
         var i = 0;
         for (; i + 16 <= n; i += 16)
             Avx512F.Store(x + i, Avx512F.Multiply(Avx512F.LoadVector512(x + i), Sigmoid(Avx512F.LoadVector512(gate + i))));
-        for (; i < n; i += 8)
+        for (; i + 8 <= n; i += 8)
             Avx.Store(x + i, Avx.Multiply(Avx.LoadVector256(x + i), Ops.Sigmoid(Avx.LoadVector256(gate + i))));
+        for (; i < n; i++) x[i] *= Ops.Sigmoid(gate[i]);
     }
 
     public static float SumOfSquares(float* x, int n)
@@ -59,12 +61,15 @@ internal static unsafe class OpsAvx512
         }
         var folded = Avx512F.Add(s0, s1);
         var sum = Avx.Add(folded.GetLower(), folded.GetUpper());
-        for (; i < n; i += 8)
+        if (i + 8 <= n)
         {
             var v = Avx.LoadVector256(x + i);
             sum = Fma.MultiplyAdd(v, v, sum);
+            i += 8;
         }
-        return Vector256.Sum(sum);
+        var tail = 0f;
+        for (; i < n; i++) tail = MathF.FusedMultiplyAdd(x[i], x[i], tail);
+        return Vector256.Sum(sum) + tail;
     }
 
     public static void RmsUnit(float* x, int n, float* destination)
@@ -75,7 +80,8 @@ internal static unsafe class OpsAvx512
         for (; i + 16 <= n; i += 16)
             Avx512F.Store(destination + i, Avx512F.Multiply(Avx512F.LoadVector512(x + i), wide));
         var tail = Vector256.Create(inverse);
-        for (; i < n; i += 8) Avx.Store(destination + i, Avx.Multiply(Avx.LoadVector256(x + i), tail));
+        for (; i + 8 <= n; i += 8) Avx.Store(destination + i, Avx.Multiply(Avx.LoadVector256(x + i), tail));
+        for (; i < n; i++) destination[i] = x[i] * inverse;
     }
 
     public static float Dot(float* a, float* b, int n)
@@ -95,8 +101,14 @@ internal static unsafe class OpsAvx512
         }
         var folded = Avx512F.Add(s0, s1);
         var sum = Avx.Add(folded.GetLower(), folded.GetUpper());
-        for (; i < n; i += 8) sum = Fma.MultiplyAdd(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i), sum);
-        return Vector256.Sum(sum);
+        if (i + 8 <= n)
+        {
+            sum = Fma.MultiplyAdd(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i), sum);
+            i += 8;
+        }
+        var tail = 0f;
+        for (; i < n; i++) tail = MathF.FusedMultiplyAdd(a[i], b[i], tail);
+        return Vector256.Sum(sum) + tail;
     }
 
     public static void Softmax(float* s, int n)
@@ -164,8 +176,9 @@ internal static unsafe class OpsAvx512
             Avx512F.Store(destination + i, Avx512F.Multiply(Avx512F.Multiply(Avx512F.Add(one, Avx512F.LoadVector512(scale + i)), Avx512F.LoadVector512(x + i)), wide));
         var tailInverse = Vector256.Create(inverse);
         var tailOne = Vector256.Create(1f);
-        for (; i < n; i += 8)
+        for (; i + 8 <= n; i += 8)
             Avx.Store(destination + i, Avx.Multiply(Avx.Multiply(Avx.Add(tailOne, Avx.LoadVector256(scale + i)), Avx.LoadVector256(x + i)), tailInverse));
+        for (; i < n; i++) destination[i] = (1f + scale[i]) * x[i] * inverse;
     }
 
     public static void Combine4(float* s, int dim, float w0, float w1, float w2, float w3, float* y, float post, float* destination)
@@ -206,7 +219,8 @@ internal static unsafe class OpsAvx512
         var i = 0;
         for (; i + 16 <= n; i += 16)
             Avx512F.Store(destination + i, Avx512F.Subtract(Avx512F.LoadVector512(a + i), Avx512F.LoadVector512(b + i)));
-        for (; i < n; i += 8) Avx.Store(destination + i, Avx.Subtract(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
+        for (; i + 8 <= n; i += 8) Avx.Store(destination + i, Avx.Subtract(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
+        for (; i < n; i++) destination[i] = a[i] - b[i];
     }
 
     public static void MultiplyAccumulate(float* destination, float* a, float* b, int n)
@@ -214,8 +228,9 @@ internal static unsafe class OpsAvx512
         var i = 0;
         for (; i + 16 <= n; i += 16)
             Avx512F.Store(destination + i, Avx512F.FusedMultiplyAdd(Avx512F.LoadVector512(a + i), Avx512F.LoadVector512(b + i), Avx512F.LoadVector512(destination + i)));
-        for (; i < n; i += 8)
+        for (; i + 8 <= n; i += 8)
             Avx.Store(destination + i, Fma.MultiplyAdd(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i), Avx.LoadVector256(destination + i)));
+        for (; i < n; i++) destination[i] += a[i] * b[i];
     }
 
     public static void ScaleAdd(float* destination, float scale, float* x, float xScale, int n)
@@ -227,7 +242,8 @@ internal static unsafe class OpsAvx512
             Avx512F.Store(destination + i, Avx512F.FusedMultiplyAdd(xs, Avx512F.LoadVector512(x + i), Avx512F.Multiply(s, Avx512F.LoadVector512(destination + i))));
         var t = Vector256.Create(scale);
         var tx = Vector256.Create(xScale);
-        for (; i < n; i += 8) Avx.Store(destination + i, Fma.MultiplyAdd(tx, Avx.LoadVector256(x + i), Avx.Multiply(t, Avx.LoadVector256(destination + i))));
+        for (; i + 8 <= n; i += 8) Avx.Store(destination + i, Fma.MultiplyAdd(tx, Avx.LoadVector256(x + i), Avx.Multiply(t, Avx.LoadVector256(destination + i))));
+        for (; i < n; i++) destination[i] = scale * destination[i] + xScale * x[i];
     }
 
     public static void AddScaled(float* destination, float* x, float scale, int n)
@@ -237,7 +253,8 @@ internal static unsafe class OpsAvx512
         for (; i + 16 <= n; i += 16)
             Avx512F.Store(destination + i, Avx512F.FusedMultiplyAdd(s, Avx512F.LoadVector512(x + i), Avx512F.LoadVector512(destination + i)));
         var t = Vector256.Create(scale);
-        for (; i < n; i += 8) Avx.Store(destination + i, Fma.MultiplyAdd(t, Avx.LoadVector256(x + i), Avx.LoadVector256(destination + i)));
+        for (; i + 8 <= n; i += 8) Avx.Store(destination + i, Fma.MultiplyAdd(t, Avx.LoadVector256(x + i), Avx.LoadVector256(destination + i)));
+        for (; i < n; i++) destination[i] += scale * x[i];
     }
 
     public static void Glu(float* value, float* gate, float* destination, int n)
@@ -245,8 +262,9 @@ internal static unsafe class OpsAvx512
         var i = 0;
         for (; i + 16 <= n; i += 16)
             Avx512F.Store(destination + i, Avx512F.Multiply(Avx512F.LoadVector512(value + i), Sigmoid(Avx512F.LoadVector512(gate + i))));
-        for (; i < n; i += 8)
+        for (; i + 8 <= n; i += 8)
             Avx.Store(destination + i, Avx.Multiply(Avx.LoadVector256(value + i), Ops.Sigmoid(Avx.LoadVector256(gate + i))));
+        for (; i < n; i++) destination[i] = value[i] * Ops.Sigmoid(gate[i]);
     }
 
     public static void Taps3(float* taps, int width, float* current, float* destination)

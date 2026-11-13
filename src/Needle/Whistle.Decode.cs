@@ -138,22 +138,46 @@ public sealed unsafe partial class Whistle
         var firstToken = Stopwatch.GetTimestamp();
         var decodeStart = firstToken;
         var steps = 0;
-        var forced = BeamWidth > 1 ? BeamSearch(keywords) : null;
-        if (forced != null && !align)
+        var (forced, forcedProbs) = BeamWidth > 1 ? BeamSearch(keywords, align) : (null, null);
+        if (forced != null)
         {
             pass.Tokens.AddRange(forced);
             pass.TtftMs = (Stopwatch.GetTimestamp() - started) * 1000.0 / Stopwatch.Frequency;
             steps = forced.Count;
+            if (align)
+            {
+                pass.Probabilities.AddRange(forcedProbs!);
+                var total = forced.Count + 1;
+                var alignBuf = total <= 512 ? stackalloc int[total] : new int[total];
+                for (var i = 0; i < forced.Count; i++) alignBuf[i] = forced[i];
+                alignBuf[forced.Count] = Eos;
+                decoder.Feed(alignBuf, computeLogits: false);
+            }
         }
-        for (var step = 0; step < g.MaxSeq - 3 && (forced == null || align); step++)
+        var hasKeywords = keywords != null && keywords.Count > 0;
+        for (var step = 0; step < g.MaxSeq - 3 && forced == null; step++)
         {
             logits = decoder.Logits;
-            logits.Slice(0, textVocab).CopyTo(new Span<float>(scores, textVocab));
-            scores[0] = scores[2] = scores[3] = -1e30f;
-            ApplyKeywordBias(keywords, pass.Tokens, scores);
-            var best = forced != null ? (step < forced.Count ? forced[step] : Eos) : Ops.ArgMax(scores, textVocab);
+            int best;
+            float prob;
+            if (!hasKeywords)
+            {
+                var lp = 0f;
+                var p = 0f;
+                fixed (float* src = logits)
+                    Ops.TopKLogSoftmax(src, textVocab, 1, &best, &lp, align ? &p : null, true);
+                prob = p;
+            }
+            else
+            {
+                logits.Slice(0, textVocab).CopyTo(new Span<float>(scores, textVocab));
+                scores[0] = scores[2] = scores[3] = -1e30f;
+                ApplyKeywordBias(keywords, pass.Tokens, scores);
+                best = Ops.ArgMax(scores, textVocab);
+                prob = align ? Ops.BestProbability(scores, textVocab, scores[best]) : 0f;
+            }
             if (step == 0) pass.TtftMs = (Stopwatch.GetTimestamp() - started) * 1000.0 / Stopwatch.Frequency;
-            if (align) pass.Probabilities.Add(Ops.BestProbability(scores, textVocab, scores[best]));
+            if (align) pass.Probabilities.Add(prob);
             if (best == Eos)
             {
                 if (align)
@@ -199,7 +223,7 @@ public sealed unsafe partial class Whistle
 
     float Normalized(float score, int length) => BeamLengthPenalty == 0f ? score : score / MathF.Pow(length, BeamLengthPenalty);
 
-    List<int> BeamSearch(IReadOnlyList<string>? keywords)
+    (List<int> Tokens, List<float>? Probs) BeamSearch(IReadOnlyList<string>? keywords, bool trackProbs)
     {
         var width = BeamWidth;
         EnsureBeams(width);
@@ -207,44 +231,58 @@ public sealed unsafe partial class Whistle
         var live = beamEngines.AsSpan(0, width).ToArray();
         var next = beamEngines.AsSpan(width, width).ToArray();
         var liveTokens = new List<int>[width];
+        var liveProbs = trackProbs ? new List<float>[width] : null;
         var liveScores = new float[width];
         liveTokens[0] = new List<int>();
+        if (trackProbs) liveProbs![0] = new List<float>();
         live[0].CopyFrom(decoder);
         var liveCount = 1;
-        var finished = new List<(float Score, List<int> Tokens)>();
-        var candidates = new List<(float Score, int Parent, int Token)>();
-        var parents = new int[width];
-        var picks = new int[width];
-        var pickScores = new float[width];
+        var finished = new List<(float Score, List<int> Tokens, List<float>? Probs)>();
+        var candidates = new List<(float Score, float Prob, int Parent, int Token)>();
+        var parents = stackalloc int[width];
+        var picks = stackalloc int[width];
+        var pickScores = stackalloc float[width];
+        var pickProbs = stackalloc float[width];
+        var lastChild = stackalloc int[width];
+        var topIdx = stackalloc int[width];
+        var topLogProbs = stackalloc float[width];
+        var topProbs = stackalloc float[width];
         var one = stackalloc int[1];
+        var hasKeywords = keywords != null && keywords.Count > 0;
         for (var step = 0; step < g.MaxSeq - 4; step++)
         {
             candidates.Clear();
             for (var i = 0; i < liveCount; i++)
             {
-                var row = beamScores + (long)i * textVocab;
                 var logits = live[i].Logits;
-                logits.Slice(0, textVocab).CopyTo(new Span<float>(row, textVocab));
-                row[0] = row[2] = row[3] = -1e30f;
-                ApplyKeywordBias(keywords, liveTokens[i], row);
-                Ops.LogSoftmax(row, textVocab);
-                for (var k = 0; k < width; k++)
+                if (hasKeywords)
                 {
-                    var best = Ops.ArgMax(row, textVocab);
-                    candidates.Add((liveScores[i] + row[best], i, best));
-                    row[best] = float.NegativeInfinity;
+                    var row = beamScores + (long)i * textVocab;
+                    logits.Slice(0, textVocab).CopyTo(new Span<float>(row, textVocab));
+                    row[0] = row[2] = row[3] = -1e30f;
+                    ApplyKeywordBias(keywords, liveTokens[i], row);
+                    Ops.TopKLogSoftmax(row, textVocab, width, topIdx, topLogProbs, trackProbs ? topProbs : null, false);
                 }
+                else
+                {
+                    fixed (float* lp = logits)
+                        Ops.TopKLogSoftmax(lp, textVocab, width, topIdx, topLogProbs, trackProbs ? topProbs : null, true);
+                }
+                for (var k = 0; k < width; k++)
+                    candidates.Add((liveScores[i] + topLogProbs[k], trackProbs ? topProbs[k] : 0f, i, topIdx[k]));
             }
             candidates.Sort((a, b) => b.Score.CompareTo(a.Score));
             var kept = 0;
             foreach (var c in candidates)
             {
-                if (c.Token == Eos) finished.Add((c.Score, liveTokens[c.Parent]));
+                if (c.Token == Eos)
+                    finished.Add((c.Score, new List<int>(liveTokens[c.Parent]), trackProbs ? new List<float>(liveProbs![c.Parent]) : null));
                 else
                 {
                     parents[kept] = c.Parent;
                     picks[kept] = c.Token;
                     pickScores[kept] = c.Score;
+                    pickProbs[kept] = c.Prob;
                     kept++;
                 }
                 if (kept >= width) break;
@@ -258,33 +296,57 @@ public sealed unsafe partial class Whistle
                 for (var j = 0; j < kept; j++) bestLive = MathF.Max(bestLive, Normalized(pickScores[j], liveTokens[parents[j]].Count + 1));
                 if (bestFinished >= bestLive) break;
             }
+            for (var p = 0; p < liveCount; p++) lastChild[p] = -1;
+            for (var j = 0; j < kept; j++) lastChild[parents[j]] = j;
             var nextTokens = new List<int>[width];
+            var nextProbs = trackProbs ? new List<float>[width] : null;
             for (var j = 0; j < kept; j++)
             {
-                next[j].CopyFrom(live[parents[j]]);
+                var p = parents[j];
+                if (j == lastChild[p]) continue;
+                next[j].CopyFrom(live[p], copyLogits: false);
                 one[0] = picks[j];
                 next[j].Feed(new ReadOnlySpan<int>(one, 1));
-                nextTokens[j] = new List<int>(liveTokens[parents[j]]) { picks[j] };
+                nextTokens[j] = new List<int>(liveTokens[p]) { picks[j] };
+                if (trackProbs) nextProbs![j] = new List<float>(liveProbs![p]) { pickProbs[j] };
+                liveScores[j] = pickScores[j];
+            }
+            for (var j = 0; j < kept; j++)
+            {
+                var p = parents[j];
+                if (j != lastChild[p]) continue;
+                one[0] = picks[j];
+                live[p].Feed(new ReadOnlySpan<int>(one, 1));
+                (next[j], live[p]) = (live[p], next[j]);
+                liveTokens[p].Add(picks[j]);
+                nextTokens[j] = liveTokens[p];
+                if (trackProbs)
+                {
+                    liveProbs![p].Add(pickProbs[j]);
+                    nextProbs![j] = liveProbs[p];
+                }
                 liveScores[j] = pickScores[j];
             }
             (live, next) = (next, live);
             liveTokens = nextTokens;
+            if (trackProbs) liveProbs = nextProbs;
             liveCount = kept;
         }
         var winner = default(List<int>);
+        var winnerProbs = default(List<float>);
         var winnerScore = float.NegativeInfinity;
         foreach (var f in finished)
         {
             var score = Normalized(f.Score, f.Tokens.Count + 1);
-            if (score > winnerScore) { winnerScore = score; winner = f.Tokens; }
+            if (score > winnerScore) { winnerScore = score; winner = f.Tokens; winnerProbs = f.Probs; }
         }
-        if (winner != null) return winner;
+        if (winner != null) return (winner, winnerProbs);
         for (var j = 0; j < liveCount; j++)
         {
             var score = Normalized(liveScores[j], liveTokens[j].Count);
-            if (score > winnerScore) { winnerScore = score; winner = liveTokens[j]; }
+            if (score > winnerScore) { winnerScore = score; winner = liveTokens[j]; winnerProbs = trackProbs ? liveProbs![j] : null; }
         }
-        return winner ?? new List<int>();
+        return (winner ?? new List<int>(), trackProbs ? (winnerProbs ?? new List<float>()) : null);
     }
 
 
@@ -370,7 +432,12 @@ public sealed unsafe partial class Whistle
             if (i == 0 || tokenizer.PieceText(pass.Tokens[i]).StartsWith('▁')) starts.Add(i);
         var text = new StringBuilder();
         var rows = pass.Tokens.Count;
-        var frameStarts = align && rows > 0 ? TokenFrames(rows) : null;
+        int[]? frameStarts = null;
+        if (align && rows > 0)
+        {
+            EnsureSpanBuffers();
+            frameStarts = TokenFramesSpan(rows);
+        }
         for (var w = 0; w < starts.Count; w++)
         {
             var from = starts[w];
@@ -385,79 +452,6 @@ public sealed unsafe partial class Whistle
             pass.Words.Add(new Word(word, frameStarts[from] * FrameSeconds, frameStarts[to] * FrameSeconds, probability / (to - from)));
         }
         pass.Text = text.ToString();
-    }
-
-    int[] TokenFrames(int tokens)
-    {
-        var rows = tokens + 1;
-        var columns = frames;
-        var cost = new float[rows, columns];
-        var filtered = new float[columns];
-        var window = stackalloc float[7];
-        var normalized = new float[rows, columns];
-        for (var j = 0; j < columns; j++)
-        {
-            double mean = 0, squares = 0;
-            for (var i = 0; i < rows; i++) mean += alignment[(long)(1 + i) * frames + j];
-            mean /= rows;
-            for (var i = 0; i < rows; i++) { var d = alignment[(long)(1 + i) * frames + j] - mean; squares += d * d; }
-            var std = Math.Sqrt(squares / rows) + 1e-9;
-            for (var i = 0; i < rows; i++) normalized[i, j] = (float)((alignment[(long)(1 + i) * frames + j] - mean) / std);
-        }
-        for (var i = 0; i < rows; i++)
-        {
-            for (var j = 0; j < columns; j++)
-            {
-                var n = 0;
-                for (var k = -3; k <= 3; k++) window[n++] = normalized[i, Math.Clamp(j + k, 0, columns - 1)];
-                for (var a2 = 1; a2 < 7; a2++)
-                {
-                    var v = window[a2];
-                    var b2 = a2 - 1;
-                    while (b2 >= 0 && window[b2] > v) { window[b2 + 1] = window[b2]; b2--; }
-                    window[b2 + 1] = v;
-                }
-                filtered[j] = window[3];
-            }
-            for (var j = 0; j < columns; j++) cost[i, j] = -filtered[j];
-        }
-        var total = new float[rows, columns];
-        for (var i = 0; i < rows; i++)
-            for (var j = 0; j < columns; j++)
-            {
-                float best;
-                if (i == 0) best = j > 0 ? Math.Min(0f, total[0, j - 1]) : 0f;
-                else
-                {
-                    best = total[i - 1, j];
-                    if (j > 0) best = Math.Min(best, Math.Min(total[i - 1, j - 1], total[i, j - 1]));
-                }
-                total[i, j] = cost[i, j] + best;
-            }
-        var starts = new int[rows];
-        Array.Fill(starts, int.MaxValue);
-        var r = rows - 1;
-        var c = 0;
-        for (var j = 1; j < columns; j++) if (total[r, j] < total[r, c]) c = j;
-        for (;;)
-        {
-            starts[r] = Math.Min(starts[r], c);
-            if (r == 0)
-            {
-                if (c > 0 && total[0, c - 1] < 0f) { c--; continue; }
-                break;
-            }
-            var diagonal = c > 0 ? total[r - 1, c - 1] : float.PositiveInfinity;
-            var up = total[r - 1, c];
-            var left = c > 0 ? total[r, c - 1] : float.PositiveInfinity;
-            if (diagonal <= up && diagonal <= left) { r--; c--; }
-            else if (up <= left) r--;
-            else c--;
-        }
-        for (var i = rows - 2; i >= 0; i--) if (starts[i] == int.MaxValue) starts[i] = starts[i + 1];
-        for (var i = 1; i < rows; i++) if (starts[i] == int.MaxValue) starts[i] = starts[i - 1];
-        for (var i = 1; i < rows; i++) starts[i] = Math.Max(starts[i], starts[i - 1]);
-        return starts;
     }
 
     public WhistleStream Stream(string? language = null, IReadOnlyList<string>? keywords = null) => new(this, language, keywords);

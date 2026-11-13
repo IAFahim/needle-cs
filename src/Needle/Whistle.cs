@@ -183,8 +183,9 @@ public sealed unsafe partial class Whistle : IDisposable
         frames = 0;
         if (l0 < 1) return 0;
         var half = audio->Window / 2;
-        Mem.Clear(padded, (nuint)(samples + 2 * half + audio->Hop + audio->Fft) * 4);
-        for (var i = 0; i < samples; i++) padded[half + i] = pcm[i];
+        Mem.Clear(padded, (nuint)half * 4);
+        pcm.Slice(0, samples).CopyTo(new Span<float>(padded + half, samples));
+        Mem.Clear(padded + half + samples, (nuint)(half + audio->Hop + audio->Fft) * 4);
         fixed (Frontend* fp = &front)
         {
             var job = new FeatureJob { Front = fp, Padded = padded, Output = features, TaskPeaks = featurePeaks, Frames = l0 };

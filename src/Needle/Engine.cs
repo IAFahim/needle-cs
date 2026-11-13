@@ -34,6 +34,16 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
     internal float* Alignment;
     internal int AlignmentFromLayer;
     float* captureBuffer;
+    long captureCapacity;
+
+    void EnsureCaptureBuffer(int frames)
+    {
+        var needed = (long)chunk * g.Heads * frames;
+        if (needed <= captureCapacity) return;
+        if (captureBuffer != null) Mem.Free(captureBuffer);
+        captureBuffer = (float*)Mem.AllocZeroed((nuint)needed * 4);
+        captureCapacity = needed;
+    }
     readonly Geometry g;
     readonly int chunk;
     readonly int capacity;
@@ -162,7 +172,8 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         attnArrivals = arena.Take<int>((nuint)chunk * (nuint)g.KvHeads);
         stealCursors = arena.Take<int>(8 * 16);
         gatePeaks = arena.Take<float>((nuint)(Math.Max(g.Heads, 8) * 16));
-        mlpScratch = arena.Take<float>((nuint)HadamardMlp.ScratchFloats(dim, g.HadaRows * g.HadaCols));
+        var mlpBaseScratch = HadamardMlp.ScratchFloats(dim, g.HadaRows * g.HadaCols);
+        mlpScratch = arena.Take<float>((nuint)(mlpBaseScratch + Math.Max(pool.Members, 1) * Math.Max(128, 4 * g.HadaCols) + 16));
         blockTable = arena.TakeUncleared<LayerWeights>((nuint)g.Layers);
         for (var l = 0; l < g.Layers; l++) blockTable[l] = model.Blocks[l];
         if (g.SiteCount > 0)
@@ -353,11 +364,11 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         Length = 0;
     }
 
-    internal void CopyFrom(EngineCore<TClock> source)
+    internal void CopyFrom(EngineCore<TClock> source, bool copyLogits = true)
     {
         Buffer.MemoryCopy(source.state, state, stateBytes, stateBytes);
         Length = source.Length;
-        CopyPrefix(source.logits, logits, 0, model.Embedding.Rows);
+        if (copyLogits) CopyPrefix(source.logits, logits, 0, model.Embedding.Rows);
         for (var l = 0; l < g.Layers; l++)
         {
             CopyPrefix(source.keyCache, keyCache, (long)l * capacity * kWidth, (long)Length * kWidth);
@@ -540,8 +551,9 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         }
         EngramHash.Rows(g, tokens, count, position, previousTokens, engramRows);
         clock.Lap(Stage.Embed);
-        if (count == 1 && Observer == null && Alignment == null)
+        if (count == 1 && Observer == null)
         {
+            if (Alignment != null && cross.Frames > 0) EnsureCaptureBuffer(cross.Frames);
             if (pooling) RestorePool();
             RunTokenTeam(position, wantLogits);
             historyPending = false;
@@ -698,6 +710,9 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         public float InverseRootDim;
         public CrossWeights* CrossLayers;
         public CrossMemory Cross;
+        public float* Alignment;
+        public float* CaptureBuffer;
+        public int AlignmentFromLayer;
     }
 
     DecodeJob BuildTeamJob(int count, int position, bool wantLogits) => new DecodeJob
@@ -771,6 +786,9 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         InverseRootDim = 1f / MathF.Sqrt(dim),
         CrossLayers = cross.Frames > 0 ? model.Audio->Cross : null,
         Cross = cross,
+        Alignment = Alignment,
+        CaptureBuffer = captureBuffer,
+        AlignmentFromLayer = AlignmentFromLayer,
     };
 
     static void RunSidecarDecodeTeam(void* context, int member) =>
@@ -923,7 +941,15 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         var mixLogits = stackalloc float[Lanes * Lanes];
         var unitA = stackalloc float[dim];
         var unitB = stackalloc float[dim];
-        if (job.Confidence != null && member == lead)
+        var tileStride = Math.Max(128, 4 * g.HadaCols);
+        var tileScratch = (float*)(((nuint)(job.MlpScratch + HadamardMlp.ScratchFloats(dim, g.HadaRows * g.HadaCols)) + 31) & ~(nuint)31) + member * tileStride;
+#if NEEDLE_SIMD
+        var simdAttnGate = Simd.UseAvx && (void*)Kernels.Active.Prepare == null && (void*)Kernels.Active.GateFakeA8 == null && g.OutputWidth == g.Heads * g.VDim;
+        var parallelPool = members > 1 && job.Confidence != null;
+#else
+        var parallelPool = members > 1 && job.Confidence != null;
+#endif
+        if (job.Confidence != null && !parallelPool && member == lead)
             PoolRow(ref job, job.Stream, 0, true);
         for (var l = 0; l < layers; l++)
         {
@@ -934,6 +960,7 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
             var qkvLive = job.QkvLive + (long)l * job.HistoryPerLayer;
             var site = g.SiteOf(l);
             var hasEngram = site >= 0;
+            if (parallelPool && l > 0) Pool.Barrier(job.Barrier);
             if (member == lead)
             {
                 job.StealCursors[0] = 0;
@@ -942,6 +969,7 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
                 job.StealCursors[48] = 0;
                 job.StealCursors[64] = 0;
                 job.StealCursors[96] = 0;
+                job.StealCursors[112] = 0;
                 Quant.PrepareRmsFakeA8(s, job.Normed, streamWidth, 4, job.StreamAct.Slice(0));
                 job.Clock.Lap(Stage.HyperPrepare);
 
@@ -966,6 +994,8 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
                 job.Clock.Lap(Stage.HyperPhi);
                 PrepareMixAndPrep(w, ref job, l, site, hasEngram, s, hpre, mixLogits);
             }
+            else if (parallelPool && member == members - 1)
+                PoolRow(ref job, s, l, l == 0);
             Pool.Barrier(job.Barrier);
             if (hasEngram)
             {
@@ -1027,11 +1057,31 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
                 Window = g.IsGlobal(l) ? 0 : g.SlidingWindow,
                 Capacity = job.Capacity,
             };
+#if NEEDLE_SIMD
+            if (simdAttnGate)
+            {
+                attnBatch.Gate = job.GateOut;
+                attnBatch.GatePeaks = job.GatePeaks;
+            }
+#endif
             attnBatch.Plan(members, 1, job.AttnPartials, job.AttnArrivals);
             RunAttentionTasks(&attnBatch, job.StealCursors + 96, member, members);
             if (member == lead) job.Clock.Lap(Stage.AttentionCore);
             Pool.Barrier(job.Barrier);
 
+#if NEEDLE_SIMD
+            if (simdAttnGate)
+            {
+                if (member == lead)
+                {
+                    var peak = 0f;
+                    for (var h = 0; h < g.Heads; h++) peak = MathF.Max(peak, job.GatePeaks[h * 16]);
+                    Quant.PrepareFakeGroupsRange(job.AttnOut, peak, 1f, 2, job.DimAct.Slice(0), 0, job.DimAct.Groups);
+                    job.Clock.Lap(Stage.AttentionGate);
+                }
+            }
+            else
+#endif
             if (member == lead)
             {
                 Quant.PrepareGateFakeA8(job.AttnOut, job.GateOut, g.OutputWidth, 2, job.DimAct.Slice(0));
@@ -1069,6 +1119,7 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
                     job.QueryScale[h] = Quant.QuantizeInt8(q, g.QkDim, job.QueryInt8 + h * g.QkDim);
                 }
                 Pool.Barrier(job.Barrier);
+                var capturing = job.Alignment != null && l >= job.AlignmentFromLayer;
                 var crossBatch = new AttentionBatch
                 {
                     Queries = job.QueryInt8,
@@ -1078,6 +1129,7 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
                     Values = job.Cross.Values + (long)l * frames * g.Heads * g.VDim,
                     ValueScales = job.Cross.ValueScales + (long)l * frames * g.Heads,
                     Output = job.AttnOut,
+                    Probabilities = capturing ? job.CaptureBuffer : null,
                     Heads = g.Heads,
                     KvHeads = g.Heads,
                     QkDim = g.QkDim,
@@ -1087,12 +1139,38 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
                     Capacity = Math.Max(frames, job.Capacity),
                     Frames = frames,
                 };
+#if NEEDLE_SIMD
+                if (simdAttnGate)
+                {
+                    crossBatch.Gate = job.GateOut;
+                    crossBatch.GatePeaks = job.GatePeaks;
+                }
+#endif
                 crossBatch.Plan(members, 1, job.AttnPartials, job.AttnArrivals);
-                Shard(crossBatch.TeamTasks, member, members, out var caFirst, out var caCount);
-                for (var i = caFirst; i < caFirst + caCount; i++) AttentionBatch.RunTask(&crossBatch, i);
+                RunAttentionTasks(&crossBatch, job.StealCursors + 112, member, members);
                 Pool.Barrier(job.Barrier);
                 if (member == lead)
-                    Quant.PrepareGateFakeA8(job.AttnOut, job.GateOut, g.OutputWidth, 2, job.DimAct.Slice(0));
+                {
+                    if (capturing)
+                    {
+                        var share = 1f / (g.Heads * (layers - job.AlignmentFromLayer));
+                        var dst = job.Alignment + (long)job.Position * frames;
+                        for (var h = 0; h < g.Heads; h++)
+                            Ops.AddScaled(dst, job.CaptureBuffer + h * frames, share, frames);
+                    }
+#if NEEDLE_SIMD
+                    if (simdAttnGate)
+                    {
+                        var peak = 0f;
+                        for (var h = 0; h < g.Heads; h++) peak = MathF.Max(peak, job.GatePeaks[h * 16]);
+                        Quant.PrepareFakeGroupsRange(job.AttnOut, peak, 1f, 2, job.DimAct.Slice(0), 0, job.DimAct.Groups);
+                    }
+                    else
+#endif
+                    {
+                        Quant.PrepareGateFakeA8(job.AttnOut, job.GateOut, g.OutputWidth, 2, job.DimAct.Slice(0));
+                    }
+                }
                 Pool.Barrier(job.Barrier);
                 var crossOut = new MatMulBatch(job.DimAct, 1);
                 crossOut.Add(c->Out, job.AttnProj, dim);
@@ -1124,10 +1202,11 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
                     Cols = g.HadaCols,
                     Scale = 1f,
                 };
-                HadamardMlp.Apply(&mlp, job.Residual, job.MlpScratch);
+                HadamardMlp.Apply(&mlp, job.Residual, job.MlpScratch, tileScratch);
                 job.Clock.Lap(Stage.Mlp);
                 Ops.CombineDiff4x4(s, dim, job.ResidualMix, job.Residual, job.Input, job.PostGate, next);
-                if (job.Confidence != null) PoolRow(ref job, next, l + 1, false);
+                if (job.Confidence != null && (!parallelPool || (l == layers - 1 && job.WantLogits == 0)))
+                    PoolRow(ref job, next, l + 1, false);
                 job.Clock.Lap(Stage.Combine);
             }
         }
@@ -1140,6 +1219,8 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
                 job.StealCursors[80] = 0;
             }
             Pool.Barrier(job.Barrier);
+            if (parallelPool && member == members - 1)
+                PoolRow(ref job, (layers & 1) == 0 ? job.Stream : job.Next, layers, false);
             var head = new MatMulBatch(job.HeadAct, 1);
             head.Add(job.Embedding, job.Logits, job.Embedding.Rows);
             MatMulBatch.RunSteal(&head, job.StealCursors + 80, member, members);
@@ -2039,7 +2120,7 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         var capturing = Alignment != null && l >= AlignmentFromLayer;
         if (capturing)
         {
-            if (captureBuffer == null) captureBuffer = (float*)Mem.Alloc((nuint)(chunk * heads * frames) * 4);
+            EnsureCaptureBuffer(frames);
             attention.Probabilities = captureBuffer;
         }
         clock.PoolRun();

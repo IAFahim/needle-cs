@@ -48,6 +48,41 @@ internal static unsafe class Ops
         var r = Avx.Reciprocal(denom);
         return Avx.Multiply(r, Fma.MultiplyAddNegated(denom, r, Vector256.Create(2f)));
     }
+
+    internal static void ApplyGateAndHeadPeaks(float* output, float* gate, int heads, int vDim, float* peaks)
+    {
+        for (var h = 0; h < heads; h++)
+        {
+            var x = output + h * vDim;
+            var g = gate + h * vDim;
+            var peak0 = Vector256<float>.Zero;
+            var peak1 = Vector256<float>.Zero;
+            var i = 0;
+            for (; i + 16 <= vDim; i += 16)
+            {
+                var v0 = Avx.Multiply(Avx.LoadVector256(x + i), Sigmoid(Avx.LoadVector256(g + i)));
+                var v1 = Avx.Multiply(Avx.LoadVector256(x + i + 8), Sigmoid(Avx.LoadVector256(g + i + 8)));
+                Avx.Store(x + i, v0);
+                Avx.Store(x + i + 8, v1);
+                peak0 = Avx.Max(peak0, Vector256.Abs(v0));
+                peak1 = Avx.Max(peak1, Vector256.Abs(v1));
+            }
+            for (; i + 8 <= vDim; i += 8)
+            {
+                var v = Avx.Multiply(Avx.LoadVector256(x + i), Sigmoid(Avx.LoadVector256(g + i)));
+                Avx.Store(x + i, v);
+                peak0 = Avx.Max(peak0, Vector256.Abs(v));
+            }
+            var headPeak = FoldPeak(Avx.Max(peak0, peak1));
+            for (; i < vDim; i++)
+            {
+                var v = x[i] * Sigmoid(g[i]);
+                x[i] = v;
+                headPeak = MathF.Max(headPeak, MathF.Abs(v));
+            }
+            peaks[h * 16] = headPeak;
+        }
+    }
 #endif
 
     public static float Sigmoid(float x) => 1f / (1f + MathF.Exp(-x));
@@ -60,11 +95,13 @@ internal static unsafe class Ops
         if (!Simd.Enabled) { Scalar.Silu(x, n); return; }
 #if NEEDLE_SIMD
         if (Tiers.Active == CpuTier.Avx512Bw) { OpsAvx512.Silu(x, n); return; }
-        for (var i = 0; i < n; i += 8)
+        var i = 0;
+        for (; i + 8 <= n; i += 8)
         {
             var v = Avx.LoadVector256(x + i);
             Avx.Store(x + i, Avx.Multiply(v, Sigmoid(v)));
         }
+        for (; i < n; i++) x[i] *= Sigmoid(x[i]);
 #endif
     }
 
@@ -76,8 +113,10 @@ internal static unsafe class Ops
         if (!Simd.Enabled) { Scalar.MultiplyBySigmoid(x, gate, n); return; }
 #if NEEDLE_SIMD
         if (Tiers.Active == CpuTier.Avx512Bw) { OpsAvx512.MultiplyBySigmoid(x, gate, n); return; }
-        for (var i = 0; i < n; i += 8)
+        var i = 0;
+        for (; i + 8 <= n; i += 8)
             Avx.Store(x + i, Avx.Multiply(Avx.LoadVector256(x + i), Sigmoid(Avx.LoadVector256(gate + i))));
+        for (; i < n; i++) x[i] *= Sigmoid(gate[i]);
 #endif
     }
 
@@ -180,11 +219,14 @@ internal static unsafe class Ops
             InvokeRmsUnit(kernelFp, x, n, destination);
             return;
         }
-        if (!Simd.Enabled) { var scalarInverse = InverseRms(x, n); for (var i = 0; i < n; i++) destination[i] = x[i] * scalarInverse; return; }
+        if (!Simd.Enabled) { var scalarInverse = InverseRms(x, n); for (var k = 0; k < n; k++) destination[k] = x[k] * scalarInverse; return; }
 #if NEEDLE_SIMD
         if (Tiers.Active == CpuTier.Avx512Bw) { OpsAvx512.RmsUnit(x, n, destination); return; }
-        var inverse = Vector256.Create(InverseRms(x, n));
-        for (var i = 0; i < n; i += 8) Avx.Store(destination + i, Avx.Multiply(Avx.LoadVector256(x + i), inverse));
+        var scalarInv = InverseRms(x, n);
+        var inverse = Vector256.Create(scalarInv);
+        var i = 0;
+        for (; i + 8 <= n; i += 8) Avx.Store(destination + i, Avx.Multiply(Avx.LoadVector256(x + i), inverse));
+        for (; i < n; i++) destination[i] = x[i] * scalarInv;
 #endif
     }
 
@@ -199,13 +241,16 @@ internal static unsafe class Ops
             InvokeZeroCenteredRms(kernelFp, x, scale, n, destination);
             return;
         }
-        if (!Simd.Enabled) { var scalarInverse = InverseRms(x, n); for (var i = 0; i < n; i++) destination[i] = (1f + scale[i]) * x[i] * scalarInverse; return; }
+        if (!Simd.Enabled) { var scalarInverse = InverseRms(x, n); for (var k = 0; k < n; k++) destination[k] = (1f + scale[k]) * x[k] * scalarInverse; return; }
 #if NEEDLE_SIMD
         if (Tiers.Active == CpuTier.Avx512Bw) { OpsAvx512.ZeroCenteredRms(x, scale, n, destination); return; }
-        var inverse = Vector256.Create(InverseRms(x, n));
+        var scalarInv = InverseRms(x, n);
+        var inverse = Vector256.Create(scalarInv);
         var one = Vector256.Create(1f);
-        for (var i = 0; i < n; i += 8)
+        var i = 0;
+        for (; i + 8 <= n; i += 8)
             Avx.Store(destination + i, Avx.Multiply(Avx.Multiply(Avx.Add(one, Avx.LoadVector256(scale + i)), Avx.LoadVector256(x + i)), inverse));
+        for (; i < n; i++) destination[i] = (1f + scale[i]) * x[i] * scalarInv;
 #endif
     }
 
@@ -615,11 +660,17 @@ internal static unsafe class Ops
             Avx.Store(destination + i, Avx.Multiply(Avx.Min(Avx.Max(q0, low), high), vA8Scale));
             Avx.Store(destination + i + 8, Avx.Multiply(Avx.Min(Avx.Max(q1, low), high), vA8Scale));
         }
-        for (; i < n; i += 8)
+        for (; i + 8 <= n; i += 8)
         {
             var v = Avx.Multiply(Avx.LoadVector256(x + i), vRmsInv);
             var q = Avx.RoundToNearestInteger(Avx.Multiply(v, vA8Inv));
             Avx.Store(destination + i, Avx.Multiply(Avx.Min(Avx.Max(q, low), high), vA8Scale));
+        }
+        var sInvA8 = 1f / scale;
+        for (; i < n; i++)
+        {
+            var q = MathF.Round(x[i] * inv * sInvA8);
+            destination[i] = MathF.Min(MathF.Max(q, -128f), 127f) * scale;
         }
 #endif
     }
@@ -656,11 +707,17 @@ internal static unsafe class Ops
             Avx.Store(destination + i, Avx.Multiply(Avx.Min(Avx.Max(q0, low), high), vA8Scale));
             Avx.Store(destination + i + 8, Avx.Multiply(Avx.Min(Avx.Max(q1, low), high), vA8Scale));
         }
-        for (; i < n; i += 8)
+        for (; i + 8 <= n; i += 8)
         {
             var v = Avx.Multiply(Avx.Multiply(Avx.Add(one, Avx.LoadVector256(scale + i)), Avx.LoadVector256(x + i)), vRmsInv);
             var q = Avx.RoundToNearestInteger(Avx.Multiply(v, vA8Inv));
             Avx.Store(destination + i, Avx.Multiply(Avx.Min(Avx.Max(q, low), high), vA8Scale));
+        }
+        var sInvA8 = 1f / a8Scale;
+        for (; i < n; i++)
+        {
+            var q = MathF.Round((1f + scale[i]) * x[i] * inv * sInvA8);
+            destination[i] = MathF.Min(MathF.Max(q, -128f), 127f) * a8Scale;
         }
 #endif
     }
@@ -690,13 +747,20 @@ internal static unsafe class Ops
             peak0 = Avx.Max(peak0, Vector256.Abs(v0));
             peak1 = Avx.Max(peak1, Vector256.Abs(v1));
         }
-        for (; i < n; i += 8)
+        for (; i + 8 <= n; i += 8)
         {
             var v = Avx.Multiply(Avx.LoadVector256(x + i), Sigmoid(Avx.LoadVector256(gate + i)));
             Avx.Store(x + i, v);
             peak0 = Avx.Max(peak0, Vector256.Abs(v));
         }
-        FinishFakeA8(x, n, FoldPeak(Avx.Max(peak0, peak1)));
+        var peak = FoldPeak(Avx.Max(peak0, peak1));
+        for (; i < n; i++)
+        {
+            var v = x[i] * Sigmoid(gate[i]);
+            x[i] = v;
+            peak = MathF.Max(peak, MathF.Abs(v));
+        }
+        FinishFakeA8(x, n, peak);
 #endif
     }
 
@@ -723,11 +787,13 @@ internal static unsafe class Ops
             Avx.Store(x + i, Avx.Multiply(Avx.Min(Avx.Max(q0, low), high), sc));
             Avx.Store(x + i + 8, Avx.Multiply(Avx.Min(Avx.Max(q1, low), high), sc));
         }
-        for (; i < n; i += 8)
+        for (; i + 8 <= n; i += 8)
         {
             var q = Avx.RoundToNearestInteger(Avx.Multiply(Avx.LoadVector256(x + i), inverse));
             Avx.Store(x + i, Avx.Multiply(Avx.Min(Avx.Max(q, low), high), sc));
         }
+        var sInv = 1f / scale;
+        for (; i < n; i++) x[i] = MathF.Min(MathF.Max(MathF.Round(x[i] * sInv), -128f), 127f) * scale;
     }
 #endif
 
@@ -736,53 +802,61 @@ internal static unsafe class Ops
 #if NEEDLE_SIMD
         if (!Simd.UseNeon && Simd.Enabled && (void*)Kernels.Active.CombineDiff4 == null)
         {
-            var s1 = s + dim;
-            var s2 = s + 2 * dim;
-            var s3 = s + 3 * dim;
-            var d1 = destination + dim;
-            var d2 = destination + 2 * dim;
-            var d3 = destination + 3 * dim;
-            var p0 = Avx.BroadcastScalarToVector256(postGate);
-            var p1 = Avx.BroadcastScalarToVector256(postGate + 1);
-            var p2 = Avx.BroadcastScalarToVector256(postGate + 2);
-            var p3 = Avx.BroadcastScalarToVector256(postGate + 3);
-            for (var c = 0; c < dim; c += 8)
-            {
-                var diff = Avx.Subtract(Avx.LoadVector256(x + c), Avx.LoadVector256(u + c));
-                var v0 = Avx.LoadVector256(s + c);
-                var v1 = Avx.LoadVector256(s1 + c);
-                var v2 = Avx.LoadVector256(s2 + c);
-                var v3 = Avx.LoadVector256(s3 + c);
-                var a0 = Fma.MultiplyAdd(Avx.BroadcastScalarToVector256(mix), v0, Avx.Multiply(p0, diff));
-                a0 = Fma.MultiplyAdd(Avx.BroadcastScalarToVector256(mix + 1), v1, a0);
-                a0 = Fma.MultiplyAdd(Avx.BroadcastScalarToVector256(mix + 2), v2, a0);
-                a0 = Fma.MultiplyAdd(Avx.BroadcastScalarToVector256(mix + 3), v3, a0);
-                Avx.Store(destination + c, a0);
-
-                var a1 = Fma.MultiplyAdd(Avx.BroadcastScalarToVector256(mix + 4), v0, Avx.Multiply(p1, diff));
-                a1 = Fma.MultiplyAdd(Avx.BroadcastScalarToVector256(mix + 5), v1, a1);
-                a1 = Fma.MultiplyAdd(Avx.BroadcastScalarToVector256(mix + 6), v2, a1);
-                a1 = Fma.MultiplyAdd(Avx.BroadcastScalarToVector256(mix + 7), v3, a1);
-                Avx.Store(d1 + c, a1);
-
-                var a2 = Fma.MultiplyAdd(Avx.BroadcastScalarToVector256(mix + 8), v0, Avx.Multiply(p2, diff));
-                a2 = Fma.MultiplyAdd(Avx.BroadcastScalarToVector256(mix + 9), v1, a2);
-                a2 = Fma.MultiplyAdd(Avx.BroadcastScalarToVector256(mix + 10), v2, a2);
-                a2 = Fma.MultiplyAdd(Avx.BroadcastScalarToVector256(mix + 11), v3, a2);
-                Avx.Store(d2 + c, a2);
-
-                var a3 = Fma.MultiplyAdd(Avx.BroadcastScalarToVector256(mix + 12), v0, Avx.Multiply(p3, diff));
-                a3 = Fma.MultiplyAdd(Avx.BroadcastScalarToVector256(mix + 13), v1, a3);
-                a3 = Fma.MultiplyAdd(Avx.BroadcastScalarToVector256(mix + 14), v2, a3);
-                a3 = Fma.MultiplyAdd(Avx.BroadcastScalarToVector256(mix + 15), v3, a3);
-                Avx.Store(d3 + c, a3);
-            }
+            CombineDiff4x4Range(s, dim, mix, x, u, postGate, destination, 0, dim);
             return;
         }
 #endif
         for (var i = 0; i < 4; i++)
             CombineDiff4(s, dim, mix[i * 4], mix[i * 4 + 1], mix[i * 4 + 2], mix[i * 4 + 3], x, u, postGate[i], destination + (long)i * dim);
     }
+
+#if NEEDLE_SIMD
+    internal static void CombineDiff4x4Range(float* s, int dim, float* mix, float* x, float* u, float* postGate, float* destination, int offsetStart, int offsetEnd)
+    {
+        var s1 = s + dim;
+        var s2 = s + 2 * dim;
+        var s3 = s + 3 * dim;
+        var d1 = destination + dim;
+        var d2 = destination + 2 * dim;
+        var d3 = destination + 3 * dim;
+        var p0 = Avx.BroadcastScalarToVector256(postGate);
+        var p1 = Avx.BroadcastScalarToVector256(postGate + 1);
+        var p2 = Avx.BroadcastScalarToVector256(postGate + 2);
+        var p3 = Avx.BroadcastScalarToVector256(postGate + 3);
+        for (var c = offsetStart; c < offsetEnd; c += 8)
+        {
+            var diff = Avx.Subtract(Avx.LoadVector256(x + c), Avx.LoadVector256(u + c));
+            var v0 = Avx.LoadVector256(s + c);
+            var v1 = Avx.LoadVector256(s1 + c);
+            var v2 = Avx.LoadVector256(s2 + c);
+            var v3 = Avx.LoadVector256(s3 + c);
+            var a0 = Fma.MultiplyAdd(Avx.BroadcastScalarToVector256(mix), v0, Avx.Multiply(p0, diff));
+            a0 = Fma.MultiplyAdd(Avx.BroadcastScalarToVector256(mix + 1), v1, a0);
+            a0 = Fma.MultiplyAdd(Avx.BroadcastScalarToVector256(mix + 2), v2, a0);
+            a0 = Fma.MultiplyAdd(Avx.BroadcastScalarToVector256(mix + 3), v3, a0);
+            Avx.Store(destination + c, a0);
+
+            var a1 = Fma.MultiplyAdd(Avx.BroadcastScalarToVector256(mix + 4), v0, Avx.Multiply(p1, diff));
+            a1 = Fma.MultiplyAdd(Avx.BroadcastScalarToVector256(mix + 5), v1, a1);
+            a1 = Fma.MultiplyAdd(Avx.BroadcastScalarToVector256(mix + 6), v2, a1);
+            a1 = Fma.MultiplyAdd(Avx.BroadcastScalarToVector256(mix + 7), v3, a1);
+            Avx.Store(d1 + c, a1);
+
+            var a2 = Fma.MultiplyAdd(Avx.BroadcastScalarToVector256(mix + 8), v0, Avx.Multiply(p2, diff));
+            a2 = Fma.MultiplyAdd(Avx.BroadcastScalarToVector256(mix + 9), v1, a2);
+            a2 = Fma.MultiplyAdd(Avx.BroadcastScalarToVector256(mix + 10), v2, a2);
+            a2 = Fma.MultiplyAdd(Avx.BroadcastScalarToVector256(mix + 11), v3, a2);
+            Avx.Store(d2 + c, a2);
+
+            var a3 = Fma.MultiplyAdd(Avx.BroadcastScalarToVector256(mix + 12), v0, Avx.Multiply(p3, diff));
+            a3 = Fma.MultiplyAdd(Avx.BroadcastScalarToVector256(mix + 13), v1, a3);
+            a3 = Fma.MultiplyAdd(Avx.BroadcastScalarToVector256(mix + 14), v2, a3);
+            a3 = Fma.MultiplyAdd(Avx.BroadcastScalarToVector256(mix + 15), v3, a3);
+            Avx.Store(d3 + c, a3);
+        }
+    }
+
+#endif
 
     public static void CombineDiff4(float* s, int dim, float w0, float w1, float w2, float w3, float* x, float* u, float post, float* destination)
     {
@@ -827,13 +901,16 @@ internal static unsafe class Ops
         }
         if (!Simd.Enabled) { Scalar.PostNormAdd(residual, x, scale, gate, n); return; }
 #if NEEDLE_SIMD
-        var inverse = Vector256.Create(InverseRms(x, n));
+        var scalarInv = InverseRms(x, n);
+        var inverse = Vector256.Create(scalarInv);
         var one = Vector256.Create(1f);
         var g = Vector256.Create(gate);
-        for (var i = 0; i < n; i += 8)
+        var i = 0;
+        for (; i + 8 <= n; i += 8)
             Avx.Store(residual + i, Fma.MultiplyAdd(g,
                 Avx.Multiply(Avx.Multiply(Avx.Add(one, Avx.LoadVector256(scale + i)), Avx.LoadVector256(x + i)), inverse),
                 Avx.LoadVector256(residual + i)));
+        for (; i < n; i++) residual[i] += gate * (1f + scale[i]) * x[i] * scalarInv;
 #endif
     }
 
@@ -845,7 +922,9 @@ internal static unsafe class Ops
         if (!Simd.Enabled) { Scalar.Subtract(a, b, n, destination); return; }
 #if NEEDLE_SIMD
         if (Tiers.Active == CpuTier.Avx512Bw) { OpsAvx512.Subtract(a, b, n, destination); return; }
-        for (var i = 0; i < n; i += 8) Avx.Store(destination + i, Avx.Subtract(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
+        var i = 0;
+        for (; i + 8 <= n; i += 8) Avx.Store(destination + i, Avx.Subtract(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
+        for (; i < n; i++) destination[i] = a[i] - b[i];
 #endif
     }
 
@@ -863,8 +942,10 @@ internal static unsafe class Ops
         if (!Simd.Enabled) { Scalar.MultiplyAccumulate(destination, a, b, n); return; }
 #if NEEDLE_SIMD
         if (Tiers.Active == CpuTier.Avx512Bw) { OpsAvx512.MultiplyAccumulate(destination, a, b, n); return; }
-        for (var i = 0; i < n; i += 8)
+        var i = 0;
+        for (; i + 8 <= n; i += 8)
             Avx.Store(destination + i, Fma.MultiplyAdd(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i), Avx.LoadVector256(destination + i)));
+        for (; i < n; i++) destination[i] += a[i] * b[i];
 #endif
     }
 
@@ -884,7 +965,9 @@ internal static unsafe class Ops
         if (Tiers.Active == CpuTier.Avx512Bw) { OpsAvx512.ScaleAdd(destination, scale, x, xScale, n); return; }
         var s = Vector256.Create(scale);
         var xs = Vector256.Create(xScale);
-        for (var i = 0; i < n; i += 8) Avx.Store(destination + i, Fma.MultiplyAdd(xs, Avx.LoadVector256(x + i), Avx.Multiply(s, Avx.LoadVector256(destination + i))));
+        var i = 0;
+        for (; i + 8 <= n; i += 8) Avx.Store(destination + i, Fma.MultiplyAdd(xs, Avx.LoadVector256(x + i), Avx.Multiply(s, Avx.LoadVector256(destination + i))));
+        for (; i < n; i++) destination[i] = scale * destination[i] + xScale * x[i];
 #endif
     }
 
@@ -903,7 +986,9 @@ internal static unsafe class Ops
 #if NEEDLE_SIMD
         if (Tiers.Active == CpuTier.Avx512Bw) { OpsAvx512.AddScaled(destination, x, scale, n); return; }
         var s = Vector256.Create(scale);
-        for (var i = 0; i < n; i += 8) Avx.Store(destination + i, Fma.MultiplyAdd(s, Avx.LoadVector256(x + i), Avx.LoadVector256(destination + i)));
+        var i = 0;
+        for (; i + 8 <= n; i += 8) Avx.Store(destination + i, Fma.MultiplyAdd(s, Avx.LoadVector256(x + i), Avx.LoadVector256(destination + i)));
+        for (; i < n; i++) destination[i] += scale * x[i];
 #endif
     }
 
@@ -920,8 +1005,10 @@ internal static unsafe class Ops
         if (!Simd.Enabled) { Scalar.Glu(value, gate, destination, n); return; }
 #if NEEDLE_SIMD
         if (Tiers.Active == CpuTier.Avx512Bw) { OpsAvx512.Glu(value, gate, destination, n); return; }
-        for (var i = 0; i < n; i += 8)
+        var i = 0;
+        for (; i + 8 <= n; i += 8)
             Avx.Store(destination + i, Avx.Multiply(Avx.LoadVector256(value + i), Sigmoid(Avx.LoadVector256(gate + i))));
+        for (; i < n; i++) destination[i] = value[i] * Sigmoid(gate[i]);
 #endif
     }
 
@@ -951,9 +1038,173 @@ internal static unsafe class Ops
 
     public static int ArgMax(float* x, int n)
     {
+#if NEEDLE_SIMD
+        if (Simd.Enabled && !Simd.UseNeon && n >= 32)
+        {
+            var p0 = Vector256.Create(float.NegativeInfinity);
+            var p1 = p0;
+            var p2 = p0;
+            var p3 = p0;
+            var i = 0;
+            var bulk32 = n & ~31;
+            for (; i < bulk32; i += 32)
+            {
+                p0 = Avx.Max(p0, Avx.LoadVector256(x + i));
+                p1 = Avx.Max(p1, Avx.LoadVector256(x + i + 8));
+                p2 = Avx.Max(p2, Avx.LoadVector256(x + i + 16));
+                p3 = Avx.Max(p3, Avx.LoadVector256(x + i + 24));
+            }
+            p0 = Avx.Max(Avx.Max(p0, p1), Avx.Max(p2, p3));
+            var bulk8 = n & ~7;
+            for (; i < bulk8; i += 8) p0 = Avx.Max(p0, Avx.LoadVector256(x + i));
+            var peak = Max8(p0);
+            for (; i < n; i++) peak = MathF.Max(peak, x[i]);
+            if (float.IsFinite(peak))
+            {
+                var vPeak = Vector256.Create(peak);
+                for (i = 0; i < bulk8; i += 8)
+                {
+                    var mask = Avx.MoveMask(Avx.CompareEqual(Avx.LoadVector256(x + i), vPeak));
+                    if (mask != 0) return i + System.Numerics.BitOperations.TrailingZeroCount((uint)mask);
+                }
+                for (; i < n; i++) if (x[i] == peak) return i;
+            }
+        }
+#endif
         var best = 0;
         for (var i = 1; i < n; i++) if (x[i] > x[best]) best = i;
         return best;
+    }
+
+    public static void TopKLogSoftmax(float* x, int n, int k, int* indices, float* logProbs, float* probs, bool maskSpecial023)
+    {
+        var topVal = stackalloc float[k];
+        var topIdx = stackalloc int[k];
+        for (var i = 0; i < k; i++) { topVal[i] = float.NegativeInfinity; topIdx[i] = -1; }
+        var minVal = float.NegativeInfinity;
+        var minIdx = int.MaxValue;
+        var start = 0;
+        if (maskSpecial023 && n > 1)
+        {
+            topVal[0] = x[1];
+            topIdx[0] = 1;
+            if (k == 1) { minVal = topVal[0]; minIdx = 1; }
+            start = 4;
+        }
+#if NEEDLE_SIMD
+        if (Simd.Enabled && !Simd.UseNeon && n >= 16)
+        {
+            var headEnd = Math.Min(8, n);
+            for (var i = start; i < headEnd; i++)
+            {
+                var v = x[i];
+                if (v > minVal || (v == minVal && i < minIdx))
+                {
+                    var pos = k - 1;
+                    while (pos > 0 && (v > topVal[pos - 1] || (v == topVal[pos - 1] && i < topIdx[pos - 1])))
+                    {
+                        topVal[pos] = topVal[pos - 1];
+                        topIdx[pos] = topIdx[pos - 1];
+                        pos--;
+                    }
+                    topVal[pos] = v;
+                    topIdx[pos] = i;
+                    minVal = topVal[k - 1];
+                    minIdx = topIdx[k - 1];
+                }
+            }
+            var bulk8 = n & ~7;
+            var vMin = Vector256.Create(minVal);
+            var idx = 8;
+            for (; idx < bulk8; idx += 8)
+            {
+                var vec = Avx.LoadVector256(x + idx);
+                var mask = Avx.MoveMask(Avx.CompareGreaterThan(vec, vMin));
+                if (mask == 0) continue;
+                for (var b = 0; b < 8; b++)
+                {
+                    if ((mask & (1 << b)) == 0) continue;
+                    var j = idx + b;
+                    var v = x[j];
+                    if (v > minVal || (v == minVal && j < minIdx))
+                    {
+                        var pos = k - 1;
+                        while (pos > 0 && (v > topVal[pos - 1] || (v == topVal[pos - 1] && j < topIdx[pos - 1])))
+                        {
+                            topVal[pos] = topVal[pos - 1];
+                            topIdx[pos] = topIdx[pos - 1];
+                            pos--;
+                        }
+                        topVal[pos] = v;
+                        topIdx[pos] = j;
+                        minVal = topVal[k - 1];
+                        minIdx = topIdx[k - 1];
+                    }
+                }
+                vMin = Vector256.Create(minVal);
+            }
+            start = idx;
+        }
+#endif
+        for (var i = start; i < n; i++)
+        {
+            if (maskSpecial023 && (i == 0 || i == 2 || i == 3)) continue;
+            var v = x[i];
+            if (v > minVal || (v == minVal && i < minIdx))
+            {
+                var pos = k - 1;
+                while (pos > 0 && (v > topVal[pos - 1] || (v == topVal[pos - 1] && i < topIdx[pos - 1])))
+                {
+                    topVal[pos] = topVal[pos - 1];
+                    topIdx[pos] = topIdx[pos - 1];
+                    pos--;
+                }
+                topVal[pos] = v;
+                topIdx[pos] = i;
+                minVal = topVal[k - 1];
+                minIdx = topIdx[k - 1];
+            }
+        }
+        var peak = topVal[0];
+        float logShift;
+#if NEEDLE_SIMD
+        if (Simd.Enabled && !Simd.UseNeon && n >= 16)
+        {
+            var shift = Vector256.Create(peak);
+            var first = Avx.LoadVector256(x);
+            if (maskSpecial023) first = Avx.Blend(first, Vector256.Create(-1e30f), 0x0D);
+            var s0 = Exp(Avx.Subtract(first, shift));
+            var s1 = Exp(Avx.Subtract(Avx.LoadVector256(x + 8), shift));
+            var bulk8 = n & ~7;
+            var i = 16;
+            for (; i < bulk8 - 8; i += 16)
+            {
+                s0 = Avx.Add(s0, Exp(Avx.Subtract(Avx.LoadVector256(x + i), shift)));
+                s1 = Avx.Add(s1, Exp(Avx.Subtract(Avx.LoadVector256(x + i + 8), shift)));
+            }
+            for (; i < bulk8; i += 8) s0 = Avx.Add(s0, Exp(Avx.Subtract(Avx.LoadVector256(x + i), shift)));
+            var total = Vector256.Sum(Avx.Add(s0, s1));
+            for (; i < n; i++) total += MathF.Exp(x[i] - peak);
+            logShift = peak + MathF.Log(total);
+        }
+        else
+#endif
+        {
+            double total = 0;
+            for (var i = 0; i < n; i++)
+            {
+                var v = maskSpecial023 && (i == 0 || i == 2 || i == 3) ? -1e30f : x[i];
+                total += Math.Exp(v - peak);
+            }
+            logShift = peak + (float)Math.Log(total);
+        }
+        for (var m = 0; m < k; m++)
+        {
+            indices[m] = topIdx[m];
+            var lp = topVal[m] - logShift;
+            logProbs[m] = lp;
+            if (probs != null) probs[m] = MathF.Exp(lp);
+        }
     }
 
     public static int ArgMaxMasked(float* x, uint* mask, int words, int length)

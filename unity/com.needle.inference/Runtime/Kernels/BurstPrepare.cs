@@ -48,12 +48,15 @@ namespace Needle.BurstKernels
             {
                 v256 sign = X86.Avx.mm256_set1_ps(-0.0f);
                 v256 peak = X86.Avx.mm256_set1_ps(0f);
-                for (int i = 0; i < n; i += 8)
+                int i = 0;
+                for (; i + 8 <= n; i += 8)
                     peak = X86.Avx.mm256_max_ps(peak, X86.Avx.mm256_andnot_ps(sign, X86.Avx.mm256_loadu_ps(x + i)));
                 v128 halves = X86.Sse.max_ps(X86.Avx.mm256_castps256_ps128(peak), X86.Avx.mm256_extractf128_ps(peak, 1));
                 v128 pairs = X86.Sse.max_ps(halves, X86.Sse.shuffle_ps(halves, halves, 0x4E));
                 v128 quad = X86.Sse.max_ps(pairs, X86.Sse.shuffle_ps(pairs, pairs, 0xB1));
-                return X86.Sse.cvtss_f32(quad);
+                float best = X86.Sse.cvtss_f32(quad);
+                for (; i < n; i++) best = MathF.Max(best, MathF.Abs(x[i]));
+                return best;
             }
             return 0f;
         }
@@ -81,12 +84,13 @@ namespace Needle.BurstKernels
             {
                 float peak = AbsMaxX86(x, n);
                 float scale = peak > 0f ? peak / 127f : 1f;
-                v256 inverse = X86.Avx.mm256_set1_ps(1f / scale);
+                float scalarInv = 1f / scale;
+                v256 inverse = X86.Avx.mm256_set1_ps(scalarInv);
                 v256 interleave = new v256(0, 4, 1, 5, 2, 6, 3, 7);
                 int i = 0;
                 for (; i + 32 <= n; i += 32)
                     X86.Avx.mm256_storeu_si256((v256*)(destination + i), Pack32X86(x + i, inverse, interleave));
-                for (; i < n; i += 8)
+                for (; i + 8 <= n; i += 8)
                 {
                     v256 q = X86.Avx.mm256_cvtps_epi32(X86.Avx.mm256_mul_ps(X86.Avx.mm256_loadu_ps(x + i), inverse));
                     v128 packed = X86.Sse2.packs_epi32(
@@ -95,6 +99,7 @@ namespace Needle.BurstKernels
                     packed = X86.Sse2.packs_epi16(packed, packed);
                     *(long*)(destination + i) = X86.Sse2.cvtsi128_si64(packed);
                 }
+                for (; i < n; i++) destination[i] = (sbyte)MathF.Min(MathF.Max(RoundEvenScalar(x[i] * scalarInv), -128f), 127f);
                 return scale;
             }
             return 0f;

@@ -233,6 +233,7 @@ internal sealed unsafe class Pool : IDisposable
         OsThreads.ConfigureCurrentThread(policy.Priority, policy.Placement, cpu);
         var deadline = Stopwatch.GetTimestamp() + spinTicks;
         var teamSeen = 0L;
+        var spins = 0;
         while (Volatile.Read(ref control->Stopping) == 0)
         {
             var paused = IsPaused;
@@ -245,10 +246,11 @@ internal sealed unsafe class Pool : IDisposable
                 teamFunction(teamContext, index);
                 Interlocked.Increment(ref control->TeamDone);
                 deadline = Stopwatch.GetTimestamp() + spinTicks;
+                spins = 0;
                 continue;
             }
-            if (!paused && Drain()) { deadline = Stopwatch.GetTimestamp() + spinTicks; continue; }
-            if (!paused && Stopwatch.GetTimestamp() < deadline)
+            if (!paused && Drain()) { deadline = Stopwatch.GetTimestamp() + spinTicks; spins = 0; continue; }
+            if (!paused && (((++spins & 63) != 0 && spinTicks > 0) || Stopwatch.GetTimestamp() < deadline))
             {
 #if NET8_0_OR_GREATER
                 if (System.Runtime.Intrinsics.X86.X86Base.IsSupported) System.Runtime.Intrinsics.X86.X86Base.Pause();
@@ -260,6 +262,7 @@ internal sealed unsafe class Pool : IDisposable
             }
             Park();
             deadline = Stopwatch.GetTimestamp() + spinTicks;
+            spins = 0;
         }
     }
 

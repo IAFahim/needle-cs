@@ -15,8 +15,8 @@ return args switch
     ["bench-e2e", var model, var tools, .. var options] => BenchE2E.Run(model, tools, options),
     ["generate", var model, var text, .. var count] => Generate(model, text, count.Length > 0 ? int.Parse(count[0]) : 80),
     ["transcribe", var model, var wav, .. var options] => Transcribe(model, wav, options),
-    ["stream", var model, var wav] => StreamClip(model, wav),
-    ["voice", var needle, var whistle, var tools, var wav] => Voice(needle, whistle, tools, wav),
+    ["stream", var model, var wav, .. var soptions] => StreamClip(model, wav, soptions),
+    ["voice", var needle, var whistle, var tools, var wav, .. var voptions] => Voice(needle, whistle, tools, wav, voptions),
     ["embed", var model, var text] => EmbedText(model, text),
     ["eval", var model, var dataset, .. var options] => Eval.Run(model, dataset, options),
     ["call", var model, var tools, .. var queries] => Call(model, tools, queries),
@@ -37,9 +37,9 @@ static int Usage()
     Console.Error.WriteLine("needle serve <needle3.cact> <tools.json> [options] (stdin JSON lines -> stdout replies)");
     Console.Error.WriteLine("needle prime <model.cact> <tools.json> <out.prefix> [--system TEXT] [--context N] [--threads N] [--max-reasoning N] [--max-calls N]");
     Console.Error.WriteLine("needle call <model.cact> <tools.json> [query ...] [--no-date] [--no-retrieval] [--prefix <out.prefix>]");
-    Console.Error.WriteLine("needle transcribe <whistle.cact> <clip.wav> [--language xx] [--words] [--keywords a,b] [--repeat n]");
-    Console.Error.WriteLine("needle stream <whistle.cact> <clip.wav>");
-    Console.Error.WriteLine("needle voice <needle3.cact> <whistle.cact> <tools.json> <clip.wav>");
+    Console.Error.WriteLine("needle transcribe <whistle.cact> <clip.wav> [--language xx] [--words] [--keywords a,b] [--repeat n] [--threads n]");
+    Console.Error.WriteLine("needle stream <whistle.cact> <clip.wav> [--threads n]");
+    Console.Error.WriteLine("needle voice <needle3.cact> <whistle.cact> <tools.json> <clip.wav> [--threads n]");
     Console.Error.WriteLine("needle embed <needle3.cact> <text>");
     Console.Error.WriteLine("needle generate <needle3.cact> <raw prompt> [tokens]");
     return 2;
@@ -175,6 +175,7 @@ static int Transcribe(string modelPath, string wavPath, string[] options)
             case "--language": language = options[++i]; break;
             case "--words": words = true; break;
             case "--repeat": repeat = int.Parse(options[++i]); break;
+            case "--threads": threads = int.Parse(options[++i]); break;
             case "--keywords": keywords.AddRange(options[++i].Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)); break;
         }
     var pcm = Wav.Read(wavPath);
@@ -195,11 +196,20 @@ static int Transcribe(string modelPath, string wavPath, string[] options)
     return 0;
 }
 
-static int StreamClip(string modelPath, string wavPath)
+static int ParseThreadsOption(string[] options)
 {
+    var threads = int.Parse(Environment.GetEnvironmentVariable("NEEDLE_THREADS") ?? Math.Clamp(Environment.ProcessorCount / 2, 1, 8).ToString());
+    for (var i = 0; i < options.Length; i++)
+        if (options[i] == "--threads" && i + 1 < options.Length) threads = int.Parse(options[++i]);
+    return threads;
+}
+
+static int StreamClip(string modelPath, string wavPath, string[] options)
+{
+    var threads = ParseThreadsOption(options);
     var pcm = Wav.Read(wavPath);
     using var model = Model.Open(modelPath);
-    using var whistle = new Whistle(model, Math.Clamp(Environment.ProcessorCount / 2, 1, 8));
+    using var whistle = new Whistle(model, threads);
     var stream = whistle.Stream();
     var committed = new List<string>();
     for (var at = 0; at < pcm.Length; at += 16000)
@@ -214,9 +224,9 @@ static int StreamClip(string modelPath, string wavPath)
     return 0;
 }
 
-static int Voice(string needlePath, string whistlePath, string toolsPath, string wavPath)
+static int Voice(string needlePath, string whistlePath, string toolsPath, string wavPath, string[] options)
 {
-    var threads = int.Parse(Environment.GetEnvironmentVariable("NEEDLE_THREADS") ?? Math.Clamp(Environment.ProcessorCount / 2, 1, 8).ToString());
+    var threads = ParseThreadsOption(options);
     using var needle = Model.Open(needlePath);
     using var whistle = Model.Open(whistlePath);
     using var voice = new VoiceSession(needle, whistle, File.ReadAllText(toolsPath), new NeedleOptions { Threads = threads });

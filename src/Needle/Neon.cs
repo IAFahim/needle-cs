@@ -53,57 +53,73 @@ internal static unsafe class Neon
 
     public static void Silu(float* x, int n)
     {
-        for (var i = 0; i < n; i += 4)
+        var i = 0;
+        for (; i + 4 <= n; i += 4)
         {
             var v = AdvSimd.LoadVector128(x + i);
             AdvSimd.Store(x + i, AdvSimd.Multiply(v, Sigmoid(v)));
         }
+        for (; i < n; i++) x[i] *= Ops.Sigmoid(x[i]);
     }
 
     public static void MultiplyBySigmoid(float* x, float* gate, int n)
     {
-        for (var i = 0; i < n; i += 4)
+        var i = 0;
+        for (; i + 4 <= n; i += 4)
             AdvSimd.Store(x + i, AdvSimd.Multiply(AdvSimd.LoadVector128(x + i), Sigmoid(AdvSimd.LoadVector128(gate + i))));
+        for (; i < n; i++) x[i] *= Ops.Sigmoid(gate[i]);
     }
 
     public static float SumOfSquares(float* x, int n)
     {
         var s0 = Vector128<float>.Zero;
         var s1 = Vector128<float>.Zero;
-        for (var i = 0; i < n; i += 8)
+        var i = 0;
+        for (; i + 8 <= n; i += 8)
         {
             var a = AdvSimd.LoadVector128(x + i);
             var b = AdvSimd.LoadVector128(x + i + 4);
             s0 = AdvSimd.FusedMultiplyAdd(s0, a, a);
             s1 = AdvSimd.FusedMultiplyAdd(s1, b, b);
         }
-        return HorizontalSum(AdvSimd.Add(s0, s1));
+        var tail = 0f;
+        for (; i < n; i++) tail = MathF.FusedMultiplyAdd(x[i], x[i], tail);
+        return HorizontalSum(AdvSimd.Add(s0, s1)) + tail;
     }
 
     public static float Dot(float* a, float* b, int n)
     {
         var s0 = Vector128<float>.Zero;
         var s1 = Vector128<float>.Zero;
-        for (var i = 0; i < n; i += 8)
+        var i = 0;
+        for (; i + 8 <= n; i += 8)
         {
             s0 = AdvSimd.FusedMultiplyAdd(s0, AdvSimd.LoadVector128(a + i), AdvSimd.LoadVector128(b + i));
             s1 = AdvSimd.FusedMultiplyAdd(s1, AdvSimd.LoadVector128(a + i + 4), AdvSimd.LoadVector128(b + i + 4));
         }
-        return HorizontalSum(AdvSimd.Add(s0, s1));
+        var tail = 0f;
+        for (; i < n; i++) tail = MathF.FusedMultiplyAdd(a[i], b[i], tail);
+        return HorizontalSum(AdvSimd.Add(s0, s1)) + tail;
     }
 
     public static void RmsUnit(float* x, int n, float* destination)
     {
-        var inverse = Vector128.Create(1f / MathF.Sqrt(SumOfSquares(x, n) / n + RmsEpsilon));
-        for (var i = 0; i < n; i += 4) AdvSimd.Store(destination + i, AdvSimd.Multiply(AdvSimd.LoadVector128(x + i), inverse));
+        var scalarInv = 1f / MathF.Sqrt(SumOfSquares(x, n) / n + RmsEpsilon);
+        var inverse = Vector128.Create(scalarInv);
+        var i = 0;
+        for (; i + 4 <= n; i += 4) AdvSimd.Store(destination + i, AdvSimd.Multiply(AdvSimd.LoadVector128(x + i), inverse));
+        for (; i < n; i++) destination[i] = x[i] * scalarInv;
     }
 
     public static void ZeroCenteredRms(float* x, float* scale, int n, float* destination)
     {
-        var inverse = Vector128.Create(1f / MathF.Sqrt(SumOfSquares(x, n) / n + RmsEpsilon));
+        var scalarInv = 1f / MathF.Sqrt(SumOfSquares(x, n) / n + RmsEpsilon);
+        var inverse = Vector128.Create(scalarInv);
         var one = Vector128.Create(1f);
-        for (var i = 0; i < n; i += 4)
+        var i = 0;
+        for (; i + 4 <= n; i += 4)
             AdvSimd.Store(destination + i, AdvSimd.Multiply(AdvSimd.Multiply(AdvSimd.Add(one, AdvSimd.LoadVector128(scale + i)), AdvSimd.LoadVector128(x + i)), inverse));
+        for (; i < n; i++) destination[i] = (1f + scale[i]) * x[i] * scalarInv;
     }
 
     public static void Softmax(float* s, int n)
@@ -199,33 +215,43 @@ internal static unsafe class Neon
 
     public static void Subtract(float* a, float* b, int n, float* destination)
     {
-        for (var i = 0; i < n; i += 4) AdvSimd.Store(destination + i, AdvSimd.Subtract(AdvSimd.LoadVector128(a + i), AdvSimd.LoadVector128(b + i)));
+        var i = 0;
+        for (; i + 4 <= n; i += 4) AdvSimd.Store(destination + i, AdvSimd.Subtract(AdvSimd.LoadVector128(a + i), AdvSimd.LoadVector128(b + i)));
+        for (; i < n; i++) destination[i] = a[i] - b[i];
     }
 
     public static void MultiplyAccumulate(float* destination, float* a, float* b, int n)
     {
-        for (var i = 0; i < n; i += 4)
+        var i = 0;
+        for (; i + 4 <= n; i += 4)
             AdvSimd.Store(destination + i, AdvSimd.FusedMultiplyAdd(AdvSimd.LoadVector128(destination + i), AdvSimd.LoadVector128(a + i), AdvSimd.LoadVector128(b + i)));
+        for (; i < n; i++) destination[i] += a[i] * b[i];
     }
 
     public static void ScaleAdd(float* destination, float scale, float* x, float xScale, int n)
     {
         var s = Vector128.Create(scale);
         var xs = Vector128.Create(xScale);
-        for (var i = 0; i < n; i += 4)
+        var i = 0;
+        for (; i + 4 <= n; i += 4)
             AdvSimd.Store(destination + i, AdvSimd.FusedMultiplyAdd(AdvSimd.Multiply(s, AdvSimd.LoadVector128(destination + i)), xs, AdvSimd.LoadVector128(x + i)));
+        for (; i < n; i++) destination[i] = scale * destination[i] + xScale * x[i];
     }
 
     public static void AddScaled(float* destination, float* x, float scale, int n)
     {
         var s = Vector128.Create(scale);
-        for (var i = 0; i < n; i += 4) AdvSimd.Store(destination + i, AdvSimd.FusedMultiplyAdd(AdvSimd.LoadVector128(destination + i), s, AdvSimd.LoadVector128(x + i)));
+        var i = 0;
+        for (; i + 4 <= n; i += 4) AdvSimd.Store(destination + i, AdvSimd.FusedMultiplyAdd(AdvSimd.LoadVector128(destination + i), s, AdvSimd.LoadVector128(x + i)));
+        for (; i < n; i++) destination[i] += scale * x[i];
     }
 
     public static void Glu(float* value, float* gate, float* destination, int n)
     {
-        for (var i = 0; i < n; i += 4)
+        var i = 0;
+        for (; i + 4 <= n; i += 4)
             AdvSimd.Store(destination + i, AdvSimd.Multiply(AdvSimd.LoadVector128(value + i), Sigmoid(AdvSimd.LoadVector128(gate + i))));
+        for (; i < n; i++) destination[i] = value[i] * Ops.Sigmoid(gate[i]);
     }
 
     public static void Taps3(float* taps, int width, float* current, float* destination)
@@ -242,8 +268,11 @@ internal static unsafe class Neon
     public static float AbsMax(float* x, int n)
     {
         var peak = Vector128<float>.Zero;
-        for (var i = 0; i < n; i += 4) peak = AdvSimd.Max(peak, AdvSimd.Abs(AdvSimd.LoadVector128(x + i)));
-        return AdvSimd.Arm64.MaxAcross(peak).ToScalar();
+        var i = 0;
+        for (; i + 4 <= n; i += 4) peak = AdvSimd.Max(peak, AdvSimd.Abs(AdvSimd.LoadVector128(x + i)));
+        var best = AdvSimd.Arm64.MaxAcross(peak).ToScalar();
+        for (; i < n; i++) best = MathF.Max(best, MathF.Abs(x[i]));
+        return best;
     }
 
     public static void RoundTrip(float* x, int n, float inverse, float scale)
@@ -252,25 +281,30 @@ internal static unsafe class Neon
         var sc = Vector128.Create(scale);
         var low = Vector128.Create(-128f);
         var high = Vector128.Create(127f);
-        for (var i = 0; i < n; i += 4)
+        var i = 0;
+        for (; i + 4 <= n; i += 4)
         {
             var q = AdvSimd.RoundToNearest(AdvSimd.Multiply(AdvSimd.LoadVector128(x + i), inv));
             AdvSimd.Store(x + i, AdvSimd.Multiply(AdvSimd.Min(AdvSimd.Max(q, low), high), sc));
         }
+        for (; i < n; i++) x[i] = MathF.Min(MathF.Max(MathF.Round(x[i] * inverse), -128f), 127f) * scale;
     }
 
     public static float QuantizeInt8(float* x, int n, sbyte* destination)
     {
         var peak = AbsMax(x, n);
         var scale = peak > 0f ? peak / 127f : 1f;
-        var inv = Vector128.Create(1f / scale);
-        for (var i = 0; i < n; i += 4)
+        var scalarInv = 1f / scale;
+        var inv = Vector128.Create(scalarInv);
+        var i = 0;
+        for (; i + 4 <= n; i += 4)
         {
             var wide = AdvSimd.ConvertToInt32RoundToZero(AdvSimd.Multiply(AdvSimd.LoadVector128(x + i), inv));
             var narrow = AdvSimd.ExtractNarrowingSaturateLower(wide).ToVector128();
             var bytes = AdvSimd.ExtractNarrowingSaturateLower(narrow);
             *(int*)(destination + i) = bytes.AsInt32().ToScalar();
         }
+        for (; i < n; i++) destination[i] = (sbyte)MathF.Min(MathF.Max(MathF.Round(x[i] * scalarInv), -128f), 127f);
         return scale;
     }
 
@@ -1005,41 +1039,67 @@ internal static unsafe class Neon
 
     public static void RmsFakeA8(float* x, int n, float* destination)
     {
-        var inverse = Vector128.Create(1f / MathF.Sqrt(SumOfSquares(x, n) / n + RmsEpsilon));
+        var scalarInv = 1f / MathF.Sqrt(SumOfSquares(x, n) / n + RmsEpsilon);
+        var inverse = Vector128.Create(scalarInv);
         var peak = Vector128<float>.Zero;
-        for (var i = 0; i < n; i += 4)
+        var i = 0;
+        for (; i + 4 <= n; i += 4)
         {
             var v = AdvSimd.Multiply(AdvSimd.LoadVector128(x + i), inverse);
             AdvSimd.Store(destination + i, v);
             peak = AdvSimd.Max(peak, AdvSimd.Abs(v));
         }
-        FinishFakeA8(destination, n, AdvSimd.Arm64.MaxAcross(peak).ToScalar());
+        var folded = AdvSimd.Arm64.MaxAcross(peak).ToScalar();
+        for (; i < n; i++)
+        {
+            var v = x[i] * scalarInv;
+            destination[i] = v;
+            folded = MathF.Max(folded, MathF.Abs(v));
+        }
+        FinishFakeA8(destination, n, folded);
     }
 
     public static void CenteredRmsFakeA8(float* x, float* scale, int n, float* destination)
     {
-        var inverse = Vector128.Create(1f / MathF.Sqrt(SumOfSquares(x, n) / n + RmsEpsilon));
+        var scalarInv = 1f / MathF.Sqrt(SumOfSquares(x, n) / n + RmsEpsilon);
+        var inverse = Vector128.Create(scalarInv);
         var one = Vector128.Create(1f);
         var peak = Vector128<float>.Zero;
-        for (var i = 0; i < n; i += 4)
+        var i = 0;
+        for (; i + 4 <= n; i += 4)
         {
             var v = AdvSimd.Multiply(AdvSimd.Multiply(AdvSimd.Add(one, AdvSimd.LoadVector128(scale + i)), AdvSimd.LoadVector128(x + i)), inverse);
             AdvSimd.Store(destination + i, v);
             peak = AdvSimd.Max(peak, AdvSimd.Abs(v));
         }
-        FinishFakeA8(destination, n, AdvSimd.Arm64.MaxAcross(peak).ToScalar());
+        var folded = AdvSimd.Arm64.MaxAcross(peak).ToScalar();
+        for (; i < n; i++)
+        {
+            var v = (1f + scale[i]) * x[i] * scalarInv;
+            destination[i] = v;
+            folded = MathF.Max(folded, MathF.Abs(v));
+        }
+        FinishFakeA8(destination, n, folded);
     }
 
     public static void GateFakeA8(float* x, float* gate, int n)
     {
         var peak = Vector128<float>.Zero;
-        for (var i = 0; i < n; i += 4)
+        var i = 0;
+        for (; i + 4 <= n; i += 4)
         {
             var v = AdvSimd.Multiply(AdvSimd.LoadVector128(x + i), Sigmoid(AdvSimd.LoadVector128(gate + i)));
             AdvSimd.Store(x + i, v);
             peak = AdvSimd.Max(peak, AdvSimd.Abs(v));
         }
-        FinishFakeA8(x, n, AdvSimd.Arm64.MaxAcross(peak).ToScalar());
+        var folded = AdvSimd.Arm64.MaxAcross(peak).ToScalar();
+        for (; i < n; i++)
+        {
+            var v = x[i] * Ops.Sigmoid(gate[i]);
+            x[i] = v;
+            folded = MathF.Max(folded, MathF.Abs(v));
+        }
+        FinishFakeA8(x, n, folded);
     }
 
     static void FinishFakeA8(float* x, int n, float peak)
@@ -1068,12 +1128,15 @@ internal static unsafe class Neon
 
     public static void PostNormAdd(float* residual, float* x, float* scale, float gate, int n)
     {
-        var inverse = Vector128.Create(1f / MathF.Sqrt(SumOfSquares(x, n) / n + RmsEpsilon));
+        var scalarInv = 1f / MathF.Sqrt(SumOfSquares(x, n) / n + RmsEpsilon);
+        var inverse = Vector128.Create(scalarInv);
         var one = Vector128.Create(1f);
         var g = Vector128.Create(gate);
-        for (var i = 0; i < n; i += 4)
+        var i = 0;
+        for (; i + 4 <= n; i += 4)
             AdvSimd.Store(residual + i, AdvSimd.FusedMultiplyAdd(AdvSimd.LoadVector128(residual + i), g,
                 AdvSimd.Multiply(AdvSimd.Multiply(AdvSimd.Add(one, AdvSimd.LoadVector128(scale + i)), AdvSimd.LoadVector128(x + i)), inverse)));
+        for (; i < n; i++) residual[i] += gate * (1f + scale[i]) * x[i] * scalarInv;
     }
 
     [SkipLocalsInit]
