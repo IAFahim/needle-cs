@@ -208,7 +208,8 @@ namespace Needle.Samples
     {
         public const int ToolCount = 4;
 
-        public static System.ReadOnlySpan<byte> Schema => "[{\"name\":\"move_to\",\"description\":\"Move the selected unit to a map position.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"number\"},\"y\":{\"type\":\"number\"}},\"required\":[\"x\",\"y\"]}},{\"name\":\"attack\",\"description\":\"Attack a target entity.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"target_id\":{\"type\":\"integer\"}},\"required\":[\"target_id\"]}},{\"name\":\"give_item\",\"description\":\"Give items to a party member.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"item\":{\"type\":\"string\",\"enum\":[\"potion\",\"sword\",\"shield\",\"arrow\",\"gold\"]},\"count\":{\"type\":\"integer\"}},\"required\":[\"item\",\"count\"]}},{\"name\":\"set_formation\",\"description\":\"Change the squad formation.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"formation\":{\"type\":\"string\",\"enum\":[\"line\",\"wedge\",\"circle\",\"column\"]}}}}]"u8;
+        static readonly byte[] SchemaBytes = System.Text.Encoding.UTF8.GetBytes("[{\"name\":\"move_to\",\"description\":\"Move the selected unit to a map position.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"number\"},\"y\":{\"type\":\"number\"}},\"required\":[\"x\",\"y\"]}},{\"name\":\"attack\",\"description\":\"Attack a target entity.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"target_id\":{\"type\":\"integer\"}},\"required\":[\"target_id\"]}},{\"name\":\"give_item\",\"description\":\"Give items to a party member.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"item\":{\"type\":\"string\",\"enum\":[\"potion\",\"sword\",\"shield\",\"arrow\",\"gold\"]},\"count\":{\"type\":\"integer\"}},\"required\":[\"item\",\"count\"]}},{\"name\":\"set_formation\",\"description\":\"Change the squad formation.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"formation\":{\"type\":\"string\",\"enum\":[\"line\",\"wedge\",\"circle\",\"column\"]}}}}]");
+        public static System.ReadOnlySpan<byte> Schema => SchemaBytes;
 
         static readonly int[] NodeTable = new int[] { 0, 0, 0, 0, 0, 0, 0, 0, 1, -1, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0, -1, 0, 0, 0, 0, 7, 0, 0, 0, 1, 0, 0, 0, 11, 0, 0, 0, 0, 0, 0, 0, 10, 4, 0, 0, 0, 0, 0, 0, 7, 2, 0, 3, 0, 0, 0, 0, 7, 1, 2, 1, 0, 0, 0, 0, 8, 5, 0, 0, 0, 0, 0, 0, 7, 2, 3, 3, 0, 0, 0, 0, 8, 4, 5, 0, 0, 0, 0, 0, 7, 1, 5, 0, 0, 0, 0, 0 };
         static readonly int[] PropertyTable = new int[] { 0, 1, 3, 0, 1, 1, 3, 0, 2, 9, 2, 0, 47, 4, 12, 0, 51, 5, 2, 0, 85, 9, 14, 0 };
@@ -372,18 +373,6 @@ namespace Needle.Samples
             }
         }
 
-    }
-    public readonly struct NpcToolSet : global::Needle.Tools.IToolSet
-    {
-        public static System.ReadOnlySpan<byte> Schema => NpcCommands.Schema;
-        public static System.ReadOnlySpan<int> GrammarNodes => NpcCommands.GrammarNodes;
-        public static System.ReadOnlySpan<int> GrammarProperties => NpcCommands.GrammarProperties;
-        public static System.ReadOnlySpan<int> GrammarLiterals => NpcCommands.GrammarLiterals;
-        public static System.ReadOnlySpan<int> GrammarUnions => NpcCommands.GrammarUnions;
-        public static System.ReadOnlySpan<int> GrammarTools => NpcCommands.GrammarTools;
-        public static System.ReadOnlySpan<byte> GrammarBytes => NpcCommands.GrammarBytes;
-        public static int GrammarRoot => NpcCommands.GrammarRoot;
-        public static int GrammarToolCount => NpcCommands.GrammarToolCount;
     }
 
 }

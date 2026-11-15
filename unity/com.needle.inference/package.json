@@ -12,6 +12,11 @@
   },
   "samples": [
     {
+      "displayName": "Playground (3D Arena + HUD)",
+      "description": "Interactive 3D URP arena showcasing Needle 3 tool calling (typed Squad Sink, Smart Camp, Assistant) and Whistle speech-to-text with live telemetry.",
+      "path": "Samples~/Playground"
+    },
+    {
       "displayName": "Squad commander (MonoBehaviour)",
       "description": "Free-form orders for a squad from a text box or voice transcript. Allocation-free on the main thread, no ECS needed.",
       "path": "Samples~/SquadCommander"

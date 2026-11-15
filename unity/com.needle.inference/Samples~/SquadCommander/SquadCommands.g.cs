@@ -303,7 +303,8 @@ namespace Needle.Samples.SquadCommander
     {
         public const int ToolCount = 6;
 
-        public static System.ReadOnlySpan<byte> Schema => "[{\"name\":\"move_to\",\"description\":\"Move the selected unit to a map position.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"number\",\"description\":\"Map x coordinate\"},\"y\":{\"type\":\"number\",\"description\":\"Map y coordinate\"}},\"required\":[\"x\",\"y\"]}},{\"name\":\"attack\",\"description\":\"Attack a target.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"target\":{\"type\":\"string\",\"description\":\"Name of the enemy or building\",\"maxLength\":64}},\"required\":[\"target\"]}},{\"name\":\"give_item\",\"description\":\"Give items to a party member.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"item\":{\"type\":\"string\",\"enum\":[\"potion\",\"sword\",\"shield\",\"arrow\",\"gold\"]},\"count\":{\"type\":\"integer\",\"description\":\"How many\"},\"to\":{\"type\":\"string\",\"description\":\"Party member name\",\"maxLength\":32}},\"required\":[\"item\",\"count\",\"to\"]}},{\"name\":\"set_formation\",\"description\":\"Change the squad formation.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"formation\":{\"type\":\"string\",\"enum\":[\"line\",\"wedge\",\"circle\",\"column\"]}}}},{\"name\":\"follow\",\"description\":\"Follow a character.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"target\":{\"type\":\"string\",\"description\":\"Who to follow\",\"maxLength\":32}},\"required\":[\"target\"]}},{\"name\":\"stop\",\"description\":\"Stop all current actions.\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}]"u8;
+        static readonly byte[] SchemaBytes = System.Text.Encoding.UTF8.GetBytes("[{\"name\":\"move_to\",\"description\":\"Move the selected unit to a map position.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"number\",\"description\":\"Map x coordinate\"},\"y\":{\"type\":\"number\",\"description\":\"Map y coordinate\"}},\"required\":[\"x\",\"y\"]}},{\"name\":\"attack\",\"description\":\"Attack a target.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"target\":{\"type\":\"string\",\"description\":\"Name of the enemy or building\",\"maxLength\":64}},\"required\":[\"target\"]}},{\"name\":\"give_item\",\"description\":\"Give items to a party member.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"item\":{\"type\":\"string\",\"enum\":[\"potion\",\"sword\",\"shield\",\"arrow\",\"gold\"]},\"count\":{\"type\":\"integer\",\"description\":\"How many\"},\"to\":{\"type\":\"string\",\"description\":\"Party member name\",\"maxLength\":32}},\"required\":[\"item\",\"count\",\"to\"]}},{\"name\":\"set_formation\",\"description\":\"Change the squad formation.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"formation\":{\"type\":\"string\",\"enum\":[\"line\",\"wedge\",\"circle\",\"column\"]}}}},{\"name\":\"follow\",\"description\":\"Follow a character.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"target\":{\"type\":\"string\",\"description\":\"Who to follow\",\"maxLength\":32}},\"required\":[\"target\"]}},{\"name\":\"stop\",\"description\":\"Stop all current actions.\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}]");
+        public static System.ReadOnlySpan<byte> Schema => SchemaBytes;
 
         static readonly int[] NodeTable = new int[] { 0, 0, 0, 0, 0, 0, 0, 0, 1, -1, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0, -1, 0, 0, 0, 0, 7, 0, 0, 0, 1, 0, 0, 0, 11, 0, 0, 0, 0, 0, 0, 0, 10, 6, 0, 0, 0, 0, 0, 0, 7, 2, 0, 3, 0, 0, 0, 0, 1, 64, 0, 0, 0, 0, 0, 0, 7, 1, 2, 1, 0, 0, 0, 0, 8, 5, 0, 0, 0, 0, 0, 0, 1, 32, 0, 0, 0, 0, 0, 0, 7, 3, 3, 7, 0, 0, 0, 0, 8, 4, 5, 0, 0, 0, 0, 0, 7, 1, 6, 0, 0, 0, 0, 0, 1, 32, 0, 0, 0, 0, 0, 0, 7, 1, 7, 1, 0, 0, 0, 0, 7, 0, 8, 0, 0, 0, 0, 0 };
         static readonly int[] PropertyTable = new int[] { 0, 1, 3, 0, 1, 1, 3, 0, 2, 6, 11, 0, 44, 4, 13, 0, 48, 5, 2, 0, 53, 2, 14, 0, 84, 9, 16, 0, 93, 6, 18, 0 };
@@ -505,18 +506,6 @@ namespace Needle.Samples.SquadCommander
             }
         }
 
-    }
-    public readonly struct SquadToolSet : global::Needle.Tools.IToolSet
-    {
-        public static System.ReadOnlySpan<byte> Schema => SquadCommands.Schema;
-        public static System.ReadOnlySpan<int> GrammarNodes => SquadCommands.GrammarNodes;
-        public static System.ReadOnlySpan<int> GrammarProperties => SquadCommands.GrammarProperties;
-        public static System.ReadOnlySpan<int> GrammarLiterals => SquadCommands.GrammarLiterals;
-        public static System.ReadOnlySpan<int> GrammarUnions => SquadCommands.GrammarUnions;
-        public static System.ReadOnlySpan<int> GrammarTools => SquadCommands.GrammarTools;
-        public static System.ReadOnlySpan<byte> GrammarBytes => SquadCommands.GrammarBytes;
-        public static int GrammarRoot => SquadCommands.GrammarRoot;
-        public static int GrammarToolCount => SquadCommands.GrammarToolCount;
     }
 
 }

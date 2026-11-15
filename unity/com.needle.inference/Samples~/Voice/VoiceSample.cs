@@ -34,10 +34,20 @@ namespace Needle.Samples
             int cores = System.Math.Max(1, System.Environment.ProcessorCount);
             return System.Math.Max(1, System.Math.Min(4, cores / 2));
         }
+        public bool TriggerClip()
+        {
+            if (whistle == null || clip == null) return false;
+            talk.Hold();
+            head = 0;
+            held = true;
+            return true;
+        }
         void Update()
         {
             if (whistle == null) return;
-            if (Input.GetKeyDown(KeyCode.V)) { talk.Hold(); head = 0; held = true; }
+#if ENABLE_LEGACY_INPUT_MANAGER
+            if (Input.GetKeyDown(KeyCode.V)) TriggerClip();
+#endif
             if (held)
             {
                 var rooms = new System.Span<float>(clip, head, System.Math.Min(1600, clip.Length - head));
@@ -45,6 +55,12 @@ namespace Needle.Samples
                 head += rooms.Length;
                 if (!held) Release();
             }
+        }
+        void OnGUI()
+        {
+            if (whistle == null) return;
+            if (GUI.Button(new Rect(16f, 16f, 220f, 34f), "Run Voice Sample (" + ClipFile + ")"))
+                TriggerClip();
         }
         void Release()
         {
