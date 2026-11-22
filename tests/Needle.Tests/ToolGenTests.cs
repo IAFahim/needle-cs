@@ -37,6 +37,23 @@ public partial interface IDeviceCommands
     [Tool("Calibrate the sensor.")] void Calibrate(double gain);
 }
 
+// No text arguments: the generated sink must not carry text scratch state (issue: unused fields
+// and an empty switch broke builds with warnings as errors).
+[NeedleTools]
+public partial interface ICounterCommands
+{
+    [Tool("Add to the counter.")] void Add([Param("How much")] int amount);
+    [Tool("Reset the counter.")] void Reset();
+}
+
+// No arguments at all.
+[NeedleTools]
+public partial interface IPingCommands
+{
+    [Tool("Ping the host.")] void Ping();
+    [Tool("Stop the host.")] void Stop();
+}
+
 public sealed unsafe class ToolGenTests
 {
     const string NpcToolsJson = """
@@ -220,6 +237,21 @@ public sealed unsafe class ToolGenTests
 
         Assert.False(NpcCommands.TryBind(new FunctionCall("nope", "{}"), out _));
         Assert.False(GameCommands.TryBind(new FunctionCall("nope", "{}"), out _));
+    }
+
+    [Fact]
+    public void ToolSetsWithoutTextOrWithoutArgumentsBind()
+    {
+        Assert.Equal(2, CounterCommands.ToolCount);
+        Assert.True(CounterCommands.TryBind(new FunctionCall("add", "{\"amount\":7}"), out var add));
+        Assert.Equal(7, add.Add.Amount);
+        Assert.True(CounterCommands.TryBind(new FunctionCall("reset", "{}"), out var reset));
+        Assert.Equal(CounterCommandKind.Reset, reset.Kind);
+
+        Assert.Equal(2, PingCommands.ToolCount);
+        Assert.True(PingCommands.TryBind(new FunctionCall("stop", "{}"), out var stop));
+        Assert.Equal(PingCommandKind.Stop, stop.Kind);
+        Assert.False(PingCommands.TryBind(new FunctionCall("add", "{}"), out _));
     }
 
     [Fact]

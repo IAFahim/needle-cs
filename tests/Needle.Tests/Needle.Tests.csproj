@@ -3,6 +3,8 @@
     <TargetFramework>net10.0</TargetFramework>
     <IsPackable>false</IsPackable>
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <!-- Generated tool sinks must stay warning-free for hosts that build with warnings as errors. -->
+    <WarningsAsErrors>$(WarningsAsErrors);CS0414;CS1522;CS0169;CS0649</WarningsAsErrors>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
