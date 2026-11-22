@@ -63,6 +63,7 @@ public sealed class NativeParityTests : IDisposable
         ("give Lyra 3 potions", ""),
         ("give Lyra 3 potions", FixedDate),
         ("attack the watchtower near the river", ""),
+        ("attack the watchtower near the river", FixedDate),
     };
 
     [Fact]
@@ -131,16 +132,20 @@ public sealed class NativeParityTests : IDisposable
             Assert.All(managed, name => Assert.Contains(name, GiveOrSay));
             Assert.Equal(managed[0], managed[1]);
         }
-        native!.Init("", tools);
-        var watchtower = native.Complete("attack the watchtower near the river", MaxNewTokens);
-        output.WriteLine($"native watchtower -> {watchtower.CallNames}");
-        Assert.Contains(watchtower.CallNames, AttackOrRefusal);
-        foreach (var threads in new[] { 4, 1 })
+        foreach (var system in new[] { "", FixedDate })
         {
-            using var session = Fresh(tools, "", threads, 64);
-            var reply = session.Complete("attack the watchtower near the river");
-            Assert.Contains(reply.CallNames(), AttackOrRefusal);
-            if (reply.CallNames() == "") Assert.Equal("attack", reply.SuppressedCalls.CallNames());
+            native!.Init(system, tools);
+            var watchtower = native.Complete("attack the watchtower near the river", MaxNewTokens);
+            output.WriteLine($"native watchtower [{system}] -> {watchtower.CallNames} at {watchtower.Confidence}");
+            Assert.Contains(watchtower.CallNames, AttackOrRefusal);
+            foreach (var threads in new[] { 4, 1 })
+            {
+                using var session = Fresh(tools, system, threads, 64);
+                var reply = session.Complete("attack the watchtower near the river");
+                output.WriteLine($"managed watchtower [{system}] t={threads} -> {reply.CallNames()} at {reply.Confidence}");
+                Assert.Contains(reply.CallNames(), AttackOrRefusal);
+                if (reply.CallNames() == "") Assert.Equal("attack", reply.SuppressedCalls.CallNames());
+            }
         }
     }
 
