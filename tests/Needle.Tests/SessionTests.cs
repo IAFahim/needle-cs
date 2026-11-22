@@ -121,6 +121,18 @@ public sealed class SessionTests : IDisposable
     }
 
     [Fact]
+    public void ACatalogToolLongerThanTheEmbedderWindowIsIndexedByItsHead()
+    {
+        var shades = string.Join(",", Enumerable.Range(0, 150).Select(i => $"\"shade_{i}\""));
+        var paint = $"{{\"name\":\"paint_wall\",\"description\":\"paint the wall in a color.\",\"parameters\":{{\"type\":\"object\",\"properties\":{{\"color\":{{\"type\":\"string\",\"description\":\"The color\",\"enum\":[{shades}]}}}},\"required\":[\"color\"]}}}}";
+        var tools = SessionCases.Catalog()[..^1] + "," + paint + "]";
+        using var session = Create(tools, new NeedleOptions { Threads = 4, RetrievalTopK = 5 });
+        Assert.Equal("set_alarm", Assert.Single(session.Complete("set an alarm for seven in the morning").FunctionCalls).Name);
+        session.Reset();
+        Assert.Equal("paint_wall", Assert.Single(session.Complete("paint the wall in shade_12").FunctionCalls).Name);
+    }
+
+    [Fact]
     public void EmbeddingsAreUnitVectors()
     {
         using var session = Create();

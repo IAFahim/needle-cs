@@ -1134,7 +1134,14 @@ public sealed unsafe partial class NeedleSession : IDisposable
     {
         EnsureEmbedder();
         for (var t = 0; t < allTools.Tools.Count; t++)
-            Embed(allTools.Tools[t].ToString()).CopyTo(toolEmbeddings, t * embeddingWidth);
+        {
+            var text = Encoding.UTF8.GetBytes(allTools.Tools[t].ToString());
+            var ids = new int[text.Length * 3 + 9];
+            ids[0] = tokenizer.BeginId;
+            var count = 1 + tokenizer.Encode(text, ids.AsSpan(1), true);
+            EmbedTokens(new ReadOnlySpan<int>(ids, 0, Math.Min(count, embedderCapacity)));
+            new ReadOnlySpan<float>(pooled, embeddingWidth).CopyTo(new Span<float>(toolEmbeddings, t * embeddingWidth, embeddingWidth));
+        }
     }
 
     FailureReason SelectTools(ReadOnlySpan<byte> query)
