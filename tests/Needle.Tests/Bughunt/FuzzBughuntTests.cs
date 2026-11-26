@@ -283,6 +283,41 @@ public sealed class FuzzBughuntTests
         Assert.Equal(set.Render(), JsonValue.Parse(set.Render()).ToString());
     }
 
+    static void AssertRequiredNamesItsOwnProperties(JsonValue schema)
+    {
+        if (schema.Kind == JsonKind.Array) foreach (var item in schema.Items) AssertRequiredNamesItsOwnProperties(item);
+        if (schema.Kind != JsonKind.Object) return;
+        if (schema.Get("required") is { Kind: JsonKind.Array } required && schema.Get("properties") is { Kind: JsonKind.Object } properties)
+            foreach (var name in required.Items) Assert.Contains(name.Text, properties.Members.ConvertAll(m => m.Key));
+        foreach (var member in schema.Members) AssertRequiredNamesItsOwnProperties(member.Value);
+    }
+
+    [Theory]
+    [InlineData("{\"name\":\"t\",\"parameters\":{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"string\"}},\"required\":[\"a\"]}},\"required\":[\"a\"]}}")]
+    [InlineData("{\"name\":\"t\",\"parameters\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"pet\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"age\":{\"type\":\"integer\"}},\"required\":[\"name\",\"age\"]}},\"required\":[\"name\",\"pet\"]}}")]
+    [InlineData("{\"name\":\"t\",\"parameters\":{\"type\":\"object\",\"required\":[\"userName\"],\"properties\":{\"user_name\":{\"type\":\"string\"},\"userName\":{\"type\":\"string\"}}}}")]
+    public void RenderedRequiredListsNameTheirOwnRenamedProperties(string tool)
+    {
+        var set = new ToolSet(tool);
+        foreach (var rendered in set.Tools) AssertRequiredNamesItsOwnProperties(rendered);
+        var original = JsonValue.Parse(tool).Get("parameters")!.Get("required")!.Items.ConvertAll(r => r.Text);
+        var renamed = set.Tools[0].Get("parameters")!.Get("required")!.Items.ConvertAll(r => set.OriginalProperty("t", r.Text));
+        Assert.Equal(original, renamed);
+    }
+
+    [Fact]
+    public void NestedPropertyKeepsItsOwnOriginalNameWhenAnOuterOneSnakeCasesOntoIt()
+    {
+        var set = new ToolSet("{\"name\":\"t\",\"parameters\":{\"type\":\"object\",\"properties\":{\"info\":{\"type\":\"object\",\"properties\":{\"user_name\":{\"type\":\"string\"}}},\"userName\":{\"type\":\"string\"}}}}");
+        var properties = set.Tools[0].Get("parameters")!.Get("properties")!;
+        var nested = properties.Get("info")!.Get("properties")!.Members[0].Key;
+        var outer = properties.Members[1].Key;
+        var generated = Encoding.UTF8.GetBytes($"[{{\"name\":\"t\",\"arguments\":{{\"info\":{{\"{nested}\":\"x\"}},\"{outer}\":\"y\"}}}}]");
+        var destination = new byte[512];
+        Assert.True(CallRestorer.TryRestore(set.Aliases, generated, destination, new byte[64], new CallSpan[4], out var length, out _));
+        Assert.Equal("[{\"name\":\"t\",\"arguments\":{\"info\":{\"user_name\":\"x\"},\"userName\":\"y\"}}]", Encoding.UTF8.GetString(destination, 0, length));
+    }
+
     static string Fuzz<T>(int seed, int cases, TimeSpan cap, Func<Random, T> generate, Action<T> run, Type allowed)
     {
         var random = new Random(seed);
