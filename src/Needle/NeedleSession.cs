@@ -184,6 +184,7 @@ public sealed unsafe partial class NeedleSession : IDisposable
     int callTextLength;
     int restoredCallCount;
     int cancelRequested;
+    int disposed;
     Engine? embedder;
     ToolSet active;
     Grammar grammar;
@@ -1201,6 +1202,7 @@ public sealed unsafe partial class NeedleSession : IDisposable
 
     public void Dispose()
     {
+        if (System.Threading.Interlocked.Exchange(ref disposed, 1) != 0) return;
         engine.Dispose();
         embedder?.Dispose();
         tokenizer.Dispose();

@@ -69,6 +69,7 @@ public sealed class InferenceThread : IDisposable
 public sealed class NeedleService : IDisposable
 {
     readonly InferenceThread thread = new();
+    int disposed;
     Model? model;
     NeedleSession? session;
 
@@ -87,18 +88,23 @@ public sealed class NeedleService : IDisposable
 
     public void Dispose()
     {
-        thread.Run(() =>
+        if (Interlocked.Exchange(ref disposed, 1) != 0) return;
+        try
         {
-            session?.Dispose();
-            model?.Dispose();
-        }).Wait();
-        thread.Dispose();
+            thread.Run(() =>
+            {
+                session?.Dispose();
+                model?.Dispose();
+            }).Wait();
+        }
+        finally { thread.Dispose(); }
     }
 }
 
 public sealed class SpeechService : IDisposable
 {
     readonly InferenceThread thread = new();
+    int disposed;
     Model? model;
     Whistle? whistle;
 
@@ -114,11 +120,15 @@ public sealed class SpeechService : IDisposable
 
     public void Dispose()
     {
-        thread.Run(() =>
+        if (Interlocked.Exchange(ref disposed, 1) != 0) return;
+        try
         {
-            whistle?.Dispose();
-            model?.Dispose();
-        }).Wait();
-        thread.Dispose();
+            thread.Run(() =>
+            {
+                whistle?.Dispose();
+                model?.Dispose();
+            }).Wait();
+        }
+        finally { thread.Dispose(); }
     }
 }

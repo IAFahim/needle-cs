@@ -101,6 +101,7 @@ public sealed unsafe class BatchedSession : IDisposable
     readonly int embeddingWidth;
     readonly Lane[] lanes;
     int laneCount;
+    int disposed;
     internal long TurnGate;
 
     public BatchedSession(Model model, NeedleOptions? options = null, int maxSequences = 8)
@@ -727,6 +728,7 @@ public sealed unsafe class BatchedSession : IDisposable
 
     public void Dispose()
     {
+        if (System.Threading.Interlocked.Exchange(ref disposed, 1) != 0) return;
         for (var i = 0; i < laneCount; i++)
         {
             lanes[i].Grammar.Dispose();
