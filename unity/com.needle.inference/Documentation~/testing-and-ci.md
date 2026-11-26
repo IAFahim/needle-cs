@@ -76,7 +76,15 @@ python3 tools/unity-bench-compare.py --native out/unity/bench-native.json \
 
 The native library runs with its own default thread count; the Unity runs use `NEEDLE_THREADS`.
 Compare runs from one machine only, and only while nothing else runs on it: another Unity or
-GitHub runner job on the same PC skews a bench by tens of percent.
+GitHub runner job on the same PC skews a bench by tens of percent, and the native library, which
+spins its own worker threads, far more. CI therefore benches the native library first, on the idle
+machine, and again after the Unity runs (`native-after` in the table); when the two disagree, the
+machine was busy and the speedups are not trustworthy. The CPU load and the busiest processes are
+printed before each bench.
+
+The `simd` field of a report names the tier of the kernels that ran and their provider. In the
+Editor and a CoreCLR player that is the `net10.0` sidecar; an IL2CPP player has no sidecar and runs
+the Burst or `netstandard2.1` kernels.
 
 ## The CI workflow
 
@@ -86,7 +94,8 @@ GitHub runner job on the same PC skews a bench by tens of percent.
   `tools/pack-unity.sh --check`. It needs no Unity and runs for every pull request, forks included.
 - **Unity Editor, players and bench** on a self-hosted runner with the labels `self-hosted`,
   `Linux`, `X64` and `unity`: fetch, lint, fresh install, EditMode, PlayMode, the Editor bench, the
-  IL2CPP and CoreCLR player benches, the native bench, and a comparison table in the run summary.
+  IL2CPP and CoreCLR player benches, the native bench before and after them, and a comparison
+  table in the run summary. A failed player build prints the errors from its build log.
   Logs, NUnit XML and bench JSON are uploaded as the `unity-<run>` artifact. It skips pull requests
   from forks, runs one at a time, and is never cancelled halfway.
 
@@ -110,8 +119,10 @@ On a Linux x64 PC with Unity:
 3. **Unity.** `7000.0.0a16` (the demo's version), or the newest Unity 7 editor already on the PC,
    with Linux Build Support (IL2CPP) for the IL2CPP player
    (`unity install-modules --editor-version <version> --module linux-il2cpp --accept-eula --yes`
-   adds it). The CoreCLR player needs nothing extra. On Arch Linux the IL2CPP build also needs the
-   `libncurses`/`libxml2` shims in `il2cpp-players.md`.
+   adds it; `tools/unity-ci.sh player il2cpp` stops with that command when the module is
+   missing). The CoreCLR player needs nothing extra. On Arch Linux (Omarchy included) the IL2CPP
+   build also needs the `libncurses`/`libxml2` shims in `il2cpp-players.md`, and needs them again
+   whenever Unity downloads a fresh copy of its IL2CPP toolchain.
 4. **License.** Sign in to Unity Hub once as the runner's user and activate a license; batch runs
    reuse it. Only to activate from the workflow instead, add the repository secrets `UNITY_SERIAL`,
    `UNITY_EMAIL` and `UNITY_PASSWORD`.

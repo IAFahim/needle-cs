@@ -110,6 +110,19 @@ jobs:
           ln -sfn "$NEEDLE_REF_CACHE" ref
           NEEDLE_REF_DIR="$NEEDLE_REF_CACHE" bash tools/fetch.sh
 
+      # The native library spins its own worker threads and slows down sharply when anything else
+      # uses the CPU, so it runs first, on the idle machine, and once more after the Unity runs to
+      # show how much the machine drifted. The CPU load and the busiest processes are printed
+      # before each bench so a skewed number can be explained.
+      - name: Bench the native library on the idle machine
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: |
+          mkdir -p out/unity
+          uptime; ps -eo pcpu,comm --sort=-pcpu | head -n 6
+          python3 tools/native_bench.py ref/hf/wheel ref/hf/needle3.cact tools/tools.json \
+            --sets all --reps "$NEEDLE_REPS" --warmup "$NEEDLE_WARMUPS" --json > out/unity/bench-native.json
+
       - name: Package checks
         if: ${{ !cancelled() }}
         run: tools/unity-ci.sh lint
@@ -128,7 +141,9 @@ jobs:
 
       - name: Bench in the Editor (CoreCLR)
         if: ${{ !cancelled() }}
-        run: tools/unity-ci.sh bench-editmode
+        run: |
+          uptime; ps -eo pcpu,comm --sort=-pcpu | head -n 6
+          tools/unity-ci.sh bench-editmode
 
       - name: Bench an IL2CPP player
         if: ${{ !cancelled() && (github.event_name != 'workflow_dispatch' || inputs.players) }}
@@ -138,12 +153,13 @@ jobs:
         if: ${{ !cancelled() && (github.event_name != 'workflow_dispatch' || inputs.players) }}
         run: tools/unity-ci.sh player coreclr
 
-      - name: Bench the native library on the same machine
+      - name: Bench the native library again after the Unity runs
         if: ${{ !cancelled() }}
         continue-on-error: true
         run: |
+          uptime; ps -eo pcpu,comm --sort=-pcpu | head -n 6
           python3 tools/native_bench.py ref/hf/wheel ref/hf/needle3.cact tools/tools.json \
-            --sets all --reps "$NEEDLE_REPS" --warmup "$NEEDLE_WARMUPS" --json > out/unity/bench-native.json
+            --sets all --reps "$NEEDLE_REPS" --warmup "$NEEDLE_WARMUPS" --json > out/unity/bench-native-after.json
 
       - name: Compare the benches
         if: ${{ !cancelled() }}
@@ -151,7 +167,8 @@ jobs:
           python3 tools/unity-bench-compare.py --native out/unity/bench-native.json \
             editor=out/unity/bench-editmode.json \
             il2cpp=out/unity/bench-player-il2cpp.json \
-            coreclr=out/unity/bench-player-coreclr.json | tee -a "$GITHUB_STEP_SUMMARY"
+            coreclr=out/unity/bench-player-coreclr.json \
+            native-after=out/unity/bench-native-after.json | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Upload logs, test results and bench JSON
         if: ${{ always() }}

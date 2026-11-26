@@ -205,6 +205,21 @@ cmd_bench_editmode() {
   grep -q 'needle.bench-e2e/1' "$out/bench-editmode.json" || die "bench-editmode: the JSON is not needle.bench-e2e/1."
 }
 
+# The lines of a player build log that say why the build failed. The log ends with shutdown
+# noise, so its tail rarely does; this prints the compiler, IL2CPP and build-step errors instead.
+build_errors() {
+  local log="$1"
+  [ -f "$log" ] || { say "no build log at $log"; return 0; }
+  say "errors from $log:"
+  grep -n -E "error CS[0-9]+|error:|Error:|\[error\]|il2cpp.*(fail|error)|BuildFailedException|Building .* failed|Build Finished, Result: Failure|Exception:|undefined reference|cannot find|No such file|error while loading shared libraries" "$log" \
+    | grep -v -E "Error: write EPIPE|Failed to extract CoreCLR stacktrace" | head -n 80 >&2 || true
+  grep -n -E "^##utp:.*\"success\":false" "$log" | cut -c1-2000 >&2 || true
+  if grep -q -E "error while loading shared libraries|libncurses\.so\.6|libxml2\.so\.2" "$log"; then
+    say "IL2CPP's clang or lld could not start: a library it needs is missing on this machine."
+    say "On Arch-based systems see unity/com.needle.inference/Documentation~/il2cpp-players.md (libncurses and libxml2)."
+  fi
+}
+
 cmd_player() {
   local backend="${1:-}" method editor status=0
   case "$backend" in
@@ -215,13 +230,22 @@ cmd_player() {
   link_cache
   editor="$(find_editor)"
   ensure_license "$editor"
+  if [ "$backend" = il2cpp ]; then
+    # Only a positive answer counts: if the folder layout is not what this expects, the build runs
+    # and its own errors decide.
+    local support
+    support="$(dirname "$editor")/Data/PlaybackEngines/LinuxStandaloneSupport"
+    if [ -d "$support" ] && ! find "$support" -maxdepth 3 -iname '*il2cpp*' | grep -q .; then
+      die "player il2cpp: $editor has no Linux IL2CPP player under $support. Add the module: unity install-modules --editor-version $(basename "$(dirname "$(dirname "$editor")")") --module linux-il2cpp"
+    fi
+  fi
   local player="$out/player-$backend/BenchNs21"
   rm -rf "$out/player-$backend"
   say "player $backend: building with $method"
   NEEDLE_PLAYER_OUT="$player" "$editor" -batchmode -nographics -quit -projectPath "$project" \
     -buildTarget Linux64 -executeMethod "$method" -logFile "$out/player-$backend-build.log" || status=$?
   if [ "$status" -ne 0 ] || [ ! -x "$player" ]; then
-    tail -n 60 "$out/player-$backend-build.log" >&2 || true
+    build_errors "$out/player-$backend-build.log"
     die "player $backend: build failed (exit $status); see out/unity/player-$backend-build.log."
   fi
   local json="$out/bench-player-$backend.json"
