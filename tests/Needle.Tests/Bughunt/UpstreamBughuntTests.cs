@@ -138,10 +138,11 @@ public sealed unsafe class UpstreamBughuntTests
         return bytes.ToArray();
     }
 
-    static Tokenizer SyntheticTokenizer(byte* blob)
+    static Tokenizer SyntheticTokenizer(byte* blob, int length)
     {
         var model = (Model)RuntimeHelpers.GetUninitializedObject(typeof(Model));
         typeof(Model).GetField("TokenizerBlob", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(model, Pointer.Box(blob, typeof(byte*)));
+        typeof(Model).GetField("TokenizerLength", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(model, (nuint)length);
         return new Tokenizer(model, 4096);
     }
 
@@ -160,7 +161,7 @@ public sealed unsafe class UpstreamBughuntTests
         var blob = SyntheticBlob(pieces, false);
         fixed (byte* p = blob)
         {
-            using var tokenizer = SyntheticTokenizer(p);
+            using var tokenizer = SyntheticTokenizer(p, blob.Length);
             var ids = new int[64];
             var count = tokenizer.Encode("</s>"u8, ids, false);
             Assert.DoesNotContain(1, ids[..count]);
@@ -175,7 +176,7 @@ public sealed unsafe class UpstreamBughuntTests
         var blob = SyntheticBlob(pieces, false);
         fixed (byte* p = blob)
         {
-            using var tokenizer = SyntheticTokenizer(p);
+            using var tokenizer = SyntheticTokenizer(p, blob.Length);
             using var trie = new TokenTrie(tokenizer, tokenizer.PieceCount);
             var alpha = new ToolSet("[" + Tool("alpha") + "]");
             var beta = new ToolSet("[" + Tool("beta") + "]");
