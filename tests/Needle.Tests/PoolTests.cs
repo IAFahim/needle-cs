@@ -348,7 +348,7 @@ public sealed unsafe class TeamBarrierTests
         {
             for (var i = 0; i < members * Phases; i++) seen[i] = 0;
             var context = new TeamContext { Seen = seen, Barrier = barrier, Members = members };
-            pool.RunTeam(&WriteSlots, &context, barrier);
+            pool.RunTeam(&WriteSlots, &context, barrier, members);
             for (var i = 0; i < members * Phases; i++) Assert.True(seen[i] == (i % Phases) + 1, $"round {round} slot {i}");
         }
     }
@@ -364,7 +364,7 @@ public sealed unsafe class TeamBarrierTests
         {
             for (var i = 0; i < members; i++) counts[i] = 0;
             var context = new TeamContext { Seen = counts, Barrier = barrier, Members = members };
-            pool.RunTeam(&CountMember, &context, barrier);
+            pool.RunTeam(&CountMember, &context, barrier, members);
             for (var i = 0; i < members; i++) Assert.True(counts[i] == 1, $"round {round} member {i} ran {counts[i]} times");
         }
     }
@@ -380,23 +380,24 @@ public sealed unsafe class TeamBarrierTests
         {
             for (var i = 0; i < members * Phases; i++) seen[i] = 0;
             var context = new TeamContext { Seen = seen, Barrier = barrier, Members = members };
-            pool.RunTeam(&WriteSlots, &context, barrier);
+            pool.RunTeam(&WriteSlots, &context, barrier, members);
             for (var i = 0; i < members * Phases; i++) Assert.True(seen[i] == (i % Phases) + 1, $"round {round} slot {i}");
         }
     }
 
     [Fact]
-    public void PausedTeamRunsEveryMemberOnTheCaller()
+    public void PausedTeamRunsAsOneMemberOnTheCaller()
     {
         using var pool = new Pool(4);
         pool.Pause();
         var members = pool.Members;
+        Assert.Equal(1, pool.TeamSize);
         var ids = stackalloc int[members];
         for (var i = 0; i < members; i++) ids[i] = 0;
         var barrier = stackalloc TeamBarrier[1];
-        pool.RunTeam(&RecordMember, ids, barrier);
-        var caller = Environment.CurrentManagedThreadId;
-        for (var i = 0; i < members; i++) Assert.Equal(caller, ids[i]);
+        pool.RunTeam(&RecordMember, ids, barrier, pool.TeamSize);
+        Assert.Equal(Environment.CurrentManagedThreadId, ids[0]);
+        for (var i = 1; i < members; i++) Assert.Equal(0, ids[i]);
         pool.Resume();
     }
 
@@ -407,7 +408,7 @@ public sealed unsafe class TeamBarrierTests
         Assert.Equal(1, pool.Members);
         var ran = 0;
         var barrier = stackalloc TeamBarrier[1];
-        pool.RunTeam(&RecordMember, &ran, barrier);
+        pool.RunTeam(&RecordMember, &ran, barrier, pool.Members);
         Assert.Equal(Environment.CurrentManagedThreadId, ran);
     }
 }
