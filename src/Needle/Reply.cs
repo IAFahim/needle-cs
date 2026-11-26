@@ -3,7 +3,7 @@ using System.Diagnostics;
 
 namespace Needle;
 
-public enum ReplyStatus : byte { Called, Responded, Refused, Failed, Cancelled }
+public enum ReplyStatus : byte { Called, Responded, Refused, Failed, Cancelled, Declined }
 
 public enum FailureReason : byte
 {
@@ -27,6 +27,10 @@ public enum ReplyFlags : byte
     None = 0,
     ReasoningTruncated = 1,
     ResponseTruncated = 2,
+    Repaired = 4,
+    Negated = 8,
+    Invalid = 16,
+    Ungrounded = 32,
 }
 
 public readonly record struct Reply(

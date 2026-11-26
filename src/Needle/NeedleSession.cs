@@ -27,6 +27,8 @@ public sealed class NeedleOptions
 
     public bool Stateless { get; init; }
 
+    public bool Repair { get; init; } = true;
+
     internal ThreadPolicy ResolvedThreading => Threading ?? ThreadPolicy.Default.WithThreads(Threads);
 
     internal NeedleOptions WithStateless(bool stateless) => new()
@@ -44,10 +46,18 @@ public sealed class NeedleOptions
         JumpForward = JumpForward,
         PromptLookup = PromptLookup,
         Stateless = stateless,
+        Repair = Repair,
     };
 }
 
 public sealed record FunctionCall(string Name, string ArgumentsJson);
+
+public sealed record CallValidation(bool Repaired, bool Negated, bool Invalid, IReadOnlyList<string> Ungrounded)
+{
+    public static CallValidation Clean { get; } = new(false, false, false, Array.Empty<string>());
+
+    public bool IsClean => !Repaired && !Negated && !Invalid && Ungrounded.Count == 0;
+}
 
 public sealed class CallResult
 {
@@ -55,6 +65,7 @@ public sealed class CallResult
     public string? Error { get; init; }
     public IReadOnlyList<FunctionCall> FunctionCalls { get; init; } = Array.Empty<FunctionCall>();
     public IReadOnlyList<FunctionCall> SuppressedCalls { get; init; } = Array.Empty<FunctionCall>();
+    public CallValidation Validation { get; init; } = CallValidation.Clean;
     public string Reasoning { get; init; } = "";
     public string Response { get; init; } = "";
     public float? Confidence { get; init; }
@@ -76,6 +87,13 @@ public sealed class CallResult
         WriteCalls(b, FunctionCalls);
         b.Append(",\"suppressed_calls\":");
         WriteCalls(b, SuppressedCalls);
+        b.Append(",\"validation\":{\"ungrounded\":[");
+        for (var i = 0; i < Validation.Ungrounded.Count; i++)
+        {
+            if (i > 0) b.Append(',');
+            JsonValue.WriteString(b, Validation.Ungrounded[i]);
+        }
+        b.Append("],\"negation\":").Append(Validation.Negated ? "true" : "false").Append(",\"repaired\":").Append(Validation.Repaired ? "true" : "false").Append('}');
         b.Append(",\"reasoning\":");
         JsonValue.WriteString(b, Reasoning);
         b.Append(",\"response\":");
@@ -194,6 +212,14 @@ public sealed unsafe partial class NeedleSession : IDisposable
     int specPrimedLength;
     int[]? pendingClosing;
     bool pendingClosingCounted;
+    readonly byte[] restored;
+    int restoredLength;
+    readonly RepairPlan? repairPlan;
+    readonly RepairScratch? repairScratch;
+    readonly RepairText? repairRequest;
+    readonly RepairText? repairHistory;
+    readonly DateTime? repairToday;
+    RepairOutcome lastRepair;
 
     public NeedleSession(Model model, string toolsJson, NeedleOptions? options = null)
         : this(model, toolsJson, null, default, options)
@@ -241,6 +267,16 @@ public sealed unsafe partial class NeedleSession : IDisposable
         callText = new byte[Math.Max(1, this.options.MaxCallTokens) * MaxPieceBytes];
         callSpans = new CallSpan[Math.Max(1, this.options.MaxCallTokens)];
         keyScratch = new byte[Math.Max(MinKeyScratchBytes, allTools.Aliases.LongestPropertyAlias + 2)];
+        restored = new byte[callText.Length * 2 + 1024];
+        if (this.options.Repair)
+        {
+            repairPlan = new RepairPlan(allTools, toolsJson);
+            repairScratch = new RepairScratch(callSpans.Length, Math.Max(64, callSpans.Length * 4), restored.Length + repairPlan.LongestValue * 8);
+            repairRequest = new RepairText(maxInputBytes + 16);
+            repairHistory = new RepairText(Math.Max(16384, maxInputBytes * 4));
+            repairToday = ParseToday(system);
+            LoadHistory();
+        }
         retrieval = allTools.Tools.Count > this.options.RetrievalTopK && model.Confidence != null;
         toolEmbeddings = retrieval ? new float[allTools.Tools.Count * embeddingWidth] : Array.Empty<float>();
         toolScores = retrieval ? new float[allTools.Tools.Count] : Array.Empty<float>();
@@ -270,6 +306,29 @@ public sealed unsafe partial class NeedleSession : IDisposable
     public int MaxInputBytes => maxInputBytes;
 
     internal int LastCallPasses { get; private set; }
+
+    public ReadOnlySpan<byte> Ungrounded => repairScratch == null || (lastRepair & RepairOutcome.Ungrounded) == 0 ? default : new ReadOnlySpan<byte>(repairScratch.Ungrounded, 0, repairScratch.UngroundedLength);
+
+    static DateTime? ParseToday(string system)
+    {
+        var match = IsoStamp.Match(system);
+        return match.Success && DateTime.TryParseExact(match.Value, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var day) ? day : null;
+    }
+
+    void LoadHistory()
+    {
+        if (repairHistory == null) return;
+        repairHistory.Load(Encoding.UTF8.GetBytes(options.System ?? ""));
+        repairRequest!.Clear();
+    }
+
+    void TrackInput(ReadOnlySpan<byte> input, bool toolResult)
+    {
+        if (repairHistory == null) return;
+        if (options.Stateless && !toolResult) LoadHistory();
+        if (!toolResult) repairRequest!.Load(input);
+        repairHistory.Append(input);
+    }
 
     public void RequestCancel() => System.Threading.Volatile.Write(ref cancelRequested, 1);
 
@@ -324,6 +383,7 @@ public sealed unsafe partial class NeedleSession : IDisposable
 
     public void Reset()
     {
+        LoadHistory();
         engine.Rewind();
         turnOne = true;
         specHistoryLength = specPrimedLength;
@@ -441,6 +501,7 @@ public sealed unsafe partial class NeedleSession : IDisposable
         progress.PromptTokens = EncodePrompt(input, toolResult);
         if (engine.Length + progress.PromptTokens > contextCapacity) return Failed(FailureReason.ContextExhausted, progress);
         turnOne = false;
+        TrackInput(input, toolResult);
         engine.Feed(new ReadOnlySpan<int>(promptIds, 0, progress.PromptTokens));
         RecordSpecHistory(new ReadOnlySpan<int>(promptIds, 0, progress.PromptTokens));
         progress.PrefillTicks = Stopwatch.GetTimestamp() - progress.Started;
@@ -460,6 +521,7 @@ public sealed unsafe partial class NeedleSession : IDisposable
         progress.PromptTokens = EncodePrompt(input, toolResult);
         if (engine.Length + progress.PromptTokens > contextCapacity) return Failed(FailureReason.ContextExhausted, progress);
         turnOne = false;
+        TrackInput(input, toolResult);
         engine.Feed(new ReadOnlySpan<int>(promptIds, 0, progress.PromptTokens));
         RecordSpecHistory(new ReadOnlySpan<int>(promptIds, 0, progress.PromptTokens));
         progress.PrefillTicks = Stopwatch.GetTimestamp() - progress.Started;
@@ -674,13 +736,33 @@ public sealed unsafe partial class NeedleSession : IDisposable
         var head = HeadProbability();
         var decode = Math.Exp(logProbability / Math.Max(1, steps));
         var confidence = (float)Math.Min(head, decode);
-        if (!CallRestorer.TryRestore(allTools.Aliases, new ReadOnlySpan<byte>(callText, 0, callTextLength), calls, keyScratch, callSpans, out var required, out restoredCallCount))
+        if (!CallRestorer.TryRestore(allTools.Aliases, new ReadOnlySpan<byte>(callText, 0, callTextLength), restored, keyScratch, callSpans, out var required, out restoredCallCount))
             return Failed(FailureReason.MalformedCalls, progress);
+        restoredLength = required;
+        lastRepair = RepairOutcome.None;
+        if (repairPlan != null)
+        {
+            lastRepair = ArgumentRepair.Apply(repairPlan, repairScratch!, repairRequest!, repairHistory!, repairToday, restored, restoredLength, callSpans, ref restoredCallCount, out var repaired);
+            if (repaired <= restored.Length) restoredLength = required = repaired;
+            progress.Flags |= ToFlags(lastRepair);
+        }
+        if (required <= calls.Length) new ReadOnlySpan<byte>(restored, 0, required).CopyTo(calls);
         var refused = confidence < options.RefuseBelow;
-        var status = required > calls.Length ? ReplyStatus.Failed : refused ? ReplyStatus.Refused : ReplyStatus.Called;
+        var declined = restoredCallCount == 0 && required <= calls.Length;
+        var status = required > calls.Length ? ReplyStatus.Failed : declined ? ReplyStatus.Declined : refused ? ReplyStatus.Refused : ReplyStatus.Called;
         var failure = required > calls.Length ? FailureReason.CallsBufferTooSmall : FailureReason.None;
         return new Reply(status, failure, progress.Flags, confidence, (float)head, (float)decode, restoredCallCount, required,
             progress.ReasoningLength, 0, progress.PromptTokens, progress.DecodeTokens, progress.PrefillTicks, progress.FirstTokenTicks, Stopwatch.GetTimestamp() - progress.Started);
+    }
+
+    static ReplyFlags ToFlags(RepairOutcome outcome)
+    {
+        var flags = ReplyFlags.None;
+        if ((outcome & (RepairOutcome.Repaired | RepairOutcome.Duplicate)) != 0) flags |= ReplyFlags.Repaired;
+        if ((outcome & RepairOutcome.Negated) != 0) flags |= ReplyFlags.Negated;
+        if ((outcome & RepairOutcome.Invalid) != 0) flags |= ReplyFlags.Invalid;
+        if ((outcome & RepairOutcome.Ungrounded) != 0) flags |= ReplyFlags.Ungrounded;
+        return flags;
     }
 
     Reply GenerateCallsTyped<TSink, TCommand>(ref TurnProgress progress, Span<TCommand> commands, ref TSink sink)
