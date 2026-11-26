@@ -23,12 +23,12 @@ public sealed class ApiGeneratorBughuntTests
         return (IIncrementalGenerator)Activator.CreateInstance(type)!;
     });
 
-    static (string[] Generator, string[] Compiler) Run(string source)
+    static (string[] Generator, string[] Compiler) Run(string source, LanguageVersion language = LanguageVersion.Preview)
     {
         var references = ((string)AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES")!).Split(Path.PathSeparator)
             .Select(p => (MetadataReference)MetadataReference.CreateFromFile(p)).ToList();
         references.Add(MetadataReference.CreateFromFile(typeof(NeedleToolsAttribute).Assembly.Location));
-        var parse = new CSharpParseOptions(LanguageVersion.Preview);
+        var parse = new CSharpParseOptions(language);
         var compilation = CSharpCompilation.Create("probe", new[] { CSharpSyntaxTree.ParseText(source, parse) }, references,
             new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary).WithAllowUnsafe(true));
         CSharpGeneratorDriver.Create(new[] { Generator.Value.AsSourceGenerator() }, parseOptions: parse)
@@ -40,6 +40,20 @@ public sealed class ApiGeneratorBughuntTests
     static void AssertCompiles(string source)
     {
         var (generator, compiler) = Run(source);
+        Assert.Empty(generator);
+        Assert.Empty(compiler);
+    }
+
+    [Fact]
+    public void Generator_CSharp10OnAToolSetCapableRuntime_Compiles()
+    {
+        var (generator, compiler) = Run("""
+            using Needle.Tools;
+            namespace N
+            {
+                [NeedleTools] public partial interface IA { [Tool("x")] void Go(int count); }
+            }
+            """, LanguageVersion.CSharp10);
         Assert.Empty(generator);
         Assert.Empty(compiler);
     }

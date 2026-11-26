@@ -36,7 +36,7 @@ public sealed class NeedleToolsGenerator : IIncrementalGenerator
             {
                 var qualified = model.GlobalNamespace ? model.CommandsName : model.Namespace + "." + model.CommandsName;
                 if (compilation.GetTypeByMetadataName(qualified) is not null) return;
-                context.AddSource(model.HintName + "Tools.g.cs", Emitter.Emit(model, built.Right, triple.Right));
+                context.AddSource(model.HintName + "Tools.g.cs", Emitter.Emit(model, built.Right && triple.Right, triple.Right));
             }
         });
     }
