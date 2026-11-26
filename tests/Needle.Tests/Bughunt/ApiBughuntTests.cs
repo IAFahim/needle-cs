@@ -34,6 +34,22 @@ public struct WideHandler : IWideCommands
 public sealed unsafe class ApiBughuntTests
 {
     [Fact]
+    public void SharedChannel_FileShorterThanItsHeaderedLayout_IsRejectedOnOpen()
+    {
+        var path = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "needle-bughunt-" + Guid.NewGuid().ToString("N") + ".chan");
+        try
+        {
+            using (SharedChannel.Create(path, 64, 64)) { }
+            using (var stream = new System.IO.FileStream(path, System.IO.FileMode.Open)) stream.SetLength(4096);
+            Assert.Throws<System.IO.InvalidDataException>(() => { using var opened = SharedChannel.Open(path); });
+        }
+        finally
+        {
+            System.IO.File.Delete(path);
+        }
+    }
+
+    [Fact]
     public void Channel_CapacityTooLargeForTheBlock_IsRejectedInsteadOfUndersizingTheAllocation()
     {
         var replyCell = sizeof(ChannelReply);
