@@ -429,3 +429,21 @@ using var agent = NeedleAgent.Open<IKitchen>("needle3.cact");
 foreach (var call in agent.Ask("set a timer for 12 minutes"))
     if (call.Is(out IKitchen.SetTimerArgs t)) Console.WriteLine($"timer: {t.Minutes} min");
 ```
+
+## 11. What is built (phases 1 to 3)
+
+The quickstart above compiles as written under C# 9 against the netstandard2.1 build, and runs on .NET 10.
+
+| Piece | Type | Notes |
+| --- | --- | --- |
+| Model | `NeedleModel` (readonly struct handle) | `Open`, `TryOpen`, `FromMemory`, `FromBytes`, `FromStream`. Reference counted: the weights live until the last agent made from them is disposed. |
+| Agent | `NeedleAgent` (readonly struct handle) | `model.Agent(json)`, `model.Agent<TTools>()`, `NeedleAgent.Open<TTools>(path)`. A default or disposed handle throws `ObjectDisposedException`. |
+| Options | `AgentOptions` (struct, no references) | Every default is upstream 4.x: automatic threads, `auto_date` on, repair on, floor 0.1, 96 reasoning tokens, 2048 context. `Toggle` for three-way switches. |
+| Asking | `Ask`, `Continue` | UTF-8, `ReadOnlySpan<char>` and `string` overloads. A caller-buffer `Ask(utf8, Span<byte>, out Reply)` returns `OperationStatus`. |
+| Answer | `Answer` (ref struct) | `Kind`, `Ok`, `Why`, `Calls`, `Suppressed`, `Text`, `Thinking`, `Confidence`, `Ungrounded`, `Details`. A view over the agent's buffers: no allocation, and it throws once a later call replaces it. |
+| Call | `Call` (ref struct) | `Name`, `Arguments` (`Utf8Span`), `Is("name")`, `Is(out TArgs)`, `TryGetInt32`/`Int64`/`Single`/`Double`/`Boolean`/`Text`/`String`. |
+| Tools | `[Tools] partial interface` | Methods and parameters described with `System.ComponentModel.Description`. Generated: `[ToolSchema]`, `XxxArgs` structs, `Calls.Schema`, `Calls.Dispatch(call or answer, handler)`. |
+| Game path | `TryPost`, `TryTake`, `IsBusy`, `Take`, `Cancel` | One request in flight per agent, run on the agent's own thread, which sleeps on an event while idle. |
+| System facts | `SetSystem` | Copies the facts in and re-primes; the tools stay. |
+
+Not built yet: `[Arg(Min, Max, Inferred)]`, streaming events per frame (`turn.Run(budget)`), the speech additions and the analyzers named in phase 2.
