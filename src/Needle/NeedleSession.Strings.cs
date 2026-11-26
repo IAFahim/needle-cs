@@ -27,6 +27,18 @@ public sealed unsafe partial class NeedleSession
 
     StringBridge? bridge;
 
+    internal int CallBufferBytes => callText.Length + CallsHeadroomBytes;
+    internal int ReasoningBufferBytes => Math.Max(0, options.MaxReasoningTokens) * MaxPieceBytes;
+    internal int ResponseBufferBytes => Math.Max(0, options.MaxCallTokens) * MaxPieceBytes;
+    internal int ViewCallCount => restoredCallCount;
+    internal CallSpan ViewCall(int index) => callSpans[index];
+    internal byte[] RestoredCalls => restored;
+    internal ReadOnlySpan<byte> ToolNameUtf8(int tool) => allTools.Aliases.OriginalToolEscaped(tool);
+    internal float RefuseFloor => options.RefuseBelow;
+    internal bool LastWasUngrounded => (lastRepair & RepairOutcome.Ungrounded) != 0;
+    internal static Reply FailedBeforeRun(FailureReason reason) =>
+        new(ReplyStatus.Failed, reason, ReplyFlags.None, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+
     public CallResult Complete(string query) => Turn(query, false);
 
     public CallResult CompleteWithToolResult(string resultJson) => Turn(resultJson, true);
