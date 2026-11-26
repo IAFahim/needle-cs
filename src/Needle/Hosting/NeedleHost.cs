@@ -353,11 +353,14 @@ public sealed unsafe class NeedleHost : IDisposable
             var spin = new SpinWait();
 #endif
             while (!channel.TryPublishReply(in reply))
+            {
+                if (Volatile.Read(ref stopping) != 0) return;
 #if NETSTANDARD2_1
                 spin.SpinOnce();
 #else
                 spin.SpinOnce(-1);
 #endif
+            }
         }
     }
 
