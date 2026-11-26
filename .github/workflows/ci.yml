@@ -8,7 +8,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install numpy sentencepiece soxr
       - run: bash tools/fetch.sh
+      - run: python3 tools/golden.py 40
+      - run: python3 tools/golden_confidence.py
       - uses: actions/upload-artifact@v4
         with: { name: ref-fixtures, path: ref, retention-days: 1, compression-level: 1 }
   test:
