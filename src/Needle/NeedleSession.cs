@@ -641,7 +641,7 @@ public sealed unsafe partial class NeedleSession : IDisposable
                     }
                     chunkCount = draftStart + accepted;
                     specFed = accepted == drafts;
-                    if (accepted > 0) maskFresh = false;
+                    maskFresh = false;
                 }
             }
             var chunk = new ReadOnlySpan<int>(chunkIds, chunkCount);
@@ -789,7 +789,7 @@ public sealed unsafe partial class NeedleSession : IDisposable
                     }
                     chunkCount = draftStart + accepted;
                     specFed = accepted == drafts;
-                    if (accepted > 0) maskFresh = false;
+                    maskFresh = false;
                 }
             }
             var chunk = new ReadOnlySpan<int>(chunkIds, chunkCount);
