@@ -74,7 +74,7 @@ public sealed unsafe class SharedChannel : IDisposable
             try
             {
                 view.SafeMemoryMappedViewHandle.AcquirePointer(ref pointer);
-                var channel = NeedleChannel.Attach(pointer + view.PointerOffset);
+                var channel = NeedleChannel.Attach(pointer + view.PointerOffset, length);
                 if (!channel.IsShared)
                     throw new InvalidDataException($"Shared channel file \"{path}\" is not a shared channel block.");
                 return new SharedChannel(file, view, path, channel);

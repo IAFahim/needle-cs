@@ -135,7 +135,10 @@ internal static unsafe class RingOps
         Volatile.Write(ref header->Cursors.Dequeue, 0L);
     }
 
-    internal static bool TryEnqueue<T>(Header* header, in T slot, out long position) where T : unmanaged
+    internal static bool TryEnqueue<T>(Header* header, in T slot, out long position) where T : unmanaged =>
+        TryEnqueue(header, in slot, out position, null, 0);
+
+    internal static bool TryEnqueue<T>(Header* header, in T slot, out long position, long* cancelWords, int cancelMask) where T : unmanaged
     {
         var cells = Cells<T>(header);
         long pos;
@@ -155,10 +158,22 @@ internal static unsafe class RingOps
             }
         }
         position = pos;
+        if (cancelWords != null) ClearFlag(cancelWords + ((pos >> 6) & cancelMask), 1L << (int)(pos & 63));
         var target = cells + (pos & header->Mask);
         target->Slot = slot;
         Volatile.Write(ref target->Sequence, pos + 1);
         return true;
+    }
+
+    static void ClearFlag(long* word, long flag)
+    {
+        var current = Volatile.Read(ref *word);
+        while ((current & flag) != 0)
+        {
+            var observed = Interlocked.CompareExchange(ref *word, current & ~flag, current);
+            if (observed == current) return;
+            current = observed;
+        }
     }
 
     internal static bool TryDequeue<T>(Header* header, out T slot, out long position) where T : unmanaged
@@ -207,6 +222,7 @@ public readonly unsafe struct NeedleChannel
     const int CancelWordsOffset = 32;
     const int MagicOffset = 40;
     const long BlockMagic = 0x31304E48434C444EL;
+    const int MaxCells = 1 << 30;
 
     const int SleepingOffset = 0;
     const int WakeFunctionOffset = 128;
@@ -231,11 +247,19 @@ public readonly unsafe struct NeedleChannel
     }
     internal static void ComputeLayout(int requestCapacity, int replyCapacity, out int requestCells, out int replyCells, out int words, out int total)
     {
+        if (requestCapacity > MaxCells) throw new ArgumentOutOfRangeException(nameof(requestCapacity), $"at most {MaxCells} requests");
+        if (replyCapacity > MaxCells) throw new ArgumentOutOfRangeException(nameof(replyCapacity), $"at most {MaxCells} replies");
         requestCells = PowerOfTwo(requestCapacity);
         replyCells = PowerOfTwo(replyCapacity);
-        words = Math.Max(1, (2 * Math.Max(requestCells, replyCells) + 63) / 64);
-        total = Align(CancelOffset(requestCells, replyCells) + words * sizeof(long));
+        words = CancelWords(requestCells, replyCells);
+        var bytes = LayoutBytes(requestCells, replyCells, words);
+        if (bytes > int.MaxValue) throw new ArgumentOutOfRangeException(nameof(replyCapacity), $"{requestCapacity} requests and {replyCapacity} replies need {bytes} bytes, more than a channel block can hold");
+        total = (int)bytes;
     }
+
+    static int CancelWords(int requestCells, int replyCells) => (int)Math.Max(1, (2L * Math.Max(requestCells, replyCells) + 63) / 64);
+
+    static long LayoutBytes(int requestCells, int replyCells, int words) => Align(CancelOffset(requestCells, replyCells) + (long)words * sizeof(long));
 
     internal static NeedleChannel InitializeBlock(byte* block, int requestCells, int replyCells, int words, long shared)
     {
@@ -247,8 +271,11 @@ public readonly unsafe struct NeedleChannel
         return Attach(block);
     }
 
-    internal static NeedleChannel Attach(byte* block)
+    internal static NeedleChannel Attach(byte* block) => Attach(block, long.MaxValue);
+
+    internal static NeedleChannel Attach(byte* block, long length)
     {
+        if (length < MagicOffset + sizeof(long)) throw new InvalidDataException("Not a Needle channel block (too short).");
         if (block == null) throw new ArgumentNullException(nameof(block));
         if (Volatile.Read(ref *(long*)(block + MagicOffset)) != BlockMagic)
             throw new InvalidDataException("Not a Needle channel block (bad magic).");
@@ -256,7 +283,8 @@ public readonly unsafe struct NeedleChannel
         var replyCells = (int)Volatile.Read(ref *(long*)(block + ReplyCellsOffset));
         var words = (int)Volatile.Read(ref *(long*)(block + CancelWordsOffset));
         if (requestCells < 1 || replyCells < 1 || words < 1 ||
-            (requestCells & (requestCells - 1)) != 0 || (replyCells & (replyCells - 1)) != 0)
+            (requestCells & (requestCells - 1)) != 0 || (replyCells & (replyCells - 1)) != 0 ||
+            words != CancelWords(requestCells, replyCells) || LayoutBytes(requestCells, replyCells, words) > length)
             throw new InvalidDataException("Corrupt Needle channel header.");
         var requests = (RingOps.Header*)(block + RequestHeaderOffset);
         var replies = (RingOps.Header*)(block + ReplyHeaderOffset(requestCells));
@@ -314,7 +342,7 @@ public readonly unsafe struct NeedleChannel
             ticket = 0;
             return false;
         }
-        if (!RingOps.TryEnqueue(requests, in request, out var position))
+        if (!RingOps.TryEnqueue(requests, in request, out var position, cancelWords, cancelMask))
         {
             ticket = 0;
             return false;
@@ -407,11 +435,11 @@ public readonly unsafe struct NeedleChannel
         Volatile.Write(ref *(long*)(block + MagicOffset), BlockMagic);
     }
 
-    static int ReplyHeaderOffset(int requestCells) =>
-        Align(RequestHeaderOffset + sizeof(RingOps.Header) + requestCells * sizeof(RingOps.Cell<ChannelRequest>));
+    static long ReplyHeaderOffset(int requestCells) =>
+        Align(RequestHeaderOffset + sizeof(RingOps.Header) + (long)requestCells * sizeof(RingOps.Cell<ChannelRequest>));
 
-    static int CancelOffset(int requestCells, int replyCells) =>
-        Align(ReplyHeaderOffset(requestCells) + sizeof(RingOps.Header) + replyCells * sizeof(RingOps.Cell<ChannelReply>));
+    static long CancelOffset(int requestCells, int replyCells) =>
+        Align(ReplyHeaderOffset(requestCells) + sizeof(RingOps.Header) + (long)replyCells * sizeof(RingOps.Cell<ChannelReply>));
 
     static int PowerOfTwo(int requested)
     {
@@ -420,5 +448,5 @@ public readonly unsafe struct NeedleChannel
         return capacity;
     }
 
-    static int Align(int value) => (value + 7) & ~7;
+    static long Align(long value) => (value + 7) & ~7L;
 }
