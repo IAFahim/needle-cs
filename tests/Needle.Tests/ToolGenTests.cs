@@ -274,7 +274,7 @@ public sealed unsafe class ToolGenTests
         Assert.Equal(Formation.Line, handler.Formations[1]);
 
         var devices = new DeviceHandler();
-        Assert.True(DeviceCommands.TryBind(new FunctionCall("set_power", "{\"on\":true,\"delayMs\":7}"), out var power));
+        Assert.True(DeviceCommands.TryBind(new FunctionCall("set_power", "{\"on\":true,\"delay_ms\":7}"), out var power));
         DeviceCommands.Dispatch(ref devices, power);
         Assert.True(devices.LastOn);
         Assert.Equal(7L, devices.LastDelayMs);
