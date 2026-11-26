@@ -457,9 +457,8 @@ internal static unsafe class Neon
             var wide = AdvSimd.ZeroExtendWideningLower(AdvSimd.LoadVector64(norms + g));
             var magnitude = AdvSimd.And(wide, Vector128.Create(0x7FFFu));
             var sign = AdvSimd.ShiftLeftLogical(AdvSimd.And(wide, Vector128.Create(0x8000u)), 16);
-            var bits = AdvSimd.Add(AdvSimd.ShiftLeftLogical(magnitude, 13), Vector128.Create(0x38000000u));
-            var nonZero = AdvSimd.CompareGreaterThan(magnitude.AsInt32(), Vector128<int>.Zero).AsUInt32();
-            var single = AdvSimd.Or(AdvSimd.And(bits, nonZero), sign).AsSingle();
+            var rebased = AdvSimd.Multiply(AdvSimd.ShiftLeftLogical(magnitude, 13).AsSingle(), Vector128.Create(5.192296858534828e33f));
+            var single = AdvSimd.Or(rebased.AsUInt32(), sign).AsSingle();
             AdvSimd.Store(factors + g, AdvSimd.Multiply(single, multiplier));
         }
         for (; g < groups; g++) factors[g] = Scalar.HalfToSingle(norms[g]) * scale;
@@ -884,6 +883,7 @@ internal static unsafe class Neon
     public static void MatMulRows(in Cq w, in Activations a, int tokens, float* y, int ldy, int rowStart, int rowEnd)
     {
         var rowFactors = stackalloc float[a.Stride * 4];
+        new Span<float>(rowFactors, a.Stride * 4).Clear();
         var scaled = stackalloc float[a.Stride * 8];
         var groups = w.Groups;
         var table = AdvSimd.LoadVector128(w.Book->Bytes);
