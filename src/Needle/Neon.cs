@@ -464,16 +464,24 @@ internal static unsafe class Neon
         for (; g < groups; g++) factors[g] = Scalar.HalfToSingle(norms[g]) * scale;
     }
 
-    public static float ScaleFactors(float* factors, float* scaled, float* scales, float* offsets, int stride)
+    public static float ScaleFactors(float* factors, float* scaled, float* scales, float* offsets, int groups)
     {
         var bias = Vector128<float>.Zero;
-        for (var v = 0; v < stride; v += 4)
+        var v = 0;
+        for (; v + 4 <= groups; v += 4)
         {
             var f = AdvSimd.Multiply(AdvSimd.LoadVector128(factors + v), AdvSimd.LoadVector128(scales + v));
             AdvSimd.Store(scaled + v, f);
             bias = AdvSimd.FusedMultiplyAdd(bias, f, AdvSimd.LoadVector128(offsets + v));
         }
-        return HorizontalSum(bias);
+        var total = HorizontalSum(bias);
+        for (; v < groups; v++)
+        {
+            var f = factors[v] * scales[v];
+            scaled[v] = f;
+            total = MathF.FusedMultiplyAdd(f, offsets[v], total);
+        }
+        return total;
     }
 
     public static void DecodeRow(in Cq w, int row, float* destination)
@@ -587,7 +595,7 @@ internal static unsafe class Neon
     public static float DotRow(in Cq w, byte* packedRows, in Activations a, int token, float* factors, float* scaled)
     {
         var groups = a.Groups;
-        var bias = ScaleFactors(factors, scaled, a.Scales + token * a.Stride, a.Offsets + token * a.Stride, a.Stride);
+        var bias = ScaleFactors(factors, scaled, a.Scales + token * a.Stride, a.Offsets + token * a.Stride, a.Groups);
         var table = AdvSimd.LoadVector128(w.Book->Bytes);
         var mask = Vector128.Create(w.Bits == 2 ? (byte)0x03 : (byte)0x0F);
         var values = a.Values + (long)token * a.Cols;
@@ -641,10 +649,10 @@ internal static unsafe class Neon
         var groups = a.Groups;
         var stride = a.Stride;
         var cols = a.Cols;
-        var bias0 = ScaleFactors(factors, scaled, a.Scales + token * stride, a.Offsets + token * stride, stride);
-        var bias1 = ScaleFactors(factors, scaled + stride, a.Scales + (token + 1) * stride, a.Offsets + (token + 1) * stride, stride);
-        var bias2 = ScaleFactors(factors, scaled + 2 * stride, a.Scales + (token + 2) * stride, a.Offsets + (token + 2) * stride, stride);
-        var bias3 = ScaleFactors(factors, scaled + 3 * stride, a.Scales + (token + 3) * stride, a.Offsets + (token + 3) * stride, stride);
+        var bias0 = ScaleFactors(factors, scaled, a.Scales + token * stride, a.Offsets + token * stride, a.Groups);
+        var bias1 = ScaleFactors(factors, scaled + stride, a.Scales + (token + 1) * stride, a.Offsets + (token + 1) * stride, a.Groups);
+        var bias2 = ScaleFactors(factors, scaled + 2 * stride, a.Scales + (token + 2) * stride, a.Offsets + (token + 2) * stride, a.Groups);
+        var bias3 = ScaleFactors(factors, scaled + 3 * stride, a.Scales + (token + 3) * stride, a.Offsets + (token + 3) * stride, a.Groups);
         var table = AdvSimd.LoadVector128(w.Book->Bytes);
         var mask = Vector128.Create(w.Bits == 2 ? (byte)0x03 : (byte)0x0F);
         var v0 = a.Values + (long)token * cols;
@@ -708,10 +716,10 @@ internal static unsafe class Neon
         var stride = a.Stride;
         for (var r = 0; r < 4; r++)
             LoadFactors(norms + (long)r * groups, groups, w.Book->ByteScale, rowFactors + r * stride);
-        var bias0 = ScaleFactors(rowFactors, scaled, a.Scales + token * stride, a.Offsets + token * stride, stride);
-        var bias1 = ScaleFactors(rowFactors + stride, scaled + stride, a.Scales + token * stride, a.Offsets + token * stride, stride);
-        var bias2 = ScaleFactors(rowFactors + 2 * stride, scaled + 2 * stride, a.Scales + token * stride, a.Offsets + token * stride, stride);
-        var bias3 = ScaleFactors(rowFactors + 3 * stride, scaled + 3 * stride, a.Scales + token * stride, a.Offsets + token * stride, stride);
+        var bias0 = ScaleFactors(rowFactors, scaled, a.Scales + token * stride, a.Offsets + token * stride, a.Groups);
+        var bias1 = ScaleFactors(rowFactors + stride, scaled + stride, a.Scales + token * stride, a.Offsets + token * stride, a.Groups);
+        var bias2 = ScaleFactors(rowFactors + 2 * stride, scaled + 2 * stride, a.Scales + token * stride, a.Offsets + token * stride, a.Groups);
+        var bias3 = ScaleFactors(rowFactors + 3 * stride, scaled + 3 * stride, a.Scales + token * stride, a.Offsets + token * stride, a.Groups);
         var values = a.Values + (long)token * a.Cols;
         var accumulator0 = 0f;
         var accumulator1 = 0f;
@@ -776,14 +784,14 @@ internal static unsafe class Neon
         var cols = a.Cols;
         LoadFactors(norms, groups, w.Book->ByteScale, rowFactors);
         LoadFactors(norms + groups, groups, w.Book->ByteScale, rowFactors + stride);
-        var bias00 = ScaleFactors(rowFactors, scaled, a.Scales + token * stride, a.Offsets + token * stride, stride);
-        var bias01 = ScaleFactors(rowFactors, scaled + stride, a.Scales + (token + 1) * stride, a.Offsets + (token + 1) * stride, stride);
-        var bias02 = ScaleFactors(rowFactors, scaled + 2 * stride, a.Scales + (token + 2) * stride, a.Offsets + (token + 2) * stride, stride);
-        var bias03 = ScaleFactors(rowFactors, scaled + 3 * stride, a.Scales + (token + 3) * stride, a.Offsets + (token + 3) * stride, stride);
-        var bias10 = ScaleFactors(rowFactors + stride, scaled + 4 * stride, a.Scales + token * stride, a.Offsets + token * stride, stride);
-        var bias11 = ScaleFactors(rowFactors + stride, scaled + 5 * stride, a.Scales + (token + 1) * stride, a.Offsets + (token + 1) * stride, stride);
-        var bias12 = ScaleFactors(rowFactors + stride, scaled + 6 * stride, a.Scales + (token + 2) * stride, a.Offsets + (token + 2) * stride, stride);
-        var bias13 = ScaleFactors(rowFactors + stride, scaled + 7 * stride, a.Scales + (token + 3) * stride, a.Offsets + (token + 3) * stride, stride);
+        var bias00 = ScaleFactors(rowFactors, scaled, a.Scales + token * stride, a.Offsets + token * stride, a.Groups);
+        var bias01 = ScaleFactors(rowFactors, scaled + stride, a.Scales + (token + 1) * stride, a.Offsets + (token + 1) * stride, a.Groups);
+        var bias02 = ScaleFactors(rowFactors, scaled + 2 * stride, a.Scales + (token + 2) * stride, a.Offsets + (token + 2) * stride, a.Groups);
+        var bias03 = ScaleFactors(rowFactors, scaled + 3 * stride, a.Scales + (token + 3) * stride, a.Offsets + (token + 3) * stride, a.Groups);
+        var bias10 = ScaleFactors(rowFactors + stride, scaled + 4 * stride, a.Scales + token * stride, a.Offsets + token * stride, a.Groups);
+        var bias11 = ScaleFactors(rowFactors + stride, scaled + 5 * stride, a.Scales + (token + 1) * stride, a.Offsets + (token + 1) * stride, a.Groups);
+        var bias12 = ScaleFactors(rowFactors + stride, scaled + 6 * stride, a.Scales + (token + 2) * stride, a.Offsets + (token + 2) * stride, a.Groups);
+        var bias13 = ScaleFactors(rowFactors + stride, scaled + 7 * stride, a.Scales + (token + 3) * stride, a.Offsets + (token + 3) * stride, a.Groups);
         var v0 = a.Values + (long)token * cols;
         var v1 = v0 + cols;
         var v2 = v1 + cols;

@@ -769,21 +769,24 @@ internal static unsafe class Attention
                 tot += w0 * partials[MaxTileHeads * VDim + Lanes + h];
                 tot += w1 * partials[PartialFloats + MaxTileHeads * VDim + Lanes + h];
 #if NEEDLE_SIMD
-                var inv = Vector256.Create(1f / tot);
-                var w0v = Vector256.Create(w0);
-                var w1v = Vector256.Create(w1);
-                for (var d = 0; d < VDim; d += Lanes)
+                if (Fma.IsSupported)
                 {
-                    var sum = Vector256<float>.Zero;
-                    sum = Fma.MultiplyAdd(w0v, Avx.LoadVector256(partials + h * VDim + d), sum);
-                    sum = Fma.MultiplyAdd(w1v, Avx.LoadVector256(partials + PartialFloats + h * VDim + d), sum);
-                    Avx.Store(output + h * VDim + d, Avx.Multiply(sum, inv));
+                    var invVector = Vector256.Create(1f / tot);
+                    var w0v = Vector256.Create(w0);
+                    var w1v = Vector256.Create(w1);
+                    for (var d = 0; d < VDim; d += Lanes)
+                    {
+                        var sum = Vector256<float>.Zero;
+                        sum = Fma.MultiplyAdd(w0v, Avx.LoadVector256(partials + h * VDim + d), sum);
+                        sum = Fma.MultiplyAdd(w1v, Avx.LoadVector256(partials + PartialFloats + h * VDim + d), sum);
+                        Avx.Store(output + h * VDim + d, Avx.Multiply(sum, invVector));
+                    }
+                    continue;
                 }
-#else
+#endif
                 var inv = 1f / tot;
                 for (var d = 0; d < VDim; d++)
                     output[h * VDim + d] = (w0 * partials[h * VDim + d] + w1 * partials[PartialFloats + h * VDim + d]) * inv;
-#endif
                 continue;
             }
             var peak = float.NegativeInfinity;
@@ -795,15 +798,19 @@ internal static unsafe class Attention
                 total += weights[c] * partials[c * PartialFloats + MaxTileHeads * VDim + Lanes + h];
             }
 #if NEEDLE_SIMD
-            var inverse = Vector256.Create(1f / total);
-            for (var d = 0; d < VDim; d += Lanes)
+            if (Fma.IsSupported)
             {
-                var sum = Vector256<float>.Zero;
-                for (var c = 0; c < count; c++)
-                    sum = Fma.MultiplyAdd(Vector256.Create(weights[c]), Avx.LoadVector256(partials + c * PartialFloats + h * VDim + d), sum);
-                Avx.Store(output + h * VDim + d, Avx.Multiply(sum, inverse));
+                var inverseVector = Vector256.Create(1f / total);
+                for (var d = 0; d < VDim; d += Lanes)
+                {
+                    var sum = Vector256<float>.Zero;
+                    for (var c = 0; c < count; c++)
+                        sum = Fma.MultiplyAdd(Vector256.Create(weights[c]), Avx.LoadVector256(partials + c * PartialFloats + h * VDim + d), sum);
+                    Avx.Store(output + h * VDim + d, Avx.Multiply(sum, inverseVector));
+                }
+                continue;
             }
-#else
+#endif
             var inverse = 1f / total;
             for (var d = 0; d < VDim; d++)
             {
@@ -812,7 +819,6 @@ internal static unsafe class Attention
                     sum += weights[c] * partials[c * PartialFloats + h * VDim + d];
                 output[h * VDim + d] = sum * inverse;
             }
-#endif
         }
     }
     [MethodImpl(MethodImplOptions.NoInlining)]
