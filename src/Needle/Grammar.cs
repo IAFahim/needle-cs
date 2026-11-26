@@ -529,6 +529,7 @@ internal sealed unsafe class Grammar : IDisposable
                 if (c == '"')
                 {
                     if (f->Aux < n[2]) return Reject;
+                    FlushSurrogate(f, ref sink);
                     sink.ValueCompleted();
                     return Pop(s, Consumed);
                 }
@@ -544,11 +545,13 @@ internal sealed unsafe class Grammar : IDisposable
                     if (max >= 0 && f->Aux >= max) return Reject;
                     f->Aux++;
                 }
+                FlushSurrogate(f, ref sink);
                 sink.StringByte(c);
                 return Consumed;
             case 2:
-                if (c == 'u') { f->Phase = 3; f->Aux2 = 0; f->Bits = 0; return Consumed; }
+                if (c == 'u') { f->Phase = 3; f->Aux2 = 0; f->Bits &= ~0xFFFFUL; return Consumed; }
                 if (c != '"' && c != '\\' && c != '/' && c != 'b' && c != 'f' && c != 'n' && c != 'r' && c != 't') return Reject;
+                FlushSurrogate(f, ref sink);
                 f->Aux++;
                 f->Phase = 1;
                 sink.StringByte(c switch
@@ -563,15 +566,39 @@ internal sealed unsafe class Grammar : IDisposable
                 return Consumed;
             default:
                 if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) return Reject;
-                f->Bits = f->Bits * 16 + HexValue(c);
+                f->Bits = (f->Bits & ~0xFFFFUL) | ((f->Bits & 0xFFFF) * 16 + HexValue(c));
                 if (++f->Aux2 == 4)
                 {
-                    EmitUnit((int)f->Bits, ref sink);
-                    f->Aux++;
+                    var unit = (int)(f->Bits & 0xFFFF);
+                    var pending = (int)(f->Bits >> 16);
                     f->Phase = 1;
+                    if (pending != 0 && unit is >= 0xDC00 and <= 0xDFFF)
+                    {
+                        EmitSupplementary(0x10000 + ((pending - 0xD800) << 10) + (unit - 0xDC00), ref sink);
+                        f->Bits = 0;
+                        return Consumed;
+                    }
+                    FlushSurrogate(f, ref sink);
+                    f->Aux++;
+                    if (unit is >= 0xD800 and <= 0xDBFF) f->Bits = (ulong)unit << 16;
+                    else EmitUnit(unit, ref sink);
                 }
                 return Consumed;
         }
+    }
+
+    static void FlushSurrogate<TSink>(Frame* f, ref TSink sink) where TSink : struct, Tools.IGrammarSink
+    {
+        if (f->Bits >> 16 != 0) EmitUnit(0xFFFD, ref sink);
+        f->Bits = 0;
+    }
+
+    static void EmitSupplementary<TSink>(int point, ref TSink sink) where TSink : struct, Tools.IGrammarSink
+    {
+        sink.StringByte((byte)(0xF0 | (point >> 18)));
+        sink.StringByte((byte)(0x80 | ((point >> 12) & 0x3F)));
+        sink.StringByte((byte)(0x80 | ((point >> 6) & 0x3F)));
+        sink.StringByte((byte)(0x80 | (point & 0x3F)));
     }
 
     static ulong HexValue(byte c) => c <= '9' ? (ulong)(c - '0') : (ulong)((c & 0xDF) - 'A' + 10);
