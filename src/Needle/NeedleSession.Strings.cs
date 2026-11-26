@@ -82,11 +82,10 @@ public sealed unsafe partial class NeedleSession
         var refused = reply.Status == ReplyStatus.Refused;
         if (reply.Failure == FailureReason.CallsBufferTooSmall)
         {
-            json = new byte[reply.Utf8Length];
-            CallRestorer.TryRestore(allTools.Aliases, new ReadOnlySpan<byte>(callText, 0, callTextLength), json, keyScratch, callSpans, out _, out _);
+            json = restored;
             refused = reply.Confidence < options.RefuseBelow;
         }
-        var calls = new FunctionCall[reply.CallCount];
+        var calls = new FunctionCall[restoredCallCount];
         for (var i = 0; i < calls.Length; i++)
         {
             var span = callSpans[i];
@@ -94,6 +93,7 @@ public sealed unsafe partial class NeedleSession
         }
         return new CallResult
         {
+            Validation = ToValidation(reply.Flags),
             FunctionCalls = refused ? Array.Empty<FunctionCall>() : calls,
             SuppressedCalls = refused ? calls : Array.Empty<FunctionCall>(),
             Reasoning = reasoning,
@@ -107,6 +107,22 @@ public sealed unsafe partial class NeedleSession
             DecodeTps = timing.DecodeTps,
             TotalMs = timing.TotalMs,
         };
+    }
+
+    CallValidation ToValidation(ReplyFlags flags)
+    {
+        if ((flags & (ReplyFlags.Repaired | ReplyFlags.Negated | ReplyFlags.Invalid | ReplyFlags.Ungrounded)) == 0) return CallValidation.Clean;
+        var ungrounded = Array.Empty<string>();
+        var lines = Ungrounded;
+        if (lines.Length > 0)
+        {
+            var list = new List<string>();
+            var start = 0;
+            for (var i = 0; i < lines.Length; i++)
+                if (lines[i] == (byte)'\n') { list.Add(Encoding.UTF8.GetString(lines.Slice(start, i - start).ToArray())); start = i + 1; }
+            ungrounded = list.ToArray();
+        }
+        return new CallValidation((flags & ReplyFlags.Repaired) != 0, (flags & ReplyFlags.Negated) != 0, (flags & ReplyFlags.Invalid) != 0, ungrounded);
     }
 
     static string Decode(byte[] buffer, int length) => Encoding.UTF8.GetString(buffer, 0, length).Trim();
