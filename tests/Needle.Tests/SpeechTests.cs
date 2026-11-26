@@ -287,7 +287,7 @@ public sealed class SpeechTests : IDisposable
     [Fact]
     public void FullLengthWindowsTranscribeWithoutOverrunningTheirBuffers()
     {
-        var pcm = Clip("test_long.wav").AsSpan(0, Whistle.MaxSeconds * 16000).ToArray();
+        var pcm = Clip("test_long.wav").AsSpan(0, Needle.Whistle.MaxSeconds * 16000).ToArray();
         var first = whistle.Transcribe(pcm, "en").Text;
         Assert.Contains("queen", first);
         Assert.Equal(first, whistle.Transcribe(pcm, "en").Text);
