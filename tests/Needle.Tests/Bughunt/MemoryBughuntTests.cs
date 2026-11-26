@@ -444,3 +444,39 @@ public sealed unsafe class MemoryBughuntTests
         Assert.Contains("2048 bytes", error.Message);
     }
 }
+
+public sealed unsafe class MemoryBughuntLeakTests
+{
+    static long VirtualBytes()
+    {
+        foreach (var line in File.ReadAllLines("/proc/self/status"))
+            if (line.StartsWith("VmSize:", StringComparison.Ordinal))
+                return long.Parse(line[7..].Trim().Split(' ')[0]) * 1024;
+        return 0;
+    }
+
+    [Fact]
+    public void RejectedModelReleasesItsWeightArena()
+    {
+        if (!OperatingSystem.IsLinux()) return;
+        var cact = new SyntheticCact().WithMinimalWeights();
+        cact.Tensors[^2] = SyntheticCact.Dense(2u << 20);
+        cact.Header[11] = 32;
+        var bytes = cact.Build();
+        var handle = GCHandle.Alloc(bytes, GCHandleType.Pinned);
+        try
+        {
+            var address = (byte*)handle.AddrOfPinnedObject();
+            var length = (nuint)bytes.Length;
+            for (var i = 0; i < 4; i++) Assert.Throws<NotSupportedException>(() => Model.FromMemory((byte*)address, length));
+            var before = VirtualBytes();
+            for (var i = 0; i < 100; i++) Assert.Throws<NotSupportedException>(() => Model.FromMemory((byte*)address, length));
+            var grown = VirtualBytes() - before;
+            Assert.True(grown < 256L << 20, $"100 rejected loads of an {bytes.Length}-byte model grew the address space by {grown >> 20} MiB");
+        }
+        finally
+        {
+            handle.Free();
+        }
+    }
+}
