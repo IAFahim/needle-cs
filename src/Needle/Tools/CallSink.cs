@@ -54,6 +54,9 @@ public struct NoSink : IGrammarSink
     }
 }
 
+// When argument repair rewrites a turn's calls (NeedleOptions.Repair), the session replays the repaired calls
+// into a copy of the sink taken before the turn and hands that copy back. A sink therefore has to be a
+// self-contained value, as the generated sinks are: state held behind a reference would see both passes.
 public interface ICallSink<TCommand> : IGrammarSink
 {
     int CallCount { get; }

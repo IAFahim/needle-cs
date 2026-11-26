@@ -45,6 +45,8 @@ internal sealed class AliasTable
 
     public string OriginalTool(int tool) => toolOriginals[tool];
 
+    public ReadOnlySpan<byte> ToolAlias(int tool) => toolAliases[tool];
+
     public ReadOnlySpan<byte> OriginalToolEscaped(int tool) => toolOriginalsEscaped[tool];
 
     public bool TryFindTool(ReadOnlySpan<byte> alias, out int tool)
