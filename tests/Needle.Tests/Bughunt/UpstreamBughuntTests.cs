@@ -231,6 +231,16 @@ public sealed unsafe class UpstreamBughuntTests
         Assert.True(Accepts(grammar, "[{\"name\":\"t\",\"arguments\":{\"x\":1.5}}]"));
     }
 
+    [Theory(Skip = "unfixed: a union commits to its first branch whose first byte fits, with no backtracking")]
+    [InlineData("{\"anyOf\":[{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"string\"}},\"required\":[\"a\"]},{\"type\":\"object\",\"properties\":{\"b\":{\"type\":\"integer\"}},\"required\":[\"b\"]}]}", "{\"b\":1}")]
+    [InlineData("{\"anyOf\":[{\"enum\":[\"auto\"]},{\"type\":\"string\"}]}", "\"manual\"")]
+    public void AUnionAcceptsAValueOfItsLaterBranchThatSharesTheFirstByte(string schema, string value)
+    {
+        var set = new ToolSet("[" + Tool("t", "{\"x\":" + schema + "}") + "]");
+        using var grammar = new Grammar(set.Tools);
+        Assert.True(Accepts(grammar, "[{\"name\":\"t\",\"arguments\":{\"x\":" + value + "}}]"));
+    }
+
     static GrammarState Advanced(Grammar grammar, string text)
     {
         var state = Grammar.Start(grammar.Program);
