@@ -74,6 +74,7 @@ internal sealed unsafe class TokenTrie : IDisposable
         var specialLengths = new List<int>();
         for (var id = 0; id < Math.Min(vocab, tokenizer.PieceCount); id++)
         {
+            if (tokenizer.PieceByteLength(id) > 256) continue;
             var length = tokenizer.ConstraintBytes(id, scratch);
             if (length == 0) continue;
             var node = 0;

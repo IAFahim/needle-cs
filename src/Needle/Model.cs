@@ -202,14 +202,18 @@ internal unsafe struct Reader
     public const byte Fp16 = 1, Fp32 = 2, Cq = 3, Raw = 4;
 
     readonly byte* map;
+    readonly nuint length;
+    readonly Record* first;
     readonly Codebook* book2;
     readonly Codebook* book4;
     Record* next;
     Arena arena;
 
-    public Reader(byte* map, Record* first, Arena arena, float* codebook)
+    public Reader(byte* map, nuint length, Record* first, Arena arena, float* codebook)
     {
         this.map = map;
+        this.length = length;
+        this.first = first;
         next = first;
         this.arena = arena;
         book2 = this.arena.Take<Codebook>(1);
@@ -237,10 +241,11 @@ internal unsafe struct Reader
     {
         var record = next++;
         var count = Elements(record);
-        var destination = arena.Take<float>(count);
+        Require(record, count, record->Dtype == Fp16 ? 2u : 4u);
+        var destination = arena.Take<float>((nuint)count);
         var source = map + record->Offset;
-        if (record->Dtype == Fp16) for (nuint i = 0; i < count; i++) destination[i] = ExactHalves ? Scalar.HalfToSingle(((ushort*)source)[i]) : Scalar.HalfToSingleUpstream(((ushort*)source)[i]);
-        else if (record->Dtype == Fp32) Buffer.MemoryCopy(source, destination, count * 4, count * 4);
+        if (record->Dtype == Fp16) for (nuint i = 0; i < (nuint)count; i++) destination[i] = ExactHalves ? Scalar.HalfToSingle(((ushort*)source)[i]) : Scalar.HalfToSingleUpstream(((ushort*)source)[i]);
+        else if (record->Dtype == Fp32) Buffer.MemoryCopy(source, destination, (long)count * 4, (long)count * 4);
         else throw new InvalidDataException("dense tensor expected");
         return destination;
     }
@@ -248,9 +253,15 @@ internal unsafe struct Reader
     public int* Indices(int expected)
     {
         var record = next++;
-        if (record->Dtype != Fp32 || (int)Elements(record) != expected) throw new InvalidDataException("permutation expected");
+        if (record->Dtype != Fp32 || Elements(record) != (ulong)expected) throw new InvalidDataException("permutation expected");
+        Require(record, (ulong)expected, 4);
         var destination = arena.Take<int>((nuint)expected);
-        for (var i = 0; i < expected; i++) destination[i] = (int)((float*)(map + record->Offset))[i];
+        for (var i = 0; i < expected; i++)
+        {
+            var value = ((float*)(map + record->Offset))[i];
+            if (!(value >= 0 && value < expected)) throw Model.Malformed($"corrupt .cact archive: tensor {record - first} is a permutation of {expected} but holds {value} at {i}");
+            destination[i] = (int)value;
+        }
         return destination;
     }
 
@@ -258,20 +269,33 @@ internal unsafe struct Reader
     {
         var record = next++;
         if (record->Dtype != Cq || (record->Bits != 2 && record->Bits != 4)) throw new InvalidDataException("2- or 4-bit CQ tensor expected");
+        if (record->Ndim != 2 || record->Shape0 > int.MaxValue || record->Shape1 > int.MaxValue) throw Model.Malformed($"corrupt .cact archive: tensor {record - first} is not a CQ matrix");
         var rows = (int)record->Shape0;
         var cols = (int)record->Shape1;
         if (cols % Needle.Cq.GroupSize != 0 || record->Group != Needle.Cq.GroupSize) throw new InvalidDataException("CQ group of 128 expected");
+        Require(record, (ulong)rows * ((ulong)cols / 8 * record->Bits + (ulong)cols / Needle.Cq.GroupSize * 2), 1);
         var indices = map + record->Offset;
         var norms = (ushort*)(indices + (long)rows * cols * record->Bits / 8);
         return new Needle.Cq(indices, norms, record->Bits == 2 ? book2 : book4, rows, cols, (int)record->Bits);
     }
 
-    static nuint Elements(Record* record)
+    ulong Elements(Record* record)
     {
-        nuint count = 1;
+        if (record->Ndim > 4) throw Model.Malformed($"corrupt .cact archive: tensor {record - first} has {record->Ndim} dimensions, more than 4");
+        ulong count = 1;
         var shape = &record->Shape0;
-        for (var i = 0; i < record->Ndim; i++) count *= shape[i];
+        for (var i = 0; i < record->Ndim; i++)
+        {
+            count *= shape[i];
+            if (count > length) throw Model.Malformed($"truncated .cact archive: tensor {record - first} has more elements than the file has bytes ({length})");
+        }
         return count;
+    }
+
+    void Require(Record* record, ulong count, ulong width)
+    {
+        if (count > length || count * width > length - record->Offset)
+            throw Model.Malformed($"truncated .cact archive: tensor {record - first} needs {count * width} bytes from byte {record->Offset}, but the file has {length} bytes");
     }
 }
 
@@ -330,7 +354,7 @@ public sealed unsafe class Model : IDisposable
         Require(Geometry.ConvTaps == 3 && Geometry.EngramConvTaps == 4 && Geometry.Dim % Cq.GroupSize == 0,
             $"unsupported convolution geometry: found ConvTaps={Geometry.ConvTaps}, EngramConvTaps={Geometry.EngramConvTaps}, Dim={Geometry.Dim}; this build supports ConvTaps=3, EngramConvTaps=4 and Dim divisible by {Cq.GroupSize}");
 
-        var reader = new Reader(map, records, arena, codebook);
+        var reader = new Reader(map, length, records, arena, codebook);
         reader.ExactHalves = !HasAudioWeights(records, count);
         Embedding = reader.Quantized();
         Blocks = reader.Take<LayerWeights>((nuint)Geometry.Layers);
@@ -360,7 +384,6 @@ public sealed unsafe class Model : IDisposable
         }
 
         var tokenizer = records + count - 1;
-        Require(tokenizer->Dtype == Reader.Raw, $"tokenizer blob missing: the last tensor has dtype {tokenizer->Dtype}, expected {Reader.Raw}");
         TokenizerBlob = map + tokenizer->Offset;
         TokenizerLength = (nuint)tokenizer->Bytes;
         arena = reader.Arena;
@@ -380,7 +403,12 @@ public sealed unsafe class Model : IDisposable
         var tableEnd = (ulong)ModelInfo.HeaderBytes + (ulong)header[2] * 4 + (ulong)count * (ulong)sizeof(Record);
         if (count == 0 || tableEnd > length)
             throw Malformed($"truncated or corrupt .cact archive: the header declares {count} tensors and {header[2]} codebook entries, needing {tableEnd} bytes of tables, but the file has {length} bytes");
+        if (header[2] < CodebookEntries)
+            throw Malformed($"corrupt .cact archive: the header declares {header[2]} codebook entries, fewer than the {CodebookEntries} the 2- and 4-bit codebooks need");
+        if (header[10] > 64)
+            throw Malformed($"corrupt .cact archive: the header declares {header[10]} layers, more than the 64 the layer mask can address");
         var records = (Record*)(map + ModelInfo.HeaderBytes + (nuint)header[2] * 4);
+        Require(records[count - 1].Dtype == Reader.Raw, $"tokenizer blob missing: the last tensor has dtype {records[count - 1].Dtype}, expected {Reader.Raw}");
         for (uint i = 0; i < count; i++)
             if (records[i].Offset > length || records[i].Bytes > length - records[i].Offset)
                 throw Malformed($"truncated .cact archive: tensor {i} ends at byte {records[i].Offset + records[i].Bytes}, but the file has {length} bytes");
@@ -395,7 +423,9 @@ public sealed unsafe class Model : IDisposable
         return false;
     }
 
-    static InvalidDataException Malformed(string facts) => new($"{facts}. {ModelInfo.RefreshGuidance}");
+    const int CodebookEntries = 28;
+
+    internal static InvalidDataException Malformed(string facts) => new($"{facts}. {ModelInfo.RefreshGuidance}");
 
     public static Model Open(string path) => Open(path, true);
 

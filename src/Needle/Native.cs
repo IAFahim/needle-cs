@@ -214,8 +214,8 @@ internal unsafe struct Arena
     public T* Take<T>(nuint count) where T : unmanaged
     {
         var aligned = (byte*)(((nuint)cursor + 63) & ~(nuint)63);
+        if (aligned > end || count > (nuint)(end - aligned) / (nuint)sizeof(T)) throw new OutOfMemoryException("arena exhausted");
         var next = aligned + count * (nuint)sizeof(T);
-        if (next > end) throw new OutOfMemoryException("arena exhausted");
         cursor = next;
         Mem.Clear(aligned, count * (nuint)sizeof(T));
         return (T*)aligned;
@@ -224,8 +224,8 @@ internal unsafe struct Arena
     public T* TakeUncleared<T>(nuint count) where T : unmanaged
     {
         var aligned = (byte*)(((nuint)cursor + 63) & ~(nuint)63);
+        if (aligned > end || count > (nuint)(end - aligned) / (nuint)sizeof(T)) throw new OutOfMemoryException("arena exhausted");
         var next = aligned + count * (nuint)sizeof(T);
-        if (next > end) throw new OutOfMemoryException("arena exhausted");
         cursor = next;
         return (T*)aligned;
     }
