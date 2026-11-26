@@ -343,51 +343,58 @@ public sealed unsafe class Model : IDisposable
         for (var i = 0; i < count; i++)
             if (records[i].Dtype == Reader.Fp16 || records[i].Dtype == Reader.Fp32) denseBytes += (nuint)records[i].Bytes * 2 + 128;
         arena = new Arena(denseBytes + (1u << 20));
-
-        var orders = arena.Take<int>(4);
-        var sites = arena.Take<int>(16);
-        Geometry = new Geometry(header, orders, sites);
-        Require(Geometry.QkDim == 48 && Geometry.VDim == 64 && Geometry.Lanes == 4,
-            $"unsupported head geometry: found QkDim={Geometry.QkDim}, VDim={Geometry.VDim}, Lanes={Geometry.Lanes}; this build supports QkDim=48, VDim=64, Lanes=4");
-        Require(Geometry.HadaCols % 8 == 0 && Geometry.HadaRows * Geometry.HadaCols == Geometry.HadaN,
-            $"unsupported MLP geometry: found HadaN={Geometry.HadaN}; this build supports sizes that split into rows by columns with columns divisible by 8");
-        Require(Geometry.ConvTaps == 3 && Geometry.EngramConvTaps == 4 && Geometry.Dim % Cq.GroupSize == 0,
-            $"unsupported convolution geometry: found ConvTaps={Geometry.ConvTaps}, EngramConvTaps={Geometry.EngramConvTaps}, Dim={Geometry.Dim}; this build supports ConvTaps=3, EngramConvTaps=4 and Dim divisible by {Cq.GroupSize}");
-
-        var reader = new Reader(map, length, records, arena, codebook);
-        reader.ExactHalves = !HasAudioWeights(records, count);
-        Embedding = reader.Quantized();
-        Blocks = reader.Take<LayerWeights>((nuint)Geometry.Layers);
-        for (var l = 0; l < Geometry.Layers; l++) Blocks[l] = new LayerWeights(ref reader);
-        Hyper = new HyperConnections(ref reader, Geometry.HadaN);
-        Sites = reader.Take<EngramSite>((nuint)Geometry.SiteCount);
-        for (var s = 0; s < Geometry.SiteCount; s++) Sites[s] = new EngramSite(ref reader);
-        FinalNorm = reader.Dense();
-        var tail = records + count - 1;
-        if (reader.Next->Dtype == Reader.Fp32 && reader.Next->Ndim == 1 && reader.Next->Shape0 == 13)
+        try
         {
-            Audio = reader.Take<AudioWeights>(1);
-            reader.ExactHalves = true;
-            *Audio = new AudioWeights(ref reader, Geometry.Layers, Geometry.HadaN);
-        }
-        else if (reader.Next != tail)
-        {
-            var manifest = reader.Dense();
-            for (var h = 0; reader.Next != tail; h++)
+            var orders = arena.Take<int>(4);
+            var sites = arena.Take<int>(16);
+            Geometry = new Geometry(header, orders, sites);
+            Require(Geometry.QkDim == 48 && Geometry.VDim == 64 && Geometry.Lanes == 4,
+                $"unsupported head geometry: found QkDim={Geometry.QkDim}, VDim={Geometry.VDim}, Lanes={Geometry.Lanes}; this build supports QkDim=48, VDim=64, Lanes=4");
+            Require(Geometry.HadaCols % 8 == 0 && Geometry.HadaRows * Geometry.HadaCols == Geometry.HadaN,
+                $"unsupported MLP geometry: found HadaN={Geometry.HadaN}; this build supports sizes that split into rows by columns with columns divisible by 8");
+            Require(Geometry.ConvTaps == 3 && Geometry.EngramConvTaps == 4 && Geometry.Dim % Cq.GroupSize == 0,
+                $"unsupported convolution geometry: found ConvTaps={Geometry.ConvTaps}, EngramConvTaps={Geometry.EngramConvTaps}, Dim={Geometry.Dim}; this build supports ConvTaps=3, EngramConvTaps=4 and Dim divisible by {Cq.GroupSize}");
+
+            var reader = new Reader(map, length, records, arena, codebook);
+            reader.ExactHalves = !HasAudioWeights(records, count);
+            Embedding = reader.Quantized();
+            Blocks = reader.Take<LayerWeights>((nuint)Geometry.Layers);
+            for (var l = 0; l < Geometry.Layers; l++) Blocks[l] = new LayerWeights(ref reader);
+            Hyper = new HyperConnections(ref reader, Geometry.HadaN);
+            Sites = reader.Take<EngramSite>((nuint)Geometry.SiteCount);
+            for (var s = 0; s < Geometry.SiteCount; s++) Sites[s] = new EngramSite(ref reader);
+            FinalNorm = reader.Dense();
+            var tail = records + count - 1;
+            if (reader.Next->Dtype == Reader.Fp32 && reader.Next->Ndim == 1 && reader.Next->Shape0 == 13)
             {
-                var code = (int)MathF.Round(manifest[h]);
-                var head = reader.Take<ProbeHead>(1);
-                *head = new ProbeHead(ref reader, code, Geometry.Layers, Geometry.Dim);
-                if (code == ProbeHead.Confidence) Confidence = head;
-                else if (code == ProbeHead.Embedding) EmbeddingHead = head;
+                Audio = reader.Take<AudioWeights>(1);
+                reader.ExactHalves = true;
+                *Audio = new AudioWeights(ref reader, Geometry.Layers, Geometry.HadaN);
             }
-        }
+            else if (reader.Next != tail)
+            {
+                var manifest = reader.Dense();
+                for (var h = 0; reader.Next != tail; h++)
+                {
+                    var code = (int)MathF.Round(manifest[h]);
+                    var head = reader.Take<ProbeHead>(1);
+                    *head = new ProbeHead(ref reader, code, Geometry.Layers, Geometry.Dim);
+                    if (code == ProbeHead.Confidence) Confidence = head;
+                    else if (code == ProbeHead.Embedding) EmbeddingHead = head;
+                }
+            }
 
-        var tokenizer = records + count - 1;
-        TokenizerBlob = map + tokenizer->Offset;
-        TokenizerLength = (nuint)tokenizer->Bytes;
-        arena = reader.Arena;
-        Info = new ModelInfo(Geometry, header[0], (long)length, count, (int)header[2], (long)tokenizer->Bytes, Audio != null, Confidence != null, EmbeddingHead != null);
+            var tokenizer = records + count - 1;
+            TokenizerBlob = map + tokenizer->Offset;
+            TokenizerLength = (nuint)tokenizer->Bytes;
+            arena = reader.Arena;
+            Info = new ModelInfo(Geometry, header[0], (long)length, count, (int)header[2], (long)tokenizer->Bytes, Audio != null, Confidence != null, EmbeddingHead != null);
+        }
+        catch
+        {
+            arena.Free();
+            throw;
+        }
     }
 
     public ModelInfo Info { get; }
