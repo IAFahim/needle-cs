@@ -1,0 +1,85 @@
+name: Bench 4.x
+
+on:
+  push:
+    branches: [claude/engine-4x]
+  workflow_dispatch:
+    inputs:
+      rounds:
+        description: interleaved rounds per engine
+        default: "5"
+
+concurrency:
+  group: bench-4x-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  DOTNET_NOLOGO: "1"
+
+jobs:
+  bench:
+    name: needle-cs vs upstream 3.3.3 vs upstream 4.x (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Restore cached models
+        uses: actions/cache@v4
+        with:
+          path: ref
+          key: bench-ref-${{ runner.arch }}-${{ hashFiles('tools/ref.lock', 'tools/fetch.sh', 'tools/fetch-engine4.sh') }}
+
+      - name: Download models, the 3.3.3 wheel and the 4.x engine
+        run: |
+          bash tools/fetch.sh
+          if [ "${{ runner.arch }}" = "ARM64" ]; then tag=manylinux2014_aarch64; else tag=manylinux2014_x86_64; fi
+          bash tools/fetch.sh --engine4 "$tag"
+
+      - name: Machine
+        run: |
+          lscpu | head -25
+          nproc
+
+      - name: Publish the NativeAOT CLI
+        run: dotnet publish src/Needle.Cli -c Release -o out/aot
+
+      - name: Smoke test all three engines
+        run: |
+          out/aot/needle call ref/hf/needle3.cact tools/tools.json "set a timer for 12 minutes and play some Miles Davis"
+          python3 tools/native_bench.py ref/native4 ref/hf/needle3.cact tools/tools.json --sets golden --reps 1 --threads 4
+          if [ "${{ runner.arch }}" = "X64" ]; then python3 tools/native_bench.py ref/hf/wheel ref/hf/needle3.cact tools/tools.json --sets golden --reps 1; fi
+
+      - name: Interleaved benchmark
+        run: |
+          rounds="${{ github.event.inputs.rounds || '5' }}"
+          engines=(--engine "upstream-4.x" "python3 tools/native_bench.py ref/native4 ref/hf/needle3.cact tools/tools.json --json --reps 3 --threads 1 2 4 0")
+          if [ "${{ runner.arch }}" = "X64" ]; then
+            engines+=(--engine "upstream-3.3.3" "python3 tools/native_bench.py ref/hf/wheel ref/hf/needle3.cact tools/tools.json --json --reps 3")
+          fi
+          engines+=(--engine "needle-cs" "out/aot/needle bench-e2e ref/hf/needle3.cact tools/tools.json --threads 1,2,4 --reps 3 --json")
+          python3 tools/bench_engines.py --rounds "$rounds" --json bench.json "${engines[@]}" | tee bench.md
+          { echo "## ${{ matrix.os }}"; echo; cat bench.md; } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.os }}
+          path: |
+            bench.md
+            bench.json

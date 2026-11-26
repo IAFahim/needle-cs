@@ -22,6 +22,7 @@ usage() {
   echo "  (no option)    download the files pinned in tools/ref.lock into ref/ and verify their SHA-256" >&2
   echo "  --verify       check the files already in ref/ against tools/ref.lock, download nothing" >&2
   echo "  --update-lock  download the newest upstream revisions and rewrite tools/ref.lock" >&2
+  echo "  --engine4      download the pinned upstream 4.x engine (libcactus) into ref/native4, verified through its release manifest" >&2
   exit 2
 }
 
@@ -136,6 +137,7 @@ update_lock() {
     mv "$destination.part" "$destination"
     echo "file $(sha256_of "$destination") $(wc -c <"$destination" | tr -d ' ') $source $remote $local_path" >>"$staging"
   done
+  if [ -f "$lock" ]; then awk '$2 == "engine4"' "$lock" >>"$staging"; fi
   mv "$staging" "$lock"
   chmod 644 "$lock"
   echo "wrote $lock; regenerate the golden fixtures next ($guidance)"
@@ -145,5 +147,6 @@ case "${1:-}" in
   "") fetch_all ;;
   --verify) verify_all ;;
   --update-lock) update_lock ;;
+  --engine4) exec "$root/tools/fetch-engine4.sh" "${2:-manylinux2014_x86_64}" ;;
   *) usage ;;
 esac
