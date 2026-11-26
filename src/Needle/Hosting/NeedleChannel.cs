@@ -284,7 +284,7 @@ public readonly unsafe struct NeedleChannel
         Volatile.Write(ref *(nint*)(block + WakeStateOffset), (nint)state);
     }
 
-    internal void SetSleeping(long value) => Volatile.Write(ref *sleeping, value);
+    internal void SetSleeping(long value) => Interlocked.Exchange(ref *sleeping, value);
 
     public bool TrySubmitQuery(ReadOnlySpan<byte> utf8, out ulong ticket)
     {
