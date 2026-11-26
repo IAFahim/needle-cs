@@ -1,0 +1,22 @@
+{
+    "name": "Needle.Unity.PlayMode.Tests",
+    "rootNamespace": "Needle.Unity.PlayMode.Tests",
+    "references": [
+        "Needle.Unity",
+        "UnityEngine.TestRunner"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": true,
+    "overrideReferences": true,
+    "precompiledReferences": [
+        "nunit.framework.dll",
+        "Needle.Inference.dll"
+    ],
+    "autoReferenced": false,
+    "defineConstraints": [
+        "UNITY_INCLUDE_TESTS"
+    ],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

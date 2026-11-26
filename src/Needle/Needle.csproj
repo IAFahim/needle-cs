@@ -17,6 +17,12 @@
     <InternalsVisibleTo Include="Needle.Tests" />
     <InternalsVisibleTo Include="needle" />
     <InternalsVisibleTo Include="Needle.Unity" />
+    <InternalsVisibleTo Include="Needle.Unity.Tests" />
+  </ItemGroup>
+  <!-- tools/pack-unity.sh stamps the Unity plugin DLLs with a hash of the sources they were built
+       from, so the check mode of tools/pack-unity.sh can tell when the committed DLLs are stale. -->
+  <ItemGroup Condition="'$(NeedleSourceStamp)' != ''">
+    <AssemblyMetadata Include="Needle.SourceStamp" Value="$(NeedleSourceStamp)" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="System.Runtime.CompilerServices.Unsafe" Version="6.0.0" />

@@ -1,0 +1,160 @@
+name: Unity
+
+# The Unity side of needle-cs: com.needle.inference's tests in the Editor (EditMode and PlayMode),
+# a clean import of the package as a Git-URL install sees it, and the bench on the Editor and on
+# IL2CPP and CoreCLR players, next to the native library on the same machine. Everything that
+# needs Unity runs on a self-hosted runner with the labels self-hosted, Linux, X64 and unity
+# (setup: unity/com.needle.inference/Documentation~/testing-and-ci.md); tools/unity-ci.sh does
+# the work, so the same steps run by hand on any machine with Unity.
+
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - "unity/**"
+      - "src/Needle/**"
+      - "Directory.Build.props"
+      - "Directory.Build.targets"
+      - "tools/pack-unity.sh"
+      - "tools/unity-*"
+      - "tools/fetch.sh"
+      - "tools/ref.lock"
+      - "tools/native_bench.py"
+      - "tools/*tools.json"
+      - ".github/workflows/unity.yml"
+  pull_request:
+    paths:
+      - "unity/**"
+      - "src/Needle/**"
+      - "Directory.Build.props"
+      - "Directory.Build.targets"
+      - "tools/pack-unity.sh"
+      - "tools/unity-*"
+      - "tools/fetch.sh"
+      - "tools/ref.lock"
+      - "tools/native_bench.py"
+      - "tools/*tools.json"
+      - ".github/workflows/unity.yml"
+  workflow_dispatch:
+    inputs:
+      threads:
+        description: Thread counts for the benches (comma separated)
+        default: "4"
+      reps:
+        description: Timed repetitions per prompt
+        default: "5"
+      players:
+        description: Build and bench the IL2CPP and CoreCLR players
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  DOTNET_NOLOGO: "1"
+
+jobs:
+  package-check:
+    name: Package layout and DLL stamps
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check metas, GUIDs, test asmdefs, tracked DLLs and C# 9 syntax
+        run: python3 tools/unity-package-lint.py
+      - name: Check the plugin DLLs were built from the current sources
+        run: bash tools/pack-unity.sh --check
+
+  unity:
+    name: Unity Editor, players and bench (self-hosted)
+    needs: package-check
+    # A self-hosted runner on a public repository would run a fork's code on the owner's PC, so
+    # pull requests from forks stop at package-check.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64, unity]
+    timeout-minutes: 240
+    # One Unity job at a time on the PC, and never cancelled halfway, so the benches are not timed
+    # while another run competes for the cores.
+    concurrency:
+      group: unity-self-hosted
+      cancel-in-progress: false
+    env:
+      NEEDLE_REQUIRE_MODEL: "1"
+      NEEDLE_THREADS: ${{ inputs.threads || '4' }}
+      NEEDLE_REPS: ${{ inputs.reps || '5' }}
+      NEEDLE_WARMUPS: "1"
+      NEEDLE_SETS: all
+      UNITY_SERIAL: ${{ secrets.UNITY_SERIAL }}
+      UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+      UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show the machine and the Unity editor in use
+        run: |
+          echo "NEEDLE_REF_CACHE=${NEEDLE_REF_CACHE:-$HOME/needle-ref}" >> "$GITHUB_ENV"
+          uname -a
+          nproc
+          grep -m1 'model name' /proc/cpuinfo || true
+          grep -o 'avx512[a-z0-9]*\|avx2\|avx_vnni\|fma' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+          echo "UNITY_EDITOR=${UNITY_EDITOR:-<newest under ~/Unity/Hub/Editor>}"
+          ls -1 "$HOME/Unity/Hub/Editor" 2>/dev/null || true
+
+      - name: Fetch the model, Whistle and audio clips into the cache (skips verified files)
+        run: |
+          NEEDLE_REF_DIR="$NEEDLE_REF_CACHE" bash tools/fetch.sh
+          ln -sfn "$NEEDLE_REF_CACHE" ref
+
+      - name: Package checks
+        run: tools/unity-ci.sh lint
+
+      - name: Clean import of the git-tracked package
+        run: tools/unity-ci.sh fresh-install
+
+      - name: EditMode tests
+        run: tools/unity-ci.sh editmode
+
+      - name: PlayMode tests
+        if: ${{ !cancelled() }}
+        run: tools/unity-ci.sh playmode
+
+      - name: Bench in the Editor (CoreCLR)
+        if: ${{ !cancelled() }}
+        run: tools/unity-ci.sh bench-editmode
+
+      - name: Bench an IL2CPP player
+        if: ${{ !cancelled() && (github.event_name != 'workflow_dispatch' || inputs.players) }}
+        run: tools/unity-ci.sh player il2cpp
+
+      - name: Bench a CoreCLR player
+        if: ${{ !cancelled() && (github.event_name != 'workflow_dispatch' || inputs.players) }}
+        run: tools/unity-ci.sh player coreclr
+
+      - name: Bench the native library on the same machine
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: |
+          python3 tools/native_bench.py ref/hf/wheel ref/hf/needle3.cact tools/tools.json \
+            --sets all --reps "$NEEDLE_REPS" --warmup "$NEEDLE_WARMUPS" --json > out/unity/bench-native.json
+
+      - name: Compare the benches
+        if: ${{ !cancelled() }}
+        run: |
+          python3 tools/unity-bench-compare.py --native out/unity/bench-native.json \
+            editor=out/unity/bench-editmode.json \
+            il2cpp=out/unity/bench-player-il2cpp.json \
+            coreclr=out/unity/bench-player-coreclr.json | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload logs, test results and bench JSON
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: unity-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            out/unity/*.xml
+            out/unity/*.log
+            out/unity/*.json
+          if-no-files-found: warn
+          retention-days: 30
