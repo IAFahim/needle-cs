@@ -171,7 +171,9 @@ public sealed unsafe partial class NeedleSession : IDisposable
     readonly Engine engine;
     readonly Tokenizer tokenizer;
     readonly TokenTrie trie;
-    readonly string system;
+    string system;
+    string systemText;
+    byte[] systemUtf8 = Array.Empty<byte>();
     readonly int maskWords;
     readonly uint* reasoningMask;
     readonly uint* decisionMask;
@@ -220,7 +222,7 @@ public sealed unsafe partial class NeedleSession : IDisposable
     readonly RepairScratch? repairScratch;
     readonly RepairText? repairRequest;
     readonly RepairText? repairHistory;
-    readonly DateTime? repairToday;
+    DateTime? repairToday;
     RepairOutcome lastRepair;
 
     public NeedleSession(Model model, string toolsJson, NeedleOptions? options = null)
@@ -242,7 +244,9 @@ public sealed unsafe partial class NeedleSession : IDisposable
         var vocabulary = model.GetVocabulary();
         tokenizer = new Tokenizer(vocabulary, TokenizerInputBytes);
         trie = new TokenTrie(vocabulary.Trie);
-        system = BuildSystem(this.options);
+        systemText = this.options.System ?? "";
+        systemUtf8 = Encoding.UTF8.GetBytes(systemText);
+        system = BuildSystem(systemText, this.options.AutoDate);
         contextCapacity = Math.Min(this.options.Context, model.Geometry.MaxSeq);
         embedderCapacity = Math.Min(EmbedderContext, model.Geometry.MaxSeq);
         maxInputBytes = Math.Max(1, Math.Min(TokenizerInputBytes - InputOverheadBytes, this.options.Context * 16));
@@ -321,7 +325,7 @@ public sealed unsafe partial class NeedleSession : IDisposable
     void LoadHistory()
     {
         if (repairHistory == null) return;
-        repairHistory.Load(Encoding.UTF8.GetBytes(options.System ?? ""));
+        repairHistory.Load(systemUtf8);
         repairRequest!.Clear();
     }
 
@@ -336,10 +340,9 @@ public sealed unsafe partial class NeedleSession : IDisposable
 
     public void RequestCancel() => System.Threading.Volatile.Write(ref cancelRequested, 1);
 
-    static string BuildSystem(NeedleOptions o)
+    static string BuildSystem(string text, bool autoDate)
     {
-        var text = o.System ?? "";
-        if (!o.AutoDate || DateKey.IsMatch(text) || IsoStamp.IsMatch(text)) return text;
+        if (!autoDate || DateKey.IsMatch(text) || IsoStamp.IsMatch(text)) return text;
         var fact = DateTime.Now.ToString("'date: 'yyyy-MM-dd ddd HH:mm", CultureInfo.InvariantCulture);
         if (string.IsNullOrWhiteSpace(text)) return fact;
         return text.TrimStart().StartsWith('{') ? text : fact + "; " + text;
@@ -383,6 +386,18 @@ public sealed unsafe partial class NeedleSession : IDisposable
         specPrimedLength = primed;
         specHistoryLength = primed;
         turnOne = true;
+    }
+
+    /// <summary>Replaces the system facts and starts a new conversation. The tools and the model stay as they are.</summary>
+    public void SetSystem(string? text)
+    {
+        systemText = text ?? "";
+        systemUtf8 = Encoding.UTF8.GetBytes(systemText);
+        system = BuildSystem(systemText, options.AutoDate);
+        if (repairScratch != null) repairToday = ParseToday(system);
+        LoadHistory();
+        if (retrieval) activeToolCount = -1;
+        else Prime(active);
     }
 
     public void Reset()
