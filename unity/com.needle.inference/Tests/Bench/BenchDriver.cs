@@ -249,23 +249,40 @@ namespace Needle.Bench
             }
         }
 
+        // The netstandard2.1 core has no hardware intrinsics, so its own tier always reads scalar;
+        // the kernels that run come from the net10.0 sidecar when the runtime loads it. Report the
+        // sidecar's tier when it is loaded, the core's otherwise, and the kernel provider.
         internal static string SimdTier()
         {
+            string tier = ReadTier("Needle.Tiers, Needle.Inference.Net10") ?? ReadTier("Needle.Tiers, Needle.Inference") ?? "unknown";
+            string provider = null;
             try
             {
-                Type tiers = Type.GetType("Needle.Tiers, Needle.Inference");
-                if (tiers == null) return "unknown";
-                FieldInfo active = tiers.GetField("Active", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
-                if (active == null) return "unknown";
-                string tier = active.GetValue(null).ToString().ToLowerInvariant();
-                if (tier == "scalar") return "scalar";
-                if (tier.IndexOf("neon", StringComparison.Ordinal) >= 0) return "neon";
-                if (tier.IndexOf("avx", StringComparison.Ordinal) >= 0) return "avx2";
-                return tier;
+                string described = Needle.NeedleRuntime.Describe();
+                int at = described.IndexOf("provider=", StringComparison.Ordinal);
+                if (at >= 0)
+                {
+                    int stop = described.IndexOf(' ', at);
+                    provider = stop < 0 ? described.Substring(at + 9) : described.Substring(at + 9, stop - at - 9);
+                }
             }
             catch (Exception)
             {
-                return "unknown";
+            }
+            return provider == null || provider == "none" ? tier : tier + " (" + provider + ")";
+        }
+
+        static string ReadTier(string typeName)
+        {
+            try
+            {
+                Type tiers = Type.GetType(typeName);
+                FieldInfo active = tiers?.GetField("Active", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+                return active?.GetValue(null)?.ToString().ToLowerInvariant();
+            }
+            catch (Exception)
+            {
+                return null;
             }
         }
 
