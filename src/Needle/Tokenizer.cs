@@ -293,7 +293,7 @@ public sealed unsafe class Tokenizer : IDisposable
         var right = nextSymbol[left];
         if (right < 0) return;
         var id = Lookup(escaped + left, symbolEnd[right] - left);
-        if (id < 0) return;
+        if (id < 0 || pieceType[id] is ControlType or UnknownType or ByteType) return;
         var i = size++;
         var entry = new Merge { Score = pieceScore[id], Left = left, Right = right, RightEnd = symbolEnd[right] };
         while (i > 0)
