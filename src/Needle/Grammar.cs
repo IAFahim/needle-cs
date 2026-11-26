@@ -227,6 +227,8 @@ internal sealed unsafe class Grammar : IDisposable
 
     int CompileUnion(List<int> branches)
     {
+        if (branches.Contains(Kind.NumNode)) branches.RemoveAll(b => b == Kind.IntNode);
+        if (branches.Count == 1) return branches[0];
         var first = unions.Count;
         unions.AddRange(branches);
         return AddNode(Kind.Union, branches.Count, first, 0, 0);

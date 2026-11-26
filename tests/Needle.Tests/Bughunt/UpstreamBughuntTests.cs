@@ -220,6 +220,17 @@ public sealed unsafe class UpstreamBughuntTests
         if (!prefixed) Assert.Equal(system, text);
     }
 
+    [Theory]
+    [InlineData("{\"type\":[\"integer\",\"number\"]}")]
+    [InlineData("{\"anyOf\":[{\"type\":\"integer\"},{\"type\":\"number\"}]}")]
+    public void AnIntegerOrNumberUnionAcceptsFractions(string schema)
+    {
+        var set = new ToolSet("[" + Tool("t", "{\"x\":" + schema + "}") + "]");
+        using var grammar = new Grammar(set.Tools);
+        Assert.True(Accepts(grammar, "[{\"name\":\"t\",\"arguments\":{\"x\":7}}]"));
+        Assert.True(Accepts(grammar, "[{\"name\":\"t\",\"arguments\":{\"x\":1.5}}]"));
+    }
+
     static GrammarState Advanced(Grammar grammar, string text)
     {
         var state = Grammar.Start(grammar.Program);
