@@ -6,8 +6,10 @@ namespace Needle;
 
 internal sealed class AgentState
 {
-    public readonly NeedleSession Session;
-    public readonly ModelState Model;
+    public readonly NeedleSession Session = null!;
+    public readonly ModelState Model = null!;
+    readonly CallSpan[]? fixedSpans;
+    readonly byte[][]? fixedNames;
     public readonly byte[] Input;
     public readonly byte[] Calls;
     public readonly byte[] Reasoning;
@@ -30,6 +32,35 @@ internal sealed class AgentState
         Response = new byte[Session.ResponseBufferBytes];
         CallSource = Calls;
     }
+
+    /// <summary>An agent state that holds fixed calls and no model, for tests of the views.</summary>
+    internal AgentState(string[] toolNames, (int Tool, string Arguments)[] calls)
+    {
+        fixedNames = new byte[toolNames.Length][];
+        for (var i = 0; i < toolNames.Length; i++) fixedNames[i] = Encoding.UTF8.GetBytes(toolNames[i]);
+        fixedSpans = new CallSpan[calls.Length];
+        var text = new StringBuilder();
+        for (var i = 0; i < calls.Length; i++)
+        {
+            var start = Encoding.UTF8.GetByteCount(text.ToString());
+            text.Append(calls[i].Arguments);
+            fixedSpans[i] = new CallSpan(calls[i].Tool, start, Encoding.UTF8.GetByteCount(calls[i].Arguments));
+        }
+        Input = Reasoning = Response = Array.Empty<byte>();
+        Calls = CallSource = Encoding.UTF8.GetBytes(text.ToString());
+        Version = 1;
+        HasAnswer = true;
+        Kind = calls.Length > 0 ? AnswerKind.Calls : AnswerKind.Declined;
+        Why = calls.Length > 0 ? AnswerWhy.None : AnswerWhy.Declined;
+    }
+
+    public int CallCount => fixedSpans?.Length ?? Session.ViewCallCount;
+
+    public CallSpan CallAt(int index) => fixedSpans != null ? fixedSpans[index] : Session.ViewCall(index);
+
+    public ReadOnlySpan<byte> ToolName(int tool) => fixedNames != null ? fixedNames[tool] : Session.ToolNameUtf8(tool);
+
+    public ReadOnlySpan<byte> Ungrounded => fixedSpans != null ? default : Session.Ungrounded;
 
     public void Record(in Reply reply, byte[] callSource)
     {
@@ -106,6 +137,10 @@ public readonly struct NeedleAgent : IDisposable, IEquatable<NeedleAgent>
             model.Release();
         }
     }
+
+    /// <summary>Loads the model and makes an agent for the tools of a <c>[Tools]</c> interface.</summary>
+    public static NeedleAgent Open<TTools>(string modelPath, in AgentOptions options = default) where TTools : class =>
+        Open(modelPath, ToolCatalog<TTools>.Json, options);
 
     internal static NeedleAgent Create(ModelState model, string toolsJson, in AgentOptions options)
     {

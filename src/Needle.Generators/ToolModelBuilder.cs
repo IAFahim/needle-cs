@@ -13,6 +13,7 @@ namespace Needle.Generators;
 public sealed class NeedleToolsGenerator : IIncrementalGenerator
 {
     const string AttributeName = "Needle.Tools.NeedleToolsAttribute";
+    const string ModernAttributeName = "Needle.ToolsAttribute";
 
     public void Initialize(IncrementalGeneratorInitializationContext context)
     {
@@ -24,6 +25,17 @@ public sealed class NeedleToolsGenerator : IIncrementalGenerator
             compilation.GetTypeByMetadataName("Needle.Tools.IToolSet") is not null);
         var useUtf8Literals = context.ParseOptionsProvider.Select(static (options, _) =>
             options is CSharpParseOptions cs && (int)cs.LanguageVersion >= 1100);
+        var modern = context.SyntaxProvider.ForAttributeWithMetadataName(
+            ModernAttributeName,
+            static (node, _) => node is InterfaceDeclarationSyntax,
+            static (context, _) => ToolModelBuilder.Build((INamedTypeSymbol)context.TargetSymbol, modern: true));
+        context.RegisterSourceOutput(modern, static (context, built) =>
+        {
+            foreach (var diagnostic in built.Diagnostics)
+                context.ReportDiagnostic(Diagnostic.Create(diagnostic.Descriptor, Location.Create(diagnostic.FilePath, diagnostic.Span, diagnostic.LineSpan)));
+            if (built.Model is { } model)
+                context.AddSource(model.InterfaceName + ".Tools.g.cs", ModernEmitter.Emit(model));
+        });
         var combined = models.Combine(hasToolSet).Combine(useUtf8Literals);
         context.RegisterSourceOutput(combined.Combine(context.CompilationProvider), static (context, pair) =>
         {
@@ -101,12 +113,14 @@ internal sealed record BuiltToolSet(ToolSetModel? Model, ImmutableArray<Diagnost
 
 internal static class ToolModelBuilder
 {
-    public static BuiltToolSet Build(INamedTypeSymbol symbol)
+    const string DescriptionAttributeName = "System.ComponentModel.DescriptionAttribute";
+
+    public static BuiltToolSet Build(INamedTypeSymbol symbol, bool modern = false)
     {
         var diagnostics = ImmutableArray.CreateBuilder<DiagnosticInfo>();
         if (symbol.TypeKind != TypeKind.Interface || symbol.Arity != 0)
         {
-            diagnostics.Add(Info("NDG002", symbol.Locations.FirstOrDefault(), "The [NeedleTools] attribute applies to non-generic interfaces only."));
+            diagnostics.Add(Info("NDG002", symbol.Locations.FirstOrDefault(), modern ? "The [Tools] attribute applies to non-generic interfaces only." : "The [NeedleTools] attribute applies to non-generic interfaces only."));
             return new BuiltToolSet(null, diagnostics.ToImmutable());
         }
         var tools = ImmutableArray.CreateBuilder<ToolEntry>();
@@ -115,7 +129,8 @@ internal static class ToolModelBuilder
         {
             if (member is not IMethodSymbol method || method.MethodKind != MethodKind.Ordinary) continue;
             var tool = method.GetAttributes().FirstOrDefault(a => a.AttributeClass?.ToDisplayString() == "Needle.Tools.ToolAttribute");
-            if (tool == null) continue;
+            if (tool == null && !modern) continue;
+            if (modern && method.IsStatic) continue;
             if (method.Arity != 0)
             {
                 diagnostics.Add(Info("NDG007", method.Locations.FirstOrDefault(), $"Tool '{method.Name}' must not be generic."));
@@ -127,7 +142,11 @@ internal static class ToolModelBuilder
                 diagnostics.Add(Info("NDG006", method.Locations.FirstOrDefault(), $"Tool name '{method.Name}' is a duplicate after snake_casing."));
                 continue;
             }
-            var description = tool.ConstructorArguments.FirstOrDefault().Value as string ?? "";
+            var description = tool?.ConstructorArguments.FirstOrDefault().Value as string
+                ?? DescriptionOf(method)
+                ?? "";
+            if (modern && description.Length == 0)
+                diagnostics.Add(Info("NDG009", method.Locations.FirstOrDefault(), $"Tool '{method.Name}' has no description; add [Description(\"...\")] so the model knows when to call it."));
             var args = ImmutableArray.CreateBuilder<ToolArg>();
             var valid = true;
             foreach (var parameter in method.Parameters)
@@ -219,7 +238,11 @@ internal static class ToolModelBuilder
     }
 
     static string? Description(IParameterSymbol parameter) =>
-        parameter.GetAttributes().FirstOrDefault(a => a.AttributeClass?.ToDisplayString() == "Needle.Tools.ParamAttribute")?.ConstructorArguments.FirstOrDefault().Value as string;
+        parameter.GetAttributes().FirstOrDefault(a => a.AttributeClass?.ToDisplayString() == "Needle.Tools.ParamAttribute")?.ConstructorArguments.FirstOrDefault().Value as string
+        ?? DescriptionOf(parameter);
+
+    static string? DescriptionOf(ISymbol symbol) =>
+        symbol.GetAttributes().FirstOrDefault(a => a.AttributeClass?.ToDisplayString() == DescriptionAttributeName)?.ConstructorArguments.FirstOrDefault().Value as string;
 
     static string? DefaultLiteral(IParameterSymbol parameter)
     {
@@ -255,6 +278,7 @@ internal static class ToolModelBuilder
             "NDG005" => "Unsupported default value",
             "NDG006" => "Duplicate tool name",
             "NDG007" => "Generic tool method",
+            "NDG009" => "Tool without a description",
             _ => "Duplicate enum literal",
         },
         id is "NDG001" or "NDG002" or "NDG003" or "NDG004" or "NDG005" ? "Error" : "Warning",
