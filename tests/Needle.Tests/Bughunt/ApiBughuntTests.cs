@@ -56,6 +56,18 @@ public struct ToolPickSink : IGrammarSink
 
 public sealed unsafe class ApiBughuntTests
 {
+    [Fact]
+    public void Utf8Text_SetFromBytes_TruncatesAtACharacterBoundary()
+    {
+        var bytes = Encoding.UTF8.GetBytes("aaaaaaa\u00e9");
+        var slot = new Utf8Text8();
+        slot.Set(bytes);
+        Assert.Equal("aaaaaaa", slot.ToString());
+        var wide = new Utf8Text16();
+        wide.Set(Encoding.UTF8.GetBytes("aaaaaaaaaaaaaa\u20ac"));
+        Assert.Equal("aaaaaaaaaaaaaa", wide.ToString());
+    }
+
     [Theory]
     [InlineData("{")]
     [InlineData("[")]
