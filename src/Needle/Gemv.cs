@@ -111,6 +111,7 @@ internal static unsafe class Gemv
     const int CacheLine = 64;
     const int HalvesPerVector = 8;
     static readonly bool UsePermute = Simd.UseAvx && Avx512Vbmi.VL.IsSupported && Environment.GetEnvironmentVariable("NEEDLE_NOAVX512") == null;
+    static readonly bool UseEvex = UsePermute && Tiers.Active == CpuTier.Avx512Vnni && EvexVnni.Ready;
     static readonly bool UsePanel = Environment.GetEnvironmentVariable("NEEDLE_PANEL") != null;
     const float HalfExponentRebias = 5.192296858534828e33f;
 
@@ -143,6 +144,7 @@ internal static unsafe class Gemv
     {
         if (Tiers.Active == CpuTier.AvxVnniInt8) RowsPhiImpl<TPlanes, VnniInt8Dot>(pre, preOut, post, postOut, res, resOut, a);
         else if (Tiers.Active == CpuTier.Avx512Bw) RowsPhiImpl<TPlanes, BwDot>(pre, preOut, post, postOut, res, resOut, a);
+        else if (Tiers.Active == CpuTier.Avx512Vnni && AvxVnni.IsSupported) RowsPhiImpl<TPlanes, VnniDot>(pre, preOut, post, postOut, res, resOut, a);
         else if (Tiers.Active == CpuTier.AvxVnni) RowsPhiImpl<TPlanes, VnniDot>(pre, preOut, post, postOut, res, resOut, a);
         else RowsPhiImpl<TPlanes, Avx2Dot>(pre, preOut, post, postOut, res, resOut, a);
     }
@@ -187,6 +189,8 @@ internal static unsafe class Gemv
         var paddedGroups = (groups + HalvesPerVector - 1) & ~(HalvesPerVector - 1);
         var convertibleRows = (long)w.Rows * groups < paddedGroups ? 0 : (int)(((long)w.Rows * groups - paddedGroups) / groups) + 1;
         var n = 0;
+        if (UseEvex)
+            n = EvexBlocks<TPlanes>(w, n, Math.Min(w.Rows, convertibleRows), stride, tables, weightedScales, a.Offsets, a.Values, scaled, y);
         for (; n + RowBlock <= w.Rows && n + RowBlock <= convertibleRows; n += RowBlock)
             Block<TPlanes, TDot>(w.Indices + (long)n * rowBytes, rowBytes, w.Norms + (long)n * groups, groups, stride, tables, weightedScales, a.Offsets, a.Values, scaled, y + n);
         for (; n < w.Rows; n++)
@@ -197,11 +201,24 @@ internal static unsafe class Gemv
     {
         if (Tiers.Active == CpuTier.AvxVnniInt8) Rows<TPlanes, VnniInt8Dot>(w, a, token, y, rowStart, rowEnd);
         else if (Tiers.Active == CpuTier.Avx512Bw) Rows<TPlanes, BwDot>(w, a, token, y, rowStart, rowEnd);
+        else if (Tiers.Active == CpuTier.Avx512Vnni && AvxVnni.IsSupported) Rows<TPlanes, VnniDot>(w, a, token, y, rowStart, rowEnd);
         else if (Tiers.Active == CpuTier.AvxVnni) Rows<TPlanes, VnniDot>(w, a, token, y, rowStart, rowEnd);
         else Rows<TPlanes, Avx2Dot>(w, a, token, y, rowStart, rowEnd);
     }
 
+    // Test hooks: the same rows through the managed AVX2 block or through the EVEX kernel.
+    internal static void RowsForTest(in Cq w, in Activations a, int token, float* y, int rowStart, int rowEnd, bool evex)
+    {
+        if (w.Bits == 2) Rows<PermuteTwoBitPlanes, Avx2Dot>(w, a, token, y, rowStart, rowEnd, evex);
+        else Rows<PermuteFourBitPlanes, Avx2Dot>(w, a, token, y, rowStart, rowEnd, evex);
+    }
+
     static void Rows<TPlanes, TDot>(in Cq w, in Activations a, int token, float* y, int rowStart, int rowEnd)
+        where TPlanes : struct, IPlaneLayout
+        where TDot : struct, IInt8Dot =>
+        Rows<TPlanes, TDot>(w, a, token, y, rowStart, rowEnd, UseEvex);
+
+    static void Rows<TPlanes, TDot>(in Cq w, in Activations a, int token, float* y, int rowStart, int rowEnd, bool evex)
         where TPlanes : struct, IPlaneLayout
         where TDot : struct, IInt8Dot
     {
@@ -220,10 +237,43 @@ internal static unsafe class Gemv
         var paddedGroups = (groups + HalvesPerVector - 1) & ~(HalvesPerVector - 1);
         var convertibleRows = (long)w.Rows * groups < paddedGroups ? 0 : (int)(((long)w.Rows * groups - paddedGroups) / groups) + 1;
         var n = rowStart;
+        if (evex)
+            n = EvexBlocks<TPlanes>(w, n, Math.Min(rowEnd, convertibleRows), stride, tables, weightedScales, offsets, values, scaled, y);
         for (; n + RowBlock <= rowEnd && n + RowBlock <= convertibleRows; n += RowBlock)
             Block<TPlanes, TDot>(w.Indices + (long)n * rowBytes, rowBytes, w.Norms + (long)n * groups, groups, stride, tables, weightedScales, offsets, values, scaled, y + n);
         for (; n < rowEnd; n++)
             y[n] = Single<TPlanes, TDot>(w.Indices + (long)n * rowBytes, w.Norms + (long)n * groups, groups, stride, n < convertibleRows, tables, weightedScales, offsets, values, scaled);
+    }
+
+    // Runs every whole four-row block in [n, end) through the AVX512-VNNI machine-code kernel and
+    // returns the first row it left for the managed tail. Same float order as Block, so bit-identical.
+    static int EvexBlocks<TPlanes>(in Cq w, int n, int end, int stride, in PlaneTables tables, float* weightedScales, float* offsets, sbyte* values, float* scaled, float* y)
+        where TPlanes : struct, IPlaneLayout
+    {
+        var blocks = (end - n) / RowBlock;
+        if (blocks <= 0) return n;
+        var planes = stackalloc byte[64];
+        Avx.Store(planes, tables.First);
+        Avx.Store(planes + 32, tables.Second);
+        var rowBytes = w.RowBytes;
+        var args = new EvexVnni.BlockArgs
+        {
+            Packed = w.Indices + (long)n * rowBytes,
+            RowBytes = rowBytes,
+            Norms = w.Norms + (long)n * w.Groups,
+            Groups = w.Groups,
+            Stride = stride,
+            WeightedScales = weightedScales,
+            Offsets = offsets,
+            Values = values,
+            Scaled = scaled,
+            Tables = planes,
+            Y = y + n,
+            Blocks = blocks,
+            PrefetchDistance = (long)PrefetchBlocks * RowBlock * rowBytes,
+        };
+        EvexVnni.Blocks(TPlanes.GroupBytes == 32 ? 2 : 4, &args);
+        return n + blocks * RowBlock;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -347,6 +397,7 @@ internal static unsafe class Gemv
     {
         if (Tiers.Active == CpuTier.AvxVnniInt8) Tile4<TPlanes, VnniInt8Dot>(w, a, token, y, ldy, rowStart, rowEnd);
         else if (Tiers.Active == CpuTier.Avx512Bw) Tile4<TPlanes, BwDot>(w, a, token, y, ldy, rowStart, rowEnd);
+        else if (Tiers.Active == CpuTier.Avx512Vnni && AvxVnni.IsSupported) Tile4<TPlanes, VnniDot>(w, a, token, y, ldy, rowStart, rowEnd);
         else if (Tiers.Active == CpuTier.AvxVnni) Tile4<TPlanes, VnniDot>(w, a, token, y, ldy, rowStart, rowEnd);
         else Tile4<TPlanes, Avx2Dot>(w, a, token, y, ldy, rowStart, rowEnd);
     }
@@ -366,6 +417,7 @@ internal static unsafe class Gemv
     {
         if (Tiers.Active == CpuTier.AvxVnniInt8) Tile2<TPlanes, VnniInt8Dot>(w, a, token, y, ldy, rowStart, rowEnd);
         else if (Tiers.Active == CpuTier.Avx512Bw) Tile2<TPlanes, BwDot>(w, a, token, y, ldy, rowStart, rowEnd);
+        else if (Tiers.Active == CpuTier.Avx512Vnni && AvxVnni.IsSupported) Tile2<TPlanes, VnniDot>(w, a, token, y, ldy, rowStart, rowEnd);
         else if (Tiers.Active == CpuTier.AvxVnni) Tile2<TPlanes, VnniDot>(w, a, token, y, ldy, rowStart, rowEnd);
         else Tile2<TPlanes, Avx2Dot>(w, a, token, y, ldy, rowStart, rowEnd);
     }
