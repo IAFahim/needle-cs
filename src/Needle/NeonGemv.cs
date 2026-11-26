@@ -182,6 +182,68 @@ internal static unsafe class NeonGemv
         }
     }
 
+    // Neon.LoadFactors then Neon.ScaleFactors for four consecutive rows against one token, with the
+    // scaled factors written group-major (quads[g * 4 + r]); returns the four biases. Same operations
+    // per element as the two-pass version: the vector half conversion for the groups LoadFactors
+    // converts four at a time, Scalar.HalfToSingle for its tail, zero past the last group.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    static Vector128<float> Factors4(ushort* norms, int groups, int stride, float byteScale, float* scales, float* offsets, float* quads)
+    {
+        var multiplier = Vector128.Create(byteScale);
+        var vectorGroups = groups & ~3;
+        var b0 = Vector128<float>.Zero;
+        var b1 = b0;
+        var b2 = b0;
+        var b3 = b0;
+        for (var v = 0; v < stride; v += 4)
+        {
+            var f0 = RowFactor(norms, v, groups, vectorGroups, multiplier, byteScale);
+            var f1 = RowFactor(norms + groups, v, groups, vectorGroups, multiplier, byteScale);
+            var f2 = RowFactor(norms + 2 * groups, v, groups, vectorGroups, multiplier, byteScale);
+            var f3 = RowFactor(norms + 3 * groups, v, groups, vectorGroups, multiplier, byteScale);
+            var sc = AdvSimd.LoadVector128(scales + v);
+            var of = AdvSimd.LoadVector128(offsets + v);
+            f0 = AdvSimd.Multiply(f0, sc);
+            f1 = AdvSimd.Multiply(f1, sc);
+            f2 = AdvSimd.Multiply(f2, sc);
+            f3 = AdvSimd.Multiply(f3, sc);
+            b0 = AdvSimd.FusedMultiplyAdd(b0, f0, of);
+            b1 = AdvSimd.FusedMultiplyAdd(b1, f1, of);
+            b2 = AdvSimd.FusedMultiplyAdd(b2, f2, of);
+            b3 = AdvSimd.FusedMultiplyAdd(b3, f3, of);
+            var t0 = AdvSimd.Arm64.ZipLow(f0, f1);
+            var t1 = AdvSimd.Arm64.ZipHigh(f0, f1);
+            var t2 = AdvSimd.Arm64.ZipLow(f2, f3);
+            var t3 = AdvSimd.Arm64.ZipHigh(f2, f3);
+            var d = quads + v * 4;
+            AdvSimd.Store(d, AdvSimd.Arm64.ZipLow(t0.AsDouble(), t2.AsDouble()).AsSingle());
+            AdvSimd.Store(d + 4, AdvSimd.Arm64.ZipHigh(t0.AsDouble(), t2.AsDouble()).AsSingle());
+            AdvSimd.Store(d + 8, AdvSimd.Arm64.ZipLow(t1.AsDouble(), t3.AsDouble()).AsSingle());
+            AdvSimd.Store(d + 12, AdvSimd.Arm64.ZipHigh(t1.AsDouble(), t3.AsDouble()).AsSingle());
+        }
+        return Vector128.Create(Neon.HorizontalSum(b0), Neon.HorizontalSum(b1), Neon.HorizontalSum(b2), Neon.HorizontalSum(b3));
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    static Vector128<float> RowFactor(ushort* norms, int v, int groups, int vectorGroups, Vector128<float> multiplier, float byteScale)
+    {
+        if (v < vectorGroups)
+        {
+            var wide = AdvSimd.ZeroExtendWideningLower(AdvSimd.LoadVector64(norms + v));
+            var magnitude = AdvSimd.And(wide, Vector128.Create(0x7FFFu));
+            var sign = AdvSimd.ShiftLeftLogical(AdvSimd.And(wide, Vector128.Create(0x8000u)), 16);
+            var bits = AdvSimd.Add(AdvSimd.ShiftLeftLogical(magnitude, 13), Vector128.Create(0x38000000u));
+            var nonZero = AdvSimd.CompareGreaterThan(magnitude.AsInt32(), Vector128<int>.Zero).AsUInt32();
+            var single = AdvSimd.Or(AdvSimd.And(bits, nonZero), sign).AsSingle();
+            return AdvSimd.Multiply(single, multiplier);
+        }
+        return Vector128.Create(
+            v < groups ? Scalar.HalfToSingle(norms[v]) * byteScale : 0f,
+            v + 1 < groups ? Scalar.HalfToSingle(norms[v + 1]) * byteScale : 0f,
+            v + 2 < groups ? Scalar.HalfToSingle(norms[v + 2]) * byteScale : 0f,
+            v + 3 < groups ? Scalar.HalfToSingle(norms[v + 3]) * byteScale : 0f);
+    }
+
     static void MatMulRows<TDot, TBits>(in Cq w, in Activations a, int tokens, float* y, int ldy, int rowStart, int rowEnd)
         where TDot : struct, INeonDot
         where TBits : struct, INeonBits
@@ -225,14 +287,7 @@ internal static unsafe class NeonGemv
         var norms = w.Norms + (long)row * groups;
         var scales = a.Scales + token * stride;
         var offsets = a.Offsets + token * stride;
-        for (var r = 0; r < 4; r++)
-            Neon.LoadFactors(norms + (long)r * groups, groups, byteScale, rowFactors + r * stride);
-        var bias = Vector128.Create(
-            Neon.ScaleFactors(rowFactors, scaled, scales, offsets, stride),
-            Neon.ScaleFactors(rowFactors + stride, scaled + stride, scales, offsets, stride),
-            Neon.ScaleFactors(rowFactors + 2 * stride, scaled + 2 * stride, scales, offsets, stride),
-            Neon.ScaleFactors(rowFactors + 3 * stride, scaled + 3 * stride, scales, offsets, stride));
-        Interleave4(scaled, stride, quads);
+        var bias = Factors4(norms, groups, stride, byteScale, scales, offsets, quads);
         var rowBytes = w.RowBytes;
         var groupBytes = rowBytes / groups;
         var p0 = w.Indices + (long)row * rowBytes;

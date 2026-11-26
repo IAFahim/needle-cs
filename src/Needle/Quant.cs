@@ -310,6 +310,7 @@ internal static unsafe class Quant
     public static void PrepareRmsFakeA8(float* x, float* scratchNormed, int cols, int bits, in Activations a)
     {
 #if NEEDLE_SIMD
+        if (Simd.UseNeon) { NeonPrepare.RmsFakeA8(x, cols, bits, a); return; }
         if (Simd.UseAvx && (void*)Kernels.Active.Prepare == null && (void*)Kernels.Active.RmsFakeA8 == null)
         {
             Ops.RmsStats(x, cols, out var inv, out var rawPeak);
@@ -325,6 +326,7 @@ internal static unsafe class Quant
     public static void PrepareGateFakeA8(float* x, float* gate, int cols, int bits, in Activations a)
     {
 #if NEEDLE_SIMD
+        if (Simd.UseNeon) { NeonPrepare.GateFakeA8(x, gate, cols, bits, a); return; }
         if (Simd.UseAvx && (void*)Kernels.Active.Prepare == null && (void*)Kernels.Active.GateFakeA8 == null)
         {
             var peak0 = Vector256<float>.Zero;
@@ -357,6 +359,7 @@ internal static unsafe class Quant
     public static void PrepareCenteredRmsFakeA8(float* x, float* normScale, float* scratchNormed, int cols, int bits, in Activations a)
     {
 #if NEEDLE_SIMD
+        if (Simd.UseNeon) { NeonPrepare.CenteredRmsFakeA8(x, normScale, cols, bits, a); return; }
         if (Simd.UseAvx && (void*)Kernels.Active.Prepare == null && (void*)Kernels.Active.CenteredRmsFakeA8 == null)
         {
             Ops.CenteredRmsStats(x, normScale, cols, out var inv, out var rawPeak);
