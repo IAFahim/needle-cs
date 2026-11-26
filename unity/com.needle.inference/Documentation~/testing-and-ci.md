@@ -43,6 +43,11 @@ Library was cold (the first run, or the first after a manifest change) can fail 
 Burst-compiled code, so a failing test run is repeated once and the second run decides; the first
 run's files are kept as `<step>-cold.xml` and `.log`.
 
+`NEEDLE_TEST_FILTER` runs only the tests whose full names match (Unity's `-testFilter`), for
+example `NEEDLE_TEST_FILTER=Needle.Unity.PlayMode.Tests.GrammarRegressionTests tools/unity-ci.sh playmode`.
+The grammar regression test asks every game query `NEEDLE_REPRO_ROUNDS` times (default 3) through a
+host with retrieval on and fails on any grammar failure (issue #74).
+
 It uses `UNITY_EDITOR` when set, else the editor named in
 `unity/NeedleDemo/ProjectSettings/ProjectVersion.txt` if it is installed under
 `~/Unity/Hub/Editor`, else the newest Unity 7 editor there. Close any Editor that has
@@ -61,6 +66,10 @@ an untracked or git-ignored DLL, a file without a `.meta`, a test assembly that 
 the sources (`AssemblyMetadata("Needle.SourceStamp")`). After any change under `src/Needle`, run
 `tools/pack-unity.sh` and commit both DLLs; `tools/pack-unity.sh --check` (run by CI) fails while
 they are stale.
+
+The source generator ships the same way: `Analyzers/Needle.Generators.dll` is built from
+`src/Needle.Generators` by the same script and stamped with a hash of the generator's own sources
+(`gen-sha256:`), so a change there without a rebuild also fails the check.
 
 ## Comparing with the native library
 

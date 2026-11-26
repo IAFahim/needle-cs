@@ -19,6 +19,8 @@
 #                         (default: $NEEDLE_REF_CACHE/unity-library when NEEDLE_REF_CACHE is set)
 #   NEEDLE_REQUIRE_MODEL  1 turns a missing model file into a failure instead of an Ignored test
 #   NEEDLE_THREADS, NEEDLE_REPS, NEEDLE_WARMUPS, NEEDLE_SETS  passed to the benches
+#   NEEDLE_TEST_FILTER    run only the tests whose full names match (Unity -testFilter: names or a regex)
+#   NEEDLE_REPRO_ROUNDS   rounds of game queries in the grammar regression test (default 3)
 #   UNITY_SERIAL, UNITY_EMAIL, UNITY_PASSWORD  only used when the Editor has no license yet
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -128,6 +130,7 @@ unity_tests() {
   # No -quit with -runTests: the test runner quits by itself.
   "$editor" -batchmode -nographics -projectPath "$path" \
     -runTests -testPlatform "$platform" -assemblyNames "$assemblies" \
+    ${NEEDLE_TEST_FILTER:+-testFilter "$NEEDLE_TEST_FILTER"} \
     -testResults "$out/$label.xml" -logFile "$out/$label.log" || status=$?
   # Unity exits 2 when tests failed, and 1 when compiling, the license or the run itself broke.
   if grep -q 'error CS[0-9]' "$out/$label.log" 2>/dev/null; then
