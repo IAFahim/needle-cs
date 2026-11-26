@@ -1,0 +1,16 @@
+{
+    "name": "Needle.Unity.Agents.Editor",
+    "rootNamespace": "Needle.EditorTools",
+    "references": [
+        "Needle.Unity"
+    ],
+    "includePlatforms": ["Editor"],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": true,
+    "precompiledReferences": ["Needle.Inference.dll"],
+    "autoReferenced": false,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

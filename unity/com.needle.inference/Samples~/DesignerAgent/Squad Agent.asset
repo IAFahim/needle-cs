@@ -1,0 +1,25 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 8a24b3028db042daaf618a7c72262a32, type: 3}
+  m_Name: Squad Agent
+  m_EditorClassIdentifier: 
+  Model: {fileID: 11400000, guid: f959f2cf65744f5bb6887c5f4c5e0e0f, type: 2}
+  Tools: {fileID: 11400000, guid: 6a18485247a840bab167e2f542a3685c, type: 2}
+  Persona: "You lead a small adventuring squad.\nThe party: Lyra (healer), Borin (fighter), Mira (scout), the captain.\nOnly act on orders from the player."
+  RefuseBelow: 0.3
+  UnsureLine: "Sorry, I didn't catch that."
+  Remember: 0
+  Think: 1
+  KnowsTheDate: 1
+  Threads: 2
+  OnlyBestTools: 0
+  WarmUp: 1

@@ -1,0 +1,91 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 0e4aadcdc9464137b02e4d0cb8c39c4b, type: 3}
+  m_Name: Squad Tools
+  m_EditorClassIdentifier: 
+  Json: {fileID: 0}
+  Tools:
+  - Name: move_to
+    Description: "Move the selected unit to a map position."
+    Parameters:
+    - Name: x
+      Type: 2
+      Description: "Map x coordinate"
+      Required: 1
+      Options: []
+    - Name: y
+      Type: 2
+      Description: "Map y coordinate"
+      Required: 1
+      Options: []
+  - Name: attack
+    Description: "Attack a target."
+    Parameters:
+    - Name: target
+      Type: 0
+      Description: "Name of the enemy or building"
+      Required: 1
+      Options: []
+  - Name: say
+    Description: "Say a line of dialogue out loud."
+    Parameters:
+    - Name: text
+      Type: 0
+      Description: "What to say"
+      Required: 1
+      Options: []
+  - Name: give_item
+    Description: "Give items to a party member."
+    Parameters:
+    - Name: item
+      Type: 4
+      Description: ""
+      Required: 1
+      Options:
+      - potion
+      - sword
+      - shield
+      - arrow
+      - gold
+    - Name: count
+      Type: 1
+      Description: "How many"
+      Required: 1
+      Options: []
+    - Name: to
+      Type: 0
+      Description: "Party member name"
+      Required: 1
+      Options: []
+  - Name: set_formation
+    Description: "Change the squad formation."
+    Parameters:
+    - Name: formation
+      Type: 4
+      Description: ""
+      Required: 1
+      Options:
+      - line
+      - wedge
+      - circle
+      - column
+  - Name: follow
+    Description: "Follow a character."
+    Parameters:
+    - Name: target
+      Type: 0
+      Description: "Who to follow"
+      Required: 1
+      Options: []
+  - Name: stop
+    Description: "Stop all current actions."
+    Parameters:
