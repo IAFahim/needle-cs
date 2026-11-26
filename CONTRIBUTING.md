@@ -12,19 +12,21 @@ Third-party materials and their licenses are listed in [NOTICE](NOTICE).
 
 Three upstream sources are involved, and they have different licenses.
 
+In November 2026 Cactus Compute renamed its repositories: the custom-licensed C++ engine formerly at `cactus-compute/cactus` is now [`cactus-compute/engine`](https://github.com/cactus-compute/engine), and the Apache-2.0 Python package formerly at `cactus-compute/needle` is now [`cactus-compute/cactus`](https://github.com/cactus-compute/cactus) (`cactus-compute` on PyPI). `cactus-compute/needle` now only holds a pointer. The rule below is unchanged; only the names moved.
+
 | Source | License | May we use it? |
 |---|---|---|
 | `Cactus-Compute/needle3` and `Cactus-Compute/whistle` weights (Hugging Face) | `apache-2.0` per the model cards | Download and load them. Do not commit them. |
-| [`cactus-compute/needle`](https://github.com/cactus-compute/needle) (Python package and architecture) | Apache License 2.0 | Yes. Derive behavior from it. |
-| [`cactus-compute/cactus`](https://github.com/cactus-compute/cactus) (C++ engine and kernels) | Custom license, not Apache-2.0 | No. Never copy code from it. |
+| [`cactus-compute/cactus`](https://github.com/cactus-compute/cactus) (Python package and architecture, formerly `cactus-compute/needle`) | Apache License 2.0 | Yes. Derive behavior from it. |
+| [`cactus-compute/engine`](https://github.com/cactus-compute/engine) (C++ engine and kernels, formerly `cactus-compute/cactus`) | Custom license, not Apache-2.0 | No. Never copy code from it. |
 
-The custom license of `cactus-compute/cactus` grants permission only to individuals using it for personal, educational, research or non-commercial purposes, to organizations with less than 2,000,000 USD in total funding and less than 2,000,000 USD in gross annual revenue, to educational institutions and students, and to registered non-profit organizations. Anyone else needs a separate commercial license from Cactus Compute, Inc. Read the file itself for the exact terms.
+The custom license of `cactus-compute/engine` grants permission only to individuals using it for personal, educational, research or non-commercial purposes, to organizations with less than 2,000,000 USD in total funding and less than 2,000,000 USD in gross annual revenue, to educational institutions and students, and to registered non-profit organizations. Anyone else needs a separate commercial license from Cactus Compute, Inc. Read the file itself for the exact terms.
 
 Rules:
 
-- Work clean-room. Do not copy, translate, paraphrase line by line, or port code from `cactus-compute/cactus`, including its kernels, tests and comments.
-- Derive behavior from `tools/golden.py` and from the Apache-2.0 Python architecture in `cactus-compute/needle`.
-- If you have read the `cactus-compute/cactus` source closely, say so in the pull request so the reviewer can judge the risk.
+- Work clean-room. Do not copy, translate, paraphrase line by line, or port code from `cactus-compute/engine`, including its kernels, tests and comments.
+- Derive behavior from `tools/golden.py` and from the Apache-2.0 Python architecture in `cactus-compute/cactus`.
+- If you have read the `cactus-compute/engine` source closely, say so in the pull request so the reviewer can judge the risk.
 - Never commit, package or ship the upstream wheel (`cactus_needle-*.whl`) or the native library `libneedle3.so` it contains. They are for local benchmarking only (W02).
 - Never commit or redistribute model files (`*.cact`), tokenizers, `config.json` from the model repository, or the downloaded audio clips. They live in `ref/`, which is git-ignored.
 - Keep `ref/` ignored. Do not use `git add -f` on anything under it.
@@ -61,7 +63,7 @@ tools/fetch.sh && pip install numpy sentencepiece && python3 tools/golden.py 40 
 
 ## Refreshing the upstream model
 
-Cactus Compute owns the model weights and the `.cact` format. `tools/ref.lock` pins every downloaded file by SHA-256 and size, and pins the Hugging Face commits of `Cactus-Compute/needle3` and `Cactus-Compute/whistle` and the `cactus-compute/cactus` commit that hosts the audio clips. `tools/fetch.sh` downloads exactly those revisions and fails with "upstream changed" when a file does not match its pin. Nothing changes silently.
+Cactus Compute owns the model weights and the `.cact` format. `tools/ref.lock` pins every downloaded file by SHA-256 and size, and pins the Hugging Face commits of `Cactus-Compute/needle3` and `Cactus-Compute/whistle` and the `cactus-compute/engine` commit that hosts the audio clips. `tools/fetch.sh` downloads exactly those revisions and fails with "upstream changed" when a file does not match its pin. Nothing changes silently.
 
 Everyday commands:
 
@@ -94,7 +96,7 @@ From `plan.md` section 8 and section 7.
 - [ ] The branch is named `w<NN>-<slug>` and touches only the files the issue names, or the pull request says why.
 - [ ] The code follows the code style above.
 - [ ] A test fails before the change and passes after it.
-- [ ] No code, comments or tests were copied from `cactus-compute/cactus`.
+- [ ] No code, comments or tests were copied from `cactus-compute/engine`.
 - [ ] No model files, tokenizers, wheels or `libneedle3.so` are committed.
 - [ ] The test suite passes:
 

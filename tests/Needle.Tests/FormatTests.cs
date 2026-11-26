@@ -347,4 +347,7 @@ public sealed class FormatTests
         Assert.Contains(new string('b', 64), failure);
         Assert.Contains(loaded, failure);
     }
+
+    [Fact]
+    public void RetrievalIsOffByDefaultLikeUpstream() => Assert.Equal(int.MaxValue, new NeedleOptions().RetrievalTopK);
 }
