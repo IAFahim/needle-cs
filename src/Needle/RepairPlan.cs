@@ -132,7 +132,7 @@ internal sealed class RepairPlan
         foreach (var tool in Tools) HasTriggers |= tool.Triggers.Length > 0;
     }
 
-    static Dictionary<string, string[]> RawTriggers(string toolsJson)
+    internal static Dictionary<string, string[]> RawTriggers(string toolsJson)
     {
         var map = new Dictionary<string, string[]>();
         JsonValue parsed;

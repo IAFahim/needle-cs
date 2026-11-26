@@ -35,6 +35,8 @@ internal unsafe struct GrammarState
 {
     public const int MaxDepth = 16;
     public int Depth;
+    /// <summary>Tools the first call must use (a 4.x trigger matched); 0 means any tool, and no call is then required.</summary>
+    public ulong Route;
     public fixed ulong Raw[MaxDepth * 3];
 
     public Frame* Frames
@@ -226,9 +228,9 @@ internal sealed unsafe class Grammar : IDisposable
         return AddNode(Kind.Union, branches.Count, first, 0, 0);
     }
 
-    public static GrammarState Start(GrammarProgram* g)
+    public static GrammarState Start(GrammarProgram* g, ulong route = 0)
     {
-        var state = new GrammarState();
+        var state = new GrammarState { Route = route & ToolMask(g) };
         Push(&state, g->Root);
         return state;
     }
@@ -321,7 +323,7 @@ internal sealed unsafe class Grammar : IDisposable
                 f->Phase = 1;
                 return Consumed;
             case 1:
-                if (c == ']') return Pop(s, Consumed);
+                if (c == ']') return s->Route != 0 ? Reject : Pop(s, Consumed);
                 goto case 3;
             case 3:
                 if (c != '{' || g->ToolCount == 0) return Reject;
@@ -341,7 +343,13 @@ internal sealed unsafe class Grammar : IDisposable
         {
             case 0:
                 if (c != CallHead[f->Aux]) return Reject;
-                if (++f->Aux == CallHead.Length) { f->Phase = 1; f->Aux = 0; f->Bits = ToolMask(g); }
+                if (++f->Aux == CallHead.Length)
+                {
+                    f->Phase = 1;
+                    f->Aux = 0;
+                    f->Bits = s->Route != 0 ? s->Route : ToolMask(g);
+                    s->Route = 0;
+                }
                 return Consumed;
             case 1:
             {
