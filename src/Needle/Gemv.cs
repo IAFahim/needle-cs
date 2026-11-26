@@ -269,11 +269,43 @@ internal static unsafe class Gemv
             Scaled = scaled,
             Tables = planes,
             Y = y + n,
-            Blocks = blocks,
+            Count = blocks,
             PrefetchDistance = (long)PrefetchBlocks * RowBlock * rowBytes,
         };
         EvexVnni.Blocks(TPlanes.GroupBytes == 32 ? 2 : 4, &args);
         return n + blocks * RowBlock;
+    }
+
+    // Every whole two-row pair in [n, end) for four tokens through the EVEX kernel (same order as Pair4).
+    static int EvexPairs<TPlanes>(in Cq w, int n, int end, int stride, int cols, in PlaneTables tables, float* weightedScales, float* offsets, sbyte* values, float* scaled, long prefetchDistance, float* y, int ldy)
+        where TPlanes : struct, IPlaneLayout
+    {
+        var pairs = (end - n) / 2;
+        if (pairs <= 0) return n;
+        var planes = stackalloc byte[64];
+        Avx.Store(planes, tables.First);
+        Avx.Store(planes + 32, tables.Second);
+        var rowBytes = w.RowBytes;
+        var args = new EvexVnni.BlockArgs
+        {
+            Packed = w.Indices + (long)n * rowBytes,
+            RowBytes = rowBytes,
+            Norms = w.Norms + (long)n * w.Groups,
+            Groups = w.Groups,
+            Stride = stride,
+            WeightedScales = weightedScales,
+            Offsets = offsets,
+            Values = values,
+            Scaled = scaled,
+            Tables = planes,
+            Y = y + n,
+            Count = pairs,
+            PrefetchDistance = prefetchDistance,
+            Cols = cols,
+            Ldy = ldy,
+        };
+        EvexVnni.Pairs(TPlanes.GroupBytes == 32 ? 2 : 4, &args);
+        return n + pairs * 2;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -422,11 +454,24 @@ internal static unsafe class Gemv
         else Tile2<TPlanes, Avx2Dot>(w, a, token, y, ldy, rowStart, rowEnd);
     }
 
+    internal static void Tile4ForTest(in Cq w, in Activations a, int token, float* y, int ldy, int rowStart, int rowEnd, bool evex)
+    {
+        if (w.Bits == 2) Tile4<PermuteTwoBitPlanes, Avx2Dot>(w, a, token, y, ldy, rowStart, rowEnd, evex);
+        else Tile4<PermuteFourBitPlanes, Avx2Dot>(w, a, token, y, ldy, rowStart, rowEnd, evex);
+    }
+
     static void Tile4<TPlanes, TDot>(in Cq w, in Activations a, int token, float* y, int ldy, int rowStart, int rowEnd)
         where TPlanes : struct, IPlaneLayout
         where TDot : struct, IInt8Dot
-        {
-            if (UsePanel) { Tile4Panel<TPlanes, TDot>(w, a, token, y, ldy, rowStart, rowEnd); return; }
+    {
+        if (UsePanel) { Tile4Panel<TPlanes, TDot>(w, a, token, y, ldy, rowStart, rowEnd); return; }
+        Tile4<TPlanes, TDot>(w, a, token, y, ldy, rowStart, rowEnd, UseEvex);
+    }
+
+    static void Tile4<TPlanes, TDot>(in Cq w, in Activations a, int token, float* y, int ldy, int rowStart, int rowEnd, bool evex)
+        where TPlanes : struct, IPlaneLayout
+        where TDot : struct, IInt8Dot
+    {
         var groups = w.Groups;
         var stride = a.Stride;
         var cols = a.Cols;
@@ -446,6 +491,8 @@ internal static unsafe class Gemv
         var convertibleRows = (long)w.Rows * groups < paddedGroups ? 0 : (int)(((long)w.Rows * groups - paddedGroups) / groups) + 1;
         var prefetchDistance = (long)PrefetchBlocks * 2 * rowBytes;
         var n = rowStart;
+        if (evex)
+            n = EvexPairs<TPlanes>(w, n, Math.Min(rowEnd, convertibleRows), stride, cols, tables, weightedScales, offsets, values, scaled, prefetchDistance, y, ldy);
         for (; n + 2 <= rowEnd && n + 2 <= convertibleRows; n += 2)
             Pair4<TPlanes, TDot>(w.Indices + (long)n * rowBytes, rowBytes, w.Norms + (long)n * groups, groups, stride, cols, tables, weightedScales, offsets, values, scaled, rowFactors, groupBytes, prefetchDistance, y + n, ldy);
         for (; n < rowEnd; n++)

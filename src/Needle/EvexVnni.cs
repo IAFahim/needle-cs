@@ -28,8 +28,10 @@ internal static unsafe partial class EvexVnni
         public float* Scaled;
         public byte* Tables;
         public float* Y;
-        public long Blocks;
+        public long Count;
         public long PrefetchDistance;
+        public long Cols;
+        public long Ldy;
     }
 
     static readonly nint Base = Load();
@@ -41,12 +43,15 @@ internal static unsafe partial class EvexVnni
 
     internal static bool Ready => Base != 0;
 
+    // Count four-row blocks of one token (Gemv.Block).
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal static void Blocks(int bits, BlockArgs* args)
-    {
-        var entry = Base + (bits == 2 ? Block2Offset : Block4Offset);
-        ((delegate* unmanaged[SuppressGCTransition]<BlockArgs*, void>)entry)(args);
-    }
+    internal static void Blocks(int bits, BlockArgs* args) =>
+        ((delegate* unmanaged[SuppressGCTransition]<BlockArgs*, void>)(Base + (bits == 2 ? Block2Offset : Block4Offset)))(args);
+
+    // Count two-row pairs of four tokens (Gemv.Pair4).
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static void Pairs(int bits, BlockArgs* args) =>
+        ((delegate* unmanaged[SuppressGCTransition]<BlockArgs*, void>)(Base + (bits == 2 ? Pair2Offset : Pair4Offset)))(args);
 
     static nint Load()
     {
@@ -62,7 +67,7 @@ internal static unsafe partial class EvexVnni
             {
                 // The kernels take their one argument in rax; the first instruction moves it there
                 // from the platform's first argument register (SysV rdi, Win64 rcx).
-                foreach (var offset in new[] { Block2Offset, Block4Offset })
+                foreach (var offset in new[] { Block2Offset, Block4Offset, Pair2Offset, Pair4Offset })
                 {
                     var p = (byte*)memory + offset;
                     if (p[0] != 0x48 || p[1] != 0x89 || p[2] != 0xF8) return 0;
@@ -81,22 +86,25 @@ internal static unsafe partial class EvexVnni
     // Runs both kernels on exact-integer inputs (unit factors, zero offsets) and checks every output
     // against a scalar reference of the documented plane layout, so a wrong encoding or a hostile
     // environment disables the tier instead of producing wrong logits.
-    static bool SelfTest(nint memory) => SelfTest(memory, 2) && SelfTest(memory, 4);
+    static bool SelfTest(nint memory) =>
+        SelfTest(memory, 2, pairs: false) && SelfTest(memory, 4, pairs: false) &&
+        SelfTest(memory, 2, pairs: true) && SelfTest(memory, 4, pairs: true);
 
-    static bool SelfTest(nint memory, int bits)
+    static bool SelfTest(nint memory, int bits, bool pairs)
     {
         const int rows = 8, groups = 3, cols = groups * Cq.GroupSize, stride = 8;
+        var tokens = pairs ? 4 : 1;
         var rowBytes = cols * bits / 8;
         var packed = stackalloc byte[rows * rowBytes + 64];
         var norms = stackalloc ushort[rows * groups + stride];
-        var weightedScales = stackalloc float[stride];
-        var offsets = stackalloc float[stride];
-        var values = stackalloc sbyte[cols];
-        var scaled = stackalloc float[4 * stride];
+        var weightedScales = stackalloc float[4 * stride];
+        var offsets = stackalloc float[4 * stride];
+        var values = stackalloc sbyte[4 * cols];
+        var scaled = stackalloc float[8 * stride];
         var tables = stackalloc byte[64];
-        var y = stackalloc float[rows];
+        var y = stackalloc float[4 * rows];
         var book = stackalloc byte[16];
-        var seed = 0x2545F491u * (uint)bits;
+        var seed = 0x2545F491u * (uint)(bits + (pairs ? 7 : 0));
         uint Next() { seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5; return seed; }
         for (var i = 0; i < 16; i++) book[i] = (byte)(Next() % 127);
         for (var i = 0; i < 32; i++)
@@ -106,33 +114,35 @@ internal static unsafe partial class EvexVnni
         }
         for (var i = 0; i < rows * rowBytes + 64; i++) packed[i] = (byte)Next();
         for (var i = 0; i < rows * groups + stride; i++) norms[i] = 0x3C00;
-        for (var i = 0; i < stride; i++) { weightedScales[i] = 5.192296858534828e33f; offsets[i] = 0f; }
-        for (var i = 0; i < cols; i++) values[i] = (sbyte)((int)(Next() % 255) - 127);
+        for (var i = 0; i < 4 * stride; i++) { weightedScales[i] = 5.192296858534828e33f; offsets[i] = 0f; }
+        for (var i = 0; i < 4 * cols; i++) values[i] = (sbyte)((int)(Next() % 255) - 127);
         var args = new BlockArgs
         {
             Packed = packed, RowBytes = rowBytes, Norms = norms, Groups = groups, Stride = stride,
             WeightedScales = weightedScales, Offsets = offsets, Values = values, Scaled = scaled,
-            Tables = tables, Y = y, Blocks = rows / 4, PrefetchDistance = 0,
+            Tables = tables, Y = y, Count = pairs ? rows / 2 : rows / 4, PrefetchDistance = 0,
+            Cols = cols, Ldy = rows,
         };
-        var entry = memory + (bits == 2 ? Block2Offset : Block4Offset);
+        var entry = memory + (pairs ? (bits == 2 ? Pair2Offset : Pair4Offset) : (bits == 2 ? Block2Offset : Block4Offset));
         ((delegate* unmanaged[SuppressGCTransition]<BlockArgs*, void>)entry)(&args);
-        for (var r = 0; r < rows; r++)
-        {
-            long expected = 0;
-            for (var k = 0; k < cols; k++)
+        for (var t = 0; t < tokens; t++)
+            for (var r = 0; r < rows; r++)
             {
-                int g = k / Cq.GroupSize, j = k % Cq.GroupSize, plane = j / 32, lane = j % 32;
-                int code;
-                if (bits == 2) code = (packed[r * rowBytes + g * 32 + lane] >> (2 * plane)) & 3;
-                else
+                long expected = 0;
+                for (var k = 0; k < cols; k++)
                 {
-                    var b = packed[r * rowBytes + g * 64 + (plane >> 1) * 32 + lane];
-                    code = (plane & 1) == 0 ? b & 15 : b >> 4;
+                    int g = k / Cq.GroupSize, j = k % Cq.GroupSize, plane = j / 32, lane = j % 32;
+                    int code;
+                    if (bits == 2) code = (packed[r * rowBytes + g * 32 + lane] >> (2 * plane)) & 3;
+                    else
+                    {
+                        var b = packed[r * rowBytes + g * 64 + (plane >> 1) * 32 + lane];
+                        code = (plane & 1) == 0 ? b & 15 : b >> 4;
+                    }
+                    expected += book[code] * values[t * cols + k];
                 }
-                expected += book[code] * values[k];
+                if (y[t * rows + r] != expected) return false;
             }
-            if (y[r] != expected) return false;
-        }
         return true;
     }
 

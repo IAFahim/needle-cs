@@ -161,6 +161,30 @@ public sealed unsafe class EvexVnniKernelTests : IDisposable
         }
     }
 
+    [Theory]
+    [MemberData(nameof(Shapes))]
+    public void EvexPairsAreBitIdenticalToManagedPairs(int bits, int rows, int cols)
+    {
+        if (!EvexVnni.Ready) return;
+        var random = new Random(rows * 17 + cols * 3 + bits);
+        var w = Weights(random, rows, cols, bits);
+        const int tokens = 8;
+        var a = Prepared(random, tokens, cols, bits);
+        foreach (var token in new[] { 0, 4 })
+            foreach (var (start, end) in new[] { (0, rows), (1, rows), (0, rows - rows / 3), (rows / 2, rows) })
+            {
+                if (start >= end) continue;
+                var expected = (float*)Allocate((nuint)(tokens * rows) * 4);
+                var actual = (float*)Allocate((nuint)(tokens * rows) * 4);
+                for (var i = 0; i < tokens * rows; i++) expected[i] = actual[i] = 7777f;
+                Gemv.Tile4ForTest(w, a, token, expected + token * rows, rows, start, end, evex: false);
+                Gemv.Tile4ForTest(w, a, token, actual + token * rows, rows, start, end, evex: true);
+                for (var i = 0; i < tokens * rows; i++)
+                    Assert.True(BitConverter.SingleToInt32Bits(expected[i]) == BitConverter.SingleToInt32Bits(actual[i]),
+                        $"bits {bits} rows {rows} cols {cols} token {token} range {start}..{end} index {i}: {expected[i]:R} vs {actual[i]:R}");
+            }
+    }
+
     void* Allocate(nuint bytes)
     {
         var p = (nint)NativeMemory.AlignedAlloc(bytes + 64, 64);
