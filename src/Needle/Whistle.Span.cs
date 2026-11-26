@@ -61,6 +61,8 @@ public sealed unsafe partial class Whistle
     IReadOnlyList<string>? spanKeywordSource = new List<string>();
     string[] spanKeywordStrings = Array.Empty<string>();
 
+    bool spanAlign = true;
+
     public int MaxTranscriptTokens => g.MaxSeq;
 
     void EnsureSpanBuffers()
@@ -106,6 +108,7 @@ public sealed unsafe partial class Whistle
 
     SpeechSpan TranscribeShortUtf8(ReadOnlySpan<float> pcm, Span<byte> utf8, Span<WordSlice> words, string? language, IReadOnlyList<string>? keywords)
     {
+        spanAlign = words.Length > 0;
         EnsureDecoderBuffers();
         EnsureSpanBuffers();
         CacheKeywords(keywords);
@@ -116,6 +119,7 @@ public sealed unsafe partial class Whistle
 
     SpeechSpan TranscribeLongUtf8(ReadOnlySpan<float> pcm, Span<byte> utf8, Span<WordSlice> words, string? language, IReadOnlyList<string>? keywords)
     {
+        spanAlign = true;
         EnsureDecoderBuffers();
         EnsureSpanBuffers();
         CacheKeywords(keywords);
@@ -134,6 +138,7 @@ public sealed unsafe partial class Whistle
         var first = true;
         while (offset < pcm.Length)
         {
+            if (offset > 0 && CancelPending()) break;
             var length = Math.Min(window, pcm.Length - offset);
             var tokens = DecodeSpan(pcm.Slice(offset, length), detected, out var windowLanguage, out var windowTtft, out var windowTps, out var windowEncode, out _);
             if (first) { firstLanguage = windowLanguage; ttftMs = windowTtft; tps = windowTps; encodeMs = windowEncode; first = false; }
@@ -208,7 +213,7 @@ public sealed unsafe partial class Whistle
         {
             count = BeamSearch(true);
             ttftMs = (Stopwatch.GetTimestamp() - started) * 1000.0 / Stopwatch.Frequency;
-            FeedForAlignment(count);
+            if (spanAlign) FeedForAlignment(count);
             tps = count / Math.Max(1e-9, (Stopwatch.GetTimestamp() - decodeStart) / (double)Stopwatch.Frequency);
             empty = false;
             return count;
@@ -216,6 +221,7 @@ public sealed unsafe partial class Whistle
         var hasKeywords = spanKeywordStrings.Length > 0;
         for (var step = 0; step < g.MaxSeq - 3; step++)
         {
+            if (CancelPending()) break;
             var logits = decoder.Logits;
             int best;
             float prob;

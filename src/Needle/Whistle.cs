@@ -930,6 +930,22 @@ public sealed unsafe partial class Whistle : IDisposable
             if (owner < 0) throw new ObjectDisposedException(nameof(Whistle));
             throw new InvalidOperationException("a Whistle instance runs one call at a time; use one instance per thread or serialise the calls");
         }
+        Volatile.Write(ref cancelRequested, 0);
+        cancelled = false;
+    }
+
+    int cancelRequested;
+    bool cancelled;
+
+    public void Cancel() => Volatile.Write(ref cancelRequested, 1);
+
+    public bool WasCancelled => cancelled;
+
+    bool CancelPending()
+    {
+        if (Volatile.Read(ref cancelRequested) == 0) return false;
+        cancelled = true;
+        return true;
     }
 
     void Exit() => Volatile.Write(ref busy, 0);
