@@ -72,6 +72,18 @@ jobs:
             done
           done
 
+      - name: Beam parallel A/B (NativeAOT)
+        run: |
+          for t in 2 3 4; do
+            for mode in 0 1; do
+              for c in hotword test_long; do
+                echo "=== threads $t beam-parallel $mode clip $c"
+                NEEDLE_BEAM_PARALLEL=$mode out/aot/needle transcribe ref/hf/whistle/whistle.cact "ref/audio/$c.wav" --repeat 6 --threads $t 2>timing.txt | md5sum
+                cat timing.txt
+              done
+            done
+          done
+
       - name: Timings (JIT)
         run: |
           dotnet build src/Needle.Cli -c Release -o out/jit >/dev/null

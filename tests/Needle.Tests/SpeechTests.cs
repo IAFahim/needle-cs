@@ -313,6 +313,51 @@ public sealed class SpeechTests : IDisposable
         return bytes.ToArray();
     }
 
+    static float[] DirectSinc(float[] input, int from, int to)
+    {
+        var ratio = (double)to / from;
+        var scale = Math.Min(1.0, ratio);
+        var radius = 24 / scale;
+        var output = new float[(int)(input.Length * ratio)];
+        for (var n = 0; n < output.Length; n++)
+        {
+            var center = n / ratio;
+            double sum = 0, weight = 0;
+            for (var i = Math.Max(0, (int)Math.Ceiling(center - radius)); i <= Math.Min(input.Length - 1, (int)Math.Floor(center + radius)); i++)
+            {
+                var t = (i - center) * scale;
+                var sinc = t == 0 ? 1.0 : Math.Sin(Math.PI * t) / (Math.PI * t);
+                var kernel = sinc * (0.5 + 0.5 * Math.Cos(Math.PI * (i - center) / radius));
+                sum += input[i] * kernel;
+                weight += kernel;
+            }
+            output[n] = (float)(weight == 0 ? 0 : sum / weight);
+        }
+        return output;
+    }
+
+    [Fact]
+    public void PolyphaseResamplingMatchesTheDirectWindowedSinc()
+    {
+        var random = new Random(7);
+        foreach (var rate in new[] { 8000, 11025, 22050, 32000, 44100, 44101, 48000, 96000 })
+        {
+            var input = new float[rate + 37];
+            for (var i = 0; i < input.Length; i++) input[i] = (float)(0.5 * Math.Sin(i * 0.013) + random.NextDouble() - 0.5);
+            var expected = DirectSinc(input, rate, Wav.SampleRate);
+            var actual = Wav.Resample(input, rate, Wav.SampleRate);
+            Assert.Equal(expected.Length, actual.Length);
+            for (var i = 0; i < expected.Length; i++) Assert.True(Math.Abs(expected[i] - actual[i]) <= 1e-6f, $"{rate} Hz sample {i}: {expected[i]} vs {actual[i]}");
+        }
+        var pcm = new float[48000];
+        var resampled = new float[Wav.ResampledLength(pcm.Length, 48000, Wav.SampleRate)];
+        Wav.Resample(pcm, 48000, Wav.SampleRate, resampled);
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        Wav.Resample(pcm, 48000, Wav.SampleRate, resampled);
+        Assert.Equal(0, GC.GetAllocatedBytesForCurrentThread() - before);
+        Assert.Throws<ArgumentException>(() => Wav.Resample(pcm, 48000, Wav.SampleRate, new float[10]));
+    }
+
     [Fact]
     public void MalformedWavHeadersAreRejectedAsInvalidData()
     {
