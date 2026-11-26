@@ -44,7 +44,7 @@ These steps need no golden fixtures. Only `dotnet test` does.
 
 ## Features
 
-- **Needle 3 Tool Calling:** Schema-driven byte-level pushdown automaton grammar constraint, multi-turn sessions, confidence scoring, top-K tool retrieval, structured extraction, and 3072-d embeddings.
+- **Needle 3 Tool Calling:** Schema-driven byte-level pushdown automaton grammar constraint, multi-turn sessions, confidence scoring, optional top-K tool retrieval (off by default), structured extraction, and 3072-d embeddings.
 - **Whistle Speech-to-Text:** 16 kHz WAV resampling, language detection/forcing, keyword biasing, DTW word timestamps, long-audio windowing, streaming, and direct audio-to-tool-call (`VoiceSession`).
 - **Portable & Embeddable:** Full scalar fallback for platforms without SIMD, `Model.FromBytes` for platforms without `mmap`, dedicated-thread `Task` wrappers (`NeedleService`, `SpeechService`), and automatic placement of worker threads on the fastest physical cores (Linux; `NEEDLE_PIN=0` disables, `NEEDLE_NODP=1` forces the NEON widening-fallback tier).
 
@@ -214,7 +214,7 @@ dotnet build src/Needle -f netstandard2.1 -c Release
 - **Model weights are not in this repository.** `needle3.cact` and `whistle.cact` come from the [Needle 3](https://huggingface.co/Cactus-Compute/needle3) and [Whistle](https://huggingface.co/Cactus-Compute/whistle) Hugging Face repositories, whose model cards declare `license: apache-2.0`. `tools/fetch.sh` downloads them into `ref/`, which is git-ignored.
 - **Game builds that ship the weights** must comply with the Apache License 2.0 for those files: include its license text and keep the attribution notices. Credits are in [NOTICE](NOTICE).
 - **The upstream wheel and `libneedle3.so`** that `tools/fetch.sh` downloads are for local benchmarking only. Never commit or ship them.
-- **Clean-room:** no code from [`cactus-compute/cactus`](https://github.com/cactus-compute/cactus), which has a custom non-Apache license, may be used here. Details are in [CONTRIBUTING.md](CONTRIBUTING.md).
+- **Clean-room:** no code from [`cactus-compute/engine`](https://github.com/cactus-compute/engine), which has a custom non-Apache license, may be used here. Details are in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Loading models on mobile and consoles
 
@@ -295,7 +295,7 @@ Reference run (needle3, 4 threads, `AutoDate=false RetrievalTopK=64`, greedy, 20
 
 These come from the misses in the suite above; re-measure on your own tools.
 
-- **Keep the set small enough to skip retrieval.** With more tools than `RetrievalTopK` (5 by default) the session embeds the query and re-primes a 5-tool prefix per prompt. On the 8-tool sets this lost 6.8 points of exact accuracy (65.9% to 59.1%) and tripled median latency (about 160 ms to 520 ms). Set `RetrievalTopK` to at least your tool count, or split tools by game state and keep fewer than 6 per session.
+- **Leave tool retrieval off unless the catalog is too big for the context.** Retrieval is off by default, as in upstream Needle 3, which has no retrieval head and reads the whole tool set. Setting `RetrievalTopK` below your tool count makes the session embed the query and re-prime a `RetrievalTopK`-tool prefix per prompt. At `RetrievalTopK = 5` on the 8-tool sets this lost 6.8 points of exact accuracy (65.9% to 59.1%) and tripled median latency (about 160 ms to 520 ms). For large catalogs, prefer splitting tools by game state.
 - **Name tools with the verb the player says.** `set_formation` for "switch to wedge" worked, but "heal Lyra" became `recruit_member(Lyra)` at confidence 0.75 and "revive Elric" became `equip_item`, because spells hid behind the generic `cast_spell(spell=...)`. Prefer one tool per spoken verb (`heal`, `revive`), and avoid several tools that all read as "do something to a party member" (`give_item`, `use_item`, `equip_item`).
 - **Use enums for closed vocabularies and booleans or integers for toggles.** The settings set (enums, booleans, slots) scored 83.8% exact, the rpg set with free-text item and member names 47.2%. Free-text arguments are where the model copies the wrong word (`give_item(to="arrow")`).
 - **Do not require arguments the player will not say.** "light a torch" has no target, and the model invents one. Default the argument in game code or give the tool a separate no-target variant.

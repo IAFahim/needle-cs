@@ -700,7 +700,7 @@ public sealed unsafe class BatchedSession : IDisposable
             SuppressedCalls = refused ? resultCalls : Array.Empty<FunctionCall>(),
             Reasoning = reasoning,
             Confidence = confidence,
-            HeadConfidence = head,
+            HeadConfidence = lane.ConfidenceScratch == null ? null : head,
             DecodeConfidence = decode,
             PrefillTokens = timing.PrefillTokens,
             DecodeTokens = timing.DecodeTokens,

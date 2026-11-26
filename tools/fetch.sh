@@ -38,7 +38,7 @@ base_url() {
   case "$1" in
     needle3) echo "https://huggingface.co/Cactus-Compute/needle3/resolve/$2" ;;
     whistle) echo "https://huggingface.co/Cactus-Compute/whistle/resolve/$2" ;;
-    cactus) echo "https://raw.githubusercontent.com/cactus-compute/cactus/$2/cactus-engine/tests/assets" ;;
+    cactus) echo "https://raw.githubusercontent.com/cactus-compute/engine/$2/cactus-engine/tests/assets" ;;
     *) fail "unknown source $1" ;;
   esac
 }
@@ -46,7 +46,7 @@ base_url() {
 latest_revision() {
   case "$1" in
     needle3 | whistle) curl -fsS "https://huggingface.co/api/models/Cactus-Compute/$1" | grep -o '"sha":"[0-9a-f]\{40\}"' | head -1 | cut -d'"' -f4 ;;
-    cactus) curl -fsS "https://github.com/cactus-compute/cactus.git/info/refs?service=git-upload-pack" | grep -a -o '[0-9a-f]\{40\} HEAD' | head -1 | cut -d' ' -f1 ;;
+    cactus) curl -fsS "https://github.com/cactus-compute/engine.git/info/refs?service=git-upload-pack" | grep -a -o '[0-9a-f]\{40\} HEAD' | head -1 | cut -d' ' -f1 ;;
   esac
 }
 

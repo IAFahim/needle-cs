@@ -22,7 +22,7 @@ See CONTRIBUTING.md.
 
 2. Model architecture and reference implementation
 
-   https://github.com/cactus-compute/needle
+   https://github.com/cactus-compute/cactus
    Licensed under the Apache License, Version 2.0.
 
    The architecture, the .cact format as documented there, and the
@@ -31,7 +31,7 @@ See CONTRIBUTING.md.
 
 3. Upstream native engine (not used, not copied)
 
-   https://github.com/cactus-compute/cactus
+   https://github.com/cactus-compute/engine
    Licensed under a custom license from Cactus Compute, Inc. that is not
    Apache-2.0. No code from that repository is included here. See the
    clean-room rule in CONTRIBUTING.md.
@@ -46,7 +46,7 @@ See CONTRIBUTING.md.
 5. Test audio clips (downloaded, not redistributed)
 
    tools/fetch.sh downloads test.wav, test_long.wav, hotword.wav and
-   record.wav from the cactus-compute/cactus repository into ref/audio/,
+   record.wav from the cactus-compute/engine repository into ref/audio/,
    which is git-ignored. They are not part of this repository. Check the
    license that applies to that repository before using them anywhere
    other than local testing.
