@@ -64,6 +64,11 @@ jobs:
           python3 tools/eval_compare.py needle-cs.json upstream-4x.json --out eval.md
           { echo "## 4.x acceptance suites (ubuntu-latest, run ${{ github.run_id }})"; echo; cat eval.md; } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Show one raw upstream envelope per suite
+        if: always()
+        run: |
+          python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); [print(s["suite"], json.dumps(s["cases"][0].get("raw_response"))) for s in d["suites"]]' upstream-4x.json || true
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:

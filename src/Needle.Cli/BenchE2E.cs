@@ -220,7 +220,9 @@ internal static class BenchE2E
         session.Reset();
         var managedBefore = GC.GetTotalAllocatedBytes(true);
         var nativeBefore = Mem.Allocations;
+        var wallStart = Stopwatch.GetTimestamp();
         var result = session.Complete(query);
+        var wallMs = (Stopwatch.GetTimestamp() - wallStart) * 1000.0 / Stopwatch.Frequency;
         var nativeAllocs = Mem.Allocations - nativeBefore;
         var managedBytes = GC.GetTotalAllocatedBytes(true) - managedBefore;
         if (!result.Success || result.PrefillTps <= 0)
@@ -237,7 +239,8 @@ internal static class BenchE2E
         prompt.PrefillMs.Add(result.PrefillTokens / result.PrefillTps * 1000.0);
         if (result.DecodeTokens > 0 && result.DecodeTps > 0) prompt.DecodeUsPerToken.Add(1e6 / result.DecodeTps);
         prompt.TtftMs.Add(result.TimeToFirstTokenMs);
-        prompt.TotalMs.Add(result.TotalMs);
+        // Wall time around the call, the way tools/native_bench.py times cactus_complete.
+        prompt.TotalMs.Add(wallMs);
         prompt.PrefillTps.Add(result.PrefillTps);
         prompt.DecodeTps.Add(result.DecodeTps);
         prompt.ManagedBytes.Add(managedBytes);
@@ -249,7 +252,9 @@ internal static class BenchE2E
         session.Reset();
         var managedBefore = GC.GetTotalAllocatedBytes(true);
         var nativeBefore = Mem.Allocations;
+        var wallStart = Stopwatch.GetTimestamp();
         var reply = session.Complete(query, calls, reasoning, response);
+        var wallMs = (Stopwatch.GetTimestamp() - wallStart) * 1000.0 / Stopwatch.Frequency;
         var nativeAllocs = Mem.Allocations - nativeBefore;
         var managedBytes = GC.GetTotalAllocatedBytes(true) - managedBefore;
         var ticksPerSecond = (double)Stopwatch.Frequency;
@@ -269,7 +274,7 @@ internal static class BenchE2E
         prompt.PrefillMs.Add(reply.PromptTokens / prefillTps * 1000.0);
         if (decodeTps > 0) prompt.DecodeUsPerToken.Add(1e6 / decodeTps);
         prompt.TtftMs.Add(reply.FirstTokenTicks * 1000.0 / ticksPerSecond);
-        prompt.TotalMs.Add(reply.ElapsedTicks * 1000.0 / ticksPerSecond);
+        prompt.TotalMs.Add(wallMs);
         prompt.PrefillTps.Add(prefillTps);
         prompt.DecodeTps.Add(decodeTps);
         prompt.ManagedBytes.Add(managedBytes);
