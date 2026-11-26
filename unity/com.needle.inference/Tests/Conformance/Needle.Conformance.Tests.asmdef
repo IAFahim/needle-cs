@@ -1,14 +1,23 @@
 {
-  "name": "Needle.Conformance.Tests",
-  "rootNamespace": "Needle.Conformance.Tests",
-  "references": [],
-  "includePlatforms": ["Editor"],
-  "excludePlatforms": [],
-  "allowUnsafeCode": false,
-  "overrideReferences": false,
-  "precompiledReferences": [],
-  "autoReferenced": false,
-  "versionDefines": [],
-  "noEngineReferences": false,
-  "optionalUnityReferences": ["TestAssemblies"]
+    "name": "Needle.Conformance.Tests",
+    "rootNamespace": "Needle.Conformance.Tests",
+    "references": [
+        "UnityEngine.TestRunner",
+        "UnityEditor.TestRunner"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": true,
+    "precompiledReferences": [
+        "nunit.framework.dll"
+    ],
+    "autoReferenced": false,
+    "defineConstraints": [
+        "UNITY_INCLUDE_TESTS"
+    ],
+    "versionDefines": [],
+    "noEngineReferences": false
 }
