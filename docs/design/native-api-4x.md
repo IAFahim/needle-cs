@@ -1,6 +1,7 @@
 # needle-cs 4.x: the native API plan
 
 Status: proposal for review. Nothing below past phase 0 is built yet.
+Six independent reviewers have read it: section 10 records what they found, and where it differs from sections 3 to 9, section 10 wins.
 Branch: `claude/engine-4x`.
 
 ## 1. The goal in one sentence
@@ -252,7 +253,7 @@ foreach (var call in voice.Hear(pcm16k)) Apply(call);         // microphone stra
 ### Targets
 
 - Over 2x faster than upstream 4.x per call on the same machine and thread count, and up to 4x inside Unity.
-- These are goals, not measurements. We do not yet know upstream 4.x's speed: the CI job added in this branch measures it first.
+- These are goals, not measurements. The first CI numbers and the restated Unity targets are in section 10.
 
 ### What we know today
 
@@ -317,3 +318,114 @@ Breaking changes are intentional. Old types go in one release, and a short table
 - **Exceptions are managed objects.** The core never throws on the per-turn path; construction has `Try` variants.
 - **A worker thread is an OS thread.** On .NET it is created through `System.Threading.Thread`, the one managed object a host owns, created once. No GC work happens on it per turn.
 - **Clean-room rule.** All 4.x behavior is derived from upstream's documentation and its Apache-2.0 Python package, never from the custom-licensed engine source.
+
+## 10. Council review
+
+Six reviewers read this doc and the code on this branch independently, each with one brief: a .NET API design reviewer, a performance engineer, a Unity game developer, a first-time user, a skeptic and a speech engineer. None of them saw the others' notes. This section is what they found and what we change.
+
+### Where they agree
+
+1. **The hero sample does not compile.** Four of six found this on their own.
+   - A nested type and a generated member with the same name (`Squad.Give` and `call.Give`) is CS0102.
+   - `record struct` and interpolated string handlers are C# 10, and `u8` is C# 11. Unity is C# 9, the audience the owner cares most about. Worse, `Ask($"...")` still compiles in C# 9 by binding to a `string` overload, so it allocates without a warning.
+   - `AgentOptions` holds a `ref struct` (`Utf8Span`) in a plain struct, which is illegal.
+   - Section 5 calls `Squad` zero-size; section 3 says a `Squad` value is one call. It cannot be both.
+2. **Disposable structs that own native memory are a use-after-free factory.** Copy an `Agent`, dispose one copy, and the other points at freed memory; `default(Agent<T>).Ask()` is an access violation, not an exception. In an IL2CPP player that is a native crash.
+3. **`ref struct` views are only lifetime-safe in name.** `var a = agent.Ask(x); agent.Ask(y); a.Calls[0]` reads the second turn's data. `Mailbox.TryReceive` hands out a view the worker is about to overwrite.
+4. **The simplest call blocks the caller.** `Ask` takes 50 to 200 ms on desktop .NET and about 700 ms in an IL2CPP player today. In `Update()` that is a visible hitch. Four ways to run a turn (`Ask`, `Turn`, `Mailbox`, async) and none marked "use this one in a game".
+5. **Refusals and failures are silent.** `foreach` over a refused answer yields nothing and says nothing.
+6. **Parameter descriptions disappeared.** The positional record form has nowhere to put them, and they measurably raise confidence today.
+7. **`Reply<TResult>(in TResult)` cannot be implemented** without reflection, because nothing says how an arbitrary struct becomes a tool result.
+8. **Fixed-size text needs honesty.** `Text32` counts bytes (about 10 CJK characters), cuts silently, and repair can write past the cap.
+9. **What is right, keep it:** compile-time tool binding, decoding straight into structs, the arena per agent, zero allocations per turn as the measured gate, the layering with `IChatClient` as an optional bridge, `Try` twins, the JSON tools path beside the typed one, and breaking the API once with a migration table.
+
+### Where they disagree, and what we pick
+
+| Question | Positions | Decision |
+|---|---|---|
+| How users declare tools | API design, Unity and skeptic: a `[Tools] partial interface` with methods (C# 9, already supported by the generator). First-time user: a partial struct with nested structs and a checked `Is(out ...)`. | **Interface.** Users write methods; the generator emits the call union and the argument structs inside it, plus checked `Is(out ...)` and an exhaustive dispatcher. Both camps get what they asked for. |
+| Owners: struct or class | Skeptic and API design: a sealed class over `SafeHandle` is fine, because one object at startup is not GC pressure. Unity and first-time user: a generation-checked struct handle. | **Generation-checked `readonly struct` handles** (slot plus generation into a native table). It keeps "no managed types" honest and works from Burst, and a stale or default handle fails cleanly: `ObjectDisposedException` on .NET, `NeedleError.Disposed` under Burst, plus `AtomicSafetyHandle` checks in the Unity editor. |
+| Attributes for limits | API design: reuse `[Description]` and DataAnnotations `[Range]`. First-time user: `[Range]` and `[Min]` clash with `UnityEngine` (CS0104). | **`[Description]` for tools and parameters** (what Microsoft.Extensions.AI reads), XML doc comments as a fallback, and Needle's own **`[Arg(Min = 1, Max = 99)]`** for limits. |
+| Mailbox from Burst jobs | Unity: make it a `NativeQueue`-style container with a `ParallelWriter`. Skeptic: Burst is a C# subset, keep Burst to the kernels. | **Kernels first.** A job-writable mailbox is a phase 5 stretch, not a phase gate. |
+| Renames | Skeptic: renaming `Utf8Text32`, `NeedleHost`, `NeedleChannel` is churn. Owner: change the API if it helps. | **Rename once, only where the name improves.** `NeedleModel` and `NeedleAgent` keep the brand on the two types people type first (plain `Agent` clashes with Semantic Kernel). |
+| Default confidence floor | First-time user: 0.3, as the README recommends. Parity with 4.x needs upstream's default. | **Upstream's default in the engine**, 0.3 in the Unity agent asset and the samples. |
+| Speed targets | Skeptic: drop the 2x and 4x numbers until they are measured. | **Measured now, see below.** Claims quote only the CI table. |
+
+### Correctness the plan must fix first (skeptic, confirmed in code)
+
+- **The typed path skips repair.** `GenerateCallsTyped` never calls `ArgumentRepair`, so the plan's main path would get none of the 4.x validation. Repair moves to a neutral per-call form (tool index plus argument slots) that both the JSON and struct paths feed, and runs as each call closes. A streamed call is marked provisional until the turn's confidence and floor are known.
+- **Phase 0 is not done.** Triggers are parsed but never used; `threads = 0` means 1 thread, not automatic; `auto_date` is off where upstream has it on; headless confidence is 1.0 where upstream returns none; and eval scoring must count ungrounded or negated calls as no call.
+- **The ungrounded check is too literal.** "7pm", "an hour", "a couple" and "full brightness" are flagged, and a game's inferred coordinates always are. It gets calibrated against upstream's own output on the six suites, and a field can opt out with `[Arg(Inferred = true)]`.
+- **Bugs in the repair code on this branch:**
+  - A value from one clause can fill a call from another ("set volume to 30 and dim the lights by 10" sets the volume to 10). The whole-request fallback applies only when there is one call.
+  - Negation reaches into quoted text ("text Sam that I won't make it" is dropped), and "or" after a negation splits the clause.
+  - `start` and `end` are treated as a route's origin and destination, which breaks calendar times.
+  - When the history buffer is full, the newest turn is the text that gets dropped.
+  - When repaired output outgrows the buffer, the spans are updated but the bytes are not.
+  - Smaller: "update" matches the date rule, a field named `number` is treated as a phone number, and month-plus-day never rolls into next year.
+- **Bench harness.** The 4.x binding matches the signatures in upstream's Apache-2.0 Python package, so the ABI worry does not hold. Three real gaps remain: upstream's Python sets threads *before* loading, while the bench sets them after, which may be why 4.x shows the same time at every thread count; times are not token-normalised (upstream may decode more tokens); and calls are never checked, so a fast wrong answer would count as a win. All three get fixed before any number is quoted outside this branch.
+
+### Unity additions (Unity reviewer)
+
+- One game path that never computes on the main thread: `pending = agent.Post(line)` returns at once, and `pending.TryTake(out answer)` in a later frame. `AskAsync` through `Awaitable` for those who want it. An analyzer warns when `Ask` is called from `Update`.
+- Assets, not file paths: a `.cact` importer producing a model asset, an agent asset (persona, options, examples, fallback lines for refusals), automatic prefix baking on import.
+- Inspector wiring with no code: the generator can emit a component with one `UnityEvent` per tool.
+- A Playground window: type an order, see calls, confidence, repairs and timing, and save it as a test case.
+- Arenas allocated through Unity's allocator so leak detection and the Memory Profiler see them; hosts disposed on domain reload and quit.
+- One model per project, one host per world, and requests with a priority, a deadline in frames and cancel-by-owner, so a crowd of NPCs cannot starve the player.
+- An honest platform matrix. Today the plugins exclude Android, iOS, WebGL and UWP; consoles need `FromMemory` and core affinity; WebGL has no threads. And the doc must say that Burst kernels already ship but are not active yet.
+
+### Speech additions (speech reviewer)
+
+- Today's streaming re-transcribes the whole window on every pass, which grows quadratically; it becomes incremental.
+- `agent.Listen(speech)` instead of a second agent; one shared native ring for microphone audio; `voice.Step(budget, out Hearing e)` with SpeechStarted, Partial, CallReady, Unsure and Done.
+- Push-to-talk with pre-roll, voice activity detection, and semantic endpointing: the grammar can see that a call is complete and close the turn after a short silence.
+- Command mode: decode speech under a phrase grammar built from the tools, plus `[Spoken]` hotwords for names. This is the largest accuracy gain on offer.
+- Word confidence flows into validation, so the game can ask "did you say Lyra?".
+
+### Performance corrections (performance reviewer)
+
+- **The cost model in section 6 is out of date.** The weights are 2-bit and 4-bit codebook, not int8, and the matrix-vector kernel is limited by instruction count, not memory. At 1 thread it is already within about 20% of its floor (7.3 µs measured against about 6.1 µs estimated for a 768x768 layer). So the levers that pay are elsewhere.
+- **The biggest lossless lever was missing: decode barely scales with threads.** 1146 µs per token at 1 thread, 812 µs at 4, only 1.41x. The MLP runs on one thread during decode, small serial stages get slower with more threads, and there are about 230 thread barriers per token (not three per layer). Splitting the MLP across threads, running the tiny serial stages on every thread instead of sharding them behind a barrier, and work stealing for every stage is estimated at 30 to 40% less time per call, with bit-identical output.
+- **Speculation and jump-forward are weak on x86 desktops.** A multi-token pass costs nearly as much per token as single passes here, so they mostly save fixed per-pass cost, which the item above already cuts. "Typed tools generate fewer tokens" is worth 2 to 4%. Speculation gets calibrated at open and switches on only where it pays (memory-bound phones and ARM with matrix instructions).
+- **Cache residency matters on small-L3 machines.** Each token reads 17.5 MB of weights; a 16 MB L3 then misses almost always. Streaming the output head past the cache and keeping each core's rows sticky could give 10 to 25% there. Measure first.
+- **Hybrid cores and Unity's own threads cause stragglers.** With hundreds of barriers per token, one slow or preempted core sets the pace. Dynamic chunking everywhere, and 1 to 2 inference threads by default in Unity.
+- **Two benchmark tables, not one.** Engine parity (same tokens, same reasoning budget, same schema bytes) and product default against product default, each with the acceptance-suite score next to it. Reasoning is 54% of decoded tokens, so `Reasoning.Auto` is the one lever of 1.5x or more, and it changes outputs.
+- **Burst must compile the whole decode step, not only the leaf kernels**, with strict float mode for parity; everything between kernels would otherwise run on Mono. Unity's CoreCLR release gets the .NET 10 SIMD build for free.
+- **"No marshalling" is worth microseconds against a 40 ms call.** It prevents frame hitches; it is not a speed lever.
+- **Cross-agent batching** (the existing 16-slot batched engine) belongs in the host. It is the throughput lever for many NPCs.
+- **Research spike with a kill rule:** a lookup-table kernel for the 2-bit weights on x86 without VNNI, dropped unless the gate layer gets at least 1.3x faster.
+- **Unity targets, restated.** 4x is not credible: upstream's native library already runs at native speed inside Unity. The honest Unity targets are engine latency within 1.1x of the .NET 10 build, at most 20 µs of main-thread cost per ask, zero GC, and no p99 frame spikes.
+
+### What we measured since the plan was written
+
+CI run 45745162350, shared 4-vCPU GitHub runners, best of 5 interleaved rounds:
+
+| Machine | Upstream 4.x | needle-cs 1 thread | needle-cs 2 threads | needle-cs 4 threads |
+|---|---|---|---|---|
+| x64, AMD EPYC Zen 4, golden set | 103 ms | 81 ms (1.27x) | 50 ms (2.05x) | 53 ms (1.92x) |
+| x64, game set | 113 ms | 86 ms (1.32x) | 52 ms (2.18x) | 55 ms (2.04x) |
+| arm64, Neoverse-N2, golden set | 82 ms | 462 ms (0.18x) | 265 ms (0.31x) | 161 ms (0.51x) |
+
+- On x64 we are about 2x faster than 4.x with 2 or more threads. Prefill is about 3x faster; decode is about 1.6x faster.
+- On arm64 we are 2 to 5 times *slower*. This is now the top performance item: the next CI run prints the active CPU tier and a stage profile to find out why.
+- Upstream 4.x shows the same time at every thread count. That may be the bench's thread-setting order (above), so the 4.x column is provisional.
+
+### The revised plan
+
+1. **Phase 0, finished properly.** Triggers, automatic threads, `auto_date`, headless confidence, the repair bugs above, and the eval rule. Port the six acceptance suites and score both engines on them. Fix the bench (threads before load, token counts, call checks). Find and fix the arm64 gap.
+2. **Phase 1, the core.** Generation-checked handles; versioned views that throw (or return `Failure`) when stale; a caller-buffer overload `Ask(utf8, Span<TCall> calls, out AnswerInfo)` returning `OperationStatus`; options as a plain property struct with `SetSystem` copying into the arena; `answer.Ok` and `answer.Why`; repair on the neutral per-call form for both paths.
+3. **Phase 2, the tools.** Evolve today's generator rather than rebuild it: `[Tools] partial interface` with `[Description]` and `[Arg]`; a generated call union with `Kind`, `Is(out ...)` and `Dispatch(ref handler)`; `ref readonly` enumeration; `Text32` exactly 32 bytes, formattable, comparable, with a truncation flag; analyzers for a missing `partial` or `[Tools]`, oversized text and `Ask` in `Update`. Cut the regex-to-DFA compiler (use .NET's own regex, built once) and the "confusable tools" analyzer.
+4. **Phase 3, time.** `Post` and `TryTake` as the one game path; per-frame `turn.Run(budget)` returning that slice's events; the same shape for voice. `Continue(resultJson)` replaces `Reply<TResult>`.
+5. **Phase 4, speech and Unity.** The speech and Unity additions above.
+6. **Phase 5 and 6.** Speed levers one at a time under the acceptance suites, in the performance reviewer's order: thread scaling and fewer barriers first, then prefill tiles, cache residency where it applies, `Reasoning.Auto` as a reported default-versus-default result, and whole-step Burst for Unity. Then the optional packages, optional packages, NuGet with the model as a content package, and a quickstart that a first-time user can run in five minutes.
+
+The five-line quickstart we will hold ourselves to, in C# 9 so it runs in Unity too:
+
+```csharp
+[Tools] public partial interface IKitchen { [Description("Set a countdown timer.")] void SetTimer([Description("Length in minutes")] int minutes); }
+
+using var agent = NeedleAgent.Open<IKitchen>("needle3.cact");
+foreach (var call in agent.Ask("set a timer for 12 minutes"))
+    if (call.Is(out IKitchen.SetTimerArgs t)) Console.WriteLine($"timer: {t.Minutes} min");
+```
