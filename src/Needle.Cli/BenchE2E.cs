@@ -20,6 +20,11 @@ internal sealed record BenchE2EOptions
     public string Api { get; init; } = "text";
     public long? MaxManagedBytes { get; init; }
     public long? MaxNativeAllocs { get; init; }
+    public string System { get; init; } = "";
+    public bool AutoDate { get; init; }
+    public int? ReasoningBudget { get; init; }
+    public int RetrievalTopK { get; init; } = 64;
+    public bool Product { get; init; }
 
     public static BenchE2EOptions Parse(string[] args)
     {
@@ -39,6 +44,11 @@ internal sealed record BenchE2EOptions
                 "--max-native-allocs" => options with { MaxNativeAllocs = long.Parse(Next()) },
                 "--json" => options with { Json = true },
                 "--profile" => options with { Profile = true },
+                "--system" => options with { System = Next() },
+                "--auto-date" => options with { AutoDate = true },
+                "--reasoning" => options with { ReasoningBudget = int.Parse(Next()) },
+                "--retrieval" => options with { RetrievalTopK = int.Parse(Next()) },
+                "--product" => options with { Product = true },
                 var unknown => throw new ArgumentException($"unknown option {unknown}"),
             };
         }
@@ -53,6 +63,9 @@ internal sealed class PromptMeasurement
 {
     public string Query = "";
     public string Calls = "";
+    public string? CallsJson;
+    public readonly HashSet<int> DecodeTokenCounts = new();
+    public readonly List<string> Errors = new();
     public int Failures;
     public int PrefillTokens;
     public int DecodeTokens;
@@ -146,7 +159,13 @@ internal static class BenchE2E
 
     static SetMeasurement MeasureSet(Model model, PromptSet set, int threads, BenchE2EOptions options)
     {
-        var sessionOptions = new NeedleOptions { Threads = threads, AutoDate = false, System = "", RetrievalTopK = 64 };
+        // --product: the library's own defaults (only the thread count set); otherwise the engine-parity
+        // setup: the system text and schema bytes the native runner hands to cactus_init, no date fact.
+        var sessionOptions = options.Product
+            ? new NeedleOptions { Threads = threads }
+            : options.ReasoningBudget is { } budget
+                ? new NeedleOptions { Threads = threads, AutoDate = options.AutoDate, System = options.System, RetrievalTopK = options.RetrievalTopK, ReasoningBudget = budget }
+                : new NeedleOptions { Threads = threads, AutoDate = options.AutoDate, System = options.System, RetrievalTopK = options.RetrievalTopK };
         var privateBefore = PrivateBytes();
         var started = Stopwatch.GetTimestamp();
         using var session = new NeedleSession(model, set.ToolsJson, sessionOptions);
@@ -207,13 +226,16 @@ internal static class BenchE2E
         if (!result.Success || result.PrefillTps <= 0)
         {
             prompt.Failures++;
+            if (prompt.Errors.Count < 3) prompt.Errors.Add(result.Error ?? "no prefill");
             return;
         }
         prompt.Calls = result.FunctionCalls.Count > 0 ? string.Join(",", result.FunctionCalls.Select(c => c.Name)) : "respond";
+        prompt.CallsJson = "[" + string.Join(",", result.FunctionCalls.Select(c => "{\"name\":" + Quote(c.Name) + ",\"arguments\":" + (string.IsNullOrWhiteSpace(c.ArgumentsJson) ? "{}" : c.ArgumentsJson) + "}")) + "]";
+        prompt.DecodeTokenCounts.Add(result.DecodeTokens);
         prompt.PrefillTokens = result.PrefillTokens;
         prompt.DecodeTokens = result.DecodeTokens;
         prompt.PrefillMs.Add(result.PrefillTokens / result.PrefillTps * 1000.0);
-        prompt.DecodeUsPerToken.Add(result.DecodeTokens > 0 && result.DecodeTps > 0 ? 1e6 / result.DecodeTps : 0);
+        if (result.DecodeTokens > 0 && result.DecodeTps > 0) prompt.DecodeUsPerToken.Add(1e6 / result.DecodeTps);
         prompt.TtftMs.Add(result.TimeToFirstTokenMs);
         prompt.TotalMs.Add(result.TotalMs);
         prompt.PrefillTps.Add(result.PrefillTps);
@@ -233,22 +255,32 @@ internal static class BenchE2E
         var ticksPerSecond = (double)Stopwatch.Frequency;
         var prefillTps = reply.PromptTokens / Math.Max(1e-9, reply.PrefillTicks / ticksPerSecond);
         var decodeTps = reply.DecodeTokens / Math.Max(1e-9, (reply.ElapsedTicks - reply.PrefillTicks) / ticksPerSecond);
-        if (reply.Status is not (ReplyStatus.Called or ReplyStatus.Responded or ReplyStatus.Refused) || decodeTps <= 0)
+        if (reply.Status is not (ReplyStatus.Called or ReplyStatus.Responded or ReplyStatus.Refused))
         {
             prompt.Failures++;
+            if (prompt.Errors.Count < 3) prompt.Errors.Add(reply.Status + " " + reply.Failure);
             return;
         }
         prompt.Calls = reply.HasCalls ? CallNames(calls, reply.Utf8Length) : "respond";
+        prompt.CallsJson = reply.Status == ReplyStatus.Called ? Encoding.UTF8.GetString(calls, 0, reply.Utf8Length) : "[]";
+        prompt.DecodeTokenCounts.Add(reply.DecodeTokens);
         prompt.PrefillTokens = reply.PromptTokens;
         prompt.DecodeTokens = reply.DecodeTokens;
         prompt.PrefillMs.Add(reply.PromptTokens / prefillTps * 1000.0);
-        prompt.DecodeUsPerToken.Add(1e6 / decodeTps);
+        if (decodeTps > 0) prompt.DecodeUsPerToken.Add(1e6 / decodeTps);
         prompt.TtftMs.Add(reply.FirstTokenTicks * 1000.0 / ticksPerSecond);
         prompt.TotalMs.Add(reply.ElapsedTicks * 1000.0 / ticksPerSecond);
         prompt.PrefillTps.Add(prefillTps);
         prompt.DecodeTps.Add(decodeTps);
         prompt.ManagedBytes.Add(managedBytes);
         prompt.NativeAllocs.Add(nativeAllocs);
+    }
+
+    static string Quote(string text)
+    {
+        var b = new StringBuilder();
+        JsonValue.WriteString(b, text);
+        return b.ToString();
     }
 
     static string CallNames(byte[] calls, int length)
@@ -368,7 +400,10 @@ internal static class BenchE2E
             json.BeginObject()
                 .Field("query", p.Query)
                 .Field("calls", p.Calls)
+                .Field("calls_json", p.CallsJson ?? "")
                 .Field("failures", p.Failures)
+                .Field("errors", string.Join("; ", p.Errors))
+                .Field("decode_tokens_varied", p.DecodeTokenCounts.Count > 1)
                 .Field("prefill_tokens", p.PrefillTokens)
                 .Field("decode_tokens", p.DecodeTokens)
                 .Field("prefill_ms", Spread.Of(p.PrefillMs))
