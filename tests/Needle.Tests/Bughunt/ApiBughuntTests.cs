@@ -56,6 +56,28 @@ public struct ToolPickSink : IGrammarSink
 
 public sealed unsafe class ApiBughuntTests
 {
+    [Theory]
+    [InlineData("{")]
+    [InlineData("[")]
+    [InlineData("[1")]
+    [InlineData("{\"a\":1")]
+    [InlineData("\"abc")]
+    [InlineData("\"a\\")]
+    [InlineData("\"\\u12\"")]
+    [InlineData("[t]")]
+    [InlineData("tru3")]
+    [InlineData("{\"on\":nope}")]
+    [InlineData("[falsy]")]
+    public void Json_MalformedInput_ThrowsFormatException(string text) =>
+        Assert.Throws<FormatException>(() => JsonValue.Parse(text));
+
+    [Fact]
+    public void Json_PathologicallyDeepNesting_ThrowsFormatExceptionInsteadOfOverflowingTheStack()
+    {
+        var deep = new string('[', 2000) + new string(']', 2000);
+        Assert.Throws<FormatException>(() => JsonValue.Parse(deep));
+    }
+
     [Fact]
     public void Services_CalledBeforeStart_FailWithInvalidOperationNotNullReference()
     {
