@@ -32,7 +32,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ref
-          key: ref-v2-${{ hashFiles('tools/fetch.sh', 'tools/golden.py', 'tools/golden_confidence.py', 'tools/golden_whistle.py') }}
+          key: ref-v2-${{ hashFiles('tools/fetch.sh', 'tools/ref.lock', 'tools/golden.py', 'tools/golden_confidence.py', 'tools/golden_whistle.py') }}
 
       - name: Set up Python
         if: steps.ref-cache.outputs.cache-hit != 'true'
@@ -263,9 +263,9 @@ jobs:
       - name: Select shard filter
         run: |
           case "${{ matrix.shard }}" in
-            unit) echo 'FILTER=FullyQualifiedName~AttentionBatchTests|FullyQualifiedName~AttentionTileTests|FullyQualifiedName~BackendTests|FullyQualifiedName~CallRestorerTests|FullyQualifiedName~EvalDatasetTests|FullyQualifiedName~FormatTests|FullyQualifiedName~FusedKernelTests|FullyQualifiedName~GrammarTests|FullyQualifiedName~HadamardMlpTests|FullyQualifiedName~Int8DotTierTests|FullyQualifiedName~KernelTests|FullyQualifiedName~MatMulTests|FullyQualifiedName~NeonTests|FullyQualifiedName~PoolTests|FullyQualifiedName~TeamBarrierTests|FullyQualifiedName~TelemetryTests|FullyQualifiedName~TierSelectionTests|FullyQualifiedName~ToolGenTests' >> $GITHUB_ENV ;;
-            core) echo 'FILTER=FullyQualifiedName~ChannelTests|FullyQualifiedName~ChunkParityTests|FullyQualifiedName~EvalTests|FullyQualifiedName~HugePagesTests|FullyQualifiedName~JumpForwardTests|FullyQualifiedName~LoadingTests|FullyQualifiedName~MaskedDecodingTests|FullyQualifiedName~NativeParityTests|FullyQualifiedName~ParityTests|FullyQualifiedName~RewindTests|FullyQualifiedName~ServiceTests|FullyQualifiedName~SessionStartupTests|FullyQualifiedName~SessionTests|FullyQualifiedName~SpanApiTests|FullyQualifiedName~SpeculativeTests|FullyQualifiedName~ToolGenSessionTests|FullyQualifiedName~TypedHostTests|FullyQualifiedName~TypedSinkTests' >> $GITHUB_ENV ;;
-            heavy) echo 'FILTER=FullyQualifiedName~BatchedDecodeTests|FullyQualifiedName~BenchHarnessTests|FullyQualifiedName~SpeechTests|FullyQualifiedName~VoiceTests|FullyQualifiedName~WhistleStageTests|FullyQualifiedName~ZeroAllocationTests' >> $GITHUB_ENV ;;
+            unit) echo 'FILTER=FullyQualifiedName~AttentionBatchTests|FullyQualifiedName~AttentionTileTests|FullyQualifiedName~Avx512OpsTests|FullyQualifiedName~BackendTests|FullyQualifiedName~CallRestorerTests|FullyQualifiedName~Needle.Tests.Conformance.|FullyQualifiedName~EvalDatasetTests|FullyQualifiedName~ForcedTierTests|FullyQualifiedName~FormatTests|FullyQualifiedName~FusedKernelTests|FullyQualifiedName~GrammarTests|FullyQualifiedName~HadamardMlpTests|FullyQualifiedName~Int8DotTierTests|FullyQualifiedName~KernelTests|FullyQualifiedName~MatMulTests|FullyQualifiedName~NeonTests|FullyQualifiedName~PoolTests|FullyQualifiedName~RopeScheduleTests|FullyQualifiedName~SimdCanaryTests|FullyQualifiedName~TeamBarrierTests|FullyQualifiedName~TelemetryTests|FullyQualifiedName~TierSelectionTests|FullyQualifiedName~ToolGenTests' >> $GITHUB_ENV ;;
+            core) echo 'FILTER=FullyQualifiedName~Needle.Tests.Bughunt.|FullyQualifiedName~ChannelTests|FullyQualifiedName~ChunkParityTests|FullyQualifiedName~EvalTests|FullyQualifiedName~HugePagesTests|FullyQualifiedName~JumpForwardTests|FullyQualifiedName~LoadingTests|FullyQualifiedName~MaskedDecodingTests|FullyQualifiedName~NativeParityTests|FullyQualifiedName~ParityTests|FullyQualifiedName~PrefixSnapshotTests|FullyQualifiedName~RewindTests|FullyQualifiedName~ServiceTests|FullyQualifiedName~SessionStartupTests|FullyQualifiedName~SessionTests|FullyQualifiedName~SpanApiTests|FullyQualifiedName~SpeculativeTests|FullyQualifiedName~ToolGenSessionTests|FullyQualifiedName~TypedHostTests|FullyQualifiedName~TypedSinkTests' >> $GITHUB_ENV ;;
+            heavy) echo 'FILTER=FullyQualifiedName~BatchedDecodeTests|FullyQualifiedName~BatchedHostTests|FullyQualifiedName~BenchHarnessTests|FullyQualifiedName~SpeechTests|FullyQualifiedName~VoiceTests|FullyQualifiedName~WhistleStageTests|FullyQualifiedName~ZeroAllocationTests' >> $GITHUB_ENV ;;
           esac
           if [ "${{ matrix.noavx512 }}" = "true" ]; then echo 'DOTNET_EnableAVX512F=0' >> $GITHUB_ENV; fi
 

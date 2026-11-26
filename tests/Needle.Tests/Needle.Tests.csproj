@@ -3,6 +3,7 @@
     <TargetFramework>net10.0</TargetFramework>
     <IsPackable>false</IsPackable>
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <DefineConstants>$(DefineConstants);NEEDLE_SIMD</DefineConstants>
     <!-- Generated tool sinks must stay warning-free for hosts that build with warnings as errors. -->
     <WarningsAsErrors>$(WarningsAsErrors);CS0414;CS1522;CS0169;CS0649</WarningsAsErrors>
   </PropertyGroup>

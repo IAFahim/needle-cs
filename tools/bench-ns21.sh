@@ -12,7 +12,7 @@ warmups="${NEEDLE_WARMUPS:-1}"
 sets="${NEEDLE_SETS:-golden}"
 out="${NEEDLE_OUT:-}"
 project="${SAY_PROJECT:-$HOME/Say}"
-mode="${1:-}"
+mode=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
