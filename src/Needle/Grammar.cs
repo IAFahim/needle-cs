@@ -179,7 +179,7 @@ internal sealed unsafe class Grammar : IDisposable
     int Compile(JsonValue schema)
     {
         if (schema.Kind != JsonKind.Object) return Kind.AnyNode;
-        if (schema.Get("enum") is { Kind: JsonKind.Array } options && options.Items.Count is > 0 and <= 64) return CompileEnum(options.Items);
+        if (schema.Get("enum") is { Kind: JsonKind.Array } options && options.Items.Count > 0) return CompileEnum(options.Items);
         if (schema.Get("const") is { } constant) return CompileEnum(new List<JsonValue> { constant });
         var branches = schema.Get("anyOf") ?? schema.Get("oneOf");
         if (branches is { Kind: JsonKind.Array } && branches.Items.Count is > 0 and <= 16) return CompileUnion(branches.Items.ConvertAll(Compile));
@@ -355,19 +355,26 @@ internal sealed unsafe class Grammar : IDisposable
             {
                 if (g->ToolCount > 64) return StepWideName(g, f, root, c, ref sink);
                 var candidates = 0UL;
+                var entries = g->Tools + root[2] * 4;
                 if (c == '"')
                 {
                     for (var t = 0; t < g->ToolCount; t++)
-                        if ((f->Bits >> t & 1) != 0 && g->Tools[(root[2] + t) * 4 + 1] == f->Aux) { f->Aux2 = t; f->Phase = 2; f->Aux = 0; sink.ToolSelected(t); return Consumed; }
+                        if (Alive(g, f, entries, 4, g->ToolCount, t) && entries[t * 4 + 1] == f->Aux) { f->Aux2 = t; f->Phase = 2; f->Aux = 0; sink.ToolSelected(t); return Consumed; }
                     return Reject;
                 }
+                var first = -1;
                 for (var t = 0; t < g->ToolCount; t++)
                 {
-                    var tool = g->Tools + (root[2] + t) * 4;
-                    if ((f->Bits >> t & 1) != 0 && tool[1] > f->Aux && g->Bytes[tool[0] + f->Aux] == c) candidates |= 1UL << t;
+                    var tool = entries + t * 4;
+                    if (Alive(g, f, entries, 4, g->ToolCount, t) && tool[1] > f->Aux && g->Bytes[tool[0] + f->Aux] == c)
+                    {
+                        candidates |= 1UL << (t & 63);
+                        if (first < 0) first = t;
+                    }
                 }
                 if (candidates == 0) return Reject;
                 f->Bits = candidates;
+                if (g->ToolCount > 64) f->Aux2 = first;
                 f->Aux++;
                 return Consumed;
             }
@@ -385,6 +392,17 @@ internal sealed unsafe class Grammar : IDisposable
                 sink.CallCompleted();
                 return Pop(s, Consumed);
         }
+    }
+
+    static bool Alive(GrammarProgram* g, Frame* f, int* entries, int stride, int count, int i)
+    {
+        if ((f->Bits >> (i & 63) & 1) == 0) return false;
+        if (count <= 64 || f->Aux == 0 || i == f->Aux2) return true;
+        var a = g->Bytes + entries[i * stride];
+        var b = g->Bytes + entries[f->Aux2 * stride];
+        if (entries[i * stride + 1] < f->Aux) return false;
+        for (var k = 0; k < f->Aux; k++) if (a[k] != b[k]) return false;
+        return true;
     }
 
     static ulong ToolMask(GrammarProgram* g) => g->ToolCount >= 64 ? ulong.MaxValue : (1UL << g->ToolCount) - 1;
@@ -712,12 +730,18 @@ internal sealed unsafe class Grammar : IDisposable
         var candidates = 0UL;
         var complete = false;
         var completed = 0;
+        var first = -1;
+        var entries = g->Literals + n[2] * 2;
         for (var i = 0; i < n[1]; i++)
         {
-            if ((f->Bits >> i & 1) == 0) continue;
-            var literal = g->Literals + (n[2] + i) * 2;
+            if (!Alive(g, f, entries, 2, n[1], i)) continue;
+            var literal = entries + i * 2;
             if (literal[1] == f->Aux) { complete = true; completed = i; }
-            else if (g->Bytes[literal[0] + f->Aux] == c) candidates |= 1UL << i;
+            else if (g->Bytes[literal[0] + f->Aux] == c)
+            {
+                candidates |= 1UL << (i & 63);
+                if (first < 0) first = i;
+            }
         }
         if (candidates == 0)
         {
@@ -727,12 +751,13 @@ internal sealed unsafe class Grammar : IDisposable
             return Pop(s, Reprocess);
         }
         f->Bits = candidates;
+        if (n[1] > 64) f->Aux2 = first;
         f->Aux++;
         var longer = false;
         var exact = -1;
         for (var i = 0; i < n[1]; i++)
         {
-            if ((candidates >> i & 1) == 0) continue;
+            if (!Alive(g, f, entries, 2, n[1], i)) continue;
             var length = g->Literals[(n[2] + i) * 2 + 1];
             if (length == f->Aux) exact = i; else longer = true;
         }

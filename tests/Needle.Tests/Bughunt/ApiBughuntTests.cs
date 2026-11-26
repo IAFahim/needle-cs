@@ -31,8 +31,89 @@ public struct WideHandler : IWideCommands
     }
 }
 
+public enum BigItem { Aa, V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15, V16, V17, V18, V19, V20, V21, V22, V23, V24, V25, V26, V27, V28, V29, V30, V31, V32, V33, V34, V35, V36, V37, V38, V39, V40, V41, V42, V43, V44, V45, V46, V47, V48, V49, V50, V51, V52, V53, V54, V55, V56, V57, V58, V59, V60, V61, V62, V63, Bb }
+
+[NeedleTools]
+public partial interface IBigEnumCommands
+{
+    [Tool("Pick an item.")] void Pick(BigItem item);
+}
+
+public struct ToolPickSink : IGrammarSink
+{
+    public int Tool;
+    public int Literal;
+    public void ToolSelected(int tool) => Tool = tool;
+    public void PropertySelected(int property) { }
+    public void StringByte(byte value) { }
+    public void NumberByte(byte value) { }
+    public void EnumSelected(int literal) => Literal = literal;
+    public void BoolSelected(bool value) { }
+    public void NullSelected() { }
+    public void ValueCompleted() { }
+    public void CallCompleted() { }
+}
+
 public sealed unsafe class ApiBughuntTests
 {
+    static bool Accepts(Grammar grammar, string text, ref ToolPickSink sink)
+    {
+        var state = Grammar.Start(grammar.Program);
+        foreach (var b in Encoding.UTF8.GetBytes(text)) if (!Grammar.Advance(grammar.Program, &state, b, ref sink)) return false;
+        return Grammar.Complete(state);
+    }
+
+    [Fact]
+    public void Generator_EnumWithMoreThan64Members_GrammarRejectsMixedLiteralsAndBindsTheRightMember()
+    {
+        var program = GrammarLoader.Load(BigEnumCommands.GrammarNodes, BigEnumCommands.GrammarProperties, BigEnumCommands.GrammarLiterals,
+            BigEnumCommands.GrammarUnions, BigEnumCommands.GrammarTools, BigEnumCommands.GrammarBytes, BigEnumCommands.GrammarRoot, BigEnumCommands.GrammarToolCount);
+        using var grammar = new Grammar(program);
+        bool Run(string text, out BigEnumCommand command)
+        {
+            var sink = new BigEnumSink();
+            var state = Grammar.Start(grammar.Program);
+            command = default;
+            foreach (var b in Encoding.UTF8.GetBytes(text)) if (!Grammar.Advance(grammar.Program, &state, b, ref sink)) return false;
+            return Grammar.Complete(state) && sink.TryTakeCall(out command);
+        }
+        Assert.False(Run("[{\"name\":\"pick\",\"arguments\":{\"item\":\"ab\"}}]", out _));
+        Assert.True(Run("[{\"name\":\"pick\",\"arguments\":{\"item\":\"bb\"}}]", out var command));
+        Assert.Equal(BigItem.Bb, command.Pick.Item);
+    }
+
+    [Fact]
+    public void Grammar_MoreThan64Tools_NeitherMixesNamesNorPicksTheWrongTool()
+    {
+        var tools = new List<string>();
+        for (var i = 0; i < 65; i++)
+        {
+            var name = i == 0 ? "aa" : i == 64 ? "bb" : "tool" + i;
+            tools.Add("{\"name\":\"" + name + "\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}");
+        }
+        var set = new ToolSet("[" + string.Join(",", tools) + "]");
+        using var grammar = new Grammar(set.Tools);
+        var sink = new ToolPickSink();
+        Assert.False(Accepts(grammar, "[{\"name\":\"ab\",\"arguments\":{}}]", ref sink));
+        sink = new ToolPickSink();
+        Assert.True(Accepts(grammar, "[{\"name\":\"bb\",\"arguments\":{}}]", ref sink));
+        Assert.Equal(64, sink.Tool);
+    }
+
+    [Fact]
+    public void Grammar_EnumWithMoreThan64Literals_NeitherMixesLiteralsNorPicksTheWrongOne()
+    {
+        var literals = new List<string>();
+        for (var i = 0; i < 65; i++) literals.Add(i == 0 ? "\"aa\"" : i == 64 ? "\"bb\"" : "\"v" + i + "\"");
+        var set = new ToolSet("[{\"name\":\"pick\",\"parameters\":{\"type\":\"object\",\"properties\":{\"item\":{\"type\":\"string\",\"enum\":[" + string.Join(",", literals) + "]}},\"required\":[\"item\"]}}]");
+        using var grammar = new Grammar(set.Tools);
+        var sink = new ToolPickSink();
+        Assert.False(Accepts(grammar, "[{\"name\":\"pick\",\"arguments\":{\"item\":\"ab\"}}]", ref sink));
+        sink = new ToolPickSink();
+        Assert.True(Accepts(grammar, "[{\"name\":\"pick\",\"arguments\":{\"item\":\"bb\"}}]", ref sink));
+        Assert.Equal(64, sink.Literal);
+    }
+
     [Fact]
     public void SharedChannel_FileShorterThanItsHeaderedLayout_IsRejectedOnOpen()
     {
