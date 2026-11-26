@@ -9,7 +9,7 @@ runner, so a run by hand and a CI run do the same thing.
 | Assembly | Mode | Needs the model | What it checks |
 |---|---|---|---|
 | `Needle.Unity.Tests` (`Tests/Runtime`) | EditMode | some tests | The two plugin DLLs carry the same source stamp, a CoreCLR Editor runs the `net10.0` kernels, the kernel table is installed, `ModelLoader` paths and errors, the unmanaged channel rings, the Burst `NeedleSystem` in a private `World`, and end to end: tool calls from a session and from `NeedleHost`, zero managed allocation on the span API, Whistle transcribing `record.wav`. |
-| `Needle.Unity.PlayMode.Tests` (`Tests/PlayMode`) | PlayMode | yes | `NeedleHost` answers while frames keep ticking, and submitting plus polling costs the main thread under 1 ms in every frame (`NEEDLE_FRAME_BUDGET_MS` changes the budget). |
+| `Needle.Unity.PlayMode.Tests` (`Tests/PlayMode`) | PlayMode | yes | `NeedleHost` answers while frames keep ticking, and submitting plus polling costs the main thread under 1 ms in every frame (`NEEDLE_FRAME_BUDGET_MS` changes the budget). The game-path bench asks the game tool set `NEEDLE_REPS` times over and fails when an ask fails or when submitting or polling allocates on the main thread; it reports main-thread microseconds per ask, frame-time spikes while the model runs and engine latency against the Unity targets of the 4.x plan (`gamepath-playmode.json`). |
 | `Needle.Conformance.Tests`, `Needle.Kernels.Burst.Tests`, `Needle.Probe.Tests` | EditMode | no | The Burst kernels against the managed reference kernels, and the runtime probe. |
 | `Needle.Bench.Tests` | EditMode | yes | The golden-set bench inside the Editor; writes `needle.bench-e2e/1` JSON. |
 

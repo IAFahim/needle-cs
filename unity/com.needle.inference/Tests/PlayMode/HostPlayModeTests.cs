@@ -88,6 +88,16 @@ namespace Needle.Unity.PlayMode.Tests
             }
         }
 
+        public static int Reps
+        {
+            get
+            {
+                int reps;
+                string text = Environment.GetEnvironmentVariable("NEEDLE_REPS");
+                return !string.IsNullOrEmpty(text) && int.TryParse(text.Trim(), out reps) && reps > 0 ? reps : 2;
+            }
+        }
+
         public static double FrameBudgetMs
         {
             get

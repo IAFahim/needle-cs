@@ -165,6 +165,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           python3 tools/unity-bench-compare.py --native out/unity/bench-native.json \
+            --gamepath out/unity/gamepath-playmode.json \
             editor=out/unity/bench-editmode.json \
             il2cpp=out/unity/bench-player-il2cpp.json \
             coreclr=out/unity/bench-player-coreclr.json \

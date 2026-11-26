@@ -169,7 +169,7 @@ cmd_editmode() {
 
 cmd_playmode() {
   link_cache
-  run_tests playmode PlayMode "Needle.Unity.PlayMode.Tests"
+  NEEDLE_GAMEPATH_OUT="$out/gamepath-playmode.json" run_tests playmode PlayMode "Needle.Unity.PlayMode.Tests"
 }
 
 cmd_fresh_install() {

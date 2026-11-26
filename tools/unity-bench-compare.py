@@ -36,6 +36,7 @@ def failures(group):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--native", help="report from tools/native_bench.py --json")
+    parser.add_argument("--gamepath", help="needle.unity-gamepath/1 report from the PlayMode game-path bench")
     parser.add_argument("runs", nargs="+", help="label=path of a needle.bench-e2e/1 report")
     options = parser.parse_args()
 
@@ -77,7 +78,40 @@ def main():
     if machine:
         lines += ["", f"Machine: {machine.get('os')}, {machine.get('arch')}, {machine.get('logical_cores')} logical cores, "
                       f"SIMD {machine.get('simd', 'n/a')}, runtime {machine.get('runtime')}."]
+    if options.gamepath:
+        lines += [""] + gamepath(options.gamepath)
     print("\n".join(lines))
+
+
+def gamepath(path):
+    """The game path in the Editor against the Unity targets of the 4.x plan."""
+    if not pathlib.Path(path).is_file():
+        return [f"No game-path report at {path}."]
+    report = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+    if report.get("schema") != "needle.unity-gamepath/1":
+        return [f"{path}: not a needle.unity-gamepath/1 report."]
+
+    def p(name, key="p50"):
+        value = (report.get(name) or {}).get(key)
+        return "n/a" if value is None else f"{value:g}"
+
+    targets = report.get("targets", {})
+
+    def met(name):
+        return "met" if (targets.get(name) or {}).get("met") else "not met"
+
+    return [
+        f"Game path in the Editor, {report.get('asks')} asks at {report.get('threads')} threads, kernels: {report.get('kernels')}.",
+        "",
+        "| measure | p50 | p99 | max | target |",
+        "|---|---:|---:|---:|---|",
+        f"| main-thread us per ask | {p('main_thread_us_per_ask')} | {p('main_thread_us_per_ask', 'p99')} | {p('main_thread_us_per_ask', 'max')} | p99 at most 20 us: {met('main_thread_us_per_ask_p99')} |",
+        f"| main-thread managed bytes | {report.get('main_thread_alloc_bytes')} | | | zero: {met('zero_main_thread_alloc')} |",
+        f"| frame work idle, ms | {p('frame_work_idle_ms')} | {p('frame_work_idle_ms', 'p99')} | {p('frame_work_idle_ms', 'max')} | |",
+        f"| frame work while inferring, ms | {p('frame_work_busy_ms')} | {p('frame_work_busy_ms', 'p99')} | {p('frame_work_busy_ms', 'max')} | p99 within 1.1x of idle: {met('frame_work_p99_busy_over_idle')} |",
+        f"| engine ms per ask | {p('engine_ms')} | {p('engine_ms', 'p99')} | {p('engine_ms', 'max')} | |",
+        f"| frames per ask | {p('frames_per_ask')} | {p('frames_per_ask', 'p99')} | {p('frames_per_ask', 'max')} | |",
+    ]
 
 
 if __name__ == "__main__":
