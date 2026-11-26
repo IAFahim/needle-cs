@@ -103,6 +103,10 @@ public readonly struct NeedleModel : IDisposable, IEquatable<NeedleModel>
     /// <summary>Makes an agent that calls the tools described by an OpenAI-style JSON array.</summary>
     public NeedleAgent Agent(string toolsJson, in AgentOptions options = default) => NeedleAgent.Create(State, toolsJson, options);
 
+    /// <summary>Makes an agent for the tools of a <c>[Tools]</c> interface.</summary>
+    public NeedleAgent Agent<TTools>(in AgentOptions options = default) where TTools : class =>
+        NeedleAgent.Create(State, ToolCatalog<TTools>.Json, options);
+
     public NeedleAgent Agent(ReadOnlySpan<byte> toolsJsonUtf8, in AgentOptions options = default) =>
         NeedleAgent.Create(State, Encoding.UTF8.GetString(toolsJsonUtf8), options);
 

@@ -570,9 +570,9 @@ internal static class Emitter
 
     static string EnumMemberName(ToolArg arg, int index) => arg.EnumTypeName! + "." + arg.EnumMembers[index];
 
-    static string Pascal(string name) => name.Length == 0 ? name : char.ToUpperInvariant(name[0]) + name.Substring(1);
+    internal static string Pascal(string name) => name.Length == 0 ? name : char.ToUpperInvariant(name[0]) + name.Substring(1);
 
-    static string CSharpEscape(string text)
+    internal static string CSharpEscape(string text)
     {
         var builder = new StringBuilder(text.Length + 8);
         foreach (var c in text)
@@ -613,7 +613,7 @@ internal static class Emitter
         return builder.ToString();
     }
 
-    static string SchemaText(ToolSetModel model)
+    internal static string SchemaText(ToolSetModel model)
     {
         var builder = new StringBuilder(256);
         builder.Append('[');
