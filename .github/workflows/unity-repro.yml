@@ -1,0 +1,57 @@
+name: Unity repro (issue 74)
+
+# A one-off check on the self-hosted Unity runner: does GrammarRejectedToken still show in the
+# Editor's stateless, retrieving host setup with the mask-cache fix of PR #73 merged in, and does
+# it show without it? Each leg runs only the PlayMode grammar regression test, NEEDLE_REPRO_ROUNDS
+# rounds of the eight game queries. This branch and file are scratch and go away after the check.
+
+on:
+  push:
+    branches: [claude/unity-repro-74]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  repro:
+    name: Grammar regression on ${{ matrix.leg }}
+    runs-on: [self-hosted, Linux, X64, unity]
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - leg: with the PR 73 fix
+            ref: ""
+          - leg: without it (PR 60 head fc13fb9)
+            ref: fc13fb9
+    env:
+      NEEDLE_REQUIRE_MODEL: "1"
+      NEEDLE_THREADS: "4"
+      NEEDLE_REPRO_ROUNDS: "10"
+      NEEDLE_TEST_FILTER: Needle.Unity.PlayMode.Tests.GrammarRegressionTests
+      UNITY_SERIAL: ${{ secrets.UNITY_SERIAL }}
+      UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+      UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref }}
+      - name: Link the model cache
+        run: |
+          echo "NEEDLE_REF_CACHE=${NEEDLE_REF_CACHE:-$HOME/needle-ref}" >> "$GITHUB_ENV"
+          git log --oneline -1
+          uptime
+      - name: Fetch the model into the cache (skips verified files)
+        continue-on-error: true
+        run: |
+          mkdir -p "$NEEDLE_REF_CACHE"
+          ln -sfn "$NEEDLE_REF_CACHE" ref
+          NEEDLE_REF_DIR="$NEEDLE_REF_CACHE" bash tools/fetch.sh
+      - name: Run the grammar regression test in PlayMode
+        run: tools/unity-ci.sh playmode
+      - name: Show the grammar failure counts
+        if: ${{ !cancelled() }}
+        run: grep -h '\[needle-repro\]' out/unity/playmode*.log || echo "no repro line in the logs"
