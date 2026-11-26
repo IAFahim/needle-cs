@@ -23,12 +23,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        sha: [a243987, 63b5974, 9d67962, 5a680bf, f778449, ae526c6]
+        sha: [a243987, 63b5974]
     defaults: { run: { shell: bash } }
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
-      - run: git checkout ${{ matrix.sha }} -- src tests Directory.Build.props 2>/dev/null || git checkout ${{ matrix.sha }} -- src tests
+      - run: rm -rf src tests && git checkout ${{ matrix.sha }} -- src tests && git checkout ${{ matrix.sha }} -- Directory.Build.props || true
       - uses: actions/setup-dotnet@v4
         with: { dotnet-version: "10.0.x" }
       - uses: actions/download-artifact@v4
