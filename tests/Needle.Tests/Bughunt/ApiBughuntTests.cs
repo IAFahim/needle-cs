@@ -56,6 +56,31 @@ public struct ToolPickSink : IGrammarSink
 
 public sealed unsafe class ApiBughuntTests
 {
+    [Fact]
+    public void Services_CalledBeforeStart_FailWithInvalidOperationNotNullReference()
+    {
+        using var needle = new NeedleService();
+        var call = needle.Complete("set a timer");
+        Assert.IsType<InvalidOperationException>(Assert.Throws<AggregateException>(() => call.Wait(5000)).InnerException);
+        using var speech = new SpeechService();
+        var transcription = speech.Transcribe(new float[16000]);
+        Assert.IsType<InvalidOperationException>(Assert.Throws<AggregateException>(() => transcription.Wait(5000)).InnerException);
+    }
+
+    [Fact]
+    public void Services_DisposeTwice_IsANoOp()
+    {
+        var needle = new NeedleService();
+        needle.Dispose();
+        needle.Dispose();
+        var speech = new SpeechService();
+        speech.Dispose();
+        speech.Dispose();
+        var thread = new InferenceThread();
+        thread.Dispose();
+        thread.Dispose();
+    }
+
     static bool Accepts(Grammar grammar, string text, ref ToolPickSink sink)
     {
         var state = Grammar.Start(grammar.Program);
