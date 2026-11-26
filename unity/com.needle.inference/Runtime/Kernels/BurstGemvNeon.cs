@@ -145,12 +145,11 @@ namespace Needle.BurstKernels
                 v128 wide = Arm.Neon.vmovl_u16(Arm.Neon.vld1_u16(norms + g));
                 v128 magnitude = Arm.Neon.vandq_u32(wide, Arm.Neon.vdupq_n_u32(0x7FFFu));
                 v128 sign = Arm.Neon.vshlq_n_u32(Arm.Neon.vandq_u32(wide, Arm.Neon.vdupq_n_u32(0x8000u)), 16);
-                v128 bits = Arm.Neon.vaddq_u32(Arm.Neon.vshlq_n_u32(magnitude, 13), Arm.Neon.vdupq_n_u32(0x38000000u));
-                v128 nonZero = Arm.Neon.vcgtq_s32(magnitude, Arm.Neon.vdupq_n_s32(0));
-                v128 combined = Arm.Neon.vorrq_u32(Arm.Neon.vandq_u32(bits, nonZero), sign);
-                uint* spill = stackalloc uint[4];
-                Arm.Neon.vst1q_u32(spill, combined);
-                v128 single = Arm.Neon.vld1q_f32((float*)spill);
+                // The half's bits shifted into a single's place read as a value 2^112 too small, for
+                // subnormal halves as well; multiplying by 2^112 is exact for every half, and 0 stays 0.
+                // Adding 0x38000000 to the exponent instead is wrong for subnormals (about 512x too large).
+                v128 rebased = Arm.Neon.vmulq_f32(Arm.Neon.vshlq_n_u32(magnitude, 13), Arm.Neon.vdupq_n_f32(5.192296858534828e33f));
+                v128 single = Arm.Neon.vorrq_u32(rebased, sign);
                 Arm.Neon.vst1q_f32(factors + g, Arm.Neon.vmulq_f32(single, multiplier));
             }
             for (; g < groups; g++) factors[g] = HalfToSingle(norms[g]) * scale;
@@ -470,6 +469,9 @@ namespace Needle.BurstKernels
         {
             if (!Arm.Neon.IsNeonSupported) return;
             float* rowFactors = stackalloc float[a.Stride * 4];
+            // LoadFactors writes only the row's groups, and ScaleFactors reads the whole stride, so the
+            // padding must not be whatever was on the stack (it can be NaN).
+            for (var i = 0; i < a.Stride * 4; i++) rowFactors[i] = 0f;
             float* scaled = stackalloc float[a.Stride * 8];
             var groups = w.Groups;
             v128 table = Arm.Neon.vld1q_u8(w.Book->Bytes);
