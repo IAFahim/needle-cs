@@ -289,7 +289,8 @@ public sealed unsafe partial class Whistle
     {
         if (width < 2 || policy.Threads < 2) return false;
         var choice = Environment.GetEnvironmentVariable("NEEDLE_BEAM_PARALLEL");
-        return choice == null ? true : choice != "0";
+        if (choice != null) return choice != "0";
+        return policy.Threads >= width || RuntimeInformation.ProcessArchitecture != Architecture.Arm64;
     }
 
     void EnsureBeams(int width)
