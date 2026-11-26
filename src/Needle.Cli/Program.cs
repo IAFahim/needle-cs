@@ -33,6 +33,11 @@ catch (Exception e) when (e is FormatException or OverflowException or ArgumentE
     Console.Error.WriteLine(e.Message);
     return Usage();
 }
+catch (Exception e) when (e is IOException or UnauthorizedAccessException or InvalidDataException or InvalidOperationException or IndexOutOfRangeException)
+{
+    Console.Error.WriteLine($"needle: {e.GetType().Name}: {e.Message}");
+    return 1;
+}
 
 static int Usage()
 {

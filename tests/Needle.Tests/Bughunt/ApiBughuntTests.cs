@@ -33,6 +33,29 @@ public struct WideHandler : IWideCommands
 
 public sealed unsafe class ApiBughuntTests
 {
+    [Theory]
+    [InlineData("call", "/nonexistent/needle3.cact", "/nonexistent/tools.json", "hi")]
+    [InlineData("bench", "/nonexistent/needle3.cact")]
+    [InlineData("transcribe", "/nonexistent/whistle.cact", "/nonexistent/clip.wav")]
+    [InlineData("transcribe", "/nonexistent/whistle.cact", "/nonexistent/clip.wav", "--language")]
+    public void Cli_MissingFilesOrOptionValues_ExitWithAnErrorInsteadOfAborting(params string[] arguments)
+    {
+        var directory = new System.IO.DirectoryInfo(AppContext.BaseDirectory);
+        while (directory != null && !System.IO.File.Exists(System.IO.Path.Combine(directory.FullName, "src", "Needle.Cli", "Needle.Cli.csproj")))
+            directory = directory.Parent;
+        var cli = System.IO.Path.Combine(directory!.FullName, "src", "Needle.Cli", "bin", "Release", "net10.0", "needle.dll");
+        Assert.True(System.IO.File.Exists(cli), "build the CLI first: dotnet build src/Needle.Cli -c Release");
+        var start = new System.Diagnostics.ProcessStartInfo("dotnet") { RedirectStandardError = true, RedirectStandardOutput = true };
+        start.ArgumentList.Add(cli);
+        foreach (var argument in arguments) start.ArgumentList.Add(argument);
+        using var process = System.Diagnostics.Process.Start(start)!;
+        var error = process.StandardError.ReadToEnd();
+        process.StandardOutput.ReadToEnd();
+        process.WaitForExit();
+        Assert.DoesNotContain("Unhandled exception", error);
+        Assert.InRange(process.ExitCode, 1, 2);
+    }
+
     [Fact]
     public void ToolSet_NestedPropertySharingATopLevelName_KeepsItsNameAndItsRequiredConstraint()
     {
