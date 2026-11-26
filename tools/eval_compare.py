@@ -25,13 +25,15 @@ def rescore(report):
     for suite in report["suites"]:
         for case in suite["cases"]:
             got = [] if case.get("gated") else case["raw_calls"]
-            ok = case.get("success", True) and eval_rule.calls_equal(got, case["want"])
+            ok = not case.get("engine_failed") and eval_rule.calls_equal(got, case["want"])
             if ok != case["ok"]:
                 mismatches.append(f"{report['engine']} {suite['suite']}: \"{case['query']}\" scorer says {case['ok']}, Python rule says {ok}")
     return mismatches
 
 
 def cause(a, b):
+    if a.get("success", True) is False or b.get("success", True) is False:
+        return "truncation (success false)"
     if keys(a["raw_calls"]) == keys(b["raw_calls"]):
         if a["negation"] != b["negation"]:
             return "negation"
@@ -73,7 +75,7 @@ def brief(case):
     if case.get("confidence") is not None:
         flags.append(f"conf {case['confidence']:.2f}")
     if not case.get("success", True):
-        flags.append(f"error {case.get('error')}")
+        flags.append(f"success false: {case.get('error')}")
     return (text + (" (" + "; ".join(flags) + ")" if flags else "")).replace("|", "\\|")
 
 

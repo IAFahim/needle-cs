@@ -92,11 +92,13 @@ def main():
             wall_ms = (time.perf_counter() - started) * 1000.0
             raw = buffer.value.decode("utf-8", "replace")
             if rc < 0:
-                response = {"success": False, "error": raw or f"cactus_complete returned {rc}", "function_calls": []}
+                response = {"success": False, "error": raw or f"cactus_complete returned {rc}", "function_calls": [], "_engine_failed": True}
             else:
                 response = json.loads(raw)
                 eval_rule.annotate_ungrounded(response, suite["tools"], eval_rule.source_years(case["query"]), system, case["query"])
-            cases.append(eval_rule.score_case(case, response, options.min_confidence, wall_ms))
+            scored = eval_rule.score_case(case, response, options.min_confidence, wall_ms)
+            scored["raw_response"] = raw if rc < 0 else json.loads(raw)
+            cases.append(scored)
         result = eval_rule.summarize(suite["suite"], cases)
         report["suites"].append(result)
         if not options.quiet:

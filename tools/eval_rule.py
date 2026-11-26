@@ -153,6 +153,13 @@ def calls_equal(a, b):
     return sorted(call_key(c) for c in a) == sorted(call_key(c) for c in b)
 
 
+def _first(response, *names):
+    for name in names:
+        if response.get(name) is not None:
+            return response[name]
+    return None
+
+
 def score_case(case, response, min_confidence, wall_ms):
     raw = response.get("function_calls") or []
     validation = response.get("validation") or {}
@@ -171,9 +178,14 @@ def score_case(case, response, min_confidence, wall_ms):
         "ungrounded": list(validation.get("ungrounded") or []), "negation": bool(validation.get("negation")),
         "repaired": bool(validation.get("repaired")), "confidence": confidence,
         "success": response.get("success", True) is not False, "error": response.get("error"),
-        "prefill_tokens": response.get("prefill_tokens"), "decode_tokens": response.get("decode_tokens"),
+        "prefill_tokens": _first(response, "prefill_tokens", "prompt_tokens"),
+        "decode_tokens": _first(response, "decode_tokens", "completion_tokens", "generated_tokens", "tokens_generated"),
         "engine_ms": response.get("total_time_ms"), "wall_ms": round(wall_ms, 2),
-        "ok": response.get("success", True) is not False and calls_equal(got, case["calls"]),
+        # The package's harness reads only function_calls, validation and confidence; an envelope with
+        # success false still scores on its (empty) calls. Only a failed cactus_complete (rc < 0), where
+        # the package raises, counts as a failure.
+        "engine_failed": bool(response.get("_engine_failed")),
+        "ok": not response.get("_engine_failed") and calls_equal(got, case["calls"]),
     }
 
 

@@ -156,7 +156,9 @@ internal static class EvalSuites
         if (got.Count > 0 && (result.Validation.Ungrounded.Count > 0 || result.Validation.Negated)) { got = Array.Empty<FunctionCall>(); gated = "validation"; }
         if (got.Count > 0 && (result.Confidence ?? 0f) < minConfidence) { got = Array.Empty<FunctionCall>(); gated = "confidence"; }
         var keys = got.Select(call => CallKey(call.Name, call.ArgumentsJson)).OrderBy(k => k, StringComparer.Ordinal).ToArray();
-        var ok = result.Success && keys.SequenceEqual(item.WantKeys);
+        // The package's harness reads only function_calls, validation and confidence, so an envelope
+        // with success false still scores on its (empty) calls.
+        var ok = keys.SequenceEqual(item.WantKeys);
         return new SuiteCaseResult(item, result, keys, gated, ok, wallMs);
     }
 
@@ -286,6 +288,7 @@ internal static class EvalSuites
             w.WriteBoolean("repaired", c.Validation.Repaired);
             if (c.Confidence is { } confidence) w.WriteNumber("confidence", Math.Round(confidence, 4)); else w.WriteNull("confidence");
             w.WriteBoolean("success", c.Success);
+            w.WriteBoolean("engine_failed", false);
             if (c.Error != null) w.WriteString("error", c.Error); else w.WriteNull("error");
             w.WriteNumber("prefill_tokens", c.PrefillTokens);
             w.WriteNumber("decode_tokens", c.DecodeTokens);
