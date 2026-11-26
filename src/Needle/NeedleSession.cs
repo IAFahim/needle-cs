@@ -760,7 +760,7 @@ public sealed unsafe partial class NeedleSession : IDisposable
             progress.ReasoningLength, 0, progress.PromptTokens, progress.DecodeTokens, progress.PrefillTicks, progress.FirstTokenTicks, Stopwatch.GetTimestamp() - progress.Started);
     }
 
-    static ReplyFlags ToFlags(RepairOutcome outcome)
+    internal static ReplyFlags ToFlags(RepairOutcome outcome)
     {
         var flags = ReplyFlags.None;
         if ((outcome & (RepairOutcome.Repaired | RepairOutcome.Duplicate)) != 0) flags |= ReplyFlags.Repaired;
@@ -776,6 +776,11 @@ public sealed unsafe partial class NeedleSession : IDisposable
     {
         var startCount = sink.CallCount;
         sink.TryTakeCall(out _);
+        // The neutral per-call form: with repair on, the constrained bytes are kept as on the JSON path, and a
+        // copy of the sink from before the turn lets a repaired call list be replayed into it.
+        var record = repairPlan != null;
+        var before = record ? sink : default;
+        callTextLength = 0;
         var jump = options.JumpForward;
         var state = Grammar.Start(grammar.Program, route);
         var logProbability = 0.0;
@@ -806,10 +811,12 @@ public sealed unsafe partial class NeedleSession : IDisposable
             if (pick < 0) return Abandon(ReplyStatus.Failed, FailureReason.GrammarDeadEnd, progress);
             if (steps == 0 && progress.FirstTokenTicks == 0) progress.FirstTokenTicks = Stopwatch.GetTimestamp() - progress.Started;
             var length = tokenizer.ConstraintBytes(pick, buffer);
+            if (record && callTextLength + length > callText.Length) return Abandon(ReplyStatus.Failed, FailureReason.CallTextTooLong, progress);
             var cursor = &state;
             for (var b = 0; b < length; b++)
             {
                 if (!Grammar.Advance(grammar.Program, cursor, buffer[b], ref sink)) return Abandon(ReplyStatus.Failed, FailureReason.GrammarRejectedToken, progress);
+                if (record) callText[callTextLength++] = buffer[b];
                 if (sink.TryTakeCall(out var call) && stored < commands.Length) commands[stored++] = call;
             }
             logProbability += Math.Log(Math.Max(probability, 1e-9));
@@ -832,9 +839,11 @@ public sealed unsafe partial class NeedleSession : IDisposable
                     var forced = SoleAllowed(mask, maskWords, sparseRows);
                     var forcedLength = tokenizer.ConstraintBytes(forced, buffer);
                     if (forcedLength <= 0) break;
+                    if (record && callTextLength + forcedLength > callText.Length) return Abandon(ReplyStatus.Failed, FailureReason.CallTextTooLong, progress);
                     for (var b = 0; b < forcedLength; b++)
                     {
                         if (!Grammar.Advance(grammar.Program, cursor, buffer[b], ref sink)) return Abandon(ReplyStatus.Failed, FailureReason.GrammarRejectedToken, progress);
+                        if (record) callText[callTextLength++] = buffer[b];
                         if (sink.TryTakeCall(out var forcedCall) && stored < commands.Length) commands[stored++] = forcedCall;
                     }
                     chunkIds[chunkCount++] = forced;
@@ -862,10 +871,12 @@ public sealed unsafe partial class NeedleSession : IDisposable
                     {
                         var draft = chunkIds[draftStart + j];
                         var draftLength = tokenizer.ConstraintBytes(draft, buffer);
+                        if (record && callTextLength + draftLength > callText.Length) return Abandon(ReplyStatus.Failed, FailureReason.CallTextTooLong, progress);
                         var draftCursor = &state;
                         for (var b = 0; b < draftLength; b++)
                         {
                             if (!Grammar.Advance(grammar.Program, draftCursor, buffer[b], ref sink)) return Abandon(ReplyStatus.Failed, FailureReason.GrammarRejectedToken, progress);
+                            if (record) callText[callTextLength++] = buffer[b];
                             if (sink.TryTakeCall(out var draftCall) && stored < commands.Length) commands[stored++] = draftCall;
                         }
                         RecordSpecHistory(draft);
@@ -909,13 +920,21 @@ public sealed unsafe partial class NeedleSession : IDisposable
         var head = HeadProbability();
         var decode = Math.Exp(logProbability / Math.Max(1, steps));
         var confidence = (float)Math.Min(head, decode);
+        lastRepair = RepairOutcome.None;
+        if (record)
+        {
+            lastRepair = CallReplay.Repair(grammar.Program, allTools.Aliases, repairPlan!, repairScratch!, repairRequest!, repairHistory!, repairToday,
+                new ReadOnlySpan<byte>(callText, 0, callTextLength), restored, keyScratch, callSpans, in before, ref sink, commands, ref stored,
+                out restoredCallCount, out restoredLength, out var repairFailure);
+            progress.Flags |= ToFlags(lastRepair);
+            if (repairFailure != FailureReason.None) return Failed(repairFailure, progress);
+        }
         var total = sink.CallCount - startCount;
         restoredCallCount = total;
         if (total > stored)
             return new Reply(ReplyStatus.Failed, FailureReason.CallsBufferTooSmall, progress.Flags, confidence, (float)head, (float)decode, total, 0,
                 progress.ReasoningLength, 0, progress.PromptTokens, progress.DecodeTokens, progress.PrefillTicks, progress.FirstTokenTicks, Stopwatch.GetTimestamp() - progress.Started);
-        var refused = confidence < options.RefuseBelow && route == 0;
-        var status = refused ? ReplyStatus.Refused : ReplyStatus.Called;
+        var status = CallReplay.Status(stored, confidence, options.RefuseBelow, route, lastRepair);
         return new Reply(status, FailureReason.None, progress.Flags, confidence, (float)head, (float)decode, stored, 0,
             progress.ReasoningLength, 0, progress.PromptTokens, progress.DecodeTokens, progress.PrefillTicks, progress.FirstTokenTicks, Stopwatch.GetTimestamp() - progress.Started);
     }
