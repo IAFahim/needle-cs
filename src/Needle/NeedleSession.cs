@@ -215,6 +215,8 @@ public sealed unsafe partial class NeedleSession : IDisposable
     readonly byte[] restored;
     int restoredLength;
     readonly RepairPlan? repairPlan;
+    readonly Triggers? triggers;
+    ulong route;
     readonly RepairScratch? repairScratch;
     readonly RepairText? repairRequest;
     readonly RepairText? repairHistory;
@@ -277,6 +279,7 @@ public sealed unsafe partial class NeedleSession : IDisposable
             repairToday = ParseToday(system);
             LoadHistory();
         }
+        triggers = Triggers.Compile(allTools, toolsJson, maxInputBytes);
         retrieval = allTools.Tools.Count > this.options.RetrievalTopK && model.Confidence != null;
         toolEmbeddings = retrieval ? new float[allTools.Tools.Count * embeddingWidth] : Array.Empty<float>();
         toolScores = retrieval ? new float[allTools.Tools.Count] : Array.Empty<float>();
@@ -324,6 +327,7 @@ public sealed unsafe partial class NeedleSession : IDisposable
 
     void TrackInput(ReadOnlySpan<byte> input, bool toolResult)
     {
+        route = toolResult || triggers == null || retrieval ? 0 : triggers.Match(input);
         if (repairHistory == null) return;
         if (options.Stateless && !toolResult) LoadHistory();
         if (!toolResult) repairRequest!.Load(input);
@@ -588,7 +592,7 @@ public sealed unsafe partial class NeedleSession : IDisposable
             if (!TryFeed(thinkEndForced)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
             for (var f = 0; f < thinkEndForced.Length; f++) RecordSpecHistory(thinkEndForced[f]);
         }
-        decision = ArgMax(decisionMask);
+        decision = route != 0 ? ToolCallStart : ArgMax(decisionMask);
         if (decision < 0) return Abandon(ReplyStatus.Failed, FailureReason.GrammarDeadEnd, progress);
         if (decision != ToolCallStart) return Respond(decision, ref progress, response);
         return null;
@@ -598,7 +602,7 @@ public sealed unsafe partial class NeedleSession : IDisposable
     {
         var budget = options.FrameBudget;
         var jump = options.JumpForward;
-        var state = Grammar.Start(grammar.Program);
+        var state = Grammar.Start(grammar.Program, route);
         var logProbability = 0.0;
         var steps = 0;
         var buffer = stackalloc byte[256];
@@ -747,7 +751,8 @@ public sealed unsafe partial class NeedleSession : IDisposable
             progress.Flags |= ToFlags(lastRepair);
         }
         if (required <= calls.Length) new ReadOnlySpan<byte>(restored, 0, required).CopyTo(calls);
-        var refused = confidence < options.RefuseBelow;
+        // 4.x: a call below the floor is withheld unless a trigger routed it; a grounding gate withholds it either way.
+        var refused = confidence < options.RefuseBelow && route == 0 || (lastRepair & RepairOutcome.Ungrounded) != 0;
         var declined = restoredCallCount == 0 && required <= calls.Length;
         var status = required > calls.Length ? ReplyStatus.Failed : declined ? ReplyStatus.Declined : refused ? ReplyStatus.Refused : ReplyStatus.Called;
         var failure = required > calls.Length ? FailureReason.CallsBufferTooSmall : FailureReason.None;
@@ -772,7 +777,7 @@ public sealed unsafe partial class NeedleSession : IDisposable
         var startCount = sink.CallCount;
         sink.TryTakeCall(out _);
         var jump = options.JumpForward;
-        var state = Grammar.Start(grammar.Program);
+        var state = Grammar.Start(grammar.Program, route);
         var logProbability = 0.0;
         var steps = 0;
         var buffer = stackalloc byte[256];
@@ -909,7 +914,7 @@ public sealed unsafe partial class NeedleSession : IDisposable
         if (total > stored)
             return new Reply(ReplyStatus.Failed, FailureReason.CallsBufferTooSmall, progress.Flags, confidence, (float)head, (float)decode, total, 0,
                 progress.ReasoningLength, 0, progress.PromptTokens, progress.DecodeTokens, progress.PrefillTicks, progress.FirstTokenTicks, Stopwatch.GetTimestamp() - progress.Started);
-        var refused = confidence < options.RefuseBelow;
+        var refused = confidence < options.RefuseBelow && route == 0;
         var status = refused ? ReplyStatus.Refused : ReplyStatus.Called;
         return new Reply(status, FailureReason.None, progress.Flags, confidence, (float)head, (float)decode, stored, 0,
             progress.ReasoningLength, 0, progress.PromptTokens, progress.DecodeTokens, progress.PrefillTicks, progress.FirstTokenTicks, Stopwatch.GetTimestamp() - progress.Started);
