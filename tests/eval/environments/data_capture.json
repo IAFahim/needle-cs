@@ -1,0 +1,364 @@
+{
+ "suite": "data_capture",
+ "source": "cactus-compute 4.2.0 cactus/environments/data_capture.py (Apache-2.0)",
+ "system": "Copy names, merchants, and descriptions verbatim from the user. Record only values the user stated; never estimate. Map each explicit supported record to exactly one declared call. Unsupported, incomplete, ambiguous, and negated requests return no call.",
+ "cases": [
+  {
+   "query": "add Maya Chen to my contacts",
+   "calls": [
+    {
+     "name": "create_contact",
+     "arguments": {
+      "name": "Maya Chen"
+     }
+    }
+   ],
+   "category": "positive",
+   "critical": false
+  },
+  {
+   "query": "save Leo Park to contacts, phone 555-0134",
+   "calls": [
+    {
+     "name": "create_contact",
+     "arguments": {
+      "name": "Leo Park",
+      "phone": "555-0134"
+     }
+    }
+   ],
+   "category": "positive",
+   "critical": false
+  },
+  {
+   "query": "create a contact for Nadia Osei, number 917-555-0188, email nadia@osei.dev",
+   "calls": [
+    {
+     "name": "create_contact",
+     "arguments": {
+      "name": "Nadia Osei",
+      "phone": "917-555-0188",
+      "email": "nadia@osei.dev"
+     }
+    }
+   ],
+   "category": "positive",
+   "critical": false
+  },
+  {
+   "query": "put Tomás Rivera in my contacts",
+   "calls": [
+    {
+     "name": "create_contact",
+     "arguments": {
+      "name": "Tomás Rivera"
+     }
+    }
+   ],
+   "category": "positive",
+   "critical": false
+  },
+  {
+   "query": "log an expense of 23 for transport",
+   "calls": [
+    {
+     "name": "log_expense",
+     "arguments": {
+      "amount": 23,
+      "category": "transport"
+     }
+    }
+   ],
+   "category": "positive",
+   "critical": false
+  },
+  {
+   "query": "record an 85.99 groceries expense from FreshMart",
+   "calls": [
+    {
+     "name": "log_expense",
+     "arguments": {
+      "amount": 85.99,
+      "category": "groceries",
+      "merchant": "FreshMart"
+     }
+    }
+   ],
+   "category": "positive",
+   "critical": false
+  },
+  {
+   "query": "track 142.75 spent on utilities",
+   "calls": [
+    {
+     "name": "log_expense",
+     "arguments": {
+      "amount": 142.75,
+      "category": "utilities"
+     }
+    }
+   ],
+   "category": "positive",
+   "critical": false
+  },
+  {
+   "query": "capture 260 in shopping spend from Uniqlo",
+   "calls": [
+    {
+     "name": "log_expense",
+     "arguments": {
+      "amount": 260,
+      "category": "shopping",
+      "merchant": "Uniqlo"
+     }
+    }
+   ],
+   "category": "positive",
+   "critical": false
+  },
+  {
+   "query": "log 18.75 for entertainment",
+   "calls": [
+    {
+     "name": "log_expense",
+     "arguments": {
+      "amount": 18.75,
+      "category": "entertainment"
+     }
+    }
+   ],
+   "category": "positive",
+   "critical": false
+  },
+  {
+   "query": "log a meal, grilled salmon with rice",
+   "calls": [
+    {
+     "name": "log_meal",
+     "arguments": {
+      "description": "grilled salmon with rice"
+     }
+    }
+   ],
+   "category": "positive",
+   "critical": false
+  },
+  {
+   "query": "log lunch, leftover pad thai",
+   "calls": [
+    {
+     "name": "log_meal",
+     "arguments": {
+      "description": "leftover pad thai",
+      "meal_type": "lunch"
+     }
+    }
+   ],
+   "category": "positive",
+   "critical": false
+  },
+  {
+   "query": "record oatmeal with berries for breakfast",
+   "calls": [
+    {
+     "name": "log_meal",
+     "arguments": {
+      "description": "oatmeal with berries",
+      "meal_type": "breakfast"
+     }
+    }
+   ],
+   "category": "positive",
+   "critical": false
+  },
+  {
+   "query": "jot down what i ate, rice cakes with peanut butter",
+   "calls": [
+    {
+     "name": "log_meal",
+     "arguments": {
+      "description": "rice cakes with peanut butter"
+     }
+    }
+   ],
+   "category": "positive",
+   "critical": false
+  },
+  {
+   "query": "log 750 ml of water",
+   "calls": [
+    {
+     "name": "log_water_intake",
+     "arguments": {
+      "amount_ml": 750
+     }
+    }
+   ],
+   "category": "positive",
+   "critical": false
+  },
+  {
+   "query": "record 500 ml of water intake",
+   "calls": [
+    {
+     "name": "log_water_intake",
+     "arguments": {
+      "amount_ml": 500
+     }
+    }
+   ],
+   "category": "positive",
+   "critical": false
+  },
+  {
+   "query": "i drank 1200 ml of water, log it",
+   "calls": [
+    {
+     "name": "log_water_intake",
+     "arguments": {
+      "amount_ml": 1200
+     }
+    }
+   ],
+   "category": "positive",
+   "critical": false
+  },
+  {
+   "query": "log my weight at 82.5 kg",
+   "calls": [
+    {
+     "name": "log_weight",
+     "arguments": {
+      "weight_kg": 82.5
+     }
+    }
+   ],
+   "category": "positive",
+   "critical": false
+  },
+  {
+   "query": "record a weight of 74 kg",
+   "calls": [
+    {
+     "name": "log_weight",
+     "arguments": {
+      "weight_kg": 74
+     }
+    }
+   ],
+   "category": "positive",
+   "critical": false
+  },
+  {
+   "query": "log an expense of 45 from this afternoon",
+   "calls": [],
+   "category": "missing",
+   "critical": true
+  },
+  {
+   "query": "record my transport spending from today as an expense",
+   "calls": [],
+   "category": "missing",
+   "critical": true
+  },
+  {
+   "query": "log my water intake from this morning",
+   "calls": [],
+   "category": "missing",
+   "critical": true
+  },
+  {
+   "query": "log my current weight for me",
+   "calls": [],
+   "category": "missing",
+   "critical": true
+  },
+  {
+   "query": "text Marcus to ask about his new number",
+   "calls": [],
+   "category": "irrelevant",
+   "critical": false
+  },
+  {
+   "query": "how much have i spent on groceries this month",
+   "calls": [],
+   "category": "irrelevant",
+   "critical": false
+  },
+  {
+   "query": "delete yesterday's lunch entry from the log",
+   "calls": [],
+   "category": "irrelevant",
+   "critical": false
+  },
+  {
+   "query": "don't log the 15.40 i spent on transport",
+   "calls": [],
+   "category": "negation",
+   "critical": true
+  },
+  {
+   "query": "do not add Ravi Kumar at 415-555-0162 to my contacts",
+   "calls": [],
+   "category": "negation",
+   "critical": true
+  },
+  {
+   "query": "never log 79.4 kg as my weight",
+   "calls": [],
+   "category": "negation",
+   "critical": true
+  },
+  {
+   "query": "log my weight as 500 kg",
+   "calls": [],
+   "category": "invalid",
+   "critical": true
+  },
+  {
+   "query": "log 9000 ml of water for today",
+   "calls": [],
+   "category": "invalid",
+   "critical": true
+  },
+  {
+   "query": "log lunch, turkey sandwich on rye, and 600 ml of water",
+   "calls": [
+    {
+     "name": "log_meal",
+     "arguments": {
+      "description": "turkey sandwich on rye",
+      "meal_type": "lunch"
+     }
+    },
+    {
+     "name": "log_water_intake",
+     "arguments": {
+      "amount_ml": 600
+     }
+    }
+   ],
+   "category": "parallel",
+   "critical": false
+  },
+  {
+   "query": "log my weight of 78.4 kg and 350 ml of water",
+   "calls": [
+    {
+     "name": "log_weight",
+     "arguments": {
+      "weight_kg": 78.4
+     }
+    },
+    {
+     "name": "log_water_intake",
+     "arguments": {
+      "amount_ml": 350
+     }
+    }
+   ],
+   "category": "parallel",
+   "critical": false
+  }
+ ]
+}

@@ -1,0 +1,74 @@
+name: Eval 4.x suites
+
+on:
+  push:
+    branches: [claude/engine-4x, claude/engine-4x-eval]
+  workflow_dispatch:
+    inputs:
+      threads:
+        description: thread count for both engines
+        default: "4"
+
+concurrency:
+  group: eval-4x-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  DOTNET_NOLOGO: "1"
+
+jobs:
+  eval:
+    name: 4.x acceptance suites, needle-cs vs upstream 4.x
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Restore cached models
+        uses: actions/cache@v4
+        with:
+          path: ref
+          key: bench-ref-${{ runner.arch }}-${{ hashFiles('tools/ref.lock', 'tools/fetch.sh', 'tools/fetch-engine4.sh') }}
+
+      - name: Download models and the 4.x engine
+        run: |
+          bash tools/fetch.sh
+          bash tools/fetch.sh --engine4 manylinux2014_x86_64
+
+      - name: Publish the NativeAOT CLI
+        run: dotnet publish src/Needle.Cli -c Release -o out/aot
+
+      - name: Score both engines on the same suites, date fact and thread count
+        run: |
+          threads="${{ github.event.inputs.threads || '4' }}"
+          date_fact="$(date -u '+%Y-%m-%d %a %H:%M')"
+          echo "date fact: $date_fact, threads: $threads"
+          set +e
+          out/aot/needle eval ref/hf/needle3.cact --suite all --threads "$threads" --date "$date_fact" --json needle-cs.json
+          echo "needle-cs exit $?"
+          python3 tools/eval_native.py ref/native4 ref/hf/needle3.cact --suite all --threads "$threads" --date "$date_fact" --json upstream-4x.json
+          echo "upstream exit $?"
+          set -e
+          python3 tools/eval_compare.py needle-cs.json upstream-4x.json --out eval.md
+          { echo "## 4.x acceptance suites (ubuntu-latest, run ${{ github.run_id }})"; echo; cat eval.md; } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eval-4x
+          path: |
+            eval.md
+            needle-cs.json
+            upstream-4x.json
