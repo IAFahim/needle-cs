@@ -62,6 +62,8 @@ jobs:
 
       - name: Smoke test all three engines
         run: |
+          out/aot/needle cpu
+          out/aot/needle bench-e2e ref/hf/needle3.cact tools/tools.json --sets golden --threads 1 --reps 1 --profile || true
           out/aot/needle call ref/hf/needle3.cact tools/tools.json "set a timer for 12 minutes and play some Miles Davis"
           python3 tools/native_bench.py ref/native4 ref/hf/needle3.cact tools/tools.json --sets golden --reps 1 --threads 4
           if [ "${{ runner.arch }}" = "X64" ]; then python3 tools/native_bench.py ref/hf/wheel ref/hf/needle3.cact tools/tools.json --sets golden --reps 1; fi
