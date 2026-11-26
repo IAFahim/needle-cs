@@ -89,6 +89,8 @@ jobs:
       UNITY_SERIAL: ${{ secrets.UNITY_SERIAL }}
       UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
       UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+    # Every step after checkout runs even when an earlier one failed, so one broken step (a clip
+    # that will not download, say) does not hide the results of the others; the job still fails.
     steps:
       - uses: actions/checkout@v4
 
@@ -104,16 +106,20 @@ jobs:
 
       - name: Fetch the model, Whistle and audio clips into the cache (skips verified files)
         run: |
-          NEEDLE_REF_DIR="$NEEDLE_REF_CACHE" bash tools/fetch.sh
+          mkdir -p "$NEEDLE_REF_CACHE"
           ln -sfn "$NEEDLE_REF_CACHE" ref
+          NEEDLE_REF_DIR="$NEEDLE_REF_CACHE" bash tools/fetch.sh
 
       - name: Package checks
+        if: ${{ !cancelled() }}
         run: tools/unity-ci.sh lint
 
       - name: Clean import of the git-tracked package
+        if: ${{ !cancelled() }}
         run: tools/unity-ci.sh fresh-install
 
       - name: EditMode tests
+        if: ${{ !cancelled() }}
         run: tools/unity-ci.sh editmode
 
       - name: PlayMode tests
