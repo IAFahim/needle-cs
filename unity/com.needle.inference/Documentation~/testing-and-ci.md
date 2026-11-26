@@ -80,7 +80,14 @@ GitHub runner job on the same PC skews a bench by tens of percent, and the nativ
 spins its own worker threads, far more. CI therefore benches the native library first, on the idle
 machine, and again after the Unity runs (`native-after` in the table); when the two disagree, the
 machine was busy and the speedups are not trustworthy. The CPU load and the busiest processes are
-printed before each bench.
+printed before each bench and recorded in `load.txt`; when the 1-minute load was over a quarter of
+the cores before any bench, the run summary says the numbers are not a fair comparison.
+
+The IL2CPP player's toolchain needs `libncurses.so.6` and `libxml2.so.2`, which Arch-based systems
+(Omarchy included) do not ship under those names. `tools/unity-ci.sh player il2cpp` then links the
+system's `libtinfo.so.6` and the 64-bit `libxml2` from Unity's own sysroots into
+`out/unity/il2cpp-shims/` and puts that folder on the build's library path, so nothing outside the
+checkout changes. When that is not enough, the manual fix in `il2cpp-players.md` still applies.
 
 The `simd` field of a report names the tier of the kernels that ran and their provider. In the
 Editor and a CoreCLR player that is the `net10.0` sidecar; an IL2CPP player has no sidecar and runs

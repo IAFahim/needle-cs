@@ -36,12 +36,13 @@ def failures(group):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--native", help="report from tools/native_bench.py --json")
+    parser.add_argument("--load", help="load.txt from tools/unity-ci.sh load: label, logical cores, 1-minute load per bench")
     parser.add_argument("--gamepath", help="needle.unity-gamepath/1 report from the PlayMode game-path bench")
     parser.add_argument("runs", nargs="+", help="label=path of a needle.bench-e2e/1 report")
     options = parser.parse_args()
 
     native = {}
-    lines = []
+    lines = busy_warning(options.load)
     if options.native and pathlib.Path(options.native).is_file():
         report = load(options.native)
         for run in report["runs"]:
@@ -81,6 +82,24 @@ def main():
     if options.gamepath:
         lines += [""] + gamepath(options.gamepath)
     print("\n".join(lines))
+
+
+def busy_warning(path):
+    """A warning when the machine was busy before a bench: over a quarter of its cores in use."""
+    if not path or not pathlib.Path(path).is_file():
+        return []
+    busy = []
+    for line in pathlib.Path(path).read_text(encoding="utf-8").splitlines():
+        parts = line.split()
+        if len(parts) != 3:
+            continue
+        label, cores, load = parts[0], int(parts[1]), float(parts[2])
+        if load > cores / 4:
+            busy.append(f"{label} {load:g} on {cores} cores")
+    if not busy:
+        return ["The machine was idle before every bench (1-minute load under a quarter of its cores).", ""]
+    return [f"**The machine was busy, so these numbers are not a fair comparison:** 1-minute load before {', '.join(busy)}. "
+            "Something else on the PC was using the CPU; the native library slows down most.", ""]
 
 
 def gamepath(path):

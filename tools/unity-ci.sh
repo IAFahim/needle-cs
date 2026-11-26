@@ -10,6 +10,7 @@
 #   tools/unity-ci.sh bench-editmode       golden-set bench inside the Editor, needle.bench-e2e/1 JSON
 #   tools/unity-ci.sh player il2cpp|coreclr  builds the bench player and runs it, needle.bench-e2e/1 JSON
 #   tools/unity-ci.sh all                  everything above, in that order
+#   tools/unity-ci.sh load <label>         records the CPU load before a bench in out/unity/load.txt
 #
 # Environment:
 #   UNITY_EDITOR          path to the Unity binary (default: ~/Unity/Hub/Editor/<ProjectVersion>/Editor/Unity)
@@ -220,6 +221,43 @@ build_errors() {
   fi
 }
 
+# IL2CPP's Linux toolchain (clang++ and ld.lld in ~/.local/share/unity3d/cache/sysroots) is built
+# against libncurses.so.6 and libxml2.so.2. Arch-based systems ship neither name: ncurses there is
+# libncursesw.so.6 plus libtinfo.so.6, and libxml2 has a newer soname. Rather than patch the cached
+# toolchain or the system, point the build's library path at a folder in out/ holding two links:
+# libncurses.so.6 to the system's libtinfo.so.6 (clang only uses terminfo from it), and
+# libxml2.so.2 to the 64-bit copy that Unity ships in its own sysroots. Nothing outside the
+# checkout changes, and nothing is linked when the system already has the library.
+il2cpp_shims() {
+  local editor="$1" shims="$out/il2cpp-shims" target candidate libs
+  rm -rf "$shims"
+  mkdir -p "$shims"
+  libs="$(ldconfig -p 2>/dev/null || true)"
+  if ! grep -q 'libncurses\.so\.6 .*x86-64' <<<"$libs"; then
+    for candidate in libtinfo.so.6 libncursesw.so.6; do
+      target="$(awk -v name="$candidate" '$1 == name && /x86-64/ { print $NF; exit }' <<<"$libs")"
+      if [ -n "$target" ]; then
+        ln -s "$target" "$shims/libncurses.so.6"
+        say "player il2cpp: no libncurses.so.6 on this system; the toolchain uses $target through $shims"
+        break
+      fi
+    done
+  fi
+  if ! grep -q 'libxml2\.so\.2 .*x86-64' <<<"$libs"; then
+    while IFS= read -r candidate; do
+      # ELF class 2 (64-bit) and machine 0x3e (x86-64), so a 32-bit copy is never picked.
+      if [ "$(od -An -tx1 -j4 -N1 "$candidate" | tr -d ' ')" = 02 ] && [ "$(od -An -tx1 -j18 -N1 "$candidate" | tr -d ' ')" = 3e ]; then
+        ln -s "$candidate" "$shims/libxml2.so.2"
+        say "player il2cpp: no libxml2.so.2 on this system; the toolchain uses $candidate through $shims"
+        break
+      fi
+    done < <(find -L "$HOME/.local/share/unity3d/cache/sysroots" "$(dirname "$editor")/Data" -name 'libxml2.so.2*' -type f 2>/dev/null | sort)
+  fi
+  if [ -n "$(ls -A "$shims")" ]; then
+    export LD_LIBRARY_PATH="$shims${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  fi
+}
+
 cmd_player() {
   local backend="${1:-}" method editor status=0
   case "$backend" in
@@ -239,6 +277,7 @@ cmd_player() {
       die "player il2cpp: $editor has no Linux IL2CPP player under $support. Add the module: unity install-modules --editor-version $(basename "$(dirname "$(dirname "$editor")")") --module linux-il2cpp"
     fi
   fi
+  [ "$backend" = il2cpp ] && il2cpp_shims "$editor"
   local player="$out/player-$backend/BenchNs21"
   rm -rf "$out/player-$backend"
   say "player $backend: building with $method"
@@ -259,8 +298,19 @@ cmd_player() {
   say "player $backend: wrote $json"
 }
 
+# Records the CPU load before a bench in out/unity/load.txt (label, logical cores, 1-minute load)
+# and prints the busiest processes, so a skewed bench can be explained.
+cmd_load() {
+  local label="${1:-bench}"
+  mkdir -p "$out"
+  printf '%s %s %s\n' "$label" "$(nproc)" "$(cut -d' ' -f1 /proc/loadavg)" >> "$out/load.txt"
+  say "load before $label: $(cut -d' ' -f1-3 /proc/loadavg) on $(nproc) logical cores; busiest processes:"
+  ps -eo pcpu,comm --sort=-pcpu 2>/dev/null | head -n 6 >&2 || true
+}
+
 case "${1:-}" in
   lint) cmd_lint ;;
+  load) shift; cmd_load "${1:-}" ;;
   editmode) cmd_editmode ;;
   playmode) cmd_playmode ;;
   fresh-install) cmd_fresh_install ;;
@@ -275,5 +325,5 @@ case "${1:-}" in
     cmd_player il2cpp
     cmd_player coreclr
     ;;
-  *) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+  *) sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
 esac
