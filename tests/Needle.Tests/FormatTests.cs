@@ -33,6 +33,7 @@ public sealed class FormatTests
             var fields = line.Split(' ');
             if (fields[0] == "revision" && fields.Length == 3) revisions[fields[1]] = fields[2];
             else if (fields[0] == "file" && fields.Length == 6) files.Add(new LockedFile(fields[1], long.Parse(fields[2]), fields[3], fields[4], fields[5]));
+            else if (fields[0] == "manifest" && fields.Length == 4 && fields[3].Length == 64) continue;   // upstream 4.x engine release, checked by tools/fetch-engine4.sh
             else throw new FormatException($"unrecognized lock line: {line}");
         }
         return new LockFile(revisions, files);

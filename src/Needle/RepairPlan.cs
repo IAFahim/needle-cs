@@ -186,19 +186,29 @@ internal sealed class RepairPlan
         var lower = name.ToLowerInvariant();
         var format = resolved.GetString("format");
         param.Date = param.Kind == ParamKind.String && param.Options.Length == 0 &&
-            (format is "date" or "date-time" || lower == "date" || lower == "day" || lower.EndsWith("_date") || lower.StartsWith("date_") || lower.EndsWith("date"));
+            (format is "date" or "date-time" || lower == "date" || lower == "day" || lower.EndsWith("_date") || lower.StartsWith("date_") || name.EndsWith("Date", StringComparison.Ordinal));
         param.Phone = param.Kind == ParamKind.String && param.Options.Length == 0 &&
-            (lower.Contains("phone") || lower == "tel" || lower.Contains("mobile") || lower == "number" || lower.EndsWith("_number") && lower.Contains("contact"));
+            (lower.Contains("phone") || lower == "tel" || lower.Contains("mobile") || (lower == "number" || lower.EndsWith("_number") && lower.Contains("contact")) && Mentions(schema, resolved, "phone"));
         if (param.Kind == ParamKind.Boolean) param.BoolPolar = BoolFamily(lower);
         param.Role = param.Kind != ParamKind.String || param.Options.Length > 0 ? ParamRole.None : lower switch
         {
             "first_name" or "firstname" or "first" or "given_name" or "givenname" => ParamRole.FirstName,
             "last_name" or "lastname" or "last" or "family_name" or "surname" => ParamRole.LastName,
-            "pickup" or "pickup_location" or "origin" or "from" or "source" or "start_location" or "departure" or "from_location" or "start" => ParamRole.Origin,
-            "destination" or "dropoff" or "dropoff_location" or "to" or "to_location" or "end_location" or "arrival" or "target_location" or "end" => ParamRole.Destination,
+            "pickup" or "pickup_location" or "origin" or "from" or "source" or "start_location" or "departure" or "from_location" => ParamRole.Origin,
+            "start" when Mentions(schema, resolved, "location", "place", "address", "where") => ParamRole.Origin,
+            "destination" or "dropoff" or "dropoff_location" or "to" or "to_location" or "end_location" or "arrival" or "target_location" => ParamRole.Destination,
+            "end" when Mentions(schema, resolved, "location", "place", "address", "where") => ParamRole.Destination,
             _ => ParamRole.None,
         };
         return param;
+    }
+
+    static bool Mentions(JsonValue schema, JsonValue resolved, params string[] words)
+    {
+        var text = (schema.GetString("description") ?? resolved.GetString("description") ?? "").ToLowerInvariant();
+        foreach (var word in words)
+            if (text.Contains(word)) return true;
+        return false;
     }
 
     static JsonValue Concrete(JsonValue schema)

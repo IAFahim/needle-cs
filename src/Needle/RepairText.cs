@@ -52,9 +52,21 @@ internal sealed class RepairText
 
     public void Append(ReadOnlySpan<byte> source)
     {
-        var room = Source.Length - SourceLength - 1;
-        if (room <= 0) return;
-        if (source.Length > room) source = source[..room];
+        var limit = Source.Length - 1;
+        if (source.Length > limit) source = source[..limit];
+        var need = SourceLength + 1 + source.Length - limit;
+        if (need > 0)
+        {
+            // Full: drop the oldest text, on a line boundary, so the newest turn is always kept.
+            if (need >= SourceLength) SourceLength = 0;
+            else
+            {
+                var cut = Array.IndexOf(Source, (byte)'\n', need, SourceLength - need);
+                cut = cut < 0 ? need : cut + 1;
+                Buffer.BlockCopy(Source, cut, Source, 0, SourceLength - cut);
+                SourceLength -= cut;
+            }
+        }
         if (SourceLength > 0) Source[SourceLength++] = (byte)'\n';
         source.CopyTo(Source.AsSpan(SourceLength));
         SourceLength += source.Length;
@@ -67,6 +79,7 @@ internal sealed class RepairText
         Words = 0;
         Clauses = SourceLength > 0 ? 1 : 0;
         NumberCount = 0;
+        negationClause = -1;
         var src = new ReadOnlySpan<byte>(Source, 0, SourceLength);
         var breakPending = false;
         var inWord = false;
@@ -121,7 +134,8 @@ internal sealed class RepairText
         if (!inWord) return;
         WordEnd[Words] = Length;
         var word = Word(Words);
-        if (IsConjunction(word) && Words > 0)
+        if (IsNegation(word)) negationClause = Clauses - 1;
+        if (IsConjunction(word) && Words > 0 && !((word.SequenceEqual("or"u8) || word.SequenceEqual("nor"u8)) && negationClause == WordClause[Words]))
         {
             WordClause[Words] = Clauses;
             Clauses++;
@@ -129,6 +143,13 @@ internal sealed class RepairText
         Words++;
         inWord = false;
     }
+
+    int negationClause = -1;
+
+    // "don't turn on the lights or the fan" negates both, so "or" after a negation does not start a new clause.
+    static bool IsNegation(ReadOnlySpan<byte> word) =>
+        word.SequenceEqual("dont"u8) || word.SequenceEqual("not"u8) || word.SequenceEqual("never"u8) || word.SequenceEqual("neither"u8) ||
+        word.SequenceEqual("wont"u8) || word.SequenceEqual("shouldnt"u8) || word.SequenceEqual("cant"u8);
 
     static bool IsConjunction(ReadOnlySpan<byte> word) =>
         word.SequenceEqual("and"u8) || word.SequenceEqual("but"u8) || word.SequenceEqual("then"u8) || word.SequenceEqual("also"u8) ||
