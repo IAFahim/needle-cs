@@ -31,8 +31,27 @@ public struct WideHandler : IWideCommands
     }
 }
 
-public sealed class ApiBughuntTests
+public sealed unsafe class ApiBughuntTests
 {
+    [Fact]
+    public void ToolSet_NestedPropertySharingATopLevelName_KeepsItsNameAndItsRequiredConstraint()
+    {
+        var set = new ToolSet("""[{"name":"book","parameters":{"type":"object","properties":{"city":{"type":"string"},"stop":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}},"required":["city","stop"]}}]""");
+        var stop = set.Tools[0].Get("parameters")!.Get("properties")!.Get("stop")!;
+        Assert.NotNull(stop.Get("properties")!.Get("city"));
+        Assert.Equal("city", stop.Get("required")!.Items[0].Text);
+
+        using var grammar = new Grammar(set.Tools);
+        bool Accepts(string text)
+        {
+            var state = Grammar.Start(grammar.Program);
+            foreach (var b in Encoding.UTF8.GetBytes(text)) if (!Grammar.Advance(grammar.Program, &state, b)) return false;
+            return Grammar.Complete(state);
+        }
+        Assert.True(Accepts("""[{"name":"book","arguments":{"city":"a","stop":{"city":"b"}}}]"""));
+        Assert.False(Accepts("""[{"name":"book","arguments":{"city":"a","stop":{}}}]"""));
+    }
+
     [Fact]
     public void Generator_TryBind_AcceptsTheSnakeCasePropertyNamesTheSchemaAdvertises()
     {
