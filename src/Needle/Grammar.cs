@@ -22,6 +22,7 @@ internal unsafe struct GrammarProgram
     public byte* Bytes;
     public int Root;
     public int ToolCount;
+    public long Serial;
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -101,12 +102,17 @@ internal sealed unsafe class Grammar : IDisposable
         for (var i = 0; i < bytes.Count; i++) Program->Bytes[i] = bytes[i];
         Program->Root = root;
         Program->ToolCount = toolSchemas.Count;
+        Program->Serial = NextSerial();
         TableLengths = (nodes.Count, properties.Count, literals.Count, unions.Count, tools.Count, bytes.Count);
     }
 
     internal readonly (int Nodes, int Properties, int Literals, int Unions, int Tools, int Bytes) TableLengths;
 
     internal Grammar(GrammarProgram* adopted) => Program = adopted;
+
+    static long serials;
+
+    internal static long NextSerial() => System.Threading.Interlocked.Increment(ref serials);
 
     static int* Copy(List<int> list)
     {
@@ -345,6 +351,7 @@ internal sealed unsafe class Grammar : IDisposable
                 return Consumed;
             case 1:
             {
+                if (g->ToolCount > 64) return StepWideName(g, f, root, c, ref sink);
                 var candidates = 0UL;
                 if (c == '"')
                 {
@@ -379,6 +386,22 @@ internal sealed unsafe class Grammar : IDisposable
     }
 
     static ulong ToolMask(GrammarProgram* g) => g->ToolCount >= 64 ? ulong.MaxValue : (1UL << g->ToolCount) - 1;
+
+    static int StepWideName<TSink>(GrammarProgram* g, Frame* f, int* root, byte c, ref TSink sink) where TSink : struct, Tools.IGrammarSink
+    {
+        var lead = f->Aux == 0 ? null : g->Tools + (root[2] + (int)f->Bits) * 4;
+        for (var t = 0; t < g->ToolCount; t++)
+        {
+            var tool = g->Tools + (root[2] + t) * 4;
+            if (c == '"' ? tool[1] != f->Aux : tool[1] <= f->Aux || g->Bytes[tool[0] + f->Aux] != c) continue;
+            if (lead != null && !new ReadOnlySpan<byte>(g->Bytes + tool[0], f->Aux).SequenceEqual(new ReadOnlySpan<byte>(g->Bytes + lead[0], f->Aux))) continue;
+            if (c == '"') { f->Aux2 = t; f->Phase = 2; f->Aux = 0; sink.ToolSelected(t); return Consumed; }
+            f->Bits = (ulong)t;
+            f->Aux++;
+            return Consumed;
+        }
+        return Reject;
+    }
 
     static int StepObject<TSink>(GrammarProgram* g, GrammarState* s, Frame* f, int* n, byte c, ref TSink sink) where TSink : struct, Tools.IGrammarSink
     {
