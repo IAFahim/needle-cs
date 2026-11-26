@@ -1,0 +1,96 @@
+name: Whistle bench
+
+on:
+  push:
+    branches: [claude/whistle-speed]
+    paths:
+      - "src/Needle/**"
+      - "src/Needle.Cli/**"
+      - ".github/workflows/whistle-bench.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: whistle-bench-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  DOTNET_NOLOGO: "1"
+
+jobs:
+  bench:
+    name: Whistle bench (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-latest
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Download Whistle and clips
+        run: |
+          mkdir -p ref/hf/whistle ref/audio
+          rev=$(awk '$1=="revision" && $2=="whistle" {print $3}' tools/ref.lock)
+          crev=$(awk '$1=="revision" && $2=="cactus" {print $3}' tools/ref.lock)
+          curl -fsSL -o ref/hf/whistle/whistle.cact "https://huggingface.co/Cactus-Compute/whistle/resolve/$rev/whistle.cact"
+          for c in test test_long hotword record; do
+            curl -fsSL -o "ref/audio/$c.wav" "https://raw.githubusercontent.com/cactus-compute/engine/$crev/cactus-engine/tests/assets/$c.wav"
+          done
+          ls -l ref/hf/whistle ref/audio
+
+      - name: Host
+        run: |
+          nproc
+          grep -m1 'model name' /proc/cpuinfo || lscpu | head -20
+          dotnet run -c Release --project src/Needle.Cli -- cpu
+
+      - name: Publish NativeAOT CLI
+        run: dotnet publish src/Needle.Cli -c Release -o out/aot
+
+      - name: Timings (NativeAOT)
+        run: |
+          for t in 1 2 4; do
+            for c in record hotword test_long; do
+              echo "=== threads $t clip $c"
+              out/aot/needle transcribe ref/hf/whistle/whistle.cact "ref/audio/$c.wav" --repeat 6 --threads $t 2>&1 | grep -v '^  '
+            done
+          done
+
+      - name: Timings (JIT)
+        run: |
+          dotnet build src/Needle.Cli -c Release -o out/jit >/dev/null
+          for t in 1 4; do
+            for c in record test_long; do
+              echo "=== threads $t clip $c"
+              dotnet out/jit/needle.dll transcribe ref/hf/whistle/whistle.cact "ref/audio/$c.wav" --repeat 8 --threads $t 2>&1 | grep -v '^  '
+            done
+          done
+
+      - name: Profile (perf, NativeAOT, 1 thread)
+        continue-on-error: true
+        run: |
+          sudo apt-get update -qq >/dev/null
+          sudo apt-get install -y -qq linux-tools-common "linux-tools-$(uname -r)" >/dev/null 2>&1 || sudo apt-get install -y -qq linux-tools-generic >/dev/null 2>&1 || true
+          PERF=$(command -v perf || ls /usr/lib/linux-tools/*/perf | head -1)
+          sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
+          for c in record test_long; do
+            echo "=== perf clip $c"
+            "$PERF" record -F 2000 -g -o "perf-$c.data" -- out/aot/needle transcribe ref/hf/whistle/whistle.cact "ref/audio/$c.wav" --repeat 8 --threads 1 >/dev/null 2>&1
+            "$PERF" report -i "perf-$c.data" --stdio --no-children --sort symbol --percent-limit 0.4 -g none 2>/dev/null | grep -v '^#' | grep -v '^$' | head -70
+          done
