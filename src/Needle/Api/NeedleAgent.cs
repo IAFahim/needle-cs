@@ -4,7 +4,7 @@ using System.Text;
 
 namespace Needle;
 
-internal sealed class AgentState
+internal sealed partial class AgentState
 {
     public readonly NeedleSession Session = null!;
     public readonly ModelState Model = null!;
@@ -101,6 +101,11 @@ internal sealed class AgentState
         });
     }
 
+    public void ThrowIfBusy()
+    {
+        if (Mailbox != null && Mailbox.Busy) throw new InvalidOperationException("a posted request is still running on this agent; TryTake its answer (or Cancel it) first");
+    }
+
     public void Invalidate()
     {
         Version = Version == int.MaxValue ? 1 : Version + 1;
@@ -113,7 +118,7 @@ internal sealed class AgentState
 /// An agent is a handle: copying it copies the handle, not the conversation, and a disposed or
 /// <c>default</c> agent throws <see cref="ObjectDisposedException"/>. One agent serves one thread at a time.
 /// </summary>
-public readonly struct NeedleAgent : IDisposable, IEquatable<NeedleAgent>
+public readonly partial struct NeedleAgent : IDisposable, IEquatable<NeedleAgent>
 {
     readonly int slot;
     readonly int generation;
@@ -192,6 +197,7 @@ public readonly struct NeedleAgent : IDisposable, IEquatable<NeedleAgent>
     public OperationStatus Ask(ReadOnlySpan<byte> utf8, Span<byte> callsJson, out Reply details)
     {
         var state = State;
+        state.ThrowIfBusy();
         state.Invalidate();
         details = state.Session.Complete(utf8, callsJson);
         if (details.Status != ReplyStatus.Failed) return OperationStatus.Done;
@@ -202,6 +208,7 @@ public readonly struct NeedleAgent : IDisposable, IEquatable<NeedleAgent>
     public void SetSystem(string? facts)
     {
         var state = State;
+        state.ThrowIfBusy();
         state.Invalidate();
         state.Session.SetSystem(facts);
     }
@@ -212,6 +219,7 @@ public readonly struct NeedleAgent : IDisposable, IEquatable<NeedleAgent>
     public void Forget()
     {
         var state = State;
+        state.ThrowIfBusy();
         state.Invalidate();
         state.Session.Reset();
     }
@@ -219,7 +227,9 @@ public readonly struct NeedleAgent : IDisposable, IEquatable<NeedleAgent>
     /// <summary>Stops a turn running on another thread as soon as it can. Safe to call from any thread.</summary>
     public void Cancel()
     {
-        if (HandleTable<AgentState>.TryGet(slot, generation, out var state)) state.Session.RequestCancel();
+        if (!HandleTable<AgentState>.TryGet(slot, generation, out var state)) return;
+        state.Mailbox?.Cancel();
+        state.Session.RequestCancel();
     }
 
     /// <summary>Runs the kernels once so the first real turn is not the slow one.</summary>
@@ -229,6 +239,7 @@ public readonly struct NeedleAgent : IDisposable, IEquatable<NeedleAgent>
     {
         var state = HandleTable<AgentState>.Remove(slot, generation);
         if (state == null) return;
+        state.StopMailbox();
         state.Invalidate();
         state.Disposed = true;
         try
@@ -243,6 +254,7 @@ public readonly struct NeedleAgent : IDisposable, IEquatable<NeedleAgent>
 
     static Answer Turn(AgentState state, ReadOnlySpan<char> text, bool toolResult)
     {
+        state.ThrowIfBusy();
         var count = Encoding.UTF8.GetByteCount(text);
         if (count > state.Input.Length)
         {
@@ -256,6 +268,7 @@ public readonly struct NeedleAgent : IDisposable, IEquatable<NeedleAgent>
 
     static Answer Turn(AgentState state, ReadOnlySpan<byte> utf8, bool toolResult)
     {
+        state.ThrowIfBusy();
         state.Invalidate();
         var reply = toolResult
             ? state.Session.CompleteWithToolResult(utf8, state.Calls, state.Reasoning, state.Response)
