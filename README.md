@@ -208,6 +208,17 @@ dotnet publish src/Needle.Cli -c Release
 dotnet build src/Needle -f netstandard2.1 -c Release
 ```
 
+### Unity package
+
+The plugin DLLs in `unity/com.needle.inference/Runtime/Plugins` are committed and stamped with a hash of `src/Needle`. After changing anything under `src/Needle`, rebuild and commit both:
+
+```sh
+tools/pack-unity.sh            # rebuilds both plugin DLLs (deterministic)
+tools/pack-unity.sh --check    # fails while the committed DLLs are stale; CI runs it
+```
+
+The package's Unity Test Framework tests (EditMode, PlayMode, the Editor and player benches, and a clean Git-URL-style import) run with `tools/unity-ci.sh` on any machine with Unity 7, and in the `Unity` workflow on a self-hosted runner. How to run them and set up the runner: [testing-and-ci.md](unity/com.needle.inference/Documentation~/testing-and-ci.md).
+
 ## Licensing and model files
 
 - **This repository's code license is pending.** The owner has not yet chosen one, so there is no `LICENSE` file. See [CONTRIBUTING.md](CONTRIBUTING.md).
