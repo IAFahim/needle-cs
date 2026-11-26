@@ -35,38 +35,56 @@ GAME_QUERIES = [
 SAMPLED = ("prefill_tps", "decode_tps", "decode_us_per_token", "total_ms")
 HIGHER_IS_BETTER = ("prefill_tps", "decode_tps")
 
+LIBRARY_NAMES = ("libneedle3.so", "libcactus.so", "libcactus.dylib")
+
 def locate_library(source, extract_dir):
-    if os.path.isfile(source) and source.endswith(".so"):
+    if os.path.isfile(source) and (source.endswith(".so") or source.endswith(".dylib")):
         return source
+    if os.path.isdir(source):
+        for name in LIBRARY_NAMES:
+            if os.path.isfile(os.path.join(source, name)):
+                return os.path.join(source, name)
     wheels = [source] if source.endswith(".whl") else sorted(glob.glob(os.path.join(source, "*.whl")))
     if not wheels:
-        sys.exit(f"no .whl found in {source}")
+        sys.exit(f"no .whl or engine library found in {source}")
     os.makedirs(extract_dir, exist_ok=True)
     with zipfile.ZipFile(wheels[-1]) as archive:
-        member = next((n for n in archive.namelist() if n.endswith(LIBRARY_NAME)), None)
+        member = next((n for n in archive.namelist() if n.split("/")[-1] in LIBRARY_NAMES), None)
         if member is None:
-            sys.exit(f"{LIBRARY_NAME} not found in {wheels[-1]}")
-        target = os.path.join(extract_dir, LIBRARY_NAME)
+            sys.exit(f"no engine library found in {wheels[-1]}")
+        target = os.path.join(extract_dir, member.split("/")[-1])
         with archive.open(member) as source_file, open(target, "wb") as target_file:
             target_file.write(source_file.read())
     return target
 
+class Engine:
+    def __init__(self, path):
+        lib = ctypes.CDLL(os.path.abspath(path))
+        self.prefix = "cactus_" if hasattr(lib, "cactus_complete") else "needle_"
+        self.abi = "cactus 4.x" if self.prefix == "cactus_" else "needle 3.x"
+        text, integer = ctypes.c_char_p, ctypes.c_int
+        signatures = {
+            "load": ([text, ctypes.c_uint64], integer),
+            "init": ([text, text, text], integer),
+            "complete": ([text, ctypes.POINTER(ctypes.c_float), integer, integer, text, integer], integer),
+            "reset": ([], None),
+        }
+        for name, (arguments, result) in signatures.items():
+            function = getattr(lib, self.prefix + name)
+            function.argtypes, function.restype = arguments, result
+            setattr(self, name, function)
+        self.set_threads = None
+        if hasattr(lib, self.prefix + "set_threads"):
+            self.set_threads = getattr(lib, self.prefix + "set_threads")
+            self.set_threads.argtypes, self.set_threads.restype = [integer], None
+
 def bind(path):
-    lib = ctypes.CDLL(os.path.abspath(path))
-    lib.needle_load.argtypes = [ctypes.c_char_p, ctypes.c_uint64]
-    lib.needle_load.restype = ctypes.c_int
-    lib.needle_init.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
-    lib.needle_init.restype = ctypes.c_int
-    lib.needle_complete.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
-    lib.needle_complete.restype = ctypes.c_int
-    lib.needle_reset.argtypes = []
-    lib.needle_reset.restype = None
-    return lib
+    return Engine(path)
 
 def complete(lib, buffer, query, max_tokens):
-    lib.needle_reset()
+    lib.reset()
     started = time.perf_counter()
-    status = lib.needle_complete(query.encode(), None, 0, max_tokens, buffer, len(buffer))
+    status = lib.complete(query.encode(), None, 0, max_tokens, buffer, len(buffer))
     wall_ms = (time.perf_counter() - started) * 1000.0
     if status < 0:
         return None, wall_ms
@@ -80,7 +98,7 @@ def spread(values, higher_is_better=False):
 def measure_set(lib, name, tools_path, queries, reps, warmups, max_tokens):
     with open(tools_path, "rb") as handle:
         tools = handle.read()
-    prefix_tokens = lib.needle_init(b"", tools, None)
+    prefix_tokens = lib.init(b"", tools, None)
     buffer = ctypes.create_string_buffer(OUTPUT_CAPACITY)
     prompts = [{"query": q, "calls": "", "failures": 0, "samples": {m: [] for m in SAMPLED}} for q in queries]
     for _ in range(warmups):
@@ -89,12 +107,12 @@ def measure_set(lib, name, tools_path, queries, reps, warmups, max_tokens):
     for _ in range(reps):
         for prompt in prompts:
             result, wall_ms = complete(lib, buffer, prompt["query"], max_tokens)
-            if result is None or not result.get("success", True) or not result.get("prefill_tps") or not result.get("decode_tps"):
+            if result is None or not result.get("success", True) or not result.get("decode_tps"):
                 prompt["failures"] += 1
                 continue
             calls = [c["name"] for c in result.get("function_calls", [])]
             prompt["calls"] = ",".join(calls) if calls else "respond"
-            prompt["samples"]["prefill_tps"].append(result["prefill_tps"])
+            prompt["samples"]["prefill_tps"].append(result.get("prefill_tps") or 0.0)
             prompt["samples"]["decode_tps"].append(result["decode_tps"])
             prompt["samples"]["decode_us_per_token"].append(1e6 / result["decode_tps"])
             prompt["samples"]["total_ms"].append(wall_ms)
@@ -120,7 +138,8 @@ def render(report):
     for run in report["runs"]:
         for group in run["sets"]:
             lines.append("")
-            lines.append(f"{group['name']} set | {group['tools']} tools | prefix {group['prefix_tokens']} tokens | threads: library default")
+            threads = "library default" if run["threads"] is None else run["threads"]
+            lines.append(f"{group['name']} set | {group['tools']} tools | prefix {group['prefix_tokens']} tokens | threads: {threads}")
             lines.append(f"{'query':<48}{'prefill tok/s':>20}{'decode tok/s':>20}{'decode us/tok':>20}{'total ms':>20}")
             lines.append(f"{'':<48}{'best':>10}{'med':>10}{'best':>10}{'med':>10}{'best':>10}{'med':>10}{'best':>10}{'med':>10}")
             for p in group["prompts"]:
@@ -137,8 +156,8 @@ def row(label, metrics):
     return f"{label[:47]:<48}" + "".join(cells)
 
 def main():
-    parser = argparse.ArgumentParser(description="Run upstream libneedle3.so through ctypes on the bench-e2e prompt sets")
-    parser.add_argument("library", help="wheel directory, .whl file or libneedle3.so")
+    parser = argparse.ArgumentParser(description="Run an upstream engine (libneedle3.so 3.x or libcactus 4.x) through ctypes on the bench-e2e prompt sets")
+    parser.add_argument("library", help="wheel directory, .whl file, engine directory, libneedle3.so or libcactus.so")
     parser.add_argument("model", help="needle3.cact")
     parser.add_argument("tools", help="tools.json used for the golden prompts")
     parser.add_argument("--game-tools", default=os.path.join(HERE, "game_tools.json"))
@@ -148,30 +167,39 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--extract-dir", default=os.path.join(HERE, "..", "ref", "native"))
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--threads", type=int, nargs="*", default=None, help="thread counts to sweep (needs set_threads; 0 is the engine's automatic count)")
     options = parser.parse_args()
 
     library = locate_library(options.library, options.extract_dir)
     lib = bind(library)
     with open(options.model, "rb") as handle:
         weights = handle.read()
-    if lib.needle_load(weights, len(weights)) < 0:
-        sys.exit("needle_load failed")
+    if lib.load(weights, len(weights)) < 0:
+        sys.exit("engine load failed")
 
     groups = []
     if options.sets in ("golden", "all"):
         groups.append(("golden", options.tools, GOLDEN_QUERIES))
     if options.sets in ("game", "all"):
         groups.append(("game", options.game_tools, GAME_QUERIES))
-    sets = [measure_set(lib, name, path, queries, options.reps, options.warmup, options.max_tokens) for name, path, queries in groups]
+    runs = []
+    for threads in (options.threads or [None]):
+        if threads is not None:
+            if lib.set_threads is None:
+                sys.exit(f"{lib.abi} has no set_threads")
+            lib.set_threads(threads)
+        sets = [measure_set(lib, name, path, queries, options.reps, options.warmup, options.max_tokens) for name, path, queries in groups]
+        runs.append({"threads": threads, "sets": sets})
 
     report = {
         "schema": "needle.bench-e2e/1",
         "engine": "native",
         "library": os.path.basename(library),
+        "abi": lib.abi,
         "model": options.model,
         "reps": options.reps,
         "machine": {"os": platform.platform(), "arch": platform.machine(), "logical_cores": os.cpu_count(), "runtime": "python " + platform.python_version()},
-        "runs": [{"threads": None, "sets": sets}],
+        "runs": runs,
     }
     print(json.dumps(report, indent=2) if options.json else render(report))
 
