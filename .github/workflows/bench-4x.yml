@@ -80,7 +80,7 @@ jobs:
         run: |
           rounds="${{ github.event.inputs.rounds || '5' }}"
           # Same schema bytes, empty system text, no date fact, the same prompts; set_threads before load.
-          engines=(--engine "upstream-4.x" "python3 tools/native_bench.py ref/native4 ref/hf/needle3.cact tools/tools.json --json --reps 3 --threads 1 2 4 0")
+          engines=(--engine "upstream-4.x" "python3 tools/native_bench.py ref/native4 ref/hf/needle3.cact tools/tools.json --json --reps 3 --threads 1 2 4 0 --probe-tokens")
           if [ "${{ runner.arch }}" = "X64" ]; then
             engines+=(--engine "upstream-3.3.3" "python3 tools/native_bench.py ref/hf/wheel ref/hf/needle3.cact tools/tools.json --json --reps 3")
           fi
@@ -95,7 +95,7 @@ jobs:
           # needle-cs: NeedleOptions defaults (library: 1 thread) and the CLI's default thread count.
           python3 tools/bench_engines.py --rounds "$rounds" --json product.json --single-row "product default" \
             --title "Product default vs product default (upstream: threads 0 + auto_date; needle-cs: NeedleOptions defaults at 1 thread and at the CLI's $cli threads)" \
-            --engine "upstream-4.x" "python3 tools/native_bench.py ref/native4 ref/hf/needle3.cact tools/tools.json --json --reps 3 --threads 0 --system auto-date" \
+            --engine "upstream-4.x" "python3 tools/native_bench.py ref/native4 ref/hf/needle3.cact tools/tools.json --json --reps 3 --threads 0 --system auto-date --probe-tokens" \
             --engine "needle-cs 1 thread" "out/aot/needle bench-e2e ref/hf/needle3.cact tools/tools.json --threads 1 --reps 3 --json --product" \
             --engine "needle-cs ${cli} threads" "out/aot/needle bench-e2e ref/hf/needle3.cact tools/tools.json --threads $cli --reps 3 --json --product" \
             | tee product.md

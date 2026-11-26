@@ -101,7 +101,31 @@ def spread(values, higher_is_better=False):
         return {"best": None, "median": None}
     return {"best": max(values) if higher_is_better else min(values), "median": statistics.median(values)}
 
-def measure_set(lib, name, tools_path, queries, reps, warmups, max_tokens, system):
+def output_key(result):
+    if result is None:
+        return None
+    return (result.get("success", True), result.get("type"), calls_json(result),
+            json.dumps(result.get("suppressed_calls") or [], sort_keys=True), result.get("reasoning"), result.get("response"))
+
+def probe_decode_tokens(lib, buffer, query, max_tokens):
+    """The 4.x envelope reports rates, not token counts. Greedy decoding is deterministic, so the
+    number of decoded tokens is the smallest max_tokens that reproduces the full-budget output.
+    Untimed; an upper bound if the engine splits its budget by max_tokens."""
+    full, _ = complete(lib, buffer, query, max_tokens)
+    if full is None or full.get("success", True) is False:
+        return None
+    want = output_key(full)
+    low, high = 1, max_tokens
+    while low < high:
+        middle = (low + high) // 2
+        result, _ = complete(lib, buffer, query, middle)
+        if output_key(result) == want:
+            high = middle
+        else:
+            low = middle + 1
+    return low
+
+def measure_set(lib, name, tools_path, queries, reps, warmups, max_tokens, system, probe=False):
     with open(tools_path, "rb") as handle:
         tools = handle.read()
     prefix_tokens = lib.init(system.encode("utf-8"), tools, None)
@@ -130,9 +154,14 @@ def measure_set(lib, name, tools_path, queries, reps, warmups, max_tokens, syste
             if decode_tps > 0:
                 prompt["samples"]["decode_us_per_token"].append(1e6 / decode_tps)
             prompt["samples"]["total_ms"].append(wall_ms)
+    if probe:
+        for prompt in prompts:
+            if prompt["decode_tokens"] is None:
+                prompt["decode_tokens"] = probe_decode_tokens(lib, buffer, prompt["query"], max_tokens)
+                prompt["decode_tokens_probed"] = True
     entries = []
     for prompt in prompts:
-        entry = {"query": prompt["query"], "calls": prompt["calls"], "calls_json": prompt["calls_json"],
+        entry = {"decode_tokens_probed": prompt.get("decode_tokens_probed", False), "query": prompt["query"], "calls": prompt["calls"], "calls_json": prompt["calls_json"],
                  "failures": prompt["failures"], "errors": prompt["errors"][:3],
                  "prefill_tokens": prompt["prefill_tokens"], "decode_tokens": prompt["decode_tokens"],
                  "decode_tokens_varied": len(prompt["token_counts"]) > 1, "prefill_ms": None, "ttft_ms": None,
@@ -185,6 +214,8 @@ def run_child(options, threads):
                "--game-tools", options.game_tools, "--sets", options.sets, "--reps", str(options.reps),
                "--warmup", str(options.warmup), "--max-tokens", str(options.max_tokens),
                "--extract-dir", options.extract_dir, "--json", "--threads", str(threads), "--system", options.system]
+    if options.probe_tokens:
+        command.append("--probe-tokens")
     if options.threads_after_load:
         command.append("--threads-after-load")
     completed = subprocess.run(command, capture_output=True, text=True)
@@ -209,6 +240,8 @@ def main():
                         help="thread counts to sweep, one process each, set before load (needs set_threads; 0 is the engine's automatic count)")
     parser.add_argument("--threads-after-load", action="store_true",
                         help="diagnostic: call set_threads after load in one process, the way this script used to")
+    parser.add_argument("--probe-tokens", action="store_true",
+                        help="when the envelope carries no token count (4.x), find it by an untimed search over max_tokens")
     parser.add_argument("--system", default="", help="system text for init; 'auto-date' is the package default (date fact only)")
     options = parser.parse_args()
     if options.system == "auto-date":
@@ -246,7 +279,7 @@ def main():
             if lib.set_threads is None:
                 sys.exit(f"{lib.abi} has no set_threads")
             lib.set_threads(threads)
-        sets = [measure_set(lib, name, path, queries, options.reps, options.warmup, options.max_tokens, options.system) for name, path, queries in groups]
+        sets = [measure_set(lib, name, path, queries, options.reps, options.warmup, options.max_tokens, options.system, options.probe_tokens) for name, path, queries in groups]
         runs.append({"threads": threads, "threads_set": None if threads is None else ("after load" if options.threads_after_load else "before load"), "sets": sets})
 
     report = {

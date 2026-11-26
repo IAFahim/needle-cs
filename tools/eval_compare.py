@@ -127,10 +127,11 @@ def main():
             suite_b = next((s for s in b["suites"] if s["suite"] == suite_a["suite"]), None)
             if suite_b is None:
                 continue
-            def total(s, k):
-                return sum((c.get(k) or 0) for c in s["cases"])
-            tokens.append(f"| {suite_a['suite']} | {total(suite_a, 'decode_tokens')} | {total(suite_b, 'decode_tokens')} | {total(suite_a, 'wall_ms'):.0f} | {total(suite_b, 'wall_ms'):.0f} |")
-        lines.append(f"Decoded tokens and wall time per suite (sum over 32 cases; informational, see the speed benchmark for timing)")
+            def total(s, k, digits=0):
+                values = [c.get(k) for c in s["cases"]]
+                return "n/a" if any(v is None for v in values) else f"{sum(values):.{digits}f}"
+            tokens.append(f"| {suite_a['suite']} | {total(suite_a, 'decode_tokens')} | {total(suite_b, 'decode_tokens')} | {total(suite_a, 'wall_ms')} | {total(suite_b, 'wall_ms')} |")
+        lines.append(f"Decoded tokens and wall time per suite (sum over 32 cases; informational, see the speed benchmark for timing; the 4.x envelope reports no token counts)")
         lines.append("")
         lines.append(f"| suite | {a['engine']} decode tok | {b['engine']} decode tok | {a['engine']} ms | {b['engine']} ms |")
         lines.append("|---|---|---|---|---|")
