@@ -105,14 +105,24 @@ public sealed class VoiceTests : IDisposable
         if (measurement.NativeCounted) Assert.Equal(0, measurement.NativeCalls);
     }
 
-    static VoiceProbe.Measurement RunVoiceProbe(int threads)
+    [Fact]
+    public void BeamSpanTranscriptionAllocatesNothing()
+    {
+        var measurement = RunVoiceProbe(4, 3);
+        Assert.Equal(0, measurement.Unexpected);
+        Assert.Equal(0, measurement.CallerThread);
+        Assert.True(measurement.WholeProcess <= measurement.Ambient, $"library added {measurement.WholeProcess} bytes against {measurement.Ambient} ambient");
+        if (measurement.NativeCounted) Assert.Equal(0, measurement.NativeCalls);
+    }
+
+    static VoiceProbe.Measurement RunVoiceProbe(int threads, int beam = 1)
     {
         var host = Environment.ProcessPath is { } path && Path.GetFileNameWithoutExtension(path) == "dotnet" ? path : Environment.GetEnvironmentVariable("DOTNET_HOST_PATH") ?? "dotnet";
         var assembly = typeof(VoiceTests).Assembly.Location;
         var stem = Path.Combine(Path.GetDirectoryName(assembly)!, Path.GetFileNameWithoutExtension(assembly));
         var start = new ProcessStartInfo(host) { RedirectStandardOutput = true, RedirectStandardError = true };
         foreach (var argument in new[] { "exec", "--runtimeconfig", stem + ".runtimeconfig.json", "--depsfile", stem + ".deps.json", assembly }) start.ArgumentList.Add(argument);
-        start.Environment[VoiceProbe.Variable] = threads.ToString();
+        start.Environment[VoiceProbe.Variable] = $"{threads}:{beam}";
         using var process = Process.Start(start)!;
         var error = process.StandardError.ReadToEndAsync();
         var output = process.StandardOutput.ReadToEnd();
@@ -234,6 +244,61 @@ public sealed class VoiceTests : IDisposable
         var silent = voice.Complete(new float[Wav.SampleRate]);
         Assert.Equal("", silent.Speech.Text);
         Assert.Equal(0f, silent.Call.Confidence);
+    }
+
+    [Fact]
+    public void VoiceSessionSpanAndManagedPathsAgreeOnTheTranscript()
+    {
+        Assets.Require();
+        using var needle = Model.Open(Assets.Model);
+        using var voice = new VoiceSession(needle, model, File.ReadAllText(Assets.Tools), new NeedleOptions { Threads = 2, AutoDate = false });
+        var transcript = Utf8Buffer(whistle);
+        var words = WordBuffer(whistle);
+        foreach (var name in new[] { "record.wav", "hotword.wav" })
+        {
+            var pcm = Clip(name);
+            var managed = voice.Complete(pcm).Speech.Text;
+            var span = voice.TranscribeSpan(pcm, transcript, words);
+            Assert.Equal(managed, Encoding.UTF8.GetString(transcript, 0, span.Utf8Length));
+        }
+    }
+
+    [Fact]
+    public void VoiceHostRejectsAnUnknownLanguageAtStart()
+    {
+        Assets.Require();
+        using var host = new VoiceHost();
+        Assert.Throws<ArgumentException>(() => host.Start(new VoiceHostOptions
+        {
+            WhistleModelPath = WhistlePath,
+            NeedleModelPath = Assets.Model,
+            ToolsJson = File.ReadAllText(Assets.Tools),
+            Session = new NeedleOptions { Threads = 2, AutoDate = false },
+            WhistleThreads = 2,
+            Language = "xx",
+        }));
+    }
+
+    [Fact]
+    public void PushToTalkReleaseKeepsAudioWrittenDuringTranscription()
+    {
+        var pcm = Clip("record.wav");
+        var talk = new PushToTalk();
+        Assert.True(talk.Write(pcm));
+        var raised = 0;
+        whistle.Observer = (stage, _) =>
+        {
+            if (stage == "mel" && Interlocked.Exchange(ref raised, 1) == 0) Assert.True(talk.Write(pcm.AsSpan(0, 1600)));
+        };
+        try
+        {
+            var released = talk.Release(whistle, Utf8Buffer(whistle), WordBuffer(whistle));
+            Assert.True(released.Utf8Length > 0);
+        }
+        finally { whistle.Observer = null; }
+        Assert.Equal(1600, talk.BufferedSamples);
+        talk.Hold();
+        Assert.False(talk.IsHeld);
     }
 
     [Fact]
@@ -428,10 +493,10 @@ internal static class VoiceProbe
 
     public readonly record struct Measurement(long CallerThread, long WholeProcess, long NativeCalls, bool NativeCounted, int Unexpected, long Ambient);
 
-    public static Measurement Measure(int threads)
+    public static Measurement Measure(int threads, int beam)
     {
         using var model = Model.Open(Path.Combine(Assets.Root, "ref/hf/whistle/whistle.cact"));
-        using var whistle = new Whistle(model, threads) { BeamWidth = 1 };
+        using var whistle = new Whistle(model, threads) { BeamWidth = beam };
         var pcm = VoiceTests.LoudestWindow(Wav.Read(Path.Combine(Assets.Root, "ref/audio/record.wav")), 3 * Wav.SampleRate);
         var utf8 = new byte[whistle.MaxTranscriptTokens * 64];
         var words = new WordSlice[whistle.MaxTranscriptTokens + 1];
@@ -489,7 +554,8 @@ internal static class VoiceProbeEntry
     {
         var request = Environment.GetEnvironmentVariable(VoiceProbe.Variable);
         if (request == null) return;
-        var measurement = VoiceProbe.Measure(int.Parse(request));
+        var parts = request.Split(':');
+        var measurement = VoiceProbe.Measure(int.Parse(parts[0]), parts.Length > 1 ? int.Parse(parts[1]) : 1);
         Console.Out.WriteLine($"voiceprobe caller={measurement.CallerThread} process={measurement.WholeProcess} native={measurement.NativeCalls} nativeCounted={measurement.NativeCounted} unexpected={measurement.Unexpected} ambient={measurement.Ambient}");
         Console.Out.Flush();
         Environment.Exit(0);

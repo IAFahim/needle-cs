@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 
 namespace Needle;
 
@@ -68,15 +69,28 @@ public sealed unsafe partial class Whistle : IDisposable
         audio = model.Audio;
         g = model.Geometry;
         dim = g.Dim;
+        var frontReady = false;
         pool = new Pool(policy);
-        decoder = new Engine(model, g.MaxSeq, 64, policy, pool);
-        tokenizer = new Tokenizer(model, 1 << 12);
-        var rawFrames = MaxSeconds * audio->SampleRate / audio->Hop;
-        maxFrames = ((((rawFrames + 1) / 2 + 1) / 2 + 1) / 2) + 2;
-        languages = ReadLanguages();
-        textVocab = model.VocabSize - languages.Length;
-        front = Frontend.Create(*audio);
-        AllocateBuffers();
+        try
+        {
+            decoder = new Engine(model, g.MaxSeq, 64, policy, pool);
+            tokenizer = new Tokenizer(model, 1 << 12);
+            var rawFrames = MaxSeconds * audio->SampleRate / audio->Hop;
+            maxFrames = ((((rawFrames + 1) / 2 + 1) / 2 + 1) / 2) + 2;
+            languages = ReadLanguages();
+            textVocab = model.VocabSize - languages.Length;
+            front = Frontend.Create(*audio);
+            frontReady = true;
+            AllocateBuffers();
+        }
+        catch
+        {
+            if (frontReady) front.Free();
+            tokenizer?.Dispose();
+            decoder?.Dispose();
+            pool.Dispose();
+            throw;
+        }
     }
 
     string[] ReadLanguages()
@@ -96,7 +110,7 @@ public sealed unsafe partial class Whistle : IDisposable
         var samples = MaxSeconds * audio->SampleRate + audio->Window;
         var rawFrames = samples / audio->Hop + 2;
         arena = new Arena((nuint)(256u << 20));
-        padded = arena.TakeUncleared<float>((nuint)samples + 512);
+        padded = arena.TakeUncleared<float>((nuint)(samples + audio->Hop + audio->Fft) + 512);
         features = arena.TakeUncleared<float>((nuint)(rawFrames * audio->Mels));
         featurePeaks = arena.TakeUncleared<float>((nuint)FeatureJob.Tasks(rawFrames));
         var f = maxFrames;
@@ -177,6 +191,19 @@ public sealed unsafe partial class Whistle : IDisposable
     }
 
     public int Encode(ReadOnlySpan<float> pcm)
+    {
+        Enter();
+        try
+        {
+            return EncodeCore(pcm);
+        }
+        finally
+        {
+            Exit();
+        }
+    }
+
+    int EncodeCore(ReadOnlySpan<float> pcm)
     {
         var samples = Math.Min(pcm.Length, MaxSeconds * audio->SampleRate);
         var l0 = samples / audio->Hop;
@@ -877,11 +904,35 @@ public sealed unsafe partial class Whistle : IDisposable
 
     public float[] Embed(ReadOnlySpan<float> pcm)
     {
-        var count = Encode(pcm);
-        var result = new float[count * dim];
-        new ReadOnlySpan<float>(encoderOutput, result.Length).CopyTo(result);
-        return result;
+        Enter();
+        try
+        {
+            var count = EncodeCore(pcm);
+            var result = new float[count * dim];
+            new ReadOnlySpan<float>(encoderOutput, result.Length).CopyTo(result);
+            return result;
+        }
+        finally
+        {
+            Exit();
+        }
     }
+
+    int busy;
+    int disposed;
+
+    void Enter()
+    {
+        if (Volatile.Read(ref disposed) != 0) throw new ObjectDisposedException(nameof(Whistle));
+        var owner = Interlocked.CompareExchange(ref busy, 1, 0);
+        if (owner != 0)
+        {
+            if (owner < 0) throw new ObjectDisposedException(nameof(Whistle));
+            throw new InvalidOperationException("a Whistle instance runs one call at a time; use one instance per thread or serialise the calls");
+        }
+    }
+
+    void Exit() => Volatile.Write(ref busy, 0);
 
     void BuildCrossMemory()
     {
@@ -925,10 +976,15 @@ public sealed unsafe partial class Whistle : IDisposable
 
     internal void Observe(ReadOnlySpan<float> pcm, string? language)
     {
-        if (Encode(pcm) == 0) return;
-        EnsureDecoderBuffers();
-        BuildCrossMemory();
-        Prime(language, false, new Pass());
+        Enter();
+        try
+        {
+            if (EncodeCore(pcm) == 0) return;
+            EnsureDecoderBuffers();
+            BuildCrossMemory();
+            Prime(language, false, new Pass());
+        }
+        finally { Exit(); }
     }
 
     public void Pause() => pool.Pause();
@@ -937,6 +993,11 @@ public sealed unsafe partial class Whistle : IDisposable
 
     public void Dispose()
     {
+        var owner = Interlocked.CompareExchange(ref busy, -1, 0);
+        if (owner == -1) return;
+        if (owner != 0) throw new InvalidOperationException("cannot dispose a Whistle while a call is running");
+        Volatile.Write(ref disposed, 1);
+        FreeDecoderBuffers();
         decoder.Dispose();
         DisposeBeams();
         tokenizer.Dispose();

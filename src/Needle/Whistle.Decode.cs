@@ -31,12 +31,17 @@ public sealed unsafe partial class Whistle
     {
         if (language != null && Array.IndexOf(languages, language) < 0) throw new ArgumentException($"language is one of {string.Join(" ", languages)}");
         var maxSamples = MaxSeconds * audio->SampleRate;
-        if (pcm.Length <= maxSamples)
+        Enter();
+        try
         {
-            var pass = Decode(pcm, language, keywords, wordTimestamps);
-            return Present(pass, pass.Text, wordTimestamps ? pass.Words : null);
+            if (pcm.Length <= maxSamples)
+            {
+                var pass = Decode(pcm, language, keywords, wordTimestamps);
+                return Present(pass, pass.Text, wordTimestamps ? pass.Words : null);
+            }
+            return TranscribeLong(pcm, language, keywords, wordTimestamps);
         }
-        return TranscribeLong(pcm, language, keywords, wordTimestamps);
+        finally { Exit(); }
     }
 
     static Transcription Present(Pass p, string text, IReadOnlyList<Word>? words) => new()
@@ -83,6 +88,12 @@ public sealed unsafe partial class Whistle
 
     static bool EndsSentence(string word) => word.Length > 0 && word[^1] is '.' or '?' or '!' or '。' or '？' or '！';
 
+    static bool Silent(ReadOnlySpan<float> pcm)
+    {
+        var rms = Rms(pcm);
+        return !(rms >= SilenceRms) || float.IsInfinity(rms);
+    }
+
     static float Rms(ReadOnlySpan<float> pcm)
     {
         double sum = 0;
@@ -108,13 +119,23 @@ public sealed unsafe partial class Whistle
         decoderReady = true;
     }
 
+    void FreeDecoderBuffers()
+    {
+        if (!decoderReady) return;
+        Mem.Free(alignment);
+        Mem.Free(scores);
+        alignment = null;
+        scores = null;
+        decoderReady = false;
+    }
+
     Pass Decode(ReadOnlySpan<float> pcm, string? language, IReadOnlyList<string>? keywords, bool align)
     {
         var pass = new Pass();
-        if (Rms(pcm) < SilenceRms) return pass;
+        if (Silent(pcm)) return pass;
         EnsureDecoderBuffers();
         var started = Stopwatch.GetTimestamp();
-        if (Encode(pcm) == 0) return pass;
+        if (EncodeCore(pcm) == 0) return pass;
         BuildCrossMemory();
         pass.EncodeMs = (Stopwatch.GetTimestamp() - started) * 1000.0 / Stopwatch.Frequency;
         return DecodeMemory(pass, started, language, keywords, align);
@@ -122,11 +143,17 @@ public sealed unsafe partial class Whistle
 
     internal string TranscribeEmbedding(ReadOnlySpan<float> embedding, string? language)
     {
-        EnsureDecoderBuffers();
-        frames = embedding.Length / dim;
-        embedding.CopyTo(new Span<float>(encoderOutput, embedding.Length));
-        BuildCrossMemory();
-        return DecodeMemory(new Pass(), Stopwatch.GetTimestamp(), language, null, false).Text;
+        if (embedding.Length % dim != 0 || embedding.Length / dim > maxFrames) throw new ArgumentException($"embedding holds whole {dim}-wide rows, at most {maxFrames}", nameof(embedding));
+        Enter();
+        try
+        {
+            EnsureDecoderBuffers();
+            frames = embedding.Length / dim;
+            embedding.CopyTo(new Span<float>(encoderOutput, embedding.Length));
+            BuildCrossMemory();
+            return DecodeMemory(new Pass(), Stopwatch.GetTimestamp(), language, null, false).Text;
+        }
+        finally { Exit(); }
     }
 
     Pass DecodeMemory(Pass pass, long started, string? language, IReadOnlyList<string>? keywords, bool align)
@@ -138,24 +165,22 @@ public sealed unsafe partial class Whistle
         var firstToken = Stopwatch.GetTimestamp();
         var decodeStart = firstToken;
         var steps = 0;
-        var (forced, forcedProbs) = BeamWidth > 1 ? BeamSearch(keywords, align) : (null, null);
-        if (forced != null)
+        var beam = BeamWidth > 1;
+        if (beam)
         {
-            pass.Tokens.AddRange(forced);
+            CacheKeywords(keywords);
+            var count = BeamSearch(align);
             pass.TtftMs = (Stopwatch.GetTimestamp() - started) * 1000.0 / Stopwatch.Frequency;
-            steps = forced.Count;
+            steps = count;
+            for (var i = 0; i < count; i++) pass.Tokens.Add(spanTokens![i]);
             if (align)
             {
-                pass.Probabilities.AddRange(forcedProbs!);
-                var total = forced.Count + 1;
-                var alignBuf = total <= 512 ? stackalloc int[total] : new int[total];
-                for (var i = 0; i < forced.Count; i++) alignBuf[i] = forced[i];
-                alignBuf[forced.Count] = Eos;
-                decoder.Feed(alignBuf, computeLogits: false);
+                for (var i = 0; i < count; i++) pass.Probabilities.Add(spanProbs![i]);
+                FeedForAlignment(count);
             }
         }
         var hasKeywords = keywords != null && keywords.Count > 0;
-        for (var step = 0; step < g.MaxSeq - 3 && forced == null; step++)
+        for (var step = 0; step < g.MaxSeq - 3 && !beam; step++)
         {
             logits = decoder.Logits;
             int best;
@@ -201,16 +226,131 @@ public sealed unsafe partial class Whistle
     public int BeamWidth { get; set; } = 3;
     public float BeamLengthPenalty { get; set; } = 1f;
 
+    struct BeamCandidate
+    {
+        public float Score;
+        public float Prob;
+        public int Parent;
+        public int Token;
+    }
+
+    static bool Before(in BeamCandidate a, in BeamCandidate b) => b.Score.CompareTo(a.Score) < 0;
+
+    static void SwapIfAfter(BeamCandidate[] items, int i, int j)
+    {
+        if (!Before(items[j], items[i])) return;
+        (items[i], items[j]) = (items[j], items[i]);
+    }
+
+    static void SortCandidates(BeamCandidate[] items, int count)
+    {
+        if (count == 2) { SwapIfAfter(items, 0, 1); return; }
+        if (count == 3)
+        {
+            SwapIfAfter(items, 0, 1);
+            SwapIfAfter(items, 0, 2);
+            SwapIfAfter(items, 1, 2);
+            return;
+        }
+        for (var i = 0; i < count - 1; i++)
+        {
+            var item = items[i + 1];
+            var j = i;
+            while (j >= 0 && Before(item, items[j]))
+            {
+                items[j + 1] = items[j];
+                j--;
+            }
+            items[j + 1] = item;
+        }
+    }
+
     Engine[]? beamEngines;
+    Engine[]? beamLive;
+    Engine[]? beamNext;
+    int[]? beamTokensA;
+    int[]? beamTokensB;
+    float[]? beamProbsA;
+    float[]? beamProbsB;
+    int[]? beamLengthsA;
+    int[]? beamLengthsB;
+    float[]? beamLiveScores;
+    BeamCandidate[]? beamCandidates;
     float* beamScores;
+    bool beamParallel;
+    GCHandle beamSelf;
+    Engine[]? beamTaskEngines;
+    Engine[]? beamTaskSources;
+    int[]? beamTaskTokens;
+
+    bool ParallelBeams(int width)
+    {
+        if (width < 2 || policy.Threads < 2) return false;
+        var choice = Environment.GetEnvironmentVariable("NEEDLE_BEAM_PARALLEL");
+        return choice == null ? true : choice != "0";
+    }
 
     void EnsureBeams(int width)
     {
+        if (width < 1) throw new InvalidOperationException("BeamWidth must be at least 1");
         if (beamEngines != null && beamEngines.Length == 2 * width) return;
         DisposeBeams();
-        beamEngines = new Engine[2 * width];
-        for (var i = 0; i < beamEngines.Length; i++) beamEngines[i] = new Engine(model, g.MaxSeq, 64, policy, pool);
+        var parallel = ParallelBeams(width);
+        var engines = new Engine[2 * width];
+        try
+        {
+            for (var i = 0; i < engines.Length; i++)
+                engines[i] = parallel
+                    ? new Engine(model, g.MaxSeq, 64, policy.WithThreads(1).WithCaller(CallerRole.Participates), null)
+                    : new Engine(model, g.MaxSeq, 64, policy, pool);
+        }
+        catch
+        {
+            foreach (var engine in engines) engine?.Dispose();
+            throw;
+        }
+        beamEngines = engines;
+        beamLive = new Engine[width];
+        beamNext = new Engine[width];
+        beamTokensA = new int[width * g.MaxSeq];
+        beamTokensB = new int[width * g.MaxSeq];
+        beamProbsA = new float[width * g.MaxSeq];
+        beamProbsB = new float[width * g.MaxSeq];
+        beamLengthsA = new int[width];
+        beamLengthsB = new int[width];
+        beamLiveScores = new float[width];
+        beamCandidates = new BeamCandidate[width * width];
         beamScores = (float*)Mem.Alloc((nuint)(width * textVocab) * 4);
+        beamParallel = parallel;
+        if (parallel)
+        {
+            beamTaskEngines = new Engine[width];
+            beamTaskSources = new Engine[width];
+            beamTaskTokens = new int[width];
+            beamSelf = GCHandle.Alloc(this, GCHandleType.Weak);
+        }
+    }
+
+    void RunBeamTasks(delegate*<void*, int, void> function, int count)
+    {
+        if (count == 0) return;
+        if (count == 1) { function((void*)GCHandle.ToIntPtr(beamSelf), 0); return; }
+        pool.Run(function, (void*)GCHandle.ToIntPtr(beamSelf), count);
+    }
+
+    static Whistle BeamOwner(void* context) => (Whistle)GCHandle.FromIntPtr((IntPtr)context).Target!;
+
+    static void ExecuteBeamCopy(void* context, int task)
+    {
+        var owner = BeamOwner(context);
+        owner.beamTaskEngines![task].CopyFrom(owner.beamTaskSources![task], copyLogits: false);
+    }
+
+    static void ExecuteBeamFeed(void* context, int task)
+    {
+        var owner = BeamOwner(context);
+        var token = owner.beamTaskTokens![task];
+        owner.beamTaskEngines![task].Feed(new ReadOnlySpan<int>(&token, 1));
     }
 
     void DisposeBeams()
@@ -218,27 +358,48 @@ public sealed unsafe partial class Whistle
         if (beamEngines != null) foreach (var engine in beamEngines) engine.Dispose();
         if (beamScores != null) Mem.Free(beamScores);
         beamEngines = null;
+        beamLive = null;
+        beamNext = null;
         beamScores = null;
+        if (beamSelf.IsAllocated) beamSelf.Free();
+        beamParallel = false;
     }
 
     float Normalized(float score, int length) => BeamLengthPenalty == 0f ? score : score / MathF.Pow(length, BeamLengthPenalty);
 
-    (List<int> Tokens, List<float>? Probs) BeamSearch(IReadOnlyList<string>? keywords, bool trackProbs)
+    int BeamSearch(bool trackProbs)
     {
         var width = BeamWidth;
         EnsureBeams(width);
-        foreach (var engine in beamEngines!) engine.Attach(memory);
-        var live = beamEngines.AsSpan(0, width).ToArray();
-        var next = beamEngines.AsSpan(width, width).ToArray();
-        var liveTokens = new List<int>[width];
-        var liveProbs = trackProbs ? new List<float>[width] : null;
-        var liveScores = new float[width];
-        liveTokens[0] = new List<int>();
-        if (trackProbs) liveProbs![0] = new List<float>();
+        EnsureSpanBuffers();
+        var engines = beamEngines!;
+        foreach (var engine in engines) engine.Attach(memory);
+        var live = beamLive!;
+        var next = beamNext!;
+        for (var i = 0; i < width; i++)
+        {
+            live[i] = engines[i];
+            next[i] = engines[width + i];
+        }
+        var stride = g.MaxSeq;
+        var liveTokens = beamTokensA!;
+        var nextTokens = beamTokensB!;
+        var liveProbs = beamProbsA!;
+        var nextProbs = beamProbsB!;
+        var liveLengths = beamLengthsA!;
+        var nextLengths = beamLengthsB!;
+        var liveScores = beamLiveScores!;
+        var candidates = beamCandidates!;
+        var outTokens = spanTokens!;
+        var outProbs = spanProbs!;
+        liveLengths[0] = 0;
+        liveScores[0] = 0f;
         live[0].CopyFrom(decoder);
         var liveCount = 1;
-        var finished = new List<(float Score, List<int> Tokens, List<float>? Probs)>();
-        var candidates = new List<(float Score, float Prob, int Parent, int Token)>();
+        var finishedCount = 0;
+        var bestFinished = float.NegativeInfinity;
+        var winnerFinished = float.NegativeInfinity;
+        var bestFinishedLength = -1;
         var parents = stackalloc int[width];
         var picks = stackalloc int[width];
         var pickScores = stackalloc float[width];
@@ -248,10 +409,10 @@ public sealed unsafe partial class Whistle
         var topLogProbs = stackalloc float[width];
         var topProbs = stackalloc float[width];
         var one = stackalloc int[1];
-        var hasKeywords = keywords != null && keywords.Count > 0;
+        var hasKeywords = spanKeywordStrings.Length > 0;
         for (var step = 0; step < g.MaxSeq - 4; step++)
         {
-            candidates.Clear();
+            var n = 0;
             for (var i = 0; i < liveCount; i++)
             {
                 var logits = live[i].Logits;
@@ -260,7 +421,7 @@ public sealed unsafe partial class Whistle
                     var row = beamScores + (long)i * textVocab;
                     logits.Slice(0, textVocab).CopyTo(new Span<float>(row, textVocab));
                     row[0] = row[2] = row[3] = -1e30f;
-                    ApplyKeywordBias(keywords, liveTokens[i], row);
+                    ApplyKeywordBiasSpan(new ReadOnlySpan<int>(liveTokens, i * stride, liveLengths[i]), row);
                     Ops.TopKLogSoftmax(row, textVocab, width, topIdx, topLogProbs, trackProbs ? topProbs : null, false);
                 }
                 else
@@ -269,86 +430,131 @@ public sealed unsafe partial class Whistle
                         Ops.TopKLogSoftmax(lp, textVocab, width, topIdx, topLogProbs, trackProbs ? topProbs : null, true);
                 }
                 for (var k = 0; k < width; k++)
-                    candidates.Add((liveScores[i] + topLogProbs[k], trackProbs ? topProbs[k] : 0f, i, topIdx[k]));
+                    candidates[n++] = new BeamCandidate { Score = liveScores[i] + topLogProbs[k], Prob = trackProbs ? topProbs[k] : 0f, Parent = i, Token = topIdx[k] };
             }
-            candidates.Sort((a, b) => b.Score.CompareTo(a.Score));
+            SortCandidates(candidates, n);
             var kept = 0;
-            foreach (var c in candidates)
+            for (var c = 0; c < n; c++)
             {
-                if (c.Token == Eos)
-                    finished.Add((c.Score, new List<int>(liveTokens[c.Parent]), trackProbs ? new List<float>(liveProbs![c.Parent]) : null));
+                var candidate = candidates[c];
+                if (candidate.Token == Eos)
+                {
+                    var length = liveLengths[candidate.Parent];
+                    var normalized = Normalized(candidate.Score, length + 1);
+                    bestFinished = MathF.Max(bestFinished, normalized);
+                    finishedCount++;
+                    if (normalized > winnerFinished)
+                    {
+                        winnerFinished = normalized;
+                        bestFinishedLength = length;
+                        Array.Copy(liveTokens, candidate.Parent * stride, outTokens, 0, length);
+                        if (trackProbs) Array.Copy(liveProbs, candidate.Parent * stride, outProbs, 0, length);
+                    }
+                }
                 else
                 {
-                    parents[kept] = c.Parent;
-                    picks[kept] = c.Token;
-                    pickScores[kept] = c.Score;
-                    pickProbs[kept] = c.Prob;
+                    parents[kept] = candidate.Parent;
+                    picks[kept] = candidate.Token;
+                    pickScores[kept] = candidate.Score;
+                    pickProbs[kept] = candidate.Prob;
                     kept++;
                 }
                 if (kept >= width) break;
             }
             if (kept == 0) break;
-            if (finished.Count >= width)
+            if (finishedCount >= width)
             {
-                var bestFinished = float.NegativeInfinity;
-                foreach (var f in finished) bestFinished = MathF.Max(bestFinished, Normalized(f.Score, f.Tokens.Count + 1));
                 var bestLive = float.NegativeInfinity;
-                for (var j = 0; j < kept; j++) bestLive = MathF.Max(bestLive, Normalized(pickScores[j], liveTokens[parents[j]].Count + 1));
+                for (var j = 0; j < kept; j++) bestLive = MathF.Max(bestLive, Normalized(pickScores[j], liveLengths[parents[j]] + 1));
                 if (bestFinished >= bestLive) break;
             }
             for (var p = 0; p < liveCount; p++) lastChild[p] = -1;
             for (var j = 0; j < kept; j++) lastChild[parents[j]] = j;
-            var nextTokens = new List<int>[width];
-            var nextProbs = trackProbs ? new List<float>[width] : null;
-            for (var j = 0; j < kept; j++)
+            if (beamParallel)
             {
-                var p = parents[j];
-                if (j == lastChild[p]) continue;
-                next[j].CopyFrom(live[p], copyLogits: false);
-                one[0] = picks[j];
-                next[j].Feed(new ReadOnlySpan<int>(one, 1));
-                nextTokens[j] = new List<int>(liveTokens[p]) { picks[j] };
-                if (trackProbs) nextProbs![j] = new List<float>(liveProbs![p]) { pickProbs[j] };
-                liveScores[j] = pickScores[j];
+                var taskEngines = beamTaskEngines!;
+                var tasks = 0;
+                for (var j = 0; j < kept; j++)
+                {
+                    var p = parents[j];
+                    if (j == lastChild[p]) continue;
+                    taskEngines[tasks] = next[j];
+                    beamTaskSources![tasks] = live[p];
+                    tasks++;
+                }
+                RunBeamTasks(&ExecuteBeamCopy, tasks);
+                for (var j = 0; j < kept; j++)
+                {
+                    var p = parents[j];
+                    taskEngines[j] = j == lastChild[p] ? live[p] : next[j];
+                    beamTaskTokens![j] = picks[j];
+                }
+                RunBeamTasks(&ExecuteBeamFeed, kept);
+                for (var j = 0; j < kept; j++)
+                {
+                    var p = parents[j];
+                    if (j == lastChild[p]) (next[j], live[p]) = (live[p], next[j]);
+                }
+            }
+            else
+            {
+                for (var j = 0; j < kept; j++)
+                {
+                    var p = parents[j];
+                    if (j == lastChild[p]) continue;
+                    next[j].CopyFrom(live[p], copyLogits: false);
+                    one[0] = picks[j];
+                    next[j].Feed(new ReadOnlySpan<int>(one, 1));
+                }
+                for (var j = 0; j < kept; j++)
+                {
+                    var p = parents[j];
+                    if (j != lastChild[p]) continue;
+                    one[0] = picks[j];
+                    live[p].Feed(new ReadOnlySpan<int>(one, 1));
+                    (next[j], live[p]) = (live[p], next[j]);
+                }
             }
             for (var j = 0; j < kept; j++)
             {
                 var p = parents[j];
-                if (j != lastChild[p]) continue;
-                one[0] = picks[j];
-                live[p].Feed(new ReadOnlySpan<int>(one, 1));
-                (next[j], live[p]) = (live[p], next[j]);
-                liveTokens[p].Add(picks[j]);
-                nextTokens[j] = liveTokens[p];
+                var length = liveLengths[p];
+                Array.Copy(liveTokens, p * stride, nextTokens, j * stride, length);
+                nextTokens[j * stride + length] = picks[j];
                 if (trackProbs)
                 {
-                    liveProbs![p].Add(pickProbs[j]);
-                    nextProbs![j] = liveProbs[p];
+                    Array.Copy(liveProbs, p * stride, nextProbs, j * stride, length);
+                    nextProbs[j * stride + length] = pickProbs[j];
                 }
+                nextLengths[j] = length + 1;
                 liveScores[j] = pickScores[j];
             }
             (live, next) = (next, live);
-            liveTokens = nextTokens;
-            if (trackProbs) liveProbs = nextProbs;
+            (liveTokens, nextTokens) = (nextTokens, liveTokens);
+            (liveProbs, nextProbs) = (nextProbs, liveProbs);
+            (liveLengths, nextLengths) = (nextLengths, liveLengths);
             liveCount = kept;
         }
-        var winner = default(List<int>);
-        var winnerProbs = default(List<float>);
+        if (bestFinishedLength >= 0) return bestFinishedLength;
+        var winner = -1;
         var winnerScore = float.NegativeInfinity;
-        foreach (var f in finished)
-        {
-            var score = Normalized(f.Score, f.Tokens.Count + 1);
-            if (score > winnerScore) { winnerScore = score; winner = f.Tokens; winnerProbs = f.Probs; }
-        }
-        if (winner != null) return (winner, winnerProbs);
         for (var j = 0; j < liveCount; j++)
         {
-            var score = Normalized(liveScores[j], liveTokens[j].Count);
-            if (score > winnerScore) { winnerScore = score; winner = liveTokens[j]; winnerProbs = trackProbs ? liveProbs![j] : null; }
+            var score = Normalized(liveScores[j], liveLengths[j]);
+            if (score > winnerScore) { winnerScore = score; winner = j; }
         }
-        return (winner ?? new List<int>(), trackProbs ? (winnerProbs ?? new List<float>()) : null);
+        if (winner < 0) return 0;
+        Array.Copy(liveTokens, winner * stride, outTokens, 0, liveLengths[winner]);
+        if (trackProbs) Array.Copy(liveProbs, winner * stride, outProbs, 0, liveLengths[winner]);
+        return liveLengths[winner];
     }
 
+    void FeedForAlignment(int count)
+    {
+        var tokens = spanTokens!;
+        tokens[count] = Eos;
+        decoder.Feed(new ReadOnlySpan<int>(tokens, 0, count + 1), computeLogits: false);
+    }
 
     void Prime(string? language, bool align, Pass pass)
     {
