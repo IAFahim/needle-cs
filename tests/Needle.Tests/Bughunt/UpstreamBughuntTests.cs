@@ -205,6 +205,21 @@ public sealed unsafe class UpstreamBughuntTests
         }
     }
 
+    [Theory]
+    [InlineData(typeof(NeedleSession), "Due Date: Friday", true)]
+    [InlineData(typeof(NeedleSession), "meeting date : noon", true)]
+    [InlineData(typeof(NeedleSession), "ship_date: 2026-12-01 maybe", false)]
+    [InlineData(typeof(NeedleSession), "order_date: friday", false)]
+    [InlineData(typeof(BatchedSession), "Due Date: Friday", true)]
+    [InlineData(typeof(BatchedSession), "order_date: friday", false)]
+    public void AutoDatePrefixesTheFactExactlyWhenUpstreamWould(Type session, string system, bool prefixed)
+    {
+        var build = session.GetMethod("BuildSystem", BindingFlags.Static | BindingFlags.NonPublic)!;
+        var text = (string)build.Invoke(null, new object[] { new NeedleOptions { AutoDate = true, System = system } })!;
+        Assert.Equal(prefixed, text.StartsWith("date: ", StringComparison.Ordinal) && text.EndsWith("; " + system, StringComparison.Ordinal));
+        if (!prefixed) Assert.Equal(system, text);
+    }
+
     static GrammarState Advanced(Grammar grammar, string text)
     {
         var state = Grammar.Start(grammar.Program);

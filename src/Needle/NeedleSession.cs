@@ -131,7 +131,7 @@ public sealed unsafe partial class NeedleSession : IDisposable
     const int EmbedderContext = 512;
     const int MinKeyScratchBytes = 64;
 
-    static readonly Regex DateKey = new(@"\bdate\s*:", RegexOptions.IgnoreCase);
+    static readonly Regex DateKey = new(@"(?<![A-Za-z])date:");
     static readonly Regex IsoStamp = new(@"\d{4}-\d{2}-\d{2}");
 
     static ReadOnlySpan<byte> ToolResultHead => "<|im_start|>tool\n<tool_result>"u8;

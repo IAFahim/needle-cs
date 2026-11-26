@@ -24,7 +24,7 @@ public sealed unsafe class BatchedSession : IDisposable
     static ReadOnlySpan<byte> LaterQueryHead => "<|im_start|>user\n"u8;
     static ReadOnlySpan<byte> QueryTail => "<|im_end|>\n<|im_start|>assistant\n"u8;
 
-    static readonly Regex DateKey = new(@"\bdate\s*:", RegexOptions.IgnoreCase);
+    static readonly Regex DateKey = new(@"(?<![A-Za-z])date:");
     static readonly Regex IsoStamp = new(@"\d{4}-\d{2}-\d{2}");
 
     enum Phase : byte { Reasoning, ThinkTail, Call, CallClosingFeed, CallClosing, Respond, RespondClosing }
