@@ -241,6 +241,38 @@ public sealed unsafe class UpstreamBughuntTests
         Assert.True(Accepts(grammar, "[{\"name\":\"t\",\"arguments\":{\"x\":" + value + "}}]"));
     }
 
+    struct ByteCollector : Tools.IGrammarSink
+    {
+        public List<byte> Bytes;
+        public void ToolSelected(int tool) { }
+        public void PropertySelected(int property) { }
+        public void StringByte(byte value) => Bytes.Add(value);
+        public void NumberByte(byte value) { }
+        public void EnumSelected(int literal) { }
+        public void BoolSelected(bool value) { }
+        public void NullSelected() { }
+        public void ValueCompleted() { }
+        public void CallCompleted() { }
+    }
+
+    [Theory]
+    [InlineData("\\ud83d\\ude00", "\U0001F600")]
+    [InlineData("a\\ud83d\\ude00b", "a\U0001F600b")]
+    [InlineData("\\ud83dx", "\uFFFDx")]
+    [InlineData("\\ude00", "\uFFFD")]
+    [InlineData("\\u00e9\\n", "\u00e9\n")]
+    public void TypedSinkDecodesSurrogatePairEscapesLikeTheJsonPath(string escaped, string expected)
+    {
+        var set = new ToolSet("[" + Tool("t", "{\"s\":{\"type\":\"string\"}}") + "]");
+        using var grammar = new Grammar(set.Tools);
+        var sink = new ByteCollector { Bytes = new List<byte>() };
+        var state = Grammar.Start(grammar.Program);
+        foreach (var b in Encoding.UTF8.GetBytes("[{\"name\":\"t\",\"arguments\":{\"s\":\"" + escaped + "\"}}]"))
+            Assert.True(Grammar.Advance(grammar.Program, &state, b, ref sink));
+        Assert.True(Grammar.Complete(state));
+        Assert.Equal(expected, Encoding.UTF8.GetString(sink.Bytes.ToArray()));
+    }
+
     static GrammarState Advanced(Grammar grammar, string text)
     {
         var state = Grammar.Start(grammar.Program);
