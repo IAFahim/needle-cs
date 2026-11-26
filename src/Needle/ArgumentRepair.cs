@@ -58,12 +58,15 @@ internal sealed class RepairScratch
     public readonly byte[] Ungrounded;
     public int UngroundedLength;
     public int ArgCount;
+    public int CallCount;
+    public readonly CallSpan[] Spans;
     public int ArenaLength;
     public byte[] PhoneText = Array.Empty<byte>();
 
     public RepairScratch(int maxCalls, int maxArgs, int callBytes)
     {
         Calls = new CallSlot[Math.Max(1, maxCalls)];
+        Spans = new CallSpan[Math.Max(1, maxCalls)];
         Args = new ArgSlot[Math.Max(8, maxArgs)];
         Arena = new byte[Math.Max(4096, callBytes * 2)];
         Output = new byte[Math.Max(4096, callBytes * 2 + 1024)];
@@ -87,6 +90,7 @@ internal static class ArgumentRepair
         s.ArgCount = 0;
         s.ArenaLength = 0;
         if (callCount == 0 || callCount > s.Calls.Length) return RepairOutcome.None;
+        s.CallCount = callCount;
         var outcome = RepairOutcome.None;
         var source = calls[..length];
         for (var c = 0; c < callCount; c++)
@@ -105,7 +109,7 @@ internal static class ArgumentRepair
             ref var call = ref s.Calls[c];
             call.Anchor = Anchor(plan, s, source, request, c);
             var tool = plan.Tools[call.Tool];
-            if (Negated(request, call.Anchor))
+            if (Negated(request, s, call.Anchor))
             {
                 call.Removed = true;
                 outcome |= RepairOutcome.Negated;
@@ -128,12 +132,15 @@ internal static class ArgumentRepair
                 outcome |= RepairOutcome.Invalid;
             }
         }
-        var written = Write(plan, s, source, callCount, spans, out var kept, ref outcome);
+        var written = Write(plan, s, source, callCount, out var kept, ref outcome);
         if (written < 0) return RepairOutcome.None;
-        if (Ungrounded(plan, s, history, request, today, kept, spans)) outcome |= RepairOutcome.Ungrounded;
-        required = written;
+        if (Ungrounded(plan, s, history, request, today, kept)) outcome |= RepairOutcome.Ungrounded;
         if ((outcome & (RepairOutcome.Repaired | RepairOutcome.Negated | RepairOutcome.Invalid | RepairOutcome.Duplicate)) == 0) return outcome;
-        if (written <= calls.Length) s.Output.AsSpan(0, written).CopyTo(calls);
+        required = written;
+        // Calls, spans and count change together or not at all, so a caller never sees spans into bytes it does not hold.
+        if (written > calls.Length) return outcome & RepairOutcome.Ungrounded;
+        s.Output.AsSpan(0, written).CopyTo(calls);
+        s.Spans.AsSpan(0, kept).CopyTo(spans);
         callCount = kept;
         return outcome;
     }
@@ -283,7 +290,7 @@ internal static class ArgumentRepair
         w.SequenceEqual("the"u8) || w.SequenceEqual("and"u8) || w.SequenceEqual("for"u8) || w.SequenceEqual("with"u8) || w.SequenceEqual("from"u8) ||
         w.SequenceEqual("that"u8) || w.SequenceEqual("this"u8) || w.SequenceEqual("please"u8);
 
-    static bool Negated(RepairText request, int clause)
+    static bool Negated(RepairText request, RepairScratch s, int clause)
     {
         if (clause < 0) return false;
         var negated = false;
@@ -291,6 +298,9 @@ internal static class ArgumentRepair
         {
             if (request.WordClause[w] != clause) continue;
             var word = request.Word(w);
+            // A negation inside the content of the request ("text Sam that I won't make it", "remind me to never ...") is not a refusal.
+            if (Complement(word)) break;
+            if (InQuote(request, s, w)) continue;
             var next = w + 1 < request.Words && request.WordClause[w + 1] == clause ? request.Word(w + 1) : default;
             var after = w + 2 < request.Words && request.WordClause[w + 2] == clause ? request.Word(w + 2) : default;
             if (word.SequenceEqual("dont"u8) || word.SequenceEqual("not"u8) || word.SequenceEqual("never"u8) || word.SequenceEqual("without"u8) ||
@@ -307,6 +317,20 @@ internal static class ArgumentRepair
         }
         return negated;
     }
+
+    static bool Complement(ReadOnlySpan<byte> word) =>
+        word.SequenceEqual("that"u8) || word.SequenceEqual("saying"u8) || word.SequenceEqual("say"u8) || word.SequenceEqual("says"u8) ||
+        word.SequenceEqual("to"u8) || word.SequenceEqual("about"u8) || word.SequenceEqual("titled"u8) || word.SequenceEqual("called"u8);
+
+    static bool InQuote(RepairText request, RepairScratch s, int word)
+    {
+        var at = request.Origin[request.WordStart[word]];
+        for (var q = 0; q < RepairScratch.MaxQuotes && s.QuoteLength[q] > 0; q++)
+            if (at >= s.QuoteStart[q] && at < s.QuoteStart[q] + s.QuoteLength[q]) return true;
+        return false;
+    }
+
+    static int Wide(RepairScratch s, int anchor) => anchor >= 0 && s.CallCount == 1 ? -1 : -2;
 
     static sbyte Cue(RepairText request, Polar family, int clause)
     {
@@ -356,7 +380,7 @@ internal static class ArgumentRepair
             if (param.Kind == ParamKind.Boolean && arg.Kind is ValueKind.True or ValueKind.False && param.BoolPolar != Polar.None)
             {
                 var direction = Cue(request, param.BoolPolar, anchor);
-                if (direction == 0 && anchor >= 0) direction = Cue(request, param.BoolPolar, -1);
+                if (direction == 0 && Wide(s, anchor) == -1) direction = Cue(request, param.BoolPolar, -1);
                 var want = direction > 0 ? ValueKind.True : ValueKind.False;
                 if (direction != 0 && arg.Kind != want) { SetLiteral(s, ref arg, want); changed = true; }
                 continue;
@@ -409,7 +433,7 @@ internal static class ArgumentRepair
     {
         var current = CurrentOption(param, s, json, arg);
         var named = NamedOption(param, request, anchor);
-        if (named < 0 && anchor >= 0) named = NamedOption(param, request, -1);
+        if (named < 0 && Wide(s, anchor) == -1) named = NamedOption(param, request, -1);
         if (named >= 0)
         {
             if (current != named && (current < 0 || request.FindPhrase(param.OptionWords[current], anchor) < 0))
@@ -422,7 +446,7 @@ internal static class ArgumentRepair
         if (param.OptionsPolar != Polar.None)
         {
             var direction = Cue(request, param.OptionsPolar, anchor);
-            if (direction == 0 && anchor >= 0) direction = Cue(request, param.OptionsPolar, -1);
+            if (direction == 0 && Wide(s, anchor) == -1) direction = Cue(request, param.OptionsPolar, -1);
             if (direction != 0)
                 for (var o = 0; o < param.Options.Length; o++)
                     if (param.OptionFamily[o] == param.OptionsPolar && param.OptionDirection[o] == direction)
@@ -627,7 +651,7 @@ internal static class ArgumentRepair
     {
         var content = StringContent(s, json, arg);
         if (content.Length < 10 || !IsIsoDate(content)) return false;
-        if (!ResolveDate(request, today, anchor, out var date) && !(anchor >= 0 && ResolveDate(request, today, -1, out date))) return false;
+        if (!ResolveDate(request, today, anchor, out var date) && !(Wide(s, anchor) == -1 && ResolveDate(request, today, -1, out date))) return false;
         Span<byte> iso = stackalloc byte[10];
         WriteIso(iso, date);
         if (content[..10].SequenceEqual(iso)) return false;
@@ -688,13 +712,13 @@ internal static class ArgumentRepair
             }
             else if (Month(word) is var month && month > 0 && w + 1 < request.Words && DayNumber(request.Word(w + 1)) is var day && day > 0)
             {
-                if (!TryDate(today.Year, month, day, w + 2 < request.Words ? request.Word(w + 2) : default, out candidate)) continue;
+                if (!TryDate(today, month, day, w + 2 < request.Words ? request.Word(w + 2) : default, out candidate)) continue;
             }
             else if (DayNumber(word) is var dayFirst && dayFirst > 0 && w + 1 < request.Words)
             {
                 var monthAt = request.Word(w + 1).SequenceEqual("of"u8) && w + 2 < request.Words ? w + 2 : w + 1;
                 var monthAfter = Month(request.Word(monthAt));
-                if (monthAfter <= 0 || !TryDate(today.Year, monthAfter, dayFirst, monthAt + 1 < request.Words ? request.Word(monthAt + 1) : default, out candidate)) continue;
+                if (monthAfter <= 0 || !TryDate(today, monthAfter, dayFirst, monthAt + 1 < request.Words ? request.Word(monthAt + 1) : default, out candidate)) continue;
                 w = monthAt;
             }
             else if (word.SequenceEqual("in"u8) && w + 2 < request.Words && RepairText.TryParseDecimal(request.Word(w + 1), out var amount) && amount < 400)
@@ -712,10 +736,15 @@ internal static class ArgumentRepair
         return found > 0;
     }
 
-    static bool TryDate(int year, int month, int day, ReadOnlySpan<byte> yearWord, out DateTime date)
+    static bool TryDate(DateTime today, int month, int day, ReadOnlySpan<byte> yearWord, out DateTime date)
     {
         date = default;
-        if (yearWord.Length == 4 && RepairText.TryParseDecimal(yearWord, out var explicitYear) && explicitYear >= 1900 && explicitYear <= 2200) year = (int)explicitYear;
+        var year = today.Year;
+        var explicitYear = 0.0;
+        var stated = yearWord.Length == 4 && RepairText.TryParseDecimal(yearWord, out explicitYear) && explicitYear >= 1900 && explicitYear <= 2200;
+        if (stated) year = (int)explicitYear;
+        // With no year, a month and day that already passed this year mean the next one ("on January 5" said in November).
+        else if (day <= DateTime.DaysInMonth(year, month) && new DateTime(year, month, day) < today.Date) year++;
         if (day > DateTime.DaysInMonth(year, month)) return false;
         date = new DateTime(year, month, day);
         return true;
@@ -812,7 +841,7 @@ internal static class ArgumentRepair
     {
         if (tool.Origin < 0) return false;
         var from = request.FindPhrase("from"u8, anchor);
-        if (from < 0 && anchor >= 0) from = request.FindPhrase("from"u8);
+        if (from < 0 && Wide(s, anchor) == -1) from = request.FindPhrase("from"u8);
         if (from < 0) return false;
         var clause = request.WordClause[from];
         var to = request.FindPhrase("to"u8, clause, from + 2);
@@ -851,7 +880,7 @@ internal static class ArgumentRepair
     {
         if (tool.SingleNumber < 0) return false;
         var by = request.FindPhrase("by"u8, anchor);
-        if (by < 0 && anchor >= 0) by = request.FindPhrase("by"u8);
+        if (by < 0 && Wide(s, anchor) == -1) by = request.FindPhrase("by"u8);
         if (by < 0 || by + 1 >= request.Words || !RepairText.TryParseDecimal(request.Word(by + 1), out var amount)) return false;
         var next = by + 2 < request.Words ? request.Word(by + 2) : default;
         if (next.SequenceEqual("pm"u8) || next.SequenceEqual("am"u8) || next.SequenceEqual("oclock"u8)) return false;
@@ -972,8 +1001,9 @@ internal static class ArgumentRepair
         return true;
     }
 
-    static int Write(RepairPlan plan, RepairScratch s, ReadOnlySpan<byte> json, int callCount, Span<CallSpan> spans, out int kept, ref RepairOutcome outcome)
+    static int Write(RepairPlan plan, RepairScratch s, ReadOnlySpan<byte> json, int callCount, out int kept, ref RepairOutcome outcome)
     {
+        var spans = s.Spans;
         var o = s.Output;
         var at = 0;
         kept = 0;
@@ -1031,8 +1061,9 @@ internal static class ArgumentRepair
         return true;
     }
 
-    static bool Ungrounded(RepairPlan plan, RepairScratch s, RepairText history, RepairText request, DateTime? today, int kept, Span<CallSpan> spans)
+    static bool Ungrounded(RepairPlan plan, RepairScratch s, RepairText history, RepairText request, DateTime? today, int kept)
     {
+        var spans = s.Spans;
         var found = false;
         var output = new ReadOnlySpan<byte>(s.Output);
         var anyYear = false;

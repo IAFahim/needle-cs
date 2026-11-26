@@ -155,7 +155,7 @@ public sealed class ArgumentRepairTests
         Assert.True(ArgumentRepair.ResolveDate(Text("lunch next monday"), new DateTime(2026, 11, 26), -1, out var date));
         Assert.Equal(new DateTime(2026, 11, 30), date);
         Assert.True(ArgumentRepair.ResolveDate(Text("party on March 4th"), new DateTime(2026, 11, 26), -1, out date));
-        Assert.Equal(new DateTime(2026, 3, 4), date);
+        Assert.Equal(new DateTime(2027, 3, 4), date);
         Assert.True(ArgumentRepair.ResolveDate(Text("in 3 days"), new DateTime(2026, 11, 26), -1, out date));
         Assert.Equal(new DateTime(2026, 11, 29), date);
     }
@@ -189,6 +189,87 @@ public sealed class ArgumentRepairTests
         var (_, outcome, ungrounded) = new Rig().Run("dim the bedroom lights", Call("set_brightness", """{"room":"bedroom","level":30}"""));
         Assert.True(outcome.HasFlag(RepairOutcome.Ungrounded));
         Assert.Equal("set_brightness.level", ungrounded);
+    }
+
+    [Fact]
+    public void ValuesStayInTheirOwnClause()
+    {
+        var generated = """[{"name":"adjust_volume","arguments":{"delta":30}},{"name":"set_brightness","arguments":{"room":"bedroom","level":10}}]""";
+        var (json, _, _) = new Rig().Run("change the volume by 30 and dim the bedroom lights to 10", generated);
+        Assert.Equal(generated, json);
+    }
+
+    [Fact]
+    public void NegationInsideTheMessageIsContent()
+    {
+        var generated = Call("send_message", """{"recipient":"Sam","message":"I won't make it"}""");
+        var (json, outcome, _) = new Rig().Run("text Sam that I won't make it", generated);
+        Assert.Equal(generated, json);
+        Assert.False(outcome.HasFlag(RepairOutcome.Negated));
+    }
+
+    [Fact]
+    public void OrAfterANegationNegatesBoth()
+    {
+        var generated = """[{"name":"turn_on_light","arguments":{"room":"kitchen"}},{"name":"turn_on_light","arguments":{"room":"hallway"}}]""";
+        var (json, _, _) = new Rig().Run("don't turn on the kitchen light or the hallway light", generated);
+        Assert.Equal("[]", json);
+    }
+
+    [Fact]
+    public void FullHistoryKeepsTheNewestTurn()
+    {
+        var history = new RepairText(64);
+        history.Load(Encoding.UTF8.GetBytes("an old line about the garden that fills the buffer"));
+        history.Append(Encoding.UTF8.GetBytes("set the bedroom to 21"));
+        Assert.True(history.HasNumber(21));
+        Assert.True(history.FindPhrase("bedroom"u8) >= 0);
+    }
+
+    [Fact]
+    public void PassedMonthAndDayMeansNextYear()
+    {
+        var request = new RepairText(256);
+        request.Load(Encoding.UTF8.GetBytes("add dentist on January 5"));
+        Assert.True(ArgumentRepair.ResolveDate(request, new DateTime(2026, 11, 26), -1, out var date));
+        Assert.Equal(new DateTime(2027, 1, 5), date);
+    }
+
+    [Fact]
+    public void ParamRolesNeedTheRightName()
+    {
+        const string tools = """
+[{"name":"schedule","description":"Schedule a meeting.","parameters":{"type":"object","properties":{"start":{"type":"string","description":"Start time"},"end":{"type":"string","description":"End time"},"update":{"type":"string"},"dueDate":{"type":"string"},"number":{"type":"string","description":"Seat number"}},"required":["start"]}}]
+""";
+        var plan = new RepairPlan(new ToolSet(tools), tools);
+        var tool = plan.Tools[0];
+        Assert.Equal(-1, tool.Origin);
+        Assert.False(tool.Params[tool.FindParam("update"u8)].Date);
+        Assert.True(tool.Params[tool.FindParam("dueDate"u8)].Date);
+        Assert.False(tool.Params[tool.FindParam("number"u8)].Phone);
+    }
+
+    [Fact]
+    public void OutputThatDoesNotFitLeavesCallsUntouched()
+    {
+        var set = new ToolSet(Home);
+        var plan = new RepairPlan(set, Home);
+        var request = new RepairText(1024);
+        var history = new RepairText(8192);
+        var q = Encoding.UTF8.GetBytes("get me a ride from Union Station to the airport");
+        request.Load(q);
+        history.Load(q);
+        var buffer = new byte[4096];
+        var spans = new CallSpan[16];
+        Assert.True(CallRestorer.TryRestore(set.Aliases, Encoding.UTF8.GetBytes(Call("book_ride", """{"destination":"airport"}""")), buffer, new byte[64], spans, out var length, out var count));
+        var before = spans[0];
+        var original = Encoding.UTF8.GetString(buffer, 0, length);
+        var outcome = ArgumentRepair.Apply(plan, new RepairScratch(16, 64, 4096), request, history, null, buffer.AsSpan(0, length), length, spans, ref count, out var required);
+        Assert.True(required > length);
+        Assert.Equal(1, count);
+        Assert.Equal(before, spans[0]);
+        Assert.Equal(original, Encoding.UTF8.GetString(buffer, 0, length));
+        Assert.False(outcome.HasFlag(RepairOutcome.Repaired));
     }
 
     [Fact]
