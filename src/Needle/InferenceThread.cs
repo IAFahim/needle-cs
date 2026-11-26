@@ -80,11 +80,13 @@ public sealed class NeedleService : IDisposable
             session = new NeedleSession(model, toolsJson, options);
         });
 
-    public Task<CallResult> Complete(string query) => thread.Run(() => session!.Complete(query));
+    public Task<CallResult> Complete(string query) => thread.Run(() => Started.Complete(query));
 
-    public Task<CallResult> CompleteWithToolResult(string resultJson) => thread.Run(() => session!.CompleteWithToolResult(resultJson));
+    public Task<CallResult> CompleteWithToolResult(string resultJson) => thread.Run(() => Started.CompleteWithToolResult(resultJson));
 
-    public Task Reset() => thread.Run(() => session!.Reset());
+    public Task Reset() => thread.Run(() => Started.Reset());
+
+    NeedleSession Started => session ?? throw new InvalidOperationException("NeedleService.Start has not completed successfully");
 
     public void Dispose()
     {
@@ -116,7 +118,7 @@ public sealed class SpeechService : IDisposable
         });
 
     public Task<Transcription> Transcribe(float[] pcm, string? language = null, IReadOnlyList<string>? keywords = null, bool wordTimestamps = false) =>
-        thread.Run(() => whistle!.Transcribe(pcm, language, keywords, wordTimestamps));
+        thread.Run(() => (whistle ?? throw new InvalidOperationException("SpeechService.Start has not completed successfully")).Transcribe(pcm, language, keywords, wordTimestamps));
 
     public void Dispose()
     {
