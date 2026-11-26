@@ -33,6 +33,29 @@ public struct WideHandler : IWideCommands
 
 public sealed unsafe class ApiBughuntTests
 {
+    [Fact]
+    public void Channel_CapacityTooLargeForTheBlock_IsRejectedInsteadOfUndersizingTheAllocation()
+    {
+        var replyCell = sizeof(ChannelReply);
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+        {
+            NeedleChannel.ComputeLayout(64, 1_000_000, out _, out var replyCells, out _, out var total);
+            Assert.True((long)total >= (long)replyCells * replyCell, $"block of {total} bytes cannot hold {replyCells} reply cells of {replyCell} bytes");
+        });
+    }
+
+    [Fact]
+    public void Channel_CapacityAboveTheLargestPowerOfTwo_IsRejectedInsteadOfHanging()
+    {
+        var layout = System.Threading.Tasks.Task.Run(() =>
+        {
+            try { NeedleChannel.ComputeLayout((1 << 30) + 1, 64, out _, out _, out _, out _); return "returned"; }
+            catch (ArgumentOutOfRangeException) { return "rejected"; }
+        });
+        Assert.True(layout.Wait(TimeSpan.FromSeconds(5)), "ComputeLayout never returned");
+        Assert.Equal("rejected", layout.Result);
+    }
+
     [Theory]
     [InlineData("call", "/nonexistent/needle3.cact", "/nonexistent/tools.json", "hi")]
     [InlineData("bench", "/nonexistent/needle3.cact")]
