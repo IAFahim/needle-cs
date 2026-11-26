@@ -17,7 +17,7 @@ Early but usable for a showcase: everything below works on Linux x64 today and i
 | Threading | `ThreadPolicy` presets, the library never pins your calling thread, workers park when idle, `Pause`/`Resume` |
 | Speed | Faster than the upstream native engine on the reference VM (73-84 ms vs 95-129 ms per call, 4 threads). A further 3x is planned, see below |
 | Per-call allocations | About 6 KB of managed allocations per call today. Zero-allocation API and typed C# calls are planned |
-| Voice | Whistle transcription matches the upstream library on record, test and hotword; long25 keeps the queen passage but differs by one short phrase (issue #38). Beam search is on by default (`BeamWidth = 3`), `BeamWidth = 1` gives faster greedy decoding |
+| Voice | Whistle transcription matches the upstream library on record, test and hotword; long25 keeps the queen passage but differs by one short phrase (issue #38). Beam search is on by default (`BeamWidth = 3`) on every path, including the allocation-free `TranscribeUtf8`, `PushToTalk`, `VoiceStream`, `VoiceSession` and `VoiceHost`; `BeamWidth = 1` gives faster greedy decoding. One `Whistle` instance runs one call at a time and throws if a second thread overlaps it |
 | Evaluating tool sets | `needle eval` with 208 game prompts, see below |
 | Unity | Package with a plain `MonoBehaviour` sample (Squad commander) and an Entities `ISystem` sample, see below |
 

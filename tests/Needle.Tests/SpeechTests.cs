@@ -1,6 +1,8 @@
 using System;
 using System.IO;
 using System.Linq;
+using System.Text;
+using System.Threading;
 using Xunit;
 
 namespace Needle.Tests;
@@ -171,5 +173,155 @@ public sealed class SpeechTests : IDisposable
         Assert.Equal(0, embedding.Length % 512);
         Assert.InRange(embedding.Length / 512, pcm.Length / 1280, pcm.Length / 1280 + 2);
         Assert.All(embedding, v => Assert.True(float.IsFinite(v)));
+    }
+
+    static void AssertSpanMatches(Transcription expected, SpeechSpan actual, byte[] utf8, WordSlice[] slices, string clip)
+    {
+        Assert.False(actual.Truncated, clip);
+        Assert.Equal(expected.Text, Encoding.UTF8.GetString(utf8, 0, actual.Utf8Length));
+        Assert.Equal(expected.Language, actual.Language);
+        var words = expected.Words!;
+        Assert.Equal(words.Count, actual.WordCount);
+        for (var i = 0; i < words.Count; i++)
+        {
+            Assert.Equal(words[i].Text, Encoding.UTF8.GetString(utf8, slices[i].Utf8Offset, slices[i].Utf8Length));
+            Assert.True(Math.Abs(words[i].Start - slices[i].Start) < 1e-9, $"{clip} word {i} start");
+            Assert.True(Math.Abs(words[i].End - slices[i].End) < 1e-9, $"{clip} word {i} end");
+            Assert.True(Math.Abs(words[i].Probability - slices[i].Probability) < 1e-6, $"{clip} word {i} probability");
+        }
+    }
+
+    [Fact]
+    public void BeamSpanMatchesTheAllocatingTranscript()
+    {
+        Assert.Equal(3, whistle.BeamWidth);
+        var utf8 = new byte[whistle.MaxTranscriptTokens * 64];
+        var slices = new WordSlice[whistle.MaxTranscriptTokens + 1];
+        foreach (var name in new[] { "record.wav", "test.wav", "hotword.wav" })
+        {
+            var pcm = Clip(name);
+            AssertSpanMatches(whistle.Transcribe(pcm, wordTimestamps: true), whistle.TranscribeUtf8(pcm, utf8, slices), utf8, slices, name);
+        }
+        var queen = Clip("test_long.wav").AsSpan(0, 25 * 16000).ToArray();
+        AssertSpanMatches(whistle.Transcribe(queen, "en", wordTimestamps: true), whistle.TranscribeUtf8(queen, utf8, slices, "en"), utf8, slices, "test_long.wav");
+        Assert.Contains("queen in Victoria", Encoding.UTF8.GetString(utf8, 0, whistle.TranscribeUtf8(queen, utf8, slices, "en").Utf8Length));
+        var keywords = new[] { "Omeprazole" };
+        var hotword = Clip("hotword.wav");
+        AssertSpanMatches(whistle.Transcribe(hotword, keywords: keywords, wordTimestamps: true), whistle.TranscribeUtf8(hotword, utf8, slices, keywords: keywords), utf8, slices, "hotword.wav keywords");
+    }
+
+    [Fact]
+    public void BeamSpanTranscriptionAllocatesNothingAfterWarmUp()
+    {
+        var pcm = Clip("record.wav");
+        var utf8 = new byte[whistle.MaxTranscriptTokens * 64];
+        var slices = new WordSlice[whistle.MaxTranscriptTokens + 1];
+        for (var i = 0; i < 2; i++) whistle.TranscribeUtf8(pcm, utf8, slices);
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        var speech = whistle.TranscribeUtf8(pcm, utf8, slices);
+        var allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+        Assert.True(speech.Utf8Length > 0);
+        Assert.Equal(0, allocated);
+    }
+
+    [Fact]
+    public void AnEmptyWordSpanStillReturnsTheText()
+    {
+        var pcm = Clip("record.wav");
+        var utf8 = new byte[whistle.MaxTranscriptTokens * 64];
+        var speech = whistle.TranscribeUtf8(pcm, utf8, Span<WordSlice>.Empty);
+        Assert.Equal(whistle.Transcribe(pcm).Text, Encoding.UTF8.GetString(utf8, 0, speech.Utf8Length));
+        Assert.Equal(0, speech.WordCount);
+        Assert.False(speech.Truncated);
+        Assert.Equal("en", speech.Language);
+    }
+
+    [Fact]
+    public void NonFiniteAudioIsTreatedAsSilence()
+    {
+        var pcm = Clip("record.wav");
+        pcm[pcm.Length / 2] = float.NaN;
+        Assert.Equal("", whistle.Transcribe(pcm).Text);
+        var utf8 = new byte[1024];
+        var slices = new WordSlice[64];
+        Assert.Equal(0, whistle.TranscribeUtf8(pcm, utf8, slices).Utf8Length);
+        pcm[pcm.Length / 2] = float.PositiveInfinity;
+        Assert.Equal("", whistle.Transcribe(pcm).Text);
+        Assert.Equal("In one short sentence, what is the speed of sound at sea level?", whistle.Transcribe(Clip("record.wav")).Text);
+    }
+
+    [Fact]
+    public void OverlappingCallsOnOneInstanceThrowInsteadOfSharingState()
+    {
+        var pcm = Clip("record.wav");
+        Exception? overlap = null;
+        var raised = 0;
+        whistle.Observer = (stage, _) =>
+        {
+            if (stage != "mel" || Interlocked.Exchange(ref raised, 1) != 0) return;
+            var other = new Thread(() =>
+            {
+                try { whistle.TranscribeUtf8(pcm, new byte[1024], new WordSlice[64]); }
+                catch (Exception error) { overlap = error; }
+            });
+            other.Start();
+            other.Join();
+        };
+        try { Assert.Equal("In one short sentence, what is the speed of sound at sea level?", whistle.Transcribe(pcm).Text); }
+        finally { whistle.Observer = null; }
+        Assert.IsType<InvalidOperationException>(overlap);
+        Assert.Equal("In one short sentence, what is the speed of sound at sea level?", whistle.Transcribe(pcm).Text);
+    }
+
+    [Fact]
+    public void DisposeIsIdempotentAndLaterCallsThrow()
+    {
+        var spare = new Whistle(model, 1);
+        Assert.Contains("speed of sound", spare.Transcribe(Clip("record.wav")).Text);
+        spare.Dispose();
+        spare.Dispose();
+        Assert.Throws<ObjectDisposedException>(() => spare.Transcribe(Clip("record.wav")));
+        Assert.Throws<ObjectDisposedException>(() => spare.TranscribeUtf8(Clip("record.wav"), new byte[64], new WordSlice[4]));
+    }
+
+    [Fact]
+    public void FullLengthWindowsTranscribeWithoutOverrunningTheirBuffers()
+    {
+        var pcm = Clip("test_long.wav").AsSpan(0, Whistle.MaxSeconds * 16000).ToArray();
+        var first = whistle.Transcribe(pcm, "en").Text;
+        Assert.Contains("queen", first);
+        Assert.Equal(first, whistle.Transcribe(pcm, "en").Text);
+    }
+
+    static byte[] WavBytes(ushort tag, ushort channels, uint rate, ushort blockAlign, int fmtLength = 16, int dataBytes = 4)
+    {
+        var fmt = new byte[fmtLength];
+        BitConverter.GetBytes(tag).CopyTo(fmt, 0);
+        if (fmtLength >= 4) BitConverter.GetBytes(channels).CopyTo(fmt, 2);
+        if (fmtLength >= 8) BitConverter.GetBytes(rate).CopyTo(fmt, 4);
+        if (fmtLength >= 14) BitConverter.GetBytes(blockAlign).CopyTo(fmt, 12);
+        var bytes = new System.Collections.Generic.List<byte>();
+        bytes.AddRange("RIFF"u8.ToArray());
+        bytes.AddRange(BitConverter.GetBytes(4 + 8 + fmtLength + 8 + dataBytes));
+        bytes.AddRange("WAVE"u8.ToArray());
+        bytes.AddRange("fmt "u8.ToArray());
+        bytes.AddRange(BitConverter.GetBytes(fmtLength));
+        bytes.AddRange(fmt);
+        bytes.AddRange("data"u8.ToArray());
+        bytes.AddRange(BitConverter.GetBytes(dataBytes));
+        bytes.AddRange(new byte[dataBytes]);
+        return bytes.ToArray();
+    }
+
+    [Fact]
+    public void MalformedWavHeadersAreRejectedAsInvalidData()
+    {
+        Assert.Equal(2, Wav.Decode(WavBytes(1, 1, 16000, 2)).Length);
+        Assert.Throws<InvalidDataException>(() => Wav.Decode(WavBytes(1, 0, 16000, 2)));
+        Assert.Throws<InvalidDataException>(() => Wav.Decode(WavBytes(1, 1, 16000, 2, fmtLength: 8)));
+        Assert.Throws<InvalidDataException>(() => Wav.Decode(WavBytes(1, 1, 16000, 0)));
+        Assert.Throws<InvalidDataException>(() => Wav.Decode(WavBytes(1, 1, 0, 2)));
+        Assert.Throws<InvalidDataException>(() => Wav.Decode(WavBytes(0xFFFE, 1, 16000, 2)));
+        Assert.Throws<InvalidDataException>(() => Wav.Decode("RIFF0000WAVX"u8.ToArray()));
     }
 }

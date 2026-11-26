@@ -20,16 +20,24 @@ public static class Wav
             var body = data.Slice(at + 8, size);
             if (data.Slice(at, 4).SequenceEqual("fmt "u8))
             {
+                if (body.Length < 16) throw new InvalidDataException("WAV fmt chunk is shorter than 16 bytes");
                 tag = BitConverter.ToUInt16(body[..2]);
                 channels = BitConverter.ToUInt16(body.Slice(2, 2));
                 rate = (int)BitConverter.ToUInt32(body.Slice(4, 4));
+                if (channels == 0) throw new InvalidDataException("WAV has zero channels");
                 width = BitConverter.ToUInt16(body.Slice(12, 2)) / channels;
-                if (tag == 0xFFFE) tag = BitConverter.ToUInt16(body.Slice(24, 2));
+                if (tag == 0xFFFE)
+                {
+                    if (body.Length < 26) throw new InvalidDataException("WAV extensible fmt chunk is shorter than 26 bytes");
+                    tag = BitConverter.ToUInt16(body.Slice(24, 2));
+                }
             }
             else if (data.Slice(at, 4).SequenceEqual("data"u8)) samples = body;
             at += 8 + size + (size & 1);
         }
         if (samples.IsEmpty) throw new InvalidDataException("WAV has no data chunk");
+        if (width < 1 || width > 8) throw new InvalidDataException($"unsupported WAV sample width {width} bytes");
+        if (rate < 1000 || rate > 768000) throw new InvalidDataException($"unsupported WAV sample rate {rate}");
         var frames = samples.Length / (width * channels);
         var mono = new float[frames];
         for (var f = 0; f < frames; f++)
