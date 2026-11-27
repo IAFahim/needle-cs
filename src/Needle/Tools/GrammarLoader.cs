@@ -23,6 +23,7 @@ internal static unsafe class GrammarLoader
         program->Bytes = CopyBytes(bytes);
         program->Root = root;
         program->ToolCount = toolCount;
+        program->Serial = Grammar.NextSerial();
         return program;
     }
 
