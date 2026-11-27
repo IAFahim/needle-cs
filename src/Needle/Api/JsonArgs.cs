@@ -91,7 +91,24 @@ internal static class JsonArgs
     }
 
     /// <summary>Copies a JSON string's contents with its escapes decoded.</summary>
-    public static bool TryUnescape(ReadOnlySpan<byte> escaped, Span<byte> destination, out int written)
+    public static bool TryUnescape(ReadOnlySpan<byte> escaped, Span<byte> destination, out int written) =>
+        Unescape(escaped, destination, false, out written);
+
+    /// <summary>Like <see cref="TryUnescape"/>, but keeps what fits, cut at a whole UTF-8 character.</summary>
+    public static void UnescapeTruncating(ReadOnlySpan<byte> escaped, Span<byte> destination, out int written)
+    {
+        if (Unescape(escaped, destination, true, out written)) return;
+        var cut = written;
+        while (cut > 0 && (destination[cut - 1] & 0xC0) == 0x80) cut--;
+        if (cut > 0 && destination[cut - 1] >= 0xC0)
+        {
+            var lead = destination[cut - 1];
+            var need = lead >= 0xF0 ? 4 : lead >= 0xE0 ? 3 : 2;
+            if (written - (cut - 1) < need) written = cut - 1;
+        }
+    }
+
+    static bool Unescape(ReadOnlySpan<byte> escaped, Span<byte> destination, bool partial, out int written)
     {
         written = 0;
         for (var i = 0; i < escaped.Length; i++)

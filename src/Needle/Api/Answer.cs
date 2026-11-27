@@ -85,7 +85,7 @@ public readonly ref struct Answer
         get
         {
             var live = Live;
-            return new CallList(live, version, live.Kind == AnswerKind.Calls ? live.Session.ViewCallCount : 0);
+            return new CallList(live, version, live.Kind == AnswerKind.Calls ? live.CallCount : 0);
         }
     }
 
@@ -95,7 +95,7 @@ public readonly ref struct Answer
         get
         {
             var live = Live;
-            return new CallList(live, version, live.Kind == AnswerKind.Refused ? live.Session.ViewCallCount : 0);
+            return new CallList(live, version, live.Kind == AnswerKind.Refused ? live.CallCount : 0);
         }
     }
 
@@ -123,7 +123,7 @@ public readonly ref struct Answer
     public float Confidence => Live.Last.Confidence;
 
     /// <summary>Values that the grounding gate could not find in the request, one per line.</summary>
-    public Utf8Span Ungrounded => new(Live.Session.Ungrounded);
+    public Utf8Span Ungrounded => new(Live.Ungrounded);
 
     /// <summary>Everything else: repair flags, both confidences, token counts and timings.</summary>
     public Reply Details => Live.Last;
@@ -220,12 +220,12 @@ public readonly ref struct Call
         {
             if (state.Version != version || !state.HasAnswer)
                 throw new InvalidOperationException("a later call on the same agent replaced this call; read what you need before you ask again");
-            return state.Session.ViewCall(Index);
+            return state.CallAt(Index);
         }
     }
 
     /// <summary>The tool's name, as written in the tools JSON.</summary>
-    public Utf8Span Name => new(state.Session.ToolNameUtf8(Span.Tool));
+    public Utf8Span Name => new(state.ToolName(Span.Tool));
 
     /// <summary>The position of the tool in the tools JSON.</summary>
     public int Tool => Span.Tool;
@@ -265,6 +265,36 @@ public readonly ref struct Call
     {
         value = 0;
         return JsonArgs.TryFind(Arguments.Bytes, name.AsSpan(), out var raw, out var isString) && !isString && Utf8Parser.TryParse(raw, out value, out var used) && used == raw.Length;
+    }
+
+    public bool TryGetSingle(string name, out float value)
+    {
+        value = 0;
+        return JsonArgs.TryFind(Arguments.Bytes, name.AsSpan(), out var raw, out var isString) && !isString && Utf8Parser.TryParse(raw, out value, out var used) && used == raw.Length;
+    }
+
+    /// <summary>Copies a string argument into a fixed buffer, escapes decoded, cut at a whole character if it is too long.</summary>
+    public bool TryGetText(string name, Span<byte> destination, out int written)
+    {
+        written = 0;
+        if (!JsonArgs.TryFind(Arguments.Bytes, name.AsSpan(), out var raw, out var isString) || !isString) return false;
+        JsonArgs.UnescapeTruncating(raw, destination, out written);
+        return true;
+    }
+
+    /// <summary>
+    /// True when this is a call to the tool whose arguments <typeparamref name="TArgs"/> holds, with the arguments read into
+    /// <paramref name="args"/>. The argument structs are generated for each method of a <c>[Tools]</c> interface.
+    /// </summary>
+    public bool Is<TArgs>(out TArgs args) where TArgs : struct, IToolArgs<TArgs>
+    {
+        var reader = default(TArgs);
+        if (!Name.Equals(reader.ToolName))
+        {
+            args = default;
+            return false;
+        }
+        return reader.TryRead(this, out args);
     }
 
     public bool TryGetBoolean(string name, out bool value)
