@@ -762,4 +762,24 @@ public sealed unsafe class NeonTests
             NativeMemory.Free(expectedScales); NativeMemory.Free(actualScales);
         }
     }
+
+    [Theory]
+    [InlineData(5)]
+    [InlineData(6)]
+    [InlineData(7)]
+    [InlineData(8)]
+    [InlineData(23)]
+    public void LoadFactorsTailMatchesScalarHalves(int groups)
+    {
+        if (!Simd.UseNeon) return;
+        var norms = stackalloc ushort[groups];
+        var specials = new ushort[] { 0x3C00, 0x0001, 0x03FF, 0x8000, 0x0000, 0x8123, 0x1555, 0xB800 };
+        var random = new Random(groups);
+        for (var g = 0; g < groups; g++) norms[g] = g < 4 ? (ushort)random.Next(0x0400, 0x7BFF) : specials[(g + groups) % specials.Length];
+        var factors = stackalloc float[groups + 8];
+        for (var i = 0; i < groups + 8; i++) factors[i] = float.NaN;
+        Neon.LoadFactors(norms, groups, 0.37f, factors);
+        for (var g = (groups & ~3); g < groups; g++)
+            Assert.Equal(BitConverter.SingleToInt32Bits(Scalar.HalfToSingle(norms[g]) * 0.37f), BitConverter.SingleToInt32Bits(factors[g]));
+    }
 }

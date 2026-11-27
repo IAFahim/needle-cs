@@ -237,6 +237,7 @@ internal static unsafe class NeonGemv
             var single = AdvSimd.Or(AdvSimd.And(bits, nonZero), sign).AsSingle();
             return AdvSimd.Multiply(single, multiplier);
         }
+        if (v < groups && groups >= 4) return AdvSimd.Multiply(Neon.HalfTail(norms, groups), multiplier);
         return Vector128.Create(
             v < groups ? Scalar.HalfToSingle(norms[v]) * byteScale : 0f,
             v + 1 < groups ? Scalar.HalfToSingle(norms[v + 1]) * byteScale : 0f,

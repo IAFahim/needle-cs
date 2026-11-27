@@ -398,7 +398,30 @@ internal static unsafe class Neon
             var single = AdvSimd.Or(AdvSimd.And(bits, nonZero), sign).AsSingle();
             AdvSimd.Store(factors + g, AdvSimd.Multiply(single, multiplier));
         }
-        for (; g < groups; g++) factors[g] = Scalar.HalfToSingle(norms[g]) * scale;
+        if (g < groups && groups >= 4) AdvSimd.Store(factors + g, AdvSimd.Multiply(HalfTail(norms, groups), multiplier));
+        else for (; g < groups; g++) factors[g] = Scalar.HalfToSingle(norms[g]) * scale;
+    }
+
+    // Scalar.HalfToSingle of a row's last groups % 4 halves (groups >= 4, groups % 4 != 0), zero in
+    // the lanes after them: one load of the last four halves, shifted down past the ones already done.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static Vector128<float> HalfTail(ushort* norms, int groups)
+    {
+        var missing = 4 - (groups & 3);
+        var packed = AdvSimd.ShiftLogicalScalar(AdvSimd.LoadVector64((ulong*)(norms + groups - 4)), Vector64.Create(-16L * missing));
+        return ExactHalves(AdvSimd.ZeroExtendWideningLower(packed.AsUInt16()));
+    }
+
+    // Scalar.HalfToSingle per lane, subnormals and the +0 for a zero magnitude included.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    static Vector128<float> ExactHalves(Vector128<uint> wide)
+    {
+        var magnitude = AdvSimd.And(wide, Vector128.Create(0x7FFFu));
+        var sign = AdvSimd.ShiftLeftLogical(AdvSimd.And(wide, Vector128.Create(0x8000u)), 16);
+        var normal = AdvSimd.Or(AdvSimd.Add(AdvSimd.ShiftLeftLogical(magnitude, 13), Vector128.Create(0x38000000u)), sign);
+        var subnormal = AdvSimd.Or(AdvSimd.Multiply(AdvSimd.ConvertToSingle(magnitude), Vector128.Create(5.9604645e-8f)).AsUInt32(), sign);
+        var value = AdvSimd.BitwiseSelect(AdvSimd.CompareLessThan(magnitude, Vector128.Create(0x400u)), subnormal, normal);
+        return AdvSimd.And(value, AdvSimd.CompareGreaterThan(magnitude, Vector128<uint>.Zero)).AsSingle();
     }
 
     public static float ScaleFactors(float* factors, float* scaled, float* scales, float* offsets, int stride)
