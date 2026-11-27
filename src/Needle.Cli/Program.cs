@@ -13,6 +13,8 @@ return args switch
     ["verify", var model, var golden] => Verify(model, golden),
     ["bench", var model, .. var options] => BenchKernels.Run(model, options),
     ["bench-e2e", var model, var tools, .. var options] => BenchE2E.Run(model, tools, options),
+    ["decode-hash", var hmodel, var htools, .. var hoptions] => DecodeHash.Run(hmodel, htools, hoptions),
+    ["bench-contention", var cmodel, var ctools, .. var coptions] => BenchContention.Run(cmodel, ctools, coptions),
     ["generate", var model, var text, .. var count] => Generate(model, text, count.Length > 0 ? int.Parse(count[0]) : 80),
     ["transcribe", var model, var wav, .. var options] => Transcribe(model, wav, options),
     ["stream", var model, var wav, .. var soptions] => StreamClip(model, wav, soptions),
@@ -34,6 +36,8 @@ static int Usage()
     Console.Error.WriteLine("needle run <model.cact> <tools.json> <query> [repeat]");
     Console.Error.WriteLine("needle bench <needle3.cact> [--threads 4] [--json]");
     Console.Error.WriteLine("needle bench-e2e <needle3.cact> <tools.json> [--threads 1,2,4] [--reps N] [--sets golden|game|all] [--api span|text] [--profile] [--json] [--system TEXT] [--auto-date] [--reasoning N] [--retrieval K] [--product] [--max-managed-bytes N] [--max-native-allocs N]");
+    Console.Error.WriteLine("needle bench-contention <needle3.cact> <tools.json> [--threads 4] [--hogs 0,N] [--policies default,game] [--gap-us 0,300] [--asks 6] [--decode 40] [--paths session-default,host-game,agent-post-game,...] [--no-engine]");
+    Console.Error.WriteLine("needle decode-hash <needle3.cact> <tools.json> [--threads 1,2,3,4,6,8] [--decode 48]");
     Console.Error.WriteLine(Eval.Usage);
     Console.Error.WriteLine(EvalSuites.Usage);
     Console.Error.WriteLine("needle serve <needle3.cact> <tools.json> [options] (stdin JSON lines -> stdout replies)");
