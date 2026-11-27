@@ -268,6 +268,11 @@ public sealed unsafe class ApiBughuntTests
         WideCommands.Dispatch(ref handler, command);
         Assert.Equal(3, handler.LastCount);
         Assert.True(handler.LastGift);
+
+        Assert.True(WideCommands.TryBind(new FunctionCall("place_order", "{\"itemCount\":4,\"giftWrap\":true}"), out var camel));
+        Assert.Equal(0b11u, camel.Presence);
+        WideCommands.Dispatch(ref handler, camel);
+        Assert.Equal(4, handler.LastCount);
     }
 
     [Fact]

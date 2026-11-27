@@ -473,11 +473,15 @@ internal static class Emitter
             builder.Append(indent).Append("                    {\n");
             builder.Append(indent).Append("                        switch (member.Key)\n");
             builder.Append(indent).Append("                        {\n");
+            var labels = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var arg in tool.Args) labels.Add(arg.Alias);
             for (var p = 0; p < tool.Args.Length; p++)
             {
                 var arg = tool.Args[p];
                 var target = $"command.{tool.Name}.{Pascal(arg.Name)}";
                 builder.Append(indent).Append("                            case \"").Append(CSharpEscape(arg.Alias)).Append("\":\n");
+                if (labels.Add(arg.Name))
+                    builder.Append(indent).Append("                            case \"").Append(CSharpEscape(arg.Name)).Append("\":\n");
                 switch (arg.Type)
                 {
                     case ArgType.Int:

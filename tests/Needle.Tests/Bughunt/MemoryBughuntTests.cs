@@ -156,7 +156,8 @@ internal sealed class SyntheticCact
 
 internal static unsafe class GuardedMemory
 {
-    const int ProtNone = 0, ProtRead = 1, ProtWrite = 2, MapPrivate = 2, MapAnonymous = 0x20;
+    const int ProtNone = 0, ProtRead = 1, ProtWrite = 2, MapPrivate = 2;
+    const uint MemCommitReserve = 0x3000, PageReadWrite = 0x04, PageNoAccess = 0x01;
 
     [DllImport("libc", SetLastError = true)]
     static extern nint mmap(nint address, nuint length, int protection, int flags, int fd, nint offset);
@@ -164,13 +165,31 @@ internal static unsafe class GuardedMemory
     [DllImport("libc", SetLastError = true)]
     static extern int mprotect(nint address, nuint length, int protection);
 
+    [DllImport("kernel32", SetLastError = true)]
+    static extern nint VirtualAlloc(nint address, nuint size, uint allocationType, uint protection);
+
+    [DllImport("kernel32", SetLastError = true)]
+    static extern int VirtualProtect(nint address, nuint size, uint protection, out uint old);
+
     public static byte* AgainstGuardPage(byte[] bytes)
     {
-        const int page = 4096;
+        var page = Environment.SystemPageSize;
         var pages = (bytes.Length + page - 1) / page + 1;
-        var region = mmap(0, (nuint)(pages * page), ProtRead | ProtWrite, MapPrivate | MapAnonymous, -1, 0);
-        if (region == -1) throw new InvalidOperationException("mmap failed");
-        if (mprotect(region + (pages - 1) * page, page, ProtNone) != 0) throw new InvalidOperationException("mprotect failed");
+        var length = (nuint)((long)pages * page);
+        nint region;
+        if (OperatingSystem.IsWindows())
+        {
+            region = VirtualAlloc(0, length, MemCommitReserve, PageReadWrite);
+            if (region == 0) throw new InvalidOperationException("VirtualAlloc failed");
+            if (VirtualProtect(region + (pages - 1) * page, (nuint)page, PageNoAccess, out _) == 0) throw new InvalidOperationException("VirtualProtect failed");
+        }
+        else
+        {
+            var anonymous = OperatingSystem.IsMacOS() ? 0x1000 : 0x20;
+            region = mmap(0, length, ProtRead | ProtWrite, MapPrivate | anonymous, -1, 0);
+            if (region == -1) throw new InvalidOperationException("mmap failed");
+            if (mprotect(region + (pages - 1) * page, (nuint)page, ProtNone) != 0) throw new InvalidOperationException("mprotect failed");
+        }
         var start = (byte*)region + (pages - 1) * page - bytes.Length;
         Marshal.Copy(bytes, 0, (nint)start, bytes.Length);
         return start;

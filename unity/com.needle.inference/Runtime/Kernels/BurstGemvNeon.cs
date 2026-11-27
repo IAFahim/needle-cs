@@ -155,17 +155,25 @@ namespace Needle.BurstKernels
             for (; g < groups; g++) factors[g] = HalfToSingle(norms[g]) * scale;
         }
 
-        static float ScaleFactors(float* factors, float* scaled, float* scales, float* offsets, int stride)
+        static float ScaleFactors(float* factors, float* scaled, float* scales, float* offsets, int groups)
         {
             if (!Arm.Neon.IsNeonSupported) return 0f;
             v128 bias = Arm.Neon.vdupq_n_f32(0f);
-            for (var v = 0; v < stride; v += 4)
+            var v = 0;
+            for (; v + 4 <= groups; v += 4)
             {
                 v128 f = Arm.Neon.vmulq_f32(Arm.Neon.vld1q_f32(factors + v), Arm.Neon.vld1q_f32(scales + v));
                 Arm.Neon.vst1q_f32(scaled + v, f);
                 bias = Arm.Neon.vfmaq_f32(bias, f, Arm.Neon.vld1q_f32(offsets + v));
             }
-            return HorizontalSumNeon(bias);
+            float total = HorizontalSumNeon(bias);
+            for (; v < groups; v++)
+            {
+                float f = factors[v] * scales[v];
+                scaled[v] = f;
+                total += f * offsets[v];
+            }
+            return total;
         }
 
         static v128 Weights(v128 table, v128 index)
@@ -205,7 +213,7 @@ namespace Needle.BurstKernels
         {
             if (!Arm.Neon.IsNeonSupported) return 0f;
             var groups = a.Groups;
-            float bias = ScaleFactors(factors, scaled, a.Scales + token * a.Stride, a.Offsets + token * a.Stride, a.Stride);
+            float bias = ScaleFactors(factors, scaled, a.Scales + token * a.Stride, a.Offsets + token * a.Stride, a.Groups);
             v128 table = Arm.Neon.vld1q_u8(w.Book->Bytes);
             v128 mask = w.Bits == 2 ? Arm.Neon.vdupq_n_u8(3) : Arm.Neon.vdupq_n_u8(15);
             sbyte* values = a.Values + (long)token * a.Cols;
@@ -235,10 +243,10 @@ namespace Needle.BurstKernels
             var groups = a.Groups;
             var stride = a.Stride;
             var cols = a.Cols;
-            float bias0 = ScaleFactors(factors, scaled, a.Scales + token * stride, a.Offsets + token * stride, stride);
-            float bias1 = ScaleFactors(factors, scaled + stride, a.Scales + (token + 1) * stride, a.Offsets + (token + 1) * stride, stride);
-            float bias2 = ScaleFactors(factors, scaled + 2 * stride, a.Scales + (token + 2) * stride, a.Offsets + (token + 2) * stride, stride);
-            float bias3 = ScaleFactors(factors, scaled + 3 * stride, a.Scales + (token + 3) * stride, a.Offsets + (token + 3) * stride, stride);
+            float bias0 = ScaleFactors(factors, scaled, a.Scales + token * stride, a.Offsets + token * stride, a.Groups);
+            float bias1 = ScaleFactors(factors, scaled + stride, a.Scales + (token + 1) * stride, a.Offsets + (token + 1) * stride, a.Groups);
+            float bias2 = ScaleFactors(factors, scaled + 2 * stride, a.Scales + (token + 2) * stride, a.Offsets + (token + 2) * stride, a.Groups);
+            float bias3 = ScaleFactors(factors, scaled + 3 * stride, a.Scales + (token + 3) * stride, a.Offsets + (token + 3) * stride, a.Groups);
             v128 table = Arm.Neon.vld1q_u8(w.Book->Bytes);
             v128 mask = w.Bits == 2 ? Arm.Neon.vdupq_n_u8(3) : Arm.Neon.vdupq_n_u8(15);
             sbyte* v0 = a.Values + (long)token * cols;
@@ -302,10 +310,10 @@ namespace Needle.BurstKernels
             var stride = a.Stride;
             for (var r = 0; r < 4; r++)
                 LoadFactors(norms + (long)r * groups, groups, w.Book->ByteScale, rowFactors + r * stride);
-            float bias0 = ScaleFactors(rowFactors, scaled, a.Scales + token * stride, a.Offsets + token * stride, stride);
-            float bias1 = ScaleFactors(rowFactors + stride, scaled + stride, a.Scales + token * stride, a.Offsets + token * stride, stride);
-            float bias2 = ScaleFactors(rowFactors + 2 * stride, scaled + 2 * stride, a.Scales + token * stride, a.Offsets + token * stride, stride);
-            float bias3 = ScaleFactors(rowFactors + 3 * stride, scaled + 3 * stride, a.Scales + token * stride, a.Offsets + token * stride, stride);
+            float bias0 = ScaleFactors(rowFactors, scaled, a.Scales + token * stride, a.Offsets + token * stride, a.Groups);
+            float bias1 = ScaleFactors(rowFactors + stride, scaled + stride, a.Scales + token * stride, a.Offsets + token * stride, a.Groups);
+            float bias2 = ScaleFactors(rowFactors + 2 * stride, scaled + 2 * stride, a.Scales + token * stride, a.Offsets + token * stride, a.Groups);
+            float bias3 = ScaleFactors(rowFactors + 3 * stride, scaled + 3 * stride, a.Scales + token * stride, a.Offsets + token * stride, a.Groups);
             sbyte* values = a.Values + (long)token * a.Cols;
             var accumulator0 = 0f;
             var accumulator1 = 0f;
@@ -381,14 +389,14 @@ namespace Needle.BurstKernels
             var cols = a.Cols;
             LoadFactors(norms, groups, w.Book->ByteScale, rowFactors);
             LoadFactors(norms + groups, groups, w.Book->ByteScale, rowFactors + stride);
-            float bias00 = ScaleFactors(rowFactors, scaled, a.Scales + token * stride, a.Offsets + token * stride, stride);
-            float bias01 = ScaleFactors(rowFactors, scaled + stride, a.Scales + (token + 1) * stride, a.Offsets + (token + 1) * stride, stride);
-            float bias02 = ScaleFactors(rowFactors, scaled + 2 * stride, a.Scales + (token + 2) * stride, a.Offsets + (token + 2) * stride, stride);
-            float bias03 = ScaleFactors(rowFactors, scaled + 3 * stride, a.Scales + (token + 3) * stride, a.Offsets + (token + 3) * stride, stride);
-            float bias10 = ScaleFactors(rowFactors + stride, scaled + 4 * stride, a.Scales + token * stride, a.Offsets + token * stride, stride);
-            float bias11 = ScaleFactors(rowFactors + stride, scaled + 5 * stride, a.Scales + (token + 1) * stride, a.Offsets + (token + 1) * stride, stride);
-            float bias12 = ScaleFactors(rowFactors + stride, scaled + 6 * stride, a.Scales + (token + 2) * stride, a.Offsets + (token + 2) * stride, stride);
-            float bias13 = ScaleFactors(rowFactors + stride, scaled + 7 * stride, a.Scales + (token + 3) * stride, a.Offsets + (token + 3) * stride, stride);
+            float bias00 = ScaleFactors(rowFactors, scaled, a.Scales + token * stride, a.Offsets + token * stride, a.Groups);
+            float bias01 = ScaleFactors(rowFactors, scaled + stride, a.Scales + (token + 1) * stride, a.Offsets + (token + 1) * stride, a.Groups);
+            float bias02 = ScaleFactors(rowFactors, scaled + 2 * stride, a.Scales + (token + 2) * stride, a.Offsets + (token + 2) * stride, a.Groups);
+            float bias03 = ScaleFactors(rowFactors, scaled + 3 * stride, a.Scales + (token + 3) * stride, a.Offsets + (token + 3) * stride, a.Groups);
+            float bias10 = ScaleFactors(rowFactors + stride, scaled + 4 * stride, a.Scales + token * stride, a.Offsets + token * stride, a.Groups);
+            float bias11 = ScaleFactors(rowFactors + stride, scaled + 5 * stride, a.Scales + (token + 1) * stride, a.Offsets + (token + 1) * stride, a.Groups);
+            float bias12 = ScaleFactors(rowFactors + stride, scaled + 6 * stride, a.Scales + (token + 2) * stride, a.Offsets + (token + 2) * stride, a.Groups);
+            float bias13 = ScaleFactors(rowFactors + stride, scaled + 7 * stride, a.Scales + (token + 3) * stride, a.Offsets + (token + 3) * stride, a.Groups);
             sbyte* v0 = a.Values + (long)token * cols;
             sbyte* v1 = v0 + cols;
             sbyte* v2 = v1 + cols;
