@@ -313,7 +313,20 @@ internal static unsafe class Neon
             var x = output + h * vDim;
             var g = gate + h * vDim;
             var peak = Vector128<float>.Zero;
+            var peak1 = Vector128<float>.Zero;
             var i = 0;
+            for (; i + 8 <= vDim; i += 8)
+            {
+                var e0 = Exp(AdvSimd.Negate(AdvSimd.LoadVector128(g + i)));
+                var e1 = Exp(AdvSimd.Negate(AdvSimd.LoadVector128(g + i + 4)));
+                var v0 = AdvSimd.Multiply(AdvSimd.LoadVector128(x + i), AdvSimd.Arm64.Divide(Vector128.Create(1f), AdvSimd.Add(Vector128.Create(1f), e0)));
+                var v1 = AdvSimd.Multiply(AdvSimd.LoadVector128(x + i + 4), AdvSimd.Arm64.Divide(Vector128.Create(1f), AdvSimd.Add(Vector128.Create(1f), e1)));
+                AdvSimd.Store(x + i, v0);
+                AdvSimd.Store(x + i + 4, v1);
+                peak = AdvSimd.Max(peak, AdvSimd.Abs(v0));
+                peak1 = AdvSimd.Max(peak1, AdvSimd.Abs(v1));
+            }
+            peak = AdvSimd.Max(peak, peak1);
             for (; i + 4 <= vDim; i += 4)
             {
                 var v = AdvSimd.Multiply(AdvSimd.LoadVector128(x + i), Sigmoid(AdvSimd.LoadVector128(g + i)));
@@ -623,7 +636,86 @@ internal static unsafe class Neon
     static Vector128<float> Gather(float* source, int* permutation) =>
         Vector128.Create(source[permutation[0]], source[permutation[1]], source[permutation[2]], source[permutation[3]]);
 
+    // Four independent vectors per step, so the long FMA and exp chains of neighbouring columns
+    // overlap; each column's arithmetic is PermuteModulateActivateSingle's.
     public static void PermuteModulateActivate(int* permutation, float* source, float* d2, float* weights, float* condU, float* b2, int width, float* destination)
+    {
+        var w0 = Vector128.Create(weights[0]);
+        var w1 = Vector128.Create(weights[1]);
+        var w2 = Vector128.Create(weights[2]);
+        var w3 = Vector128.Create(weights[3]);
+        var w4 = Vector128.Create(weights[4]);
+        var w5 = Vector128.Create(weights[5]);
+        var w6 = Vector128.Create(weights[6]);
+        var w7 = Vector128.Create(weights[7]);
+        var one = Vector128.Create(1f);
+        var i = 0;
+        for (; i + 16 <= width; i += 16)
+        {
+            var c0 = AdvSimd.FusedMultiplyAdd(one, w0, AdvSimd.LoadVector128(condU + i));
+            var c1 = AdvSimd.FusedMultiplyAdd(one, w0, AdvSimd.LoadVector128(condU + i + 4));
+            var c2 = AdvSimd.FusedMultiplyAdd(one, w0, AdvSimd.LoadVector128(condU + i + 8));
+            var c3 = AdvSimd.FusedMultiplyAdd(one, w0, AdvSimd.LoadVector128(condU + i + 12));
+            c0 = AdvSimd.FusedMultiplyAdd(c0, w1, AdvSimd.LoadVector128(condU + 1 * width + i));
+            c1 = AdvSimd.FusedMultiplyAdd(c1, w1, AdvSimd.LoadVector128(condU + 1 * width + i + 4));
+            c2 = AdvSimd.FusedMultiplyAdd(c2, w1, AdvSimd.LoadVector128(condU + 1 * width + i + 8));
+            c3 = AdvSimd.FusedMultiplyAdd(c3, w1, AdvSimd.LoadVector128(condU + 1 * width + i + 12));
+            c0 = AdvSimd.FusedMultiplyAdd(c0, w2, AdvSimd.LoadVector128(condU + 2 * width + i));
+            c1 = AdvSimd.FusedMultiplyAdd(c1, w2, AdvSimd.LoadVector128(condU + 2 * width + i + 4));
+            c2 = AdvSimd.FusedMultiplyAdd(c2, w2, AdvSimd.LoadVector128(condU + 2 * width + i + 8));
+            c3 = AdvSimd.FusedMultiplyAdd(c3, w2, AdvSimd.LoadVector128(condU + 2 * width + i + 12));
+            c0 = AdvSimd.FusedMultiplyAdd(c0, w3, AdvSimd.LoadVector128(condU + 3 * width + i));
+            c1 = AdvSimd.FusedMultiplyAdd(c1, w3, AdvSimd.LoadVector128(condU + 3 * width + i + 4));
+            c2 = AdvSimd.FusedMultiplyAdd(c2, w3, AdvSimd.LoadVector128(condU + 3 * width + i + 8));
+            c3 = AdvSimd.FusedMultiplyAdd(c3, w3, AdvSimd.LoadVector128(condU + 3 * width + i + 12));
+            c0 = AdvSimd.FusedMultiplyAdd(c0, w4, AdvSimd.LoadVector128(condU + 4 * width + i));
+            c1 = AdvSimd.FusedMultiplyAdd(c1, w4, AdvSimd.LoadVector128(condU + 4 * width + i + 4));
+            c2 = AdvSimd.FusedMultiplyAdd(c2, w4, AdvSimd.LoadVector128(condU + 4 * width + i + 8));
+            c3 = AdvSimd.FusedMultiplyAdd(c3, w4, AdvSimd.LoadVector128(condU + 4 * width + i + 12));
+            c0 = AdvSimd.FusedMultiplyAdd(c0, w5, AdvSimd.LoadVector128(condU + 5 * width + i));
+            c1 = AdvSimd.FusedMultiplyAdd(c1, w5, AdvSimd.LoadVector128(condU + 5 * width + i + 4));
+            c2 = AdvSimd.FusedMultiplyAdd(c2, w5, AdvSimd.LoadVector128(condU + 5 * width + i + 8));
+            c3 = AdvSimd.FusedMultiplyAdd(c3, w5, AdvSimd.LoadVector128(condU + 5 * width + i + 12));
+            c0 = AdvSimd.FusedMultiplyAdd(c0, w6, AdvSimd.LoadVector128(condU + 6 * width + i));
+            c1 = AdvSimd.FusedMultiplyAdd(c1, w6, AdvSimd.LoadVector128(condU + 6 * width + i + 4));
+            c2 = AdvSimd.FusedMultiplyAdd(c2, w6, AdvSimd.LoadVector128(condU + 6 * width + i + 8));
+            c3 = AdvSimd.FusedMultiplyAdd(c3, w6, AdvSimd.LoadVector128(condU + 6 * width + i + 12));
+            c0 = AdvSimd.FusedMultiplyAdd(c0, w7, AdvSimd.LoadVector128(condU + 7 * width + i));
+            c1 = AdvSimd.FusedMultiplyAdd(c1, w7, AdvSimd.LoadVector128(condU + 7 * width + i + 4));
+            c2 = AdvSimd.FusedMultiplyAdd(c2, w7, AdvSimd.LoadVector128(condU + 7 * width + i + 8));
+            c3 = AdvSimd.FusedMultiplyAdd(c3, w7, AdvSimd.LoadVector128(condU + 7 * width + i + 12));
+            var v0 = AdvSimd.FusedMultiplyAdd(AdvSimd.LoadVector128(b2 + i), AdvSimd.Multiply(AdvSimd.LoadVector128(d2 + i), c0), Gather(source, permutation + i));
+            var v1 = AdvSimd.FusedMultiplyAdd(AdvSimd.LoadVector128(b2 + i + 4), AdvSimd.Multiply(AdvSimd.LoadVector128(d2 + i + 4), c1), Gather(source, permutation + i + 4));
+            var v2 = AdvSimd.FusedMultiplyAdd(AdvSimd.LoadVector128(b2 + i + 8), AdvSimd.Multiply(AdvSimd.LoadVector128(d2 + i + 8), c2), Gather(source, permutation + i + 8));
+            var v3 = AdvSimd.FusedMultiplyAdd(AdvSimd.LoadVector128(b2 + i + 12), AdvSimd.Multiply(AdvSimd.LoadVector128(d2 + i + 12), c3), Gather(source, permutation + i + 12));
+            var e0 = Exp(AdvSimd.Negate(v0));
+            var e1 = Exp(AdvSimd.Negate(v1));
+            var e2 = Exp(AdvSimd.Negate(v2));
+            var e3 = Exp(AdvSimd.Negate(v3));
+            AdvSimd.Store(destination + i, AdvSimd.Multiply(v0, AdvSimd.Arm64.Divide(one, AdvSimd.Add(one, e0))));
+            AdvSimd.Store(destination + i + 4, AdvSimd.Multiply(v1, AdvSimd.Arm64.Divide(one, AdvSimd.Add(one, e1))));
+            AdvSimd.Store(destination + i + 8, AdvSimd.Multiply(v2, AdvSimd.Arm64.Divide(one, AdvSimd.Add(one, e2))));
+            AdvSimd.Store(destination + i + 12, AdvSimd.Multiply(v3, AdvSimd.Arm64.Divide(one, AdvSimd.Add(one, e3))));
+        }
+        for (; i < width; i += 4)
+        {
+            var condition = AdvSimd.FusedMultiplyAdd(one, w0, AdvSimd.LoadVector128(condU + i));
+            condition = AdvSimd.FusedMultiplyAdd(condition, w1, AdvSimd.LoadVector128(condU + width + i));
+            condition = AdvSimd.FusedMultiplyAdd(condition, w2, AdvSimd.LoadVector128(condU + 2 * width + i));
+            condition = AdvSimd.FusedMultiplyAdd(condition, w3, AdvSimd.LoadVector128(condU + 3 * width + i));
+            condition = AdvSimd.FusedMultiplyAdd(condition, w4, AdvSimd.LoadVector128(condU + 4 * width + i));
+            condition = AdvSimd.FusedMultiplyAdd(condition, w5, AdvSimd.LoadVector128(condU + 5 * width + i));
+            condition = AdvSimd.FusedMultiplyAdd(condition, w6, AdvSimd.LoadVector128(condU + 6 * width + i));
+            condition = AdvSimd.FusedMultiplyAdd(condition, w7, AdvSimd.LoadVector128(condU + 7 * width + i));
+            var v = AdvSimd.FusedMultiplyAdd(
+                AdvSimd.LoadVector128(b2 + i),
+                AdvSimd.Multiply(AdvSimd.LoadVector128(d2 + i), condition),
+                Gather(source, permutation + i));
+            AdvSimd.Store(destination + i, AdvSimd.Multiply(v, Sigmoid(v)));
+        }
+    }
+
+    internal static void PermuteModulateActivateSingle(int* permutation, float* source, float* d2, float* weights, float* condU, float* b2, int width, float* destination)
     {
         var w0 = Vector128.Create(weights[0]);
         var w1 = Vector128.Create(weights[1]);

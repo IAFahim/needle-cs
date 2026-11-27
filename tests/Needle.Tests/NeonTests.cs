@@ -802,6 +802,39 @@ public sealed unsafe class NeonTests
         AssertBits(live, rows + width, 2 * width, "TapsHead history");
     }
 
+    [Theory]
+    [InlineData(1024)]
+    [InlineData(1044)]
+    public void PermuteModulateActivateIsBitExactToSingleVectors(int width)
+    {
+        if (!Simd.UseNeon) return;
+        var permutation = (int*)NativeMemory.Alloc((nuint)width * 4);
+        var source = (float*)NativeMemory.Alloc((nuint)width * 4);
+        var d2 = (float*)NativeMemory.Alloc((nuint)width * 4);
+        var b2 = (float*)NativeMemory.Alloc((nuint)width * 4);
+        var condU = (float*)NativeMemory.Alloc((nuint)width * 8 * 4);
+        var expected = (float*)NativeMemory.Alloc((nuint)width * 4);
+        var actual = (float*)NativeMemory.Alloc((nuint)width * 4);
+        var weights = stackalloc float[8];
+        try
+        {
+            for (var i = 0; i < width; i++) permutation[i] = (i * 389 + 17) % width;
+            Fill(source, width, 91, 6f);
+            Fill(d2, width, 92, 2f);
+            Fill(b2, width, 93);
+            Fill(condU, width * 8, 94);
+            Fill(weights, 8, 95);
+            Neon.PermuteModulateActivateSingle(permutation, source, d2, weights, condU, b2, width, expected);
+            Neon.PermuteModulateActivate(permutation, source, d2, weights, condU, b2, width, actual);
+            AssertBits(actual, expected, width, "PermuteModulateActivate");
+        }
+        finally
+        {
+            NativeMemory.Free(permutation); NativeMemory.Free(source); NativeMemory.Free(d2); NativeMemory.Free(b2);
+            NativeMemory.Free(condU); NativeMemory.Free(expected); NativeMemory.Free(actual);
+        }
+    }
+
     [Fact]
     public void CombineDiff4x4IsBitExactToFourCombines()
     {
