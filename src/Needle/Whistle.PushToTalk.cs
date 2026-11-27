@@ -215,16 +215,12 @@ public sealed class VoiceStream
     {
         var i = 0;
         var j = 0;
-        while (i < a.Length && j < b.Length)
+        for (;;)
         {
             var x = FoldStep(a, ref i);
-            var y = FoldStep(b, ref j);
-            if (x != y) return false;
-            if (x < 0) break;
+            if (x != FoldStep(b, ref j)) return false;
+            if (x < 0) return true;
         }
-        while (i < a.Length && FoldStep(a, ref i) < 0) { }
-        while (j < b.Length && FoldStep(b, ref j) < 0) { }
-        return i >= a.Length && j >= b.Length;
     }
 
     static int FoldStep(ReadOnlySpan<byte> s, ref int i)
