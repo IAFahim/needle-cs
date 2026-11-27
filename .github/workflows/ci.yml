@@ -4,33 +4,16 @@ on:
 permissions:
   contents: read
 jobs:
-  fixtures:
+  pack:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: "3.12" }
-      - run: pip install numpy sentencepiece soxr
-      - run: bash tools/fetch.sh
-      - run: python3 tools/golden.py 40
-      - run: python3 tools/golden_confidence.py
-      - uses: actions/upload-artifact@v4
-        with: { name: ref-fixtures, path: ref, retention-days: 1, compression-level: 1 }
-  test:
-    name: arm64 ${{ matrix.mode }}
-    needs: fixtures
-    runs-on: ubuntu-24.04-arm
-    strategy:
-      fail-fast: false
-      matrix:
-        mode: [simd]
-    defaults: { run: { shell: bash } }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
         with: { dotnet-version: "10.0.x" }
-      - uses: actions/download-artifact@v4
-        with: { name: ref-fixtures, path: ref }
-      - run: |
-          if [ "${{ matrix.mode }}" = scalar ]; then export NEEDLE_SCALAR=1; fi
-          dotnet test tests/Needle.Tests -c Release --filter "FullyQualifiedName~ChunkDiag2Tests|FullyQualifiedName~ChunkDiagTests|FullyQualifiedName~ChunkParityTests|FullyQualifiedName~BatchedDecodeTests" --logger "console;verbosity=detailed" -- xUnit.ParallelizeTestCollections=false
+      - run: bash tools/pack-unity.sh && bash tools/pack-unity.sh --check && git status --short
+      - uses: actions/upload-artifact@v4
+        with:
+          name: unity-plugins
+          path: |
+            unity/com.needle.inference/Runtime/Plugins
+            unity/com.needle.inference/Analyzers

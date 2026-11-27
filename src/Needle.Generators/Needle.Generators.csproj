@@ -7,4 +7,9 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.3.1" PrivateAssets="all" />
   </ItemGroup>
+  <!-- tools/pack-unity.sh stamps the generator it ships in the Unity package with a hash of these
+       sources, so its check mode can tell when the committed Analyzers/Needle.Generators.dll is stale. -->
+  <ItemGroup Condition="'$(NeedleSourceStamp)' != ''">
+    <AssemblyMetadata Include="Needle.SourceStamp" Value="$(NeedleSourceStamp)" />
+  </ItemGroup>
 </Project>
