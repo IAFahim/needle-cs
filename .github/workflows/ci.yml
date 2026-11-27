@@ -118,11 +118,14 @@ jobs:
     #    The hang watchdog now covers macos-arm64 for the same reason
     #    (BSD top lacks the per-thread flags, so only the dotnet-stack
     #    dumps apply there).
-    #  - linux-x64-noavx512 (DOTNET_EnableAVX512F=0 experiment, AVX2
+    #  - linux-x64-noavx512 (DOTNET_EnableAVX512=0 on .NET 10, EnableAVX512F=0 before; AVX2
     #    fallback path) promoted after 5 consecutive green runs; history:
     #    41366006614 failed GenerationMatchesReferenceGreedyDecode +
     #    LongContextStaysCloseToNative, the same flake family as the
     #    required legs, not tier-specific.
+    # macos-arm64 moved from macos-14 to macos-15 on 2026-11-27: GitHub now
+    # rejects the macos-14 image ('macos-14-arm64-us-default' is not
+    # supported), so all three macos legs were cancelled before starting.
     # No macos-x64 leg: the last stable Intel image (macos-13) retired Dec
     # 2025; Intel-only coverage stays on windows/linux x64. No
     # windows-arm64 leg yet (image GA Aug 2026): unobserved with no owner,
@@ -203,21 +206,21 @@ jobs:
             neon: false
             shard: heavy
           - name: macos-arm64
-            os: macos-14
+            os: macos-15
             expected-fail: false
             scalar: false
             netstandard: false
             neon: true
             shard: unit
           - name: macos-arm64
-            os: macos-14
+            os: macos-15
             expected-fail: false
             scalar: false
             netstandard: false
             neon: true
             shard: core
           - name: macos-arm64
-            os: macos-14
+            os: macos-15
             expected-fail: false
             scalar: false
             netstandard: false
@@ -263,11 +266,12 @@ jobs:
       - name: Select shard filter
         run: |
           case "${{ matrix.shard }}" in
-            unit) echo 'FILTER=FullyQualifiedName~AttentionBatchTests|FullyQualifiedName~AttentionTileTests|FullyQualifiedName~BackendTests|FullyQualifiedName~CallRestorerTests|FullyQualifiedName~EvalDatasetTests|FullyQualifiedName~FormatTests|FullyQualifiedName~FusedKernelTests|FullyQualifiedName~GrammarTests|FullyQualifiedName~HadamardMlpTests|FullyQualifiedName~Int8DotTierTests|FullyQualifiedName~KernelTests|FullyQualifiedName~MatMulTests|FullyQualifiedName~NeonTests|FullyQualifiedName~PoolTests|FullyQualifiedName~TeamBarrierTests|FullyQualifiedName~TelemetryTests|FullyQualifiedName~TierSelectionTests|FullyQualifiedName~ToolGenTests' >> $GITHUB_ENV ;;
+            unit) echo 'FILTER=FullyQualifiedName~AttentionBatchTests|FullyQualifiedName~AttentionTileTests|FullyQualifiedName~BackendTests|FullyQualifiedName~CallRestorerTests|FullyQualifiedName~EvalDatasetTests|FullyQualifiedName~FormatTests|FullyQualifiedName~FusedKernelTests|FullyQualifiedName~GrammarTests|FullyQualifiedName~HadamardMlpTests|FullyQualifiedName~Int8DotTierTests|FullyQualifiedName~KernelTests|FullyQualifiedName~MatMulTests|FullyQualifiedName~NeonTests|FullyQualifiedName~PoolTests|FullyQualifiedName~TeamBarrierTests|FullyQualifiedName~TelemetryTests|FullyQualifiedName~TierSelectionTests|FullyQualifiedName~TierDispatchTests|FullyQualifiedName~EvexVnniKernelTests|FullyQualifiedName~ToolGenTests' >> $GITHUB_ENV ;;
             core) echo 'FILTER=FullyQualifiedName~ChannelTests|FullyQualifiedName~ChunkParityTests|FullyQualifiedName~EvalTests|FullyQualifiedName~HugePagesTests|FullyQualifiedName~JumpForwardTests|FullyQualifiedName~LoadingTests|FullyQualifiedName~MaskedDecodingTests|FullyQualifiedName~NativeParityTests|FullyQualifiedName~ParityTests|FullyQualifiedName~RewindTests|FullyQualifiedName~ServiceTests|FullyQualifiedName~SessionStartupTests|FullyQualifiedName~SessionTests|FullyQualifiedName~SpanApiTests|FullyQualifiedName~SpeculativeTests|FullyQualifiedName~ToolGenSessionTests|FullyQualifiedName~TypedHostTests|FullyQualifiedName~TypedSinkTests' >> $GITHUB_ENV ;;
             heavy) echo 'FILTER=FullyQualifiedName~BatchedDecodeTests|FullyQualifiedName~BenchHarnessTests|FullyQualifiedName~SpeechTests|FullyQualifiedName~VoiceTests|FullyQualifiedName~WhistleStageTests|FullyQualifiedName~ZeroAllocationTests' >> $GITHUB_ENV ;;
           esac
-          if [ "${{ matrix.noavx512 }}" = "true" ]; then echo 'DOTNET_EnableAVX512F=0' >> $GITHUB_ENV; fi
+          # .NET 10 renamed the knob to EnableAVX512 and ignores EnableAVX512F; set both.
+          if [ "${{ matrix.noavx512 }}" = "true" ]; then echo 'DOTNET_EnableAVX512F=0' >> $GITHUB_ENV; echo 'DOTNET_EnableAVX512=0' >> $GITHUB_ENV; fi
 
       - name: Log the kernel tier this runner selects
         run: dotnet run -c Release --project src/Needle.Cli -- cpu
