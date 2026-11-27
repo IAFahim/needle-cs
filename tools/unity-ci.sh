@@ -247,15 +247,49 @@ il2cpp_shims() {
     done
   fi
   if ! grep -q 'libxml2\.so\.2 .*x86-64' <<<"$libs"; then
+    # Prefer a copy whose own libraries are all on this system (Unity's older sysroot has one built
+    # without ICU); otherwise take the first 64-bit copy and let the pass below find what it needs.
+    local first="" chosen=""
     while IFS= read -r candidate; do
       # ELF class 2 (64-bit) and machine 0x3e (x86-64), so a 32-bit copy is never picked.
       if [ "$(od -An -tx1 -j4 -N1 "$candidate" | tr -d ' ')" = 02 ] && [ "$(od -An -tx1 -j18 -N1 "$candidate" | tr -d ' ')" = 3e ]; then
-        ln -s "$candidate" "$shims/libxml2.so.2"
-        say "player il2cpp: no libxml2.so.2 on this system; the toolchain uses $candidate through $shims"
-        break
+        [ -n "$first" ] || first="$candidate"
+        if ! ldd "$candidate" 2>/dev/null | grep -q 'not found'; then chosen="$candidate"; break; fi
       fi
     done < <(find -L "$HOME/.local/share/unity3d/cache/sysroots" "$(dirname "$editor")/Data" -name 'libxml2.so.2*' -type f 2>/dev/null | sort)
+    chosen="${chosen:-$first}"
+    if [ -n "$chosen" ]; then
+      ln -s "$chosen" "$shims/libxml2.so.2"
+      say "player il2cpp: no libxml2.so.2 on this system; the toolchain uses $chosen through $shims"
+    fi
   fi
+  # Whatever else the cached clang and lld still cannot find (ICU 70 on a system with a newer ICU,
+  # say) is taken from Unity's own Linux sysroot, which carries the libraries of the distribution the
+  # toolchain was built on. ICU cannot be pointed at another version, because its symbols carry the
+  # version number. Each pass can uncover the next missing library, so this runs a few times.
+  local cache="$HOME/.local/share/unity3d/cache/sysroots" pass tool missing name found=0
+  for pass in 1 2 3 4; do
+    missing=""
+    while IFS= read -r tool; do
+      missing+="$(LD_LIBRARY_PATH="$shims${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ldd "$tool" 2>/dev/null | awk '/=> not found/ { print $1 }')"$'\n'
+    done < <(find -L "$cache" -path '*/llvm-*/bin/*' \( -name 'clang*' -o -name 'ld.lld' -o -name 'lld' \) -type f 2>/dev/null)
+    missing="$(sort -u <<<"$missing" | sed '/^$/d')"
+    [ -n "$missing" ] || break
+    found=0
+    while IFS= read -r name; do
+      [ -e "$shims/$name" ] && continue
+      while IFS= read -r candidate; do
+        if [ "$(od -An -tx1 -j4 -N1 "$candidate" | tr -d ' ')" = 02 ] && [ "$(od -An -tx1 -j18 -N1 "$candidate" | tr -d ' ')" = 3e ]; then
+          ln -s "$candidate" "$shims/$name"
+          say "player il2cpp: no $name on this system; the toolchain uses $candidate through $shims"
+          found=1
+          break
+        fi
+      done < <(find -L "$cache" -path '*/sysroot/*' -name "$name" 2>/dev/null | sort)
+      [ -e "$shims/$name" ] || say "player il2cpp: the toolchain needs $name, which is neither on this system nor in Unity's sysroot."
+    done <<<"$missing"
+    [ "$found" = 1 ] || break
+  done
   if [ -n "$(ls -A "$shims")" ]; then
     export LD_LIBRARY_PATH="$shims${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
   fi

@@ -20,8 +20,9 @@ namespace Needle
     /// <summary>
     /// Turns plain-language orders into actions in the scene. Give it an Agent asset, call
     /// <see cref="Ask"/> (from a script, a button or an input field's On End Edit), and wire each
-    /// tool to what it should do. The model loads and answers on its own thread; the events run on
-    /// the main thread, in Update, after the answer is ready.
+    /// tool to what it should do. The model loads on a thread of its own and answers on the
+    /// agent's thread (the engine's Post and TryTake game path); the events run on the main
+    /// thread, in Update, once the answer is ready.
     /// </summary>
     [AddComponentMenu("Needle/Needle Agent")]
     [DisallowMultipleComponent]
@@ -65,16 +66,16 @@ namespace Needle
         public bool IsReady => worker != null && worker.IsReady;
 
         /// <summary>An order is waiting or being answered.</summary>
-        public bool IsBusy => worker != null && worker.IsBusy;
+        public bool IsBusy => waiting != null || (worker != null && worker.IsBusy);
 
         /// <summary>The last answer, or null.</summary>
         public NeedleAgentResult LastResult { get; private set; }
 
         AgentWorker worker;
-        string queuedBeforeReady;
+        AgentWorker.BindingPlan[] plan;
+        string waiting;
         bool announcedReady;
         bool failedToLoad;
-        readonly List<NeedleAgentResult> drained = new List<NeedleAgentResult>();
 
         void OnEnable()
         {
@@ -98,7 +99,8 @@ namespace Needle
             string path = null, error = null;
             yield return Agent.Model.Prepare(p => path = p, e => error = e);
             if (error != null) { Fail(error); yield break; }
-            worker = new AgentWorker(path, Agent.Model.Prefault, Agent.Tools.ToJson(), Agent.ToOptions(), Agent.Persona, Agent.WarmUp, Plan());
+            plan = Plan();
+            worker = new AgentWorker(path, Agent.Model.Prefault, Agent.Tools.ToJson(), Agent.ToOptions(), Agent.Persona, Agent.WarmUp);
         }
 
         AgentWorker.BindingPlan[] Plan()
@@ -134,10 +136,11 @@ namespace Needle
             if (failedToLoad) { OnFailed.Invoke("The agent did not load, so it cannot take orders."); return; }
             if (worker == null || !worker.IsReady)
             {
-                queuedBeforeReady = order;
+                // Answered once the agent is ready.
+                waiting = order;
                 return;
             }
-            if (worker.IsBusy)
+            if (worker.IsBusy || waiting != null)
             {
                 switch (WhenBusy)
                 {
@@ -145,21 +148,21 @@ namespace Needle
                         OnBusy.Invoke(order);
                         return;
                     case NeedleBusyPolicy.Interrupt:
-                        worker.ClearPending();
                         worker.CancelRunning();
                         break;
                 }
+                // Posted as soon as the answer in flight has been taken; a newer order replaces it.
+                waiting = order;
+                return;
             }
-            worker.Submit(order);
+            if (!worker.TryPost(order)) waiting = order;
         }
 
         /// <summary>Stops the answer in progress and drops a waiting order.</summary>
         public void Cancel()
         {
-            queuedBeforeReady = null;
-            if (worker == null) return;
-            worker.ClearPending();
-            worker.CancelRunning();
+            waiting = null;
+            if (worker != null) worker.CancelRunning();
         }
 
         void Update()
@@ -171,16 +174,10 @@ namespace Needle
                 if (!worker.IsReady) return;
                 announcedReady = true;
                 OnReady.Invoke();
-                if (queuedBeforeReady != null)
-                {
-                    string order = queuedBeforeReady;
-                    queuedBeforeReady = null;
-                    worker.Submit(order);
-                }
             }
-            worker.Drain(drained);
-            for (int i = 0; i < drained.Count; i++) Dispatch(drained[i]);
-            drained.Clear();
+            NeedleAgentResult result;
+            if (worker.TryTake(plan, out result)) Dispatch(result);
+            if (waiting != null && worker != null && worker.TryPost(waiting)) waiting = null;
         }
 
         void Dispatch(NeedleAgentResult result)

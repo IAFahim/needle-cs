@@ -1,13 +1,13 @@
 using System;
-using System.Collections.Generic;
 using System.Diagnostics;
 using System.Threading;
 
 namespace Needle
 {
-    // Owns one NeedleAgent on a thread of its own, so loading, warming up and answering never run
-    // on Unity's main thread. The main thread hands over one order at a time and collects finished
-    // results; both sides only take a lock long enough to swap a reference.
+    // Loads one NeedleAgent off the main thread (opening the model, building the agent and warming
+    // it up can take a while), then drives it through the engine's own game path: TryPost starts an
+    // answer on the agent's thread and returns at once, TryTake picks it up on a later frame. Results
+    // are copied out of the engine's buffers on the main thread, into objects that stay valid.
     internal sealed class AgentWorker : IDisposable
     {
         internal struct BindingPlan
@@ -23,21 +23,17 @@ namespace Needle
         readonly AgentOptions options;
         readonly string persona;
         readonly bool warmUp;
-        readonly BindingPlan[] plan;
-        readonly Thread thread;
-        readonly AutoResetEvent wake = new AutoResetEvent(false);
         readonly object gate = new object();
-        readonly List<NeedleAgentResult> finished = new List<NeedleAgentResult>();
+        readonly Thread loader;
 
         NeedleAgent agent;
-        string pending;
-        volatile bool stopping;
-        volatile bool running;
+        bool modelAcquired;
+        bool disposed;
         volatile bool ready;
         volatile string loadError;
-        bool modelAcquired;
+        string posted;
 
-        public AgentWorker(string modelPath, bool prefault, string toolsJson, AgentOptions options, string persona, bool warmUp, BindingPlan[] plan)
+        public AgentWorker(string modelPath, bool prefault, string toolsJson, AgentOptions options, string persona, bool warmUp)
         {
             this.modelPath = modelPath;
             this.prefault = prefault;
@@ -45,9 +41,8 @@ namespace Needle
             this.options = options;
             this.persona = persona;
             this.warmUp = warmUp;
-            this.plan = plan ?? new BindingPlan[0];
-            thread = new Thread(Run) { IsBackground = true, Name = "Needle agent" };
-            thread.Start();
+            loader = new Thread(Load) { IsBackground = true, Name = "Needle agent loader" };
+            loader.Start();
         }
 
         /// <summary>The agent is loaded (and warmed up, when asked) and takes orders.</summary>
@@ -56,94 +51,73 @@ namespace Needle
         /// <summary>Why the agent could not load, or null.</summary>
         public string LoadError => loadError;
 
-        /// <summary>An order is waiting or being answered.</summary>
-        public bool IsBusy
+        /// <summary>An order is being answered.</summary>
+        public bool IsBusy => ready && agent.IsBusy;
+
+        /// <summary>Starts answering an order on the agent's thread; false while another is in flight.</summary>
+        public bool TryPost(string order)
         {
-            get
-            {
-                if (running) return true;
-                lock (gate) return pending != null;
-            }
+            if (!ready || !agent.TryPost(order)) return false;
+            posted = order;
+            return true;
         }
 
-        /// <summary>Queues an order; one that has not started yet is replaced.</summary>
-        public void Submit(string order)
-        {
-            lock (gate) pending = order ?? string.Empty;
-            wake.Set();
-        }
-
-        /// <summary>Stops the order being answered. Safe from any thread.</summary>
+        /// <summary>Stops the answer in flight; it comes back as Cancelled.</summary>
         public void CancelRunning()
         {
-            if (running && ready) agent.Cancel();
+            if (ready && agent.IsBusy) agent.Cancel();
         }
 
-        /// <summary>Drops an order that has not started yet.</summary>
-        public void ClearPending()
+        /// <summary>Picks up a finished answer, copied so it stays valid.</summary>
+        public bool TryTake(BindingPlan[] plan, out NeedleAgentResult result)
         {
-            lock (gate) pending = null;
+            result = null;
+            Answer answer;
+            if (!ready || !agent.TryTake(out answer)) return false;
+            result = Copy(answer, posted, plan);
+            posted = null;
+            return true;
         }
 
-        /// <summary>Moves the finished results into <paramref name="into"/>.</summary>
-        public void Drain(List<NeedleAgentResult> into)
+        void Load()
         {
-            lock (gate)
-            {
-                if (finished.Count == 0) return;
-                into.AddRange(finished);
-                finished.Clear();
-            }
-        }
-
-        void Run()
-        {
+            NeedleAgent loaded = default;
+            bool acquired = false;
             try
             {
                 NeedleModel model = NeedleModelAsset.Acquire(modelPath, prefault);
-                modelAcquired = true;
-                agent = model.Agent(toolsJson, options);
-                if (!string.IsNullOrWhiteSpace(persona)) agent.SetSystem(persona);
-                if (warmUp) agent.WarmUp();
-                ready = true;
+                acquired = true;
+                loaded = model.Agent(toolsJson, options);
+                if (!string.IsNullOrWhiteSpace(persona)) loaded.SetSystem(persona);
+                if (warmUp) loaded.WarmUp();
             }
             catch (Exception e)
             {
+                if (loaded.IsOpen) loaded.Dispose();
+                if (acquired) NeedleModelAsset.Release(modelPath);
                 loadError = e.Message;
-                Close();
                 return;
             }
-
-            while (!stopping)
+            lock (gate)
             {
-                wake.WaitOne();
-                while (!stopping)
+                if (!disposed)
                 {
-                    string order;
-                    lock (gate)
-                    {
-                        order = pending;
-                        pending = null;
-                        if (order != null) running = true;
-                    }
-                    if (order == null) break;
-                    NeedleAgentResult result = AnswerOrder(order);
-                    lock (gate)
-                    {
-                        finished.Add(result);
-                        running = false;
-                    }
+                    agent = loaded;
+                    modelAcquired = true;
+                    ready = true;
+                    return;
                 }
             }
-            Close();
+            // Disposed while loading: nobody will use this agent.
+            loaded.Dispose();
+            NeedleModelAsset.Release(modelPath);
         }
 
-        NeedleAgentResult AnswerOrder(string order)
+        static NeedleAgentResult Copy(Answer answer, string order, BindingPlan[] plan)
         {
-            var result = new NeedleAgentResult { Order = order, Text = string.Empty, Calls = new NeedleAgentCall[0] };
+            var result = new NeedleAgentResult { Order = order ?? string.Empty, Text = string.Empty, Calls = Empty };
             try
             {
-                Answer answer = agent.Ask(order);
                 result.Kind = answer.Kind;
                 result.Why = answer.Why;
                 result.Confidence = answer.Confidence;
@@ -153,7 +127,7 @@ namespace Needle
                 {
                     CallList calls = answer.Calls;
                     var copied = new NeedleAgentCall[calls.Count];
-                    for (int i = 0; i < calls.Count; i++) copied[i] = Copy(calls[i]);
+                    for (int i = 0; i < calls.Count; i++) copied[i] = Copy(calls[i], plan);
                     result.Calls = copied;
                 }
             }
@@ -166,10 +140,12 @@ namespace Needle
             return result;
         }
 
-        NeedleAgentCall Copy(Call call)
+        static readonly NeedleAgentCall[] Empty = new NeedleAgentCall[0];
+
+        static NeedleAgentCall Copy(Call call, BindingPlan[] plan)
         {
             var copy = new NeedleAgentCall { Tool = call.Name.ToString(), Arguments = call.Arguments.ToString() };
-            for (int b = 0; b < plan.Length; b++)
+            for (int b = 0; plan != null && b < plan.Length; b++)
             {
                 if (plan[b].Tool == null || !call.Is(plan[b].Tool)) continue;
                 copy.Binding = b;
@@ -209,24 +185,19 @@ namespace Needle
             return copy;
         }
 
-        void Close()
+        public void Dispose()
         {
-            ready = false;
+            lock (gate)
+            {
+                if (disposed) return;
+                disposed = true;
+                if (!ready) return;
+                ready = false;
+            }
+            // Dispose cancels an answer in flight and waits for the agent's thread to stop.
             try { agent.Dispose(); } catch (Exception) { }
             if (modelAcquired) NeedleModelAsset.Release(modelPath);
             modelAcquired = false;
-        }
-
-        public void Dispose()
-        {
-            if (stopping) return;
-            stopping = true;
-            CancelRunning();
-            wake.Set();
-            if (!thread.Join(TimeSpan.FromSeconds(10)))
-                UnityEngine.Debug.LogWarning("[Needle] An agent's thread did not stop within ten seconds; it closes when its answer finishes.");
-            else
-                wake.Dispose();
         }
     }
 }

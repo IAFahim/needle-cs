@@ -94,9 +94,14 @@ the cores before any bench, the run summary says the numbers are not a fair comp
 
 The IL2CPP player's toolchain needs `libncurses.so.6` and `libxml2.so.2`, which Arch-based systems
 (Omarchy included) do not ship under those names. `tools/unity-ci.sh player il2cpp` then links the
-system's `libtinfo.so.6` and the 64-bit `libxml2` from Unity's own sysroots into
-`out/unity/il2cpp-shims/` and puts that folder on the build's library path, so nothing outside the
-checkout changes. When that is not enough, the manual fix in `il2cpp-players.md` still applies.
+system's `libtinfo.so.6` and a 64-bit `libxml2` from Unity's own sysroots into
+`out/unity/il2cpp-shims/` (preferring a copy whose own libraries are all present) and puts that folder
+on the build's library path, so nothing outside the checkout changes. It then asks `ldd` what the
+cached `clang` and `ld.lld` still cannot find, such as ICU 70 (`libicui18n.so.70`) on a system with a
+newer ICU, and links those from Unity's sysroot too, a few passes deep; a library that is in neither
+place is named in the log. The cached toolchain only exists after Unity has unpacked it once, so on a
+fresh machine the first IL2CPP build can fail where the second succeeds. When all of that is not
+enough, the manual fix in `il2cpp-players.md` still applies.
 
 The `simd` field of a report names the tier of the kernels that ran and their provider. In the
 Editor and a CoreCLR player that is the `net10.0` sidecar; an IL2CPP player has no sidecar and runs
