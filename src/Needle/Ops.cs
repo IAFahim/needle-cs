@@ -51,6 +51,7 @@ internal static unsafe class Ops
 
     internal static void ApplyGateAndHeadPeaks(float* output, float* gate, int heads, int vDim, float* peaks)
     {
+        if (Simd.UseNeon) { Neon.ApplyGateAndHeadPeaks(output, gate, heads, vDim, peaks); return; }
         for (var h = 0; h < heads; h++)
         {
             var x = output + h * vDim;

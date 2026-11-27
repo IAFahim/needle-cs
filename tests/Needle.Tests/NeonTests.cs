@@ -801,4 +801,43 @@ public sealed unsafe class NeonTests
         AssertBits(actual, expected, width, "TapsHead");
         AssertBits(live, rows + width, 2 * width, "TapsHead history");
     }
+
+    // The fused attention gate (per-head gate and peaks, then the groups at the folded peak) must
+    // prepare the same activations as PrepareGateFakeA8 over the whole row.
+    [Fact]
+    public void FusedAttentionGateMatchesGateFakeA8()
+    {
+        if (!Simd.Enabled || !(Simd.UseNeon || Simd.UseAvx)) return;
+        const int heads = 12;
+        const int vDim = 64;
+        const int cols = heads * vDim;
+        var x = (float*)NativeMemory.Alloc(cols * 4);
+        var fused = (float*)NativeMemory.Alloc(cols * 4);
+        var gate = (float*)NativeMemory.Alloc(cols * 4);
+        var peaks = (float*)NativeMemory.Alloc(heads * 16 * 4);
+        var expectedValues = (sbyte*)NativeMemory.Alloc(cols);
+        var actualValues = (sbyte*)NativeMemory.Alloc(cols);
+        var expectedScales = (float*)NativeMemory.AllocZeroed(32 * 4);
+        var actualScales = (float*)NativeMemory.AllocZeroed(32 * 4);
+        try
+        {
+            Fill(x, cols, 71, 3f);
+            Fill(gate, cols, 72, 4f);
+            for (var i = 0; i < cols; i++) fused[i] = x[i];
+            var expected = new Activations(expectedValues, expectedScales, expectedScales + 16, cols);
+            var actual = new Activations(actualValues, actualScales, actualScales + 16, cols);
+            Quant.PrepareGateFakeA8(x, gate, cols, 2, expected);
+            Ops.ApplyGateAndHeadPeaks(fused, gate, heads, vDim, peaks);
+            var peak = 0f;
+            for (var h = 0; h < heads; h++) peak = MathF.Max(peak, peaks[h * 16]);
+            Quant.PrepareFakeGroupsRange(fused, peak, 1f, 2, actual, 0, actual.Groups);
+            for (var i = 0; i < cols; i++) Assert.True(expectedValues[i] == actualValues[i], $"values[{i}]");
+            AssertBits(actualScales, expectedScales, 32, "scales and offsets");
+        }
+        finally
+        {
+            NativeMemory.Free(x); NativeMemory.Free(fused); NativeMemory.Free(gate); NativeMemory.Free(peaks);
+            NativeMemory.Free(expectedValues); NativeMemory.Free(actualValues); NativeMemory.Free(expectedScales); NativeMemory.Free(actualScales);
+        }
+    }
 }

@@ -303,6 +303,34 @@ internal static unsafe class Neon
         }
     }
 
+    // Per head: output *= sigmoid(gate), and the head's peak |output| at peaks[h * 16]. The products
+    // are NeonPrepare.GateFakeA8's, so the max of the head peaks is its peak and the fused attention
+    // gate prepares the same activations.
+    public static void ApplyGateAndHeadPeaks(float* output, float* gate, int heads, int vDim, float* peaks)
+    {
+        for (var h = 0; h < heads; h++)
+        {
+            var x = output + h * vDim;
+            var g = gate + h * vDim;
+            var peak = Vector128<float>.Zero;
+            var i = 0;
+            for (; i + 4 <= vDim; i += 4)
+            {
+                var v = AdvSimd.Multiply(AdvSimd.LoadVector128(x + i), Sigmoid(AdvSimd.LoadVector128(g + i)));
+                AdvSimd.Store(x + i, v);
+                peak = AdvSimd.Max(peak, AdvSimd.Abs(v));
+            }
+            var headPeak = AdvSimd.Arm64.MaxAcross(peak).ToScalar();
+            for (; i < vDim; i++)
+            {
+                var v = x[i] * Ops.Sigmoid(g[i]);
+                x[i] = v;
+                headPeak = MathF.Max(headPeak, MathF.Abs(v));
+            }
+            peaks[h * 16] = headPeak;
+        }
+    }
+
     public static float AbsMax(float* x, int n)
     {
         var peak = Vector128<float>.Zero;
