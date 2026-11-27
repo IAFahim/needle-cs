@@ -118,7 +118,7 @@ jobs:
     #    The hang watchdog now covers macos-arm64 for the same reason
     #    (BSD top lacks the per-thread flags, so only the dotnet-stack
     #    dumps apply there).
-    #  - linux-x64-noavx512 (DOTNET_EnableAVX512F=0 experiment, AVX2
+    #  - linux-x64-noavx512 (DOTNET_EnableAVX512=0 on .NET 10, EnableAVX512F=0 before; AVX2
     #    fallback path) promoted after 5 consecutive green runs; history:
     #    41366006614 failed GenerationMatchesReferenceGreedyDecode +
     #    LongContextStaysCloseToNative, the same flake family as the
@@ -270,7 +270,8 @@ jobs:
             core) echo 'FILTER=FullyQualifiedName~ChannelTests|FullyQualifiedName~ChunkParityTests|FullyQualifiedName~EvalTests|FullyQualifiedName~HugePagesTests|FullyQualifiedName~JumpForwardTests|FullyQualifiedName~LoadingTests|FullyQualifiedName~MaskedDecodingTests|FullyQualifiedName~NativeParityTests|FullyQualifiedName~ParityTests|FullyQualifiedName~RewindTests|FullyQualifiedName~ServiceTests|FullyQualifiedName~SessionStartupTests|FullyQualifiedName~SessionTests|FullyQualifiedName~SpanApiTests|FullyQualifiedName~SpeculativeTests|FullyQualifiedName~ToolGenSessionTests|FullyQualifiedName~TypedHostTests|FullyQualifiedName~TypedSinkTests' >> $GITHUB_ENV ;;
             heavy) echo 'FILTER=FullyQualifiedName~BatchedDecodeTests|FullyQualifiedName~BenchHarnessTests|FullyQualifiedName~SpeechTests|FullyQualifiedName~VoiceTests|FullyQualifiedName~WhistleStageTests|FullyQualifiedName~ZeroAllocationTests' >> $GITHUB_ENV ;;
           esac
-          if [ "${{ matrix.noavx512 }}" = "true" ]; then echo 'DOTNET_EnableAVX512F=0' >> $GITHUB_ENV; fi
+          # .NET 10 renamed the knob to EnableAVX512 and ignores EnableAVX512F; set both.
+          if [ "${{ matrix.noavx512 }}" = "true" ]; then echo 'DOTNET_EnableAVX512F=0' >> $GITHUB_ENV; echo 'DOTNET_EnableAVX512=0' >> $GITHUB_ENV; fi
 
       - name: Log the kernel tier this runner selects
         run: dotnet run -c Release --project src/Needle.Cli -- cpu

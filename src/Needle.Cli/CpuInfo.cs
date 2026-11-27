@@ -19,7 +19,7 @@ internal static class CpuInfo
         Console.WriteLine($"evex vnni   : cpu {EvexVnni.CpuHasAvx512Vnni}, kernels {(EvexVnni.Ready ? "mapped and self-tested" : "off")}");
         Console.WriteLine($"arm         : AdvSimd {AdvSimd.IsSupported}, Dp {Dp.IsSupported}");
         Console.WriteLine($"features    : {Tiers.Detected}");
-        foreach (var name in new[] { "NEEDLE_TIER", "NEEDLE_SCALAR", "NEEDLE_NOVNNI", "NEEDLE_NOAVX512", "NEEDLE_NOEVEX", "NEEDLE_NODP", "DOTNET_EnableAVX512F", "DOTNET_EnableAVX2", "DOTNET_PROCESSOR_COUNT" })
+        foreach (var name in new[] { "NEEDLE_TIER", "NEEDLE_SCALAR", "NEEDLE_NOVNNI", "NEEDLE_NOAVX512", "NEEDLE_NOEVEX", "NEEDLE_NODP", "DOTNET_EnableAVX512F", "DOTNET_EnableAVX512", "DOTNET_EnableAVX2", "DOTNET_PROCESSOR_COUNT" })
             if (Environment.GetEnvironmentVariable(name) is { } value) Console.WriteLine($"env         : {name}={value}");
         return 0;
     }
