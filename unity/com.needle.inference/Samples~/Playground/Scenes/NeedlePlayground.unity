@@ -4378,7 +4378,7 @@ MonoBehaviour:
   ModelFile: needle3.cact
   WhistleFile: whistle.cact
   MoveSpeed: 7.5
-  MinConfidence: 0.08
+  MinConfidence: 0.3
   Threads: 4
   AutoDemo: 1
 --- !u!82 &902105709

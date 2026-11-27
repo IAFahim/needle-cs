@@ -145,7 +145,7 @@ namespace Needle.Samples.Playground.Editor
             controller.ModelFile = "needle3.cact";
             controller.WhistleFile = "whistle.cact";
             controller.MoveSpeed = 7.5f;
-            controller.MinConfidence = 0.08f;
+            controller.MinConfidence = 0.3f;
             controller.Threads = 4;
             controller.AutoDemo = true;
 
