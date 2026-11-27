@@ -2,18 +2,22 @@ name: CI
 on:
   workflow_dispatch:
 permissions:
-  contents: read
+  contents: write
 jobs:
   pack:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with: { ref: claude/core-upstream-parity }
       - uses: actions/setup-dotnet@v4
         with: { dotnet-version: "10.0.x" }
-      - run: bash tools/pack-unity.sh && bash tools/pack-unity.sh --check && git status --short
-      - uses: actions/upload-artifact@v4
-        with:
-          name: unity-plugins
-          path: |
-            unity/com.needle.inference/Runtime/Plugins
-            unity/com.needle.inference/Analyzers
+      - run: |
+          test "$(git rev-parse HEAD)" = 834f0a388fd475317686df84345e4a4c36a7d680
+          bash tools/pack-unity.sh
+          bash tools/pack-unity.sh --check
+          git status --short
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add unity/com.needle.inference/Runtime/Plugins unity/com.needle.inference/Analyzers
+          git commit -m "Unity: rebuild the plugin DLLs from the current sources (tools/pack-unity.sh)"
+          git push origin HEAD:claude/core-upstream-parity
