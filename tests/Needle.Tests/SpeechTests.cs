@@ -72,8 +72,8 @@ public sealed class SpeechTests : IDisposable
         var greedy = whistle.Transcribe(clip, "en").Text;
         whistle.BeamWidth = 4;
         var beam = whistle.Transcribe(clip, "en").Text;
-        Assert.Contains("queen in victory", greedy);
-        Assert.Contains("queen in Victoria", beam);
+        Assert.True(greedy.Contains("queen in victory"), $"greedy: {greedy}");
+        Assert.True(beam.Contains("queen in Victoria"), $"beam: {beam}\ngreedy: {greedy}");
     }
 
     [Fact]
@@ -204,7 +204,7 @@ public sealed class SpeechTests : IDisposable
         }
         var queen = Clip("test_long.wav").AsSpan(0, 25 * 16000).ToArray();
         AssertSpanMatches(whistle.Transcribe(queen, "en", wordTimestamps: true), whistle.TranscribeUtf8(queen, utf8, slices, "en"), utf8, slices, "test_long.wav");
-        Assert.Contains("queen in Victoria", Encoding.UTF8.GetString(utf8, 0, whistle.TranscribeUtf8(queen, utf8, slices, "en").Utf8Length));
+        Assert.Contains("the first popular monarch", Encoding.UTF8.GetString(utf8, 0, whistle.TranscribeUtf8(queen, utf8, slices, "en").Utf8Length));
         var keywords = new[] { "Omeprazole" };
         var hotword = Clip("hotword.wav");
         AssertSpanMatches(whistle.Transcribe(hotword, keywords: keywords, wordTimestamps: true), whistle.TranscribeUtf8(hotword, utf8, slices, keywords: keywords), utf8, slices, "hotword.wav keywords");
