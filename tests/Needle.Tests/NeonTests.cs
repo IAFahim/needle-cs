@@ -802,6 +802,29 @@ public sealed unsafe class NeonTests
         AssertBits(live, rows + width, 2 * width, "TapsHead history");
     }
 
+    [Fact]
+    public void CombineDiff4x4IsBitExactToFourCombines()
+    {
+        if (!Simd.UseNeon) return;
+        const int dim = 132;
+        var s = stackalloc float[4 * dim];
+        var x = stackalloc float[dim];
+        var u = stackalloc float[dim];
+        var mix = stackalloc float[16];
+        var post = stackalloc float[4];
+        var expected = stackalloc float[4 * dim];
+        var actual = stackalloc float[4 * dim];
+        Fill(s, 4 * dim, 81, 3f);
+        Fill(x, dim, 82, 2f);
+        Fill(u, dim, 83, 2f);
+        Fill(mix, 16, 84);
+        Fill(post, 4, 85);
+        for (var i = 0; i < 4; i++)
+            Neon.CombineDiff4(s, dim, mix[i * 4], mix[i * 4 + 1], mix[i * 4 + 2], mix[i * 4 + 3], x, u, post[i], expected + i * dim);
+        Ops.CombineDiff4x4(s, dim, mix, x, u, post, actual);
+        AssertBits(actual, expected, 4 * dim, "CombineDiff4x4");
+    }
+
     // The fused attention gate (per-head gate and peaks, then the groups at the folded peak) must
     // prepare the same activations as PrepareGateFakeA8 over the whole row.
     [Fact]

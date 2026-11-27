@@ -803,6 +803,55 @@ internal static unsafe class Neon
         }
     }
 
+    // CombineDiff4 for the four output lanes in one pass over the stream: the same products in the
+    // same order, with each lane's weights read by element from mix.
+    public static void CombineDiff4x4(float* s, int dim, float* mix, float* x, float* u, float* postGate, float* destination)
+    {
+        var m0 = AdvSimd.LoadVector128(mix);
+        var m1 = AdvSimd.LoadVector128(mix + 4);
+        var m2 = AdvSimd.LoadVector128(mix + 8);
+        var m3 = AdvSimd.LoadVector128(mix + 12);
+        var p = AdvSimd.LoadVector128(postGate);
+        var s1 = s + dim;
+        var s2 = s + 2 * dim;
+        var s3 = s + 3 * dim;
+        var d1 = destination + dim;
+        var d2 = destination + 2 * dim;
+        var d3 = destination + 3 * dim;
+        for (var c = 0; c < dim; c += 4)
+        {
+            var diff = AdvSimd.Subtract(AdvSimd.LoadVector128(x + c), AdvSimd.LoadVector128(u + c));
+            var v0 = AdvSimd.LoadVector128(s + c);
+            var v1 = AdvSimd.LoadVector128(s1 + c);
+            var v2 = AdvSimd.LoadVector128(s2 + c);
+            var v3 = AdvSimd.LoadVector128(s3 + c);
+            var a0 = AdvSimd.MultiplyBySelectedScalar(diff, p, 0);
+            var a1 = AdvSimd.MultiplyBySelectedScalar(diff, p, 1);
+            var a2 = AdvSimd.MultiplyBySelectedScalar(diff, p, 2);
+            var a3 = AdvSimd.MultiplyBySelectedScalar(diff, p, 3);
+            a0 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a0, v0, m0, 0);
+            a1 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a1, v0, m1, 0);
+            a2 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a2, v0, m2, 0);
+            a3 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a3, v0, m3, 0);
+            a0 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a0, v1, m0, 1);
+            a1 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a1, v1, m1, 1);
+            a2 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a2, v1, m2, 1);
+            a3 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a3, v1, m3, 1);
+            a0 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a0, v2, m0, 2);
+            a1 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a1, v2, m1, 2);
+            a2 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a2, v2, m2, 2);
+            a3 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a3, v2, m3, 2);
+            a0 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a0, v3, m0, 3);
+            a1 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a1, v3, m1, 3);
+            a2 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a2, v3, m2, 3);
+            a3 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a3, v3, m3, 3);
+            AdvSimd.Store(destination + c, a0);
+            AdvSimd.Store(d1 + c, a1);
+            AdvSimd.Store(d2 + c, a2);
+            AdvSimd.Store(d3 + c, a3);
+        }
+    }
+
     public static void PostNormAdd(float* residual, float* x, float* scale, float gate, int n)
     {
         var scalarInv = 1f / MathF.Sqrt(SumOfSquares(x, n) / n + RmsEpsilon);
