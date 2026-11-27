@@ -1092,6 +1092,69 @@ internal static unsafe class HadamardMlp
         false;
 #endif
 
+    public static bool CanSplit(int rows, int cols) =>
+#if NEEDLE_SIMD
+        Blocked(rows, cols) && (void*)Kernels.Active.HadamardMlp == null;
+#else
+        false;
+#endif
+
+    public static int OutputRows(int dim, int rows, int cols) =>
+        Math.Min(rows, ((dim + cols - 1) / cols + TileRows - 1) / TileRows * TileRows);
+
+    public static void KronSlice(float* z, int activeRows, float* left, float* right, int rows, int cols, int rowStart, int rowEnd, float* result, float* tileScratch)
+    {
+        if (rowStart >= rowEnd) return;
+#if NEEDLE_SIMD
+        if (Simd.UseNeon) { Neon.Kron(z, activeRows, left + rowStart, right, rows, cols, rowEnd - rowStart, result + (long)rowStart * cols); return; }
+#endif
+        KronRange(z, activeRows, left, right, rows, cols, rowStart, rowEnd, result, tileScratch);
+    }
+
+    public static int TeamBackFloats(int width) => 3 * ((width + 15) & ~15);
+
+    public static void ApplyTeam(MlpBatch* b, float* residual, float* output, float* scratch, float* back, float* tileScratch, TeamBarrier* barrier, int member, int members)
+    {
+        var w = b->Weights;
+        var dim = b->Dim;
+        var rows = b->Rows;
+        var cols = b->Cols;
+        var width = b->Width;
+        var stride = (width + 15) & ~15;
+        var back1 = back;
+        var back2 = back1 + stride;
+        var back3 = back2 + stride;
+        BeginToken(b, residual, scratch);
+        Layout(scratch, dim, width, out var weights, out _, out var front, out _);
+        var inputRows = (dim + cols - 1) / cols;
+        TeamShard(rows / TileRows, member, members, out var r0, out var r1);
+        KronSlice(front, inputRows, w->W1A, w->W1B, rows, cols, r0, r1, back1, tileScratch);
+        Pool.Barrier(barrier);
+        PermuteModulateActivateRange(b->PermA, back1, w->D2, weights, w->CondU, w->B2, width, front, 0, width);
+        KronSlice(front, rows, w->W2A, w->W2B, rows, cols, r0, r1, back2, tileScratch);
+        Pool.Barrier(barrier);
+        PermuteScaleRange(b->PermB, back2, w->D3, front, 0, width);
+        TeamShard(OutputRows(dim, rows, cols) / TileRows, member, members, out var o0, out var o1);
+        KronSlice(front, rows, w->W3A, w->W3B, rows, cols, o0, o1, back3, tileScratch);
+        var e0 = o0 * cols;
+        var e1 = Math.Min(o1 * cols, dim);
+        if (e0 < e1)
+        {
+            if (output != residual) Buffer.MemoryCopy(residual + e0, output + e0, (e1 - e0) * 4, (e1 - e0) * 4);
+            AccumulateOutput(output + e0, back3 + e0, w->D4 + e0, b->Scale, e1 - e0);
+        }
+        Pool.Barrier(barrier);
+    }
+
+    static void TeamShard(int tiles, int member, int members, out int rowStart, out int rowEnd)
+    {
+        var q = tiles / members;
+        var r = tiles % members;
+        var first = member * q + Math.Min(member, r);
+        rowStart = first * TileRows;
+        rowEnd = rowStart + (q + (member < r ? 1 : 0)) * TileRows;
+    }
+
     public static void Layout(float* scratch, int dim, int width, out float* weights, out float* normalized, out float* front, out float* back)
     {
         weights = (float*)(((nuint)scratch + 31) & ~(nuint)31);

@@ -67,6 +67,10 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
     int* stealCursors;
     float* gatePeaks;
     float* mlpScratch;
+    float* mlpPrivate;
+    float* mlpBack;
+    float* streamPrivate;
+    int mlpPrivateStride;
     LayerWeights* blockTable;
     EngramSite* siteTable;
 
@@ -174,6 +178,10 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         gatePeaks = arena.Take<float>((nuint)(Math.Max(g.Heads, 8) * 16));
         var mlpBaseScratch = HadamardMlp.ScratchFloats(dim, g.HadaRows * g.HadaCols);
         mlpScratch = arena.Take<float>((nuint)(mlpBaseScratch + Math.Max(pool.Members, 1) * Math.Max(128, 4 * g.HadaCols) + 16));
+        mlpPrivateStride = ((dim + 15) & ~15) + ((mlpBaseScratch + 15) & ~15);
+        mlpPrivate = arena.Take<float>((nuint)(Math.Max(pool.Members, 1) * mlpPrivateStride));
+        mlpBack = arena.Take<float>((nuint)HadamardMlp.TeamBackFloats(g.HadaRows * g.HadaCols));
+        streamPrivate = arena.Take<float>((nuint)(Math.Max(pool.Members, 1) * streamWidth));
         blockTable = arena.TakeUncleared<LayerWeights>((nuint)g.Layers);
         for (var l = 0; l < g.Layers; l++) blockTable[l] = model.Blocks[l];
         if (g.SiteCount > 0)
@@ -702,6 +710,10 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         public int* StealCursors;
         public float* GatePeaks;
         public float* MlpScratch;
+        public float* MlpPrivate;
+        public float* MlpBack;
+        public float* StreamPrivate;
+        public int MlpPrivateStride;
         public ProbeHead* Confidence;
         public float* PoolMax;
         public float* PoolSum;
@@ -715,11 +727,13 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         public int AlignmentFromLayer;
     }
 
-    DecodeJob BuildTeamJob(int count, int position, bool wantLogits) => new DecodeJob
+    DecodeJob BuildTeamJob(int count, int position, bool wantLogits) => BuildTeamJob(count, position, wantLogits, pool.Members);
+
+    DecodeJob BuildTeamJob(int count, int position, bool wantLogits, int members) => new DecodeJob
     {
         Barrier = barrier,
         Clock = clock,
-        Members = pool.Members,
+        Members = members,
         Count = count,
         Position = position,
         Capacity = capacity,
@@ -778,6 +792,10 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         ValueCache = valueCache,
         EngramRows = engramRows,
         MlpScratch = mlpScratch,
+        MlpPrivate = mlpPrivate,
+        MlpBack = mlpBack,
+        StreamPrivate = streamPrivate,
+        MlpPrivateStride = mlpPrivateStride,
         Confidence = pooling ? model.Confidence : null,
         PoolMax = poolMax,
         PoolSum = poolSum,
@@ -799,10 +817,13 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
 
     void RunTokenTeam(int position, bool wantLogits)
     {
-        var job = BuildTeamJob(1, position, wantLogits);
+        // Decode output does not depend on the member count (see AttentionBatch.Plan), so the pool may
+        // shrink the team while other work keeps the cores busy and grow it back once barriers stop stalling.
+        var members = pool.TeamMembers;
+        var job = BuildTeamJob(1, position, wantLogits, members);
         clock.PoolRun();
         var useSidecar = typeof(TClock) == typeof(NoClock) && (void*)Kernels.SidecarDecodeTeam != null && Kernels.Provider == "net10-unmanaged";
-        pool.RunTeam(useSidecar ? &RunSidecarDecodeTeam : &ExecuteDecodeTeam, Unsafe.AsPointer(ref job), barrier);
+        pool.RunAdaptiveTeam(useSidecar ? &RunSidecarDecodeTeam : &ExecuteDecodeTeam, Unsafe.AsPointer(ref job), barrier, members);
         if ((g.Layers & 1) != 0)
         {
             var swap = stream;
@@ -813,10 +834,13 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
 
     void RunBatchTeam(int position, int count, bool wantLogits)
     {
-        var job = BuildTeamJob(count, position, wantLogits);
+        // Prefill output does not depend on the member count either, so it runs on the team size the
+        // decode runs settled on (prefill timings are not fed back: a chunk costs far more than a token).
+        var members = pool.SettledTeamMembers;
+        var job = BuildTeamJob(count, position, wantLogits, members);
         clock.PoolRun();
         var useSidecar = typeof(TClock) == typeof(NoClock) && (void*)Kernels.SidecarPrefillTeam != null && Kernels.Provider == "net10-unmanaged";
-        pool.RunTeam(useSidecar ? &RunSidecarPrefillTeam : &ExecutePrefillTeam, Unsafe.AsPointer(ref job), barrier);
+        pool.RunTeam(useSidecar ? &RunSidecarPrefillTeam : &ExecutePrefillTeam, Unsafe.AsPointer(ref job), barrier, members);
         if ((g.Layers & 1) != 0)
         {
             var swap = stream;
@@ -946,9 +970,18 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
 #if NEEDLE_SIMD
         var simdAttnGate = (Simd.UseNeon || (Simd.UseAvx && (void*)Kernels.Active.Prepare == null && (void*)Kernels.Active.GateFakeA8 == null)) && g.OutputWidth == g.Heads * g.VDim;
         var parallelPool = members > 1 && job.Confidence != null;
+        // On NEON the MLP stays on the lead: each member would repeat the begin, permute and scale steps
+        // around a Kron that is short there, and three barriers per layer cost more than the split saves.
+        // The stream prepare still splits (one barrier for the lead's combine when the MLP is serial).
+        var parallelMlp = members > 1 && !Simd.UseNeon && HadamardMlp.CanSplit(g.HadaRows, g.HadaCols);
+        var splitPrepare = members > 1 && Quant.CanSplitRmsFakeA8 && (parallelMlp || Simd.UseNeon);
 #else
         var parallelPool = members > 1 && job.Confidence != null;
+        const bool parallelMlp = false;
+        const bool splitPrepare = false;
 #endif
+        var splitHyper = members > 1;
+        var privateStream = job.StreamPrivate + (long)member * streamWidth;
         if (job.Confidence != null && !parallelPool && member == lead)
             PoolRow(ref job, job.Stream, 0, true);
         for (var l = 0; l < layers; l++)
@@ -961,7 +994,46 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
             var site = g.SiteOf(l);
             var hasEngram = site >= 0;
             if (parallelPool && l > 0) Pool.Barrier(job.Barrier);
-            if (member == lead)
+            if (splitHyper)
+            {
+#if NEEDLE_SIMD
+                if (splitPrepare)
+                {
+                    // With a serial MLP only the lead holds the new stream: wait for its combine.
+                    if (!parallelMlp && !parallelPool && l > 0) Pool.Barrier(job.Barrier);
+                    var source = l == 0 || member == lead || !parallelMlp ? s : privateStream;
+                    Ops.RmsStats(source, streamWidth, out var inverse, out var rawPeak);
+                    var act = job.StreamAct.Slice(0);
+                    Shard(act.Groups, member, members, out var firstGroup, out var groupCount);
+                    Quant.PrepareFakeGroupsRange(source, rawPeak * inverse, inverse, 4, act, firstGroup, firstGroup + groupCount);
+                }
+                else
+#endif
+                if (member == lead) Quant.PrepareRmsFakeA8(s, job.Normed, streamWidth, 4, job.StreamAct.Slice(0));
+                if (member == lead) job.Clock.Lap(Stage.HyperPrepare);
+                Pool.Barrier(job.Barrier);
+                var phiShard = new MatMulBatch(job.StreamAct, 1);
+                phiShard.Add(job.Hyper.PhiPre.Slice(l * Lanes, Lanes), job.PreOut, Lanes);
+                phiShard.Add(job.Hyper.PhiPost.Slice(l * Lanes, Lanes), job.PostOut, Lanes);
+                phiShard.Add(job.Hyper.PhiRes.Slice(l * Lanes * Lanes, Lanes * Lanes), job.ResOut, Lanes * Lanes);
+                MatMulBatch.RunShard(&phiShard, member, members);
+                if (member == lead) job.Clock.Lap(Stage.HyperPhi);
+                Pool.Barrier(job.Barrier);
+                if (member == lead)
+                {
+                    job.StealCursors[0] = 0;
+                    job.StealCursors[16] = 0;
+                    job.StealCursors[32] = 0;
+                    job.StealCursors[48] = 0;
+                    job.StealCursors[64] = 0;
+                    job.StealCursors[96] = 0;
+                    job.StealCursors[112] = 0;
+                    PrepareMixAndPrep(w, ref job, l, site, hasEngram, s, hpre, mixLogits);
+                }
+                else if (parallelPool && member == members - 1)
+                    PoolRow(ref job, s, l, l == 0);
+            }
+            else if (member == lead)
             {
                 job.StealCursors[0] = 0;
                 job.StealCursors[16] = 0;
@@ -1072,13 +1144,11 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
 #if NEEDLE_SIMD
             if (simdAttnGate)
             {
-                if (member == lead)
-                {
-                    var peak = 0f;
-                    for (var h = 0; h < g.Heads; h++) peak = MathF.Max(peak, job.GatePeaks[h * 16]);
-                    Quant.PrepareFakeGroupsRange(job.AttnOut, peak, 1f, 2, job.DimAct.Slice(0), 0, job.DimAct.Groups);
-                    job.Clock.Lap(Stage.AttentionGate);
-                }
+                var peak = 0f;
+                for (var h = 0; h < g.Heads; h++) peak = MathF.Max(peak, job.GatePeaks[h * 16]);
+                Shard(job.DimAct.Groups, member, members, out var firstGroup, out var groupCount);
+                Quant.PrepareFakeGroupsRange(job.AttnOut, peak, 1f, 2, job.DimAct.Slice(0), firstGroup, firstGroup + groupCount);
+                if (member == lead) job.Clock.Lap(Stage.AttentionGate);
             }
             else
 #endif
@@ -1183,7 +1253,21 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
                 }
             }
 
-            if (member == lead)
+            if (parallelMlp)
+            {
+                if (job.Cross.Frames > 0) Pool.Barrier(job.Barrier);
+                MlpTeam(w, ref job, member, members, tileScratch);
+                if (member == lead)
+                {
+                    Ops.CombineDiff4x4(s, dim, job.ResidualMix, job.Residual, job.Input, job.PostGate, next);
+                    if (job.Confidence != null && (!parallelPool || (l == layers - 1 && job.WantLogits == 0)))
+                        PoolRow(ref job, next, l + 1, false);
+                    job.Clock.Lap(Stage.Combine);
+                }
+                else if (splitPrepare && l + 1 < layers)
+                    Ops.CombineDiff4x4(s, dim, job.ResidualMix, job.Residual, job.Input, job.PostGate, privateStream);
+            }
+            else if (member == lead)
             {
                 if (job.Cross.Frames == 0)
                 {
@@ -1226,6 +1310,37 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
             MatMulBatch.RunSteal(&head, job.StealCursors + 80, member, members);
             if (member == lead) job.Clock.Lap(Stage.Logits);
         }
+    }
+
+    static void MlpTeam(LayerWeights* w, ref DecodeJob job, int member, int members, float* tileScratch)
+    {
+        var g = job.Geometry;
+        var dim = g.Dim;
+        var rows = g.HadaRows;
+        var cols = g.HadaCols;
+        var weightsMlp = &w->Mlp;
+        var residual = job.MlpPrivate + (long)member * job.MlpPrivateStride;
+        var scratch = residual + ((dim + 15) & ~15);
+        Buffer.MemoryCopy(job.Residual, residual, dim * 4, dim * 4);
+        if (job.Cross.Frames == 0)
+        {
+            Ops.PostNormAdd(residual, job.AttnProj, w->PostNorm, w->AttnGate, dim);
+            if (member == 0) job.Clock.Lap(Stage.AttentionPostNorm);
+        }
+        var batch = new MlpBatch
+        {
+            Weights = weightsMlp,
+            PreNorm = w->PreHada,
+            PermA = job.Hyper.PermA,
+            PermB = job.Hyper.PermB,
+            Residual = residual,
+            Dim = dim,
+            Rows = rows,
+            Cols = cols,
+            Scale = 1f,
+        };
+        HadamardMlp.ApplyTeam(&batch, residual, job.Residual, scratch, job.MlpBack, tileScratch, job.Barrier, member, members);
+        if (member == 0) job.Clock.Lap(Stage.Mlp);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -1390,11 +1505,14 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
     void RunLayerTeam(int l, int count, int position)
     {
         var site = g.SiteOf(l);
+        // The settled adaptive size, as for the fused prefill: a full team on a busy machine waits on
+        // starved workers at every barrier.
+        var members = pool.SettledTeamMembers;
         var job = new LayerJob
         {
             Barrier = barrier,
             Clock = clock,
-            Members = pool.Members,
+            Members = members,
             Layer = l,
             Lane = l % Lanes,
             Count = count,
@@ -1450,7 +1568,7 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         };
         if (site >= 0) job.Engram = model.Sites[site];
         clock.PoolRun();
-        pool.RunTeam(&ExecuteLayer, System.Runtime.CompilerServices.Unsafe.AsPointer(ref job), barrier);
+        pool.RunTeam(&ExecuteLayer, System.Runtime.CompilerServices.Unsafe.AsPointer(ref job), barrier, members);
         var swap = stream;
         stream = nextStream;
         nextStream = swap;

@@ -505,6 +505,76 @@ public sealed unsafe class HadamardMlpTests : IDisposable
             Assert.Equal(serial, Run(batch, initial, tokens, threads));
     }
 
+    struct TeamMlpJob
+    {
+        public MlpBatch* Batch;
+        public float* Residual;
+        public float* Output;
+        public float* Private;
+        public float* Back;
+        public float* Tiles;
+        public TeamBarrier* Barrier;
+        public int PrivateStride;
+        public int Members;
+    }
+
+    static void RunTeamMlp(void* context, int member)
+    {
+        var job = (TeamMlpJob*)context;
+        var dim = job->Batch->Dim;
+        var residual = job->Private + (long)member * job->PrivateStride;
+        Buffer.MemoryCopy(job->Residual, residual, dim * 4, dim * 4);
+        var scratch = residual + ((dim + 15) & ~15);
+        var tiles = job->Tiles + member * Math.Max(128, 4 * job->Batch->Cols);
+        HadamardMlp.ApplyTeam(job->Batch, residual, job->Output, scratch, job->Back, tiles, job->Barrier, member, job->Members);
+    }
+
+    [Theory]
+    [InlineData(768, 32, 32)]
+    [InlineData(640, 32, 32)]
+    [InlineData(96, 8, 16)]
+    public void TeamSplitIsBitIdenticalToApply(int dim, int rows, int cols)
+    {
+        if (!HadamardMlp.CanSplit(rows, cols)) return;
+        var batch = Batch(dim, rows, cols, 0.75f, 31);
+        var initial = Initial(dim, 17);
+        var width = rows * cols;
+        var expected = new float[dim];
+        var serialScratch = (float*)Mem.AllocZeroed((nuint)(HadamardMlp.ScratchFloats(dim, width) + 4 * cols + 64) * sizeof(float));
+        allocations.Add((nint)serialScratch);
+        fixed (float* e = expected)
+        {
+            for (var i = 0; i < dim; i++) e[i] = initial[i];
+            var tile = (float*)(((nuint)(serialScratch + HadamardMlp.ScratchFloats(dim, width)) + 31) & ~(nuint)31);
+            HadamardMlp.Apply(batch, e, serialScratch, tile);
+        }
+        foreach (var threads in new[] { 1, 2, 3, 4, 5, 8 })
+        {
+            using var pool = new Pool(threads);
+            var members = Math.Max(1, pool.Members);
+            var privateStride = ((dim + 15) & ~15) + ((HadamardMlp.ScratchFloats(dim, width) + 15) & ~15);
+            var input = Allocate(dim, new Random(0), 0f);
+            var output = Allocate(dim, new Random(0), 0f);
+            for (var i = 0; i < dim; i++) input[i] = initial[i];
+            var job = (TeamMlpJob*)Mem.AllocZeroed((nuint)sizeof(TeamMlpJob));
+            var barrier = (TeamBarrier*)Mem.AllocZeroed((nuint)sizeof(TeamBarrier));
+            allocations.Add((nint)job);
+            allocations.Add((nint)barrier);
+            job->Batch = batch;
+            job->Residual = input;
+            job->Output = output;
+            job->Private = Allocate(members * privateStride + 16, new Random(0), 0f);
+            job->Back = Allocate(HadamardMlp.TeamBackFloats(width) + 16, new Random(0), 0f);
+            job->Tiles = (float*)(((nuint)Allocate(members * Math.Max(128, 4 * cols) + 16, new Random(0), 0f) + 31) & ~(nuint)31);
+            job->Barrier = barrier;
+            job->PrivateStride = privateStride;
+            job->Members = members;
+            pool.RunTeam(&RunTeamMlp, job, barrier);
+            for (var i = 0; i < dim; i++)
+                Assert.True(BitConverter.SingleToInt32Bits(expected[i]) == BitConverter.SingleToInt32Bits(output[i]), $"threads {threads} index {i}: {expected[i]} vs {output[i]}");
+        }
+    }
+
     [Theory]
     [InlineData(32, 32, 24, 32)]
     [InlineData(32, 32, 32, 24)]
