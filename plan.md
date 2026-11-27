@@ -33,7 +33,7 @@ Last measured: 2026-10-29, on the reference box in [2.2](#22-baseline). The numb
 
 ## 1. Scope
 
-| In scope (this repo) | Out of scope (Cactus Compute: `cactus-compute/needle`) |
+| In scope (this repo) | Out of scope (Cactus Compute: `cactus-compute/cactus`) |
 |---|---|
 | Runtime inference of Needle 3 and Whistle `.cact` files | Training, fine-tuning, LoRA, distillation |
 | Kernels, scheduling, decoding, grammar, sessions | Quantization recipes, `.cact` export and format design |
@@ -43,8 +43,8 @@ Last measured: 2026-10-29, on the reference box in [2.2](#22-baseline). The numb
 | Benchmarks, parity tests, CI | |
 
 **Licensing.**
-- `needle3` and `whistle` weights are Apache-2.0 (Hugging Face model cards), and so is `cactus-compute/needle`.
-- `cactus-compute/cactus`, the C++ engine, uses a custom license: commercial users above $2M funding or revenue need a license. **Never copy code from it.** Work clean-room from `tools/golden.py` and the Apache-2.0 Python architecture.
+- `needle3` and `whistle` weights are Apache-2.0 (Hugging Face model cards), and so is `cactus-compute/cactus`.
+- `cactus-compute/engine`, the C++ engine, uses a custom license: commercial users above $2M funding or revenue need a license. **Never copy code from it.** Work clean-room from `tools/golden.py` and the Apache-2.0 Python architecture.
 - This repo has no `LICENSE` yet (W04).
 
 ## 2. Learnings

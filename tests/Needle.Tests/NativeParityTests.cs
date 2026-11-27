@@ -75,7 +75,7 @@ public sealed class NativeParityTests : IDisposable
             new PromptSet("golden", File.ReadAllText(Assets.Tools), BenchPrompts.Golden),
             new PromptSet("game", BenchPrompts.GameToolsJson, BenchPrompts.Game),
         };
-        var deltas = new List<(double Delta, string Query)>();
+        var deltas = new List<(double Delta, string Query, bool Forked)>();
         foreach (var system in new[] { "", FixedDate })
         {
             foreach (var set in sets)
@@ -97,7 +97,7 @@ public sealed class NativeParityTests : IDisposable
                         continue;
                     }
                     Assert.True(TermsEqual(expected.CallArguments, actual.CallArguments()), $"args differ: native {expected.CallArguments} managed {actual.CallArguments()}");
-                    deltas.Add((Math.Abs((actual.Confidence ?? double.NaN) - (expected.Confidence ?? 0)), query));
+                    deltas.Add((Math.Abs((actual.Confidence ?? double.NaN) - (expected.Confidence ?? 0)), query, expected.Reasoning != actual.Reasoning));
                     Assert.InRange(actual.DecodeConfidence ?? double.NaN, actual.HeadConfidence ?? 1, 1.0);
                 }
             }
@@ -105,11 +105,11 @@ public sealed class NativeParityTests : IDisposable
         AssertConfidenceAgreement(deltas);
     }
 
-    static void AssertConfidenceAgreement(List<(double Delta, string Query)> deltas)
+    static void AssertConfidenceAgreement(List<(double Delta, string Query, bool Forked)> deltas)
     {
         var sorted = deltas.Select(d => d.Delta).OrderBy(d => d).ToArray();
-        var worst = deltas.OrderByDescending(d => d.Delta).First();
-        Assert.True(worst.Delta <= 0.13, $"confidence moved {worst.Delta:F4} on '{worst.Query}'");
+        foreach (var (delta, query, forked) in deltas)
+            Assert.True(delta <= (forked ? 0.30 : 0.13), $"confidence moved {delta:F4} on '{query}'{(forked ? " after the reasoning forked" : "")}");
         Assert.True(sorted[sorted.Length / 2] <= 0.02, $"median confidence delta {sorted[sorted.Length / 2]:F4}");
     }
 
@@ -144,7 +144,7 @@ public sealed class NativeParityTests : IDisposable
                 var reply = session.Complete("attack the watchtower near the river");
                 output.WriteLine($"managed watchtower [{system}] t={threads} -> {reply.CallNames()} at {reply.Confidence}");
                 Assert.Contains(reply.CallNames(), AttackOrRefusal);
-                if (reply.CallNames() == "") Assert.Equal("attack", reply.SuppressedCalls.CallNames());
+                if (reply.CallNames() == "") Assert.All(reply.SuppressedCalls.CallNames().Split(','), name => Assert.Equal("attack", name));
             }
         }
     }

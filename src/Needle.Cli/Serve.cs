@@ -17,7 +17,7 @@ internal static class Serve
         string? system = Environment.GetEnvironmentVariable("NEEDLE_SYSTEM");
         var systemSet = false;
         var autoDate = true;
-        var topK = 5;
+        var topK = int.MaxValue;
         var stateless = false;
         var warmup = false;
         string? prefixPath = null;
@@ -47,6 +47,9 @@ internal static class Serve
                     break;
                 case "--no-retrieval":
                     topK = int.MaxValue;
+                    break;
+                case "--retrieval":
+                    if (!TakeInt(options, ref i, out topK) || topK < 1) return Usage();
                     break;
                 case "--stateless":
                     stateless = true;
@@ -239,7 +242,7 @@ internal static class Serve
 
     static int Usage()
     {
-        Console.Error.WriteLine("needle serve <model.cact> <tools.json> [--threads N] [--context N] [--max-reasoning N] [--max-calls N] [--system TEXT] [--no-date] [--no-retrieval] [--stateless] [--warmup] [--prefix <out.prefix>] (--prefix requires --no-date)");
+        Console.Error.WriteLine("needle serve <model.cact> <tools.json> [--threads N] [--context N] [--max-reasoning N] [--max-calls N] [--system TEXT] [--no-date] [--retrieval K] [--stateless] [--warmup] [--prefix <out.prefix>] (--prefix requires --no-date)");
         return 2;
     }
 }

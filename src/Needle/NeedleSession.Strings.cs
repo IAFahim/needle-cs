@@ -98,7 +98,7 @@ public sealed unsafe partial class NeedleSession
             SuppressedCalls = refused ? calls : Array.Empty<FunctionCall>(),
             Reasoning = reasoning,
             Confidence = reply.Confidence,
-            HeadConfidence = reply.HeadConfidence,
+            HeadConfidence = confidenceScratch == null ? null : reply.HeadConfidence,
             DecodeConfidence = reply.DecodeConfidence,
             PrefillTokens = timing.PrefillTokens,
             DecodeTokens = timing.DecodeTokens,
