@@ -285,9 +285,15 @@ internal static unsafe class Quant
     static void PrepareFakeGroups(float* x, float a8Peak, float rmsInv, int bits, in Activations a) =>
         PrepareFakeGroupsRange(x, a8Peak, rmsInv, bits, a, 0, a.Groups);
 
+    // Whether Ops.RmsStats plus PrepareFakeGroupsRange over any split of the groups reproduces
+    // PrepareRmsFakeA8 bit for bit on this machine, so a caller may shard the hyper prepare.
+    internal static bool CanSplitRmsFakeA8 =>
+        Simd.UseNeon || (Simd.UseAvx && (void*)Kernels.Active.Prepare == null && (void*)Kernels.Active.RmsFakeA8 == null);
+
     [SkipLocalsInit]
     internal static void PrepareFakeGroupsRange(float* x, float a8Peak, float rmsInv, int bits, in Activations a, int groupStart, int groupEnd)
     {
+        if (Simd.UseNeon) { NeonPrepare.FakeGroupsRange(x, a8Peak, rmsInv, bits, a, groupStart, groupEnd); return; }
         var a8Scale = a8Peak > 0f ? a8Peak / 127f : 1f;
         var vRmsInv = Vector256.Create(rmsInv);
         var vA8Inv = Vector256.Create(1f / a8Scale);
@@ -310,6 +316,7 @@ internal static unsafe class Quant
     public static void PrepareRmsFakeA8(float* x, float* scratchNormed, int cols, int bits, in Activations a)
     {
 #if NEEDLE_SIMD
+        if (Simd.UseNeon) { NeonPrepare.RmsFakeA8(x, cols, bits, a); return; }
         if (Simd.UseAvx && (void*)Kernels.Active.Prepare == null && (void*)Kernels.Active.RmsFakeA8 == null)
         {
             Ops.RmsStats(x, cols, out var inv, out var rawPeak);
@@ -325,6 +332,7 @@ internal static unsafe class Quant
     public static void PrepareGateFakeA8(float* x, float* gate, int cols, int bits, in Activations a)
     {
 #if NEEDLE_SIMD
+        if (Simd.UseNeon) { NeonPrepare.GateFakeA8(x, gate, cols, bits, a); return; }
         if (Simd.UseAvx && (void*)Kernels.Active.Prepare == null && (void*)Kernels.Active.GateFakeA8 == null)
         {
             var peak0 = Vector256<float>.Zero;
@@ -357,6 +365,7 @@ internal static unsafe class Quant
     public static void PrepareCenteredRmsFakeA8(float* x, float* normScale, float* scratchNormed, int cols, int bits, in Activations a)
     {
 #if NEEDLE_SIMD
+        if (Simd.UseNeon) { NeonPrepare.CenteredRmsFakeA8(x, normScale, cols, bits, a); return; }
         if (Simd.UseAvx && (void*)Kernels.Active.Prepare == null && (void*)Kernels.Active.CenteredRmsFakeA8 == null)
         {
             Ops.CenteredRmsStats(x, normScale, cols, out var inv, out var rawPeak);

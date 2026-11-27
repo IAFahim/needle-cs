@@ -122,10 +122,31 @@ internal static unsafe class Neon
         for (; i < n; i++) destination[i] = (1f + scale[i]) * x[i] * scalarInv;
     }
 
+    // The largest of n floats. Max is exact and order-free (it propagates NaN and ranks +0 above -0,
+    // as MathF.Max does), so the vector scan returns the same value as a scalar one.
+    public static float Peak(float* s, int n)
+    {
+        var p0 = Vector128.Create(float.NegativeInfinity);
+        var p1 = p0;
+        var i = 0;
+        for (; i + 8 <= n; i += 8)
+        {
+            p0 = AdvSimd.Max(p0, AdvSimd.LoadVector128(s + i));
+            p1 = AdvSimd.Max(p1, AdvSimd.LoadVector128(s + i + 4));
+        }
+        if (i + 4 <= n)
+        {
+            p0 = AdvSimd.Max(p0, AdvSimd.LoadVector128(s + i));
+            i += 4;
+        }
+        var peak = AdvSimd.Arm64.MaxAcross(AdvSimd.Max(p0, p1)).ToScalar();
+        for (; i < n; i++) peak = MathF.Max(peak, s[i]);
+        return peak;
+    }
+
     public static void Softmax(float* s, int n)
     {
-        var peak = float.NegativeInfinity;
-        for (var i = 0; i < n; i++) peak = MathF.Max(peak, s[i]);
+        var peak = Peak(s, n);
         var shift = Vector128.Create(peak);
         var sum = Vector128<float>.Zero;
         var vectorEnd = n & ~3;
@@ -265,6 +286,64 @@ internal static unsafe class Neon
         }
     }
 
+    // The decode step's causal conv for one head: Taps3's arithmetic (h2 is the newest row), so a token
+    // decoded alone matches the same token inside a prefill chunk bit for bit.
+    public static void TapsHead(float* taps, int stride, float* h0, float* h1, float* h2, float* destination, float* live0, float* live1, int n)
+    {
+        for (var c = 0; c < n; c += 4)
+        {
+            var x2 = AdvSimd.LoadVector128(h2 + c);
+            var x1 = AdvSimd.LoadVector128(h1 + c);
+            var acc = AdvSimd.Multiply(AdvSimd.LoadVector128(taps + c), x2);
+            acc = AdvSimd.FusedMultiplyAdd(acc, AdvSimd.LoadVector128(taps + stride + c), x1);
+            acc = AdvSimd.FusedMultiplyAdd(acc, AdvSimd.LoadVector128(taps + 2 * stride + c), AdvSimd.LoadVector128(h0 + c));
+            AdvSimd.Store(destination + c, acc);
+            AdvSimd.Store(live0 + c, x1);
+            AdvSimd.Store(live1 + c, x2);
+        }
+    }
+
+    // Per head: output *= sigmoid(gate), and the head's peak |output| at peaks[h * 16]. The products
+    // are NeonPrepare.GateFakeA8's, so the max of the head peaks is its peak and the fused attention
+    // gate prepares the same activations.
+    public static void ApplyGateAndHeadPeaks(float* output, float* gate, int heads, int vDim, float* peaks)
+    {
+        for (var h = 0; h < heads; h++)
+        {
+            var x = output + h * vDim;
+            var g = gate + h * vDim;
+            var peak = Vector128<float>.Zero;
+            var peak1 = Vector128<float>.Zero;
+            var i = 0;
+            for (; i + 8 <= vDim; i += 8)
+            {
+                var e0 = Exp(AdvSimd.Negate(AdvSimd.LoadVector128(g + i)));
+                var e1 = Exp(AdvSimd.Negate(AdvSimd.LoadVector128(g + i + 4)));
+                var v0 = AdvSimd.Multiply(AdvSimd.LoadVector128(x + i), AdvSimd.Arm64.Divide(Vector128.Create(1f), AdvSimd.Add(Vector128.Create(1f), e0)));
+                var v1 = AdvSimd.Multiply(AdvSimd.LoadVector128(x + i + 4), AdvSimd.Arm64.Divide(Vector128.Create(1f), AdvSimd.Add(Vector128.Create(1f), e1)));
+                AdvSimd.Store(x + i, v0);
+                AdvSimd.Store(x + i + 4, v1);
+                peak = AdvSimd.Max(peak, AdvSimd.Abs(v0));
+                peak1 = AdvSimd.Max(peak1, AdvSimd.Abs(v1));
+            }
+            peak = AdvSimd.Max(peak, peak1);
+            for (; i + 4 <= vDim; i += 4)
+            {
+                var v = AdvSimd.Multiply(AdvSimd.LoadVector128(x + i), Sigmoid(AdvSimd.LoadVector128(g + i)));
+                AdvSimd.Store(x + i, v);
+                peak = AdvSimd.Max(peak, AdvSimd.Abs(v));
+            }
+            var headPeak = AdvSimd.Arm64.MaxAcross(peak).ToScalar();
+            for (; i < vDim; i++)
+            {
+                var v = x[i] * Ops.Sigmoid(g[i]);
+                x[i] = v;
+                headPeak = MathF.Max(headPeak, MathF.Abs(v));
+            }
+            peaks[h * 16] = headPeak;
+        }
+    }
+
     public static float AbsMax(float* x, int n)
     {
         var peak = Vector128<float>.Zero;
@@ -346,93 +425,8 @@ internal static unsafe class Neon
         return AdvSimd.Arm64.ZipLow(sums.ToVector128(), diffs.ToVector128());
     }
 
-    public static void Prepare(float* x, int tokens, int cols, int bits, in Activations a)
-    {
-        var rotated = stackalloc float[Cq.GroupSize];
-        var quantized = stackalloc sbyte[Cq.GroupSize];
-        for (var t = 0; t < tokens; t++)
-            for (var g = 0; g < a.Groups; g++)
-            {
-                var slot = t * a.Stride + g;
-                Hadamard(x + (long)t * cols + g * Cq.GroupSize, rotated);
-                a.Scales[slot] = QuantizeInt8(rotated, Cq.GroupSize, quantized);
-                Planes(quantized, bits, a.Values + ((long)t * a.Groups + g) * Cq.GroupSize, out var sum);
-                a.Offsets[slot] = Codebook.Bias * sum;
-            }
-    }
-
-    public static void Planes(sbyte* quantized, int bits, sbyte* destination, out int sum)
-    {
-        sum = 0;
-        if (bits == 2)
-        {
-            for (var half = 0; half < 2; half++)
-            {
-                var q0 = AdvSimd.LoadVector128(quantized + half * 64);
-                var q1 = AdvSimd.LoadVector128(quantized + half * 64 + 16);
-                var q2 = AdvSimd.LoadVector128(quantized + half * 64 + 32);
-                var q3 = AdvSimd.LoadVector128(quantized + half * 64 + 48);
-                StorePlanes2(q0, q1, q2, q3, destination + half * 16);
-                sum += SumOf(q0) + SumOf(q1) + SumOf(q2) + SumOf(q3);
-            }
-        }
-        else
-        {
-            for (var half = 0; half < 2; half++)
-            {
-                var q0 = AdvSimd.LoadVector128(quantized + half * 64);
-                var q1 = AdvSimd.LoadVector128(quantized + half * 64 + 16);
-                var q2 = AdvSimd.LoadVector128(quantized + half * 64 + 32);
-                var q3 = AdvSimd.LoadVector128(quantized + half * 64 + 48);
-                StorePlanes4(q0, q1, q2, q3, destination + half * 64);
-                sum += SumOf(q0) + SumOf(q1) + SumOf(q2) + SumOf(q3);
-            }
-        }
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    static void StorePlanes2(Vector128<sbyte> q0, Vector128<sbyte> q1, Vector128<sbyte> q2, Vector128<sbyte> q3, sbyte* destination)
-    {
-        var table = (q0.AsByte(), q1.AsByte(), q2.AsByte(), q3.AsByte());
-        for (var p = 0; p < 4; p++)
-        {
-            var baseIndex = (byte)p;
-            var first = Vector64.Create(baseIndex, (byte)(baseIndex + 4), (byte)(baseIndex + 8), (byte)(baseIndex + 12), (byte)(baseIndex + 16), (byte)(baseIndex + 20), (byte)(baseIndex + 24), (byte)(baseIndex + 28));
-            var second = Vector64.Create((byte)(baseIndex + 32), (byte)(baseIndex + 36), (byte)(baseIndex + 40), (byte)(baseIndex + 44), (byte)(baseIndex + 48), (byte)(baseIndex + 52), (byte)(baseIndex + 56), (byte)(baseIndex + 60));
-            AdvSimd.Store(destination + p * 32, AdvSimd.VectorTableLookup(table, first).AsSByte());
-            AdvSimd.Store(destination + p * 32 + 8, AdvSimd.VectorTableLookup(table, second).AsSByte());
-        }
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    static void StorePlanes4(Vector128<sbyte> q0, Vector128<sbyte> q1, Vector128<sbyte> q2, Vector128<sbyte> q3, sbyte* destination)
-    {
-        var table = (q0.AsByte(), q1.AsByte(), q2.AsByte(), q3.AsByte());
-        for (var p = 0; p < 2; p++)
-        {
-            var baseIndex = Vector64.Create((byte)p, (byte)(p + 2), (byte)(p + 4), (byte)(p + 6), (byte)(p + 8), (byte)(p + 10), (byte)(p + 12), (byte)(p + 14));
-            for (var quarter = 0; quarter < 4; quarter++)
-            {
-                var index = AdvSimd.Add(baseIndex, Vector64.Create((byte)(16 * quarter)));
-                AdvSimd.Store(destination + p * 32 + quarter * 8, AdvSimd.VectorTableLookup(table, index).AsSByte());
-            }
-        }
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    static int SumOf(Vector128<sbyte> q)
-    {
-        if (UseDotProduct)
-        {
-            var sums = Dp.DotProduct(Vector128<int>.Zero, Vector128.Create((sbyte)1), q);
-            return AdvSimd.Arm64.AddAcross(sums).ToScalar();
-        }
-        var low = AdvSimd.SignExtendWideningLower(q.GetLower());
-        var high = AdvSimd.SignExtendWideningUpper(q);
-        var wide = AdvSimd.AddPairwiseWideningAndAdd(Vector128<int>.Zero, low);
-        wide = AdvSimd.AddPairwiseWideningAndAdd(wide, high);
-        return AdvSimd.Arm64.AddAcross(wide).ToScalar();
-    }
+    public static void Prepare(float* x, int tokens, int cols, int bits, in Activations a) =>
+        NeonPrepare.Prepare(x, tokens, cols, bits, a);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     static Vector128<int> Dot16(Vector128<int> sum, Vector128<sbyte> weights, Vector128<sbyte> values)
@@ -462,7 +456,30 @@ internal static unsafe class Neon
             var single = AdvSimd.Or(AdvSimd.And(bits, nonZero), sign).AsSingle();
             AdvSimd.Store(factors + g, AdvSimd.Multiply(single, multiplier));
         }
-        for (; g < groups; g++) factors[g] = Scalar.HalfToSingle(norms[g]) * scale;
+        if (g < groups && groups >= 4) AdvSimd.Store(factors + g, AdvSimd.Multiply(HalfTail(norms, groups), multiplier));
+        else for (; g < groups; g++) factors[g] = Scalar.HalfToSingle(norms[g]) * scale;
+    }
+
+    // Scalar.HalfToSingle of a row's last groups % 4 halves (groups >= 4, groups % 4 != 0), zero in
+    // the lanes after them: one load of the last four halves, shifted down past the ones already done.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static Vector128<float> HalfTail(ushort* norms, int groups)
+    {
+        var missing = 4 - (groups & 3);
+        var packed = AdvSimd.ShiftLogicalScalar(AdvSimd.LoadVector64((ulong*)(norms + groups - 4)), Vector64.Create(-16L * missing));
+        return ExactHalves(AdvSimd.ZeroExtendWideningLower(packed.AsUInt16()));
+    }
+
+    // Scalar.HalfToSingle per lane, subnormals and the +0 for a zero magnitude included.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    static Vector128<float> ExactHalves(Vector128<uint> wide)
+    {
+        var magnitude = AdvSimd.And(wide, Vector128.Create(0x7FFFu));
+        var sign = AdvSimd.ShiftLeftLogical(AdvSimd.And(wide, Vector128.Create(0x8000u)), 16);
+        var normal = AdvSimd.Or(AdvSimd.Add(AdvSimd.ShiftLeftLogical(magnitude, 13), Vector128.Create(0x38000000u)), sign);
+        var subnormal = AdvSimd.Or(AdvSimd.Multiply(AdvSimd.ConvertToSingle(magnitude), Vector128.Create(5.9604645e-8f)).AsUInt32(), sign);
+        var value = AdvSimd.BitwiseSelect(AdvSimd.CompareLessThan(magnitude, Vector128.Create(0x400u)), subnormal, normal);
+        return AdvSimd.And(value, AdvSimd.CompareGreaterThan(magnitude, Vector128<uint>.Zero)).AsSingle();
     }
 
     public static float ScaleFactors(float* factors, float* scaled, float* scales, float* offsets, int stride)
@@ -585,336 +602,9 @@ internal static unsafe class Neon
         }
     }
 
-    public static float DotRow(in Cq w, byte* packedRows, in Activations a, int token, float* factors, float* scaled)
-    {
-        var groups = a.Groups;
-        var bias = ScaleFactors(factors, scaled, a.Scales + token * a.Stride, a.Offsets + token * a.Stride, a.Stride);
-        var table = AdvSimd.LoadVector128(w.Book->Bytes);
-        var mask = Vector128.Create(w.Bits == 2 ? (byte)0x03 : (byte)0x0F);
-        var values = a.Values + (long)token * a.Cols;
-        var accumulator = 0f;
-        for (var g = 0; g < groups; g++)
-        {
-            var sum = GroupDot(packedRows + g * w.RowBytes / groups, values + g * Cq.GroupSize, mask, table);
-            accumulator += HorizontalSum(AdvSimd.ConvertToSingle(sum)) * scaled[g];
-        }
-        return accumulator - bias;
-    }
+    public static void MatMulRows(in Cq w, in Activations a, int tokens, float* y, int ldy, int rowStart, int rowEnd) =>
+        NeonGemv.MatMulRows(w, a, tokens, y, ldy, rowStart, rowEnd);
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal static Vector128<int> GroupDot(byte* packed, sbyte* values, Vector128<byte> mask, Vector128<byte> table)
-    {
-        var two = mask.GetElement(0) == 3;
-        var sum = Vector128<int>.Zero;
-        if (two)
-        {
-            for (var r = 0; r < 2; r++)
-            {
-                var source = AdvSimd.LoadVector128(packed + r * 16);
-                var act = values + r * 16;
-                sum = Dot16(sum, Weights(table, AdvSimd.And(source, mask)), AdvSimd.LoadVector128(act));
-                sum = Dot16(sum, Weights(table, AdvSimd.And(AdvSimd.ShiftRightLogical(source, 2), mask)), AdvSimd.LoadVector128(act + 32));
-                sum = Dot16(sum, Weights(table, AdvSimd.And(AdvSimd.ShiftRightLogical(source, 4), mask)), AdvSimd.LoadVector128(act + 64));
-                sum = Dot16(sum, Weights(table, AdvSimd.And(AdvSimd.ShiftRightLogical(source, 6), mask)), AdvSimd.LoadVector128(act + 96));
-            }
-            return sum;
-        }
-        for (var r = 0; r < 4; r++)
-        {
-            var source = AdvSimd.LoadVector128(packed + r * 16);
-            var act = values + (r >> 1) * 64 + (r & 1) * 16;
-            sum = Dot16(sum, Weights(table, AdvSimd.And(source, mask)), AdvSimd.LoadVector128(act));
-            sum = Dot16(sum, Weights(table, AdvSimd.And(AdvSimd.ShiftRightLogical(source, 4), mask)), AdvSimd.LoadVector128(act + 32));
-        }
-        return sum;
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    static Vector128<sbyte> Weights(Vector128<byte> table, Vector128<byte> index)
-    {
-        var low = AdvSimd.VectorTableLookup(table, index.GetLower());
-        var high = AdvSimd.VectorTableLookup(table, index.GetUpper());
-        return Vector128.WithUpper(low.AsSByte().ToVector128(), high.AsSByte());
-    }
-
-    public static void DotTile(in Cq w, byte* packedRows, in Activations a, int token, float* factors, float* scaled, float* y, int ldy)
-    {
-        var groups = a.Groups;
-        var stride = a.Stride;
-        var cols = a.Cols;
-        var bias0 = ScaleFactors(factors, scaled, a.Scales + token * stride, a.Offsets + token * stride, stride);
-        var bias1 = ScaleFactors(factors, scaled + stride, a.Scales + (token + 1) * stride, a.Offsets + (token + 1) * stride, stride);
-        var bias2 = ScaleFactors(factors, scaled + 2 * stride, a.Scales + (token + 2) * stride, a.Offsets + (token + 2) * stride, stride);
-        var bias3 = ScaleFactors(factors, scaled + 3 * stride, a.Scales + (token + 3) * stride, a.Offsets + (token + 3) * stride, stride);
-        var table = AdvSimd.LoadVector128(w.Book->Bytes);
-        var mask = Vector128.Create(w.Bits == 2 ? (byte)0x03 : (byte)0x0F);
-        var v0 = a.Values + (long)token * cols;
-        var v1 = v0 + cols;
-        var v2 = v1 + cols;
-        var v3 = v2 + cols;
-        var accumulator0 = 0f;
-        var accumulator1 = 0f;
-        var accumulator2 = 0f;
-        var accumulator3 = 0f;
-        var packedStep = w.RowBytes / groups;
-        var regs = w.Bits == 2 ? 2 : 4;
-        for (var g = 0; g < groups; g++)
-        {
-            var packed = packedRows + g * packedStep;
-            var sum0 = Vector128<int>.Zero;
-            var sum1 = Vector128<int>.Zero;
-            var sum2 = Vector128<int>.Zero;
-            var sum3 = Vector128<int>.Zero;
-            for (var r = 0; r < regs; r++)
-            {
-                var source = AdvSimd.LoadVector128(packed + r * 16);
-                var act = g * Cq.GroupSize + (w.Bits == 2 ? r * 16 : (r >> 1) * 64 + (r & 1) * 16);
-                if (w.Bits == 2)
-                {
-                    TilePlane(table, mask, source, 0, act, v0, v1, v2, v3, ref sum0, ref sum1, ref sum2, ref sum3);
-                    TilePlane(table, mask, AdvSimd.ShiftRightLogical(source, 2), 1, act, v0, v1, v2, v3, ref sum0, ref sum1, ref sum2, ref sum3);
-                    TilePlane(table, mask, AdvSimd.ShiftRightLogical(source, 4), 2, act, v0, v1, v2, v3, ref sum0, ref sum1, ref sum2, ref sum3);
-                    TilePlane(table, mask, AdvSimd.ShiftRightLogical(source, 6), 3, act, v0, v1, v2, v3, ref sum0, ref sum1, ref sum2, ref sum3);
-                }
-                else
-                {
-                    TilePlane(table, mask, source, 0, act, v0, v1, v2, v3, ref sum0, ref sum1, ref sum2, ref sum3);
-                    TilePlane(table, mask, AdvSimd.ShiftRightLogical(source, 4), 1, act, v0, v1, v2, v3, ref sum0, ref sum1, ref sum2, ref sum3);
-                }
-            }
-            accumulator0 += HorizontalSum(AdvSimd.ConvertToSingle(sum0)) * scaled[g];
-            accumulator1 += HorizontalSum(AdvSimd.ConvertToSingle(sum1)) * scaled[stride + g];
-            accumulator2 += HorizontalSum(AdvSimd.ConvertToSingle(sum2)) * scaled[2 * stride + g];
-            accumulator3 += HorizontalSum(AdvSimd.ConvertToSingle(sum3)) * scaled[3 * stride + g];
-        }
-        y[0] = accumulator0 - bias0;
-        y[ldy] = accumulator1 - bias1;
-        y[2 * ldy] = accumulator2 - bias2;
-        y[3 * ldy] = accumulator3 - bias3;
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    static void TilePlane(Vector128<byte> table, Vector128<byte> mask, Vector128<byte> index, int plane, int act, sbyte* v0, sbyte* v1, sbyte* v2, sbyte* v3, ref Vector128<int> sum0, ref Vector128<int> sum1, ref Vector128<int> sum2, ref Vector128<int> sum3)
-    {
-        var offset = act + plane * 32;
-        var weights = Weights(table, AdvSimd.And(index, mask));
-        sum0 = Dot16(sum0, weights, AdvSimd.LoadVector128(v0 + offset));
-        sum1 = Dot16(sum1, weights, AdvSimd.LoadVector128(v1 + offset));
-        sum2 = Dot16(sum2, weights, AdvSimd.LoadVector128(v2 + offset));
-        sum3 = Dot16(sum3, weights, AdvSimd.LoadVector128(v3 + offset));
-    }
-
-    static void DotBlock(in Cq w, byte* packed, int rowBytes, ushort* norms, int groups, in Activations a, int token, float* rowFactors, float* scaled, float* y, Vector128<byte> table, Vector128<byte> mask)
-    {
-        var stride = a.Stride;
-        for (var r = 0; r < 4; r++)
-            LoadFactors(norms + (long)r * groups, groups, w.Book->ByteScale, rowFactors + r * stride);
-        var bias0 = ScaleFactors(rowFactors, scaled, a.Scales + token * stride, a.Offsets + token * stride, stride);
-        var bias1 = ScaleFactors(rowFactors + stride, scaled + stride, a.Scales + token * stride, a.Offsets + token * stride, stride);
-        var bias2 = ScaleFactors(rowFactors + 2 * stride, scaled + 2 * stride, a.Scales + token * stride, a.Offsets + token * stride, stride);
-        var bias3 = ScaleFactors(rowFactors + 3 * stride, scaled + 3 * stride, a.Scales + token * stride, a.Offsets + token * stride, stride);
-        var values = a.Values + (long)token * a.Cols;
-        var accumulator0 = 0f;
-        var accumulator1 = 0f;
-        var accumulator2 = 0f;
-        var accumulator3 = 0f;
-        var packedStep = w.RowBytes / groups;
-        var regs = w.Bits == 2 ? 2 : 4;
-        var row1 = packed + rowBytes;
-        var row2 = packed + 2 * rowBytes;
-        var row3 = packed + 3 * rowBytes;
-        for (var g = 0; g < groups; g++)
-        {
-            var sum0 = Vector128<int>.Zero;
-            var sum1 = Vector128<int>.Zero;
-            var sum2 = Vector128<int>.Zero;
-            var sum3 = Vector128<int>.Zero;
-            var offset = g * packedStep;
-            for (var r = 0; r < regs; r++)
-            {
-                var s0 = AdvSimd.LoadVector128(packed + offset + r * 16);
-                var s1 = AdvSimd.LoadVector128(row1 + offset + r * 16);
-                var s2 = AdvSimd.LoadVector128(row2 + offset + r * 16);
-                var s3 = AdvSimd.LoadVector128(row3 + offset + r * 16);
-                var act = g * Cq.GroupSize + (w.Bits == 2 ? r * 16 : (r >> 1) * 64 + (r & 1) * 16);
-                if (w.Bits == 2)
-                {
-                    BlockPlane(table, mask, s0, s1, s2, s3, 0, act, values, ref sum0, ref sum1, ref sum2, ref sum3);
-                    BlockPlane(table, mask, AdvSimd.ShiftRightLogical(s0, 2), AdvSimd.ShiftRightLogical(s1, 2), AdvSimd.ShiftRightLogical(s2, 2), AdvSimd.ShiftRightLogical(s3, 2), 1, act, values, ref sum0, ref sum1, ref sum2, ref sum3);
-                    BlockPlane(table, mask, AdvSimd.ShiftRightLogical(s0, 4), AdvSimd.ShiftRightLogical(s1, 4), AdvSimd.ShiftRightLogical(s2, 4), AdvSimd.ShiftRightLogical(s3, 4), 2, act, values, ref sum0, ref sum1, ref sum2, ref sum3);
-                    BlockPlane(table, mask, AdvSimd.ShiftRightLogical(s0, 6), AdvSimd.ShiftRightLogical(s1, 6), AdvSimd.ShiftRightLogical(s2, 6), AdvSimd.ShiftRightLogical(s3, 6), 3, act, values, ref sum0, ref sum1, ref sum2, ref sum3);
-                }
-                else
-                {
-                    BlockPlane(table, mask, s0, s1, s2, s3, 0, act, values, ref sum0, ref sum1, ref sum2, ref sum3);
-                    BlockPlane(table, mask, AdvSimd.ShiftRightLogical(s0, 4), AdvSimd.ShiftRightLogical(s1, 4), AdvSimd.ShiftRightLogical(s2, 4), AdvSimd.ShiftRightLogical(s3, 4), 1, act, values, ref sum0, ref sum1, ref sum2, ref sum3);
-                }
-            }
-            accumulator0 += HorizontalSum(AdvSimd.ConvertToSingle(sum0)) * scaled[g];
-            accumulator1 += HorizontalSum(AdvSimd.ConvertToSingle(sum1)) * scaled[stride + g];
-            accumulator2 += HorizontalSum(AdvSimd.ConvertToSingle(sum2)) * scaled[2 * stride + g];
-            accumulator3 += HorizontalSum(AdvSimd.ConvertToSingle(sum3)) * scaled[3 * stride + g];
-        }
-        y[0] = accumulator0 - bias0;
-        y[1] = accumulator1 - bias1;
-        y[2] = accumulator2 - bias2;
-        y[3] = accumulator3 - bias3;
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    static void BlockPlane(Vector128<byte> table, Vector128<byte> mask, Vector128<byte> i0, Vector128<byte> i1, Vector128<byte> i2, Vector128<byte> i3, int plane, int act, sbyte* values, ref Vector128<int> sum0, ref Vector128<int> sum1, ref Vector128<int> sum2, ref Vector128<int> sum3)
-    {
-        var activation = AdvSimd.LoadVector128(values + act + plane * 32);
-        sum0 = Dot16(sum0, Weights(table, AdvSimd.And(i0, mask)), activation);
-        sum1 = Dot16(sum1, Weights(table, AdvSimd.And(i1, mask)), activation);
-        sum2 = Dot16(sum2, Weights(table, AdvSimd.And(i2, mask)), activation);
-        sum3 = Dot16(sum3, Weights(table, AdvSimd.And(i3, mask)), activation);
-    }
-
-    static void DotPair(in Cq w, byte* packed, int rowBytes, ushort* norms, int groups, in Activations a, int token, float* rowFactors, float* scaled, float* y, int ldy, Vector128<byte> table, Vector128<byte> mask)
-    {
-        var stride = a.Stride;
-        var cols = a.Cols;
-        LoadFactors(norms, groups, w.Book->ByteScale, rowFactors);
-        LoadFactors(norms + groups, groups, w.Book->ByteScale, rowFactors + stride);
-        var bias00 = ScaleFactors(rowFactors, scaled, a.Scales + token * stride, a.Offsets + token * stride, stride);
-        var bias01 = ScaleFactors(rowFactors, scaled + stride, a.Scales + (token + 1) * stride, a.Offsets + (token + 1) * stride, stride);
-        var bias02 = ScaleFactors(rowFactors, scaled + 2 * stride, a.Scales + (token + 2) * stride, a.Offsets + (token + 2) * stride, stride);
-        var bias03 = ScaleFactors(rowFactors, scaled + 3 * stride, a.Scales + (token + 3) * stride, a.Offsets + (token + 3) * stride, stride);
-        var bias10 = ScaleFactors(rowFactors + stride, scaled + 4 * stride, a.Scales + token * stride, a.Offsets + token * stride, stride);
-        var bias11 = ScaleFactors(rowFactors + stride, scaled + 5 * stride, a.Scales + (token + 1) * stride, a.Offsets + (token + 1) * stride, stride);
-        var bias12 = ScaleFactors(rowFactors + stride, scaled + 6 * stride, a.Scales + (token + 2) * stride, a.Offsets + (token + 2) * stride, stride);
-        var bias13 = ScaleFactors(rowFactors + stride, scaled + 7 * stride, a.Scales + (token + 3) * stride, a.Offsets + (token + 3) * stride, stride);
-        var v0 = a.Values + (long)token * cols;
-        var v1 = v0 + cols;
-        var v2 = v1 + cols;
-        var v3 = v2 + cols;
-        var accumulator00 = 0f;
-        var accumulator01 = 0f;
-        var accumulator02 = 0f;
-        var accumulator03 = 0f;
-        var accumulator10 = 0f;
-        var accumulator11 = 0f;
-        var accumulator12 = 0f;
-        var accumulator13 = 0f;
-        var packedStep = w.RowBytes / groups;
-        var regs = w.Bits == 2 ? 2 : 4;
-        var row1 = packed + rowBytes;
-        for (var g = 0; g < groups; g++)
-        {
-            var sum00 = Vector128<int>.Zero;
-            var sum01 = Vector128<int>.Zero;
-            var sum02 = Vector128<int>.Zero;
-            var sum03 = Vector128<int>.Zero;
-            var sum10 = Vector128<int>.Zero;
-            var sum11 = Vector128<int>.Zero;
-            var sum12 = Vector128<int>.Zero;
-            var sum13 = Vector128<int>.Zero;
-            var offset = g * packedStep;
-            for (var r = 0; r < regs; r++)
-            {
-                var s0 = AdvSimd.LoadVector128(packed + offset + r * 16);
-                var s1 = AdvSimd.LoadVector128(row1 + offset + r * 16);
-                var act = g * Cq.GroupSize + (w.Bits == 2 ? r * 16 : (r >> 1) * 64 + (r & 1) * 16);
-                if (w.Bits == 2)
-                {
-                    PairPlane(table, mask, s0, s1, 0, act, v0, v1, v2, v3, ref sum00, ref sum01, ref sum02, ref sum03, ref sum10, ref sum11, ref sum12, ref sum13);
-                    PairPlane(table, mask, AdvSimd.ShiftRightLogical(s0, 2), AdvSimd.ShiftRightLogical(s1, 2), 1, act, v0, v1, v2, v3, ref sum00, ref sum01, ref sum02, ref sum03, ref sum10, ref sum11, ref sum12, ref sum13);
-                    PairPlane(table, mask, AdvSimd.ShiftRightLogical(s0, 4), AdvSimd.ShiftRightLogical(s1, 4), 2, act, v0, v1, v2, v3, ref sum00, ref sum01, ref sum02, ref sum03, ref sum10, ref sum11, ref sum12, ref sum13);
-                    PairPlane(table, mask, AdvSimd.ShiftRightLogical(s0, 6), AdvSimd.ShiftRightLogical(s1, 6), 3, act, v0, v1, v2, v3, ref sum00, ref sum01, ref sum02, ref sum03, ref sum10, ref sum11, ref sum12, ref sum13);
-                }
-                else
-                {
-                    PairPlane(table, mask, s0, s1, 0, act, v0, v1, v2, v3, ref sum00, ref sum01, ref sum02, ref sum03, ref sum10, ref sum11, ref sum12, ref sum13);
-                    PairPlane(table, mask, AdvSimd.ShiftRightLogical(s0, 4), AdvSimd.ShiftRightLogical(s1, 4), 1, act, v0, v1, v2, v3, ref sum00, ref sum01, ref sum02, ref sum03, ref sum10, ref sum11, ref sum12, ref sum13);
-                }
-            }
-            accumulator00 += HorizontalSum(AdvSimd.ConvertToSingle(sum00)) * scaled[g];
-            accumulator01 += HorizontalSum(AdvSimd.ConvertToSingle(sum01)) * scaled[stride + g];
-            accumulator02 += HorizontalSum(AdvSimd.ConvertToSingle(sum02)) * scaled[2 * stride + g];
-            accumulator03 += HorizontalSum(AdvSimd.ConvertToSingle(sum03)) * scaled[3 * stride + g];
-            accumulator10 += HorizontalSum(AdvSimd.ConvertToSingle(sum10)) * scaled[4 * stride + g];
-            accumulator11 += HorizontalSum(AdvSimd.ConvertToSingle(sum11)) * scaled[5 * stride + g];
-            accumulator12 += HorizontalSum(AdvSimd.ConvertToSingle(sum12)) * scaled[6 * stride + g];
-            accumulator13 += HorizontalSum(AdvSimd.ConvertToSingle(sum13)) * scaled[7 * stride + g];
-        }
-        y[0] = accumulator00 - bias00;
-        y[ldy] = accumulator01 - bias01;
-        y[2 * ldy] = accumulator02 - bias02;
-        y[3 * ldy] = accumulator03 - bias03;
-        y[1] = accumulator10 - bias10;
-        y[ldy + 1] = accumulator11 - bias11;
-        y[2 * ldy + 1] = accumulator12 - bias12;
-        y[3 * ldy + 1] = accumulator13 - bias13;
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    static void PairPlane(Vector128<byte> table, Vector128<byte> mask, Vector128<byte> i0, Vector128<byte> i1, int plane, int act, sbyte* v0, sbyte* v1, sbyte* v2, sbyte* v3, ref Vector128<int> sum00, ref Vector128<int> sum01, ref Vector128<int> sum02, ref Vector128<int> sum03, ref Vector128<int> sum10, ref Vector128<int> sum11, ref Vector128<int> sum12, ref Vector128<int> sum13)
-    {
-        var w0 = Weights(table, AdvSimd.And(i0, mask));
-        var w1 = Weights(table, AdvSimd.And(i1, mask));
-        var offset = act + plane * 32;
-        var a0 = AdvSimd.LoadVector128(v0 + offset);
-        var a1 = AdvSimd.LoadVector128(v1 + offset);
-        var a2 = AdvSimd.LoadVector128(v2 + offset);
-        var a3 = AdvSimd.LoadVector128(v3 + offset);
-        sum00 = Dot16(sum00, w0, a0);
-        sum01 = Dot16(sum01, w0, a1);
-        sum02 = Dot16(sum02, w0, a2);
-        sum03 = Dot16(sum03, w0, a3);
-        sum10 = Dot16(sum10, w1, a0);
-        sum11 = Dot16(sum11, w1, a1);
-        sum12 = Dot16(sum12, w1, a2);
-        sum13 = Dot16(sum13, w1, a3);
-    }
-
-    static void BlockToken(in Cq w, in Activations a, int token, float* yToken, int rowStart, int rowEnd, float* rowFactors, float* scaled, Vector128<byte> table, Vector128<byte> mask)
-    {
-        var groups = w.Groups;
-        var n = rowStart;
-        for (; n + 4 <= rowEnd; n += 4)
-            DotBlock(w, w.Indices + (long)n * w.RowBytes, w.RowBytes, w.Norms + (long)n * groups, groups, a, token, rowFactors, scaled, yToken + n, table, mask);
-        for (; n < rowEnd; n++)
-        {
-            LoadFactors(w.Norms + (long)n * groups, groups, w.Book->ByteScale, rowFactors);
-            yToken[n] = DotRow(w, w.Indices + (long)n * w.RowBytes, a, token, rowFactors, scaled);
-        }
-    }
-
-    public static void MatMulRows(in Cq w, in Activations a, int tokens, float* y, int ldy, int rowStart, int rowEnd)
-    {
-        var rowFactors = stackalloc float[a.Stride * 4];
-        var scaled = stackalloc float[a.Stride * 8];
-        var groups = w.Groups;
-        var table = AdvSimd.LoadVector128(w.Book->Bytes);
-        var mask = Vector128.Create(w.Bits == 2 ? (byte)0x03 : (byte)0x0F);
-        if ((rowEnd - rowStart) * 4 <= tokens)
-        {
-            for (var t = 0; t + 4 <= tokens; t += 4)
-            {
-                var n = rowStart;
-                for (; n + 2 <= rowEnd; n += 2)
-                    DotPair(w, w.Indices + (long)n * w.RowBytes, w.RowBytes, w.Norms + (long)n * groups, groups, a, t, rowFactors, scaled, y + (long)t * ldy + n, ldy, table, mask);
-                for (; n < rowEnd; n++)
-                {
-                    LoadFactors(w.Norms + (long)n * groups, groups, w.Book->ByteScale, rowFactors);
-                    DotTile(w, w.Indices + (long)n * w.RowBytes, a, t, rowFactors, scaled, y + (long)t * ldy + n, ldy);
-                }
-            }
-            for (var t = tokens & ~3; t < tokens; t++)
-                BlockToken(w, a, t, y + (long)t * ldy, rowStart, rowEnd, rowFactors, scaled, table, mask);
-            return;
-        }
-        var full = tokens & ~3;
-        for (var n = rowStart; n < rowEnd; n++)
-        {
-            LoadFactors(w.Norms + (long)n * groups, groups, w.Book->ByteScale, rowFactors);
-            for (var t = 0; t < full; t += 4)
-                DotTile(w, w.Indices + (long)n * w.RowBytes, a, t, rowFactors, scaled, y + (long)t * ldy + n, ldy);
-        }
-        for (var t = full; t < tokens; t++)
-            BlockToken(w, a, t, y + (long)t * ldy, rowStart, rowEnd, rowFactors, scaled, table, mask);
-    }
 
     public static void ConditionWeights(float* condV, float* input, int dim, float* weights)
     {
@@ -946,7 +636,86 @@ internal static unsafe class Neon
     static Vector128<float> Gather(float* source, int* permutation) =>
         Vector128.Create(source[permutation[0]], source[permutation[1]], source[permutation[2]], source[permutation[3]]);
 
+    // Four independent vectors per step, so the long FMA and exp chains of neighbouring columns
+    // overlap; each column's arithmetic is PermuteModulateActivateSingle's.
     public static void PermuteModulateActivate(int* permutation, float* source, float* d2, float* weights, float* condU, float* b2, int width, float* destination)
+    {
+        var w0 = Vector128.Create(weights[0]);
+        var w1 = Vector128.Create(weights[1]);
+        var w2 = Vector128.Create(weights[2]);
+        var w3 = Vector128.Create(weights[3]);
+        var w4 = Vector128.Create(weights[4]);
+        var w5 = Vector128.Create(weights[5]);
+        var w6 = Vector128.Create(weights[6]);
+        var w7 = Vector128.Create(weights[7]);
+        var one = Vector128.Create(1f);
+        var i = 0;
+        for (; i + 16 <= width; i += 16)
+        {
+            var c0 = AdvSimd.FusedMultiplyAdd(one, w0, AdvSimd.LoadVector128(condU + i));
+            var c1 = AdvSimd.FusedMultiplyAdd(one, w0, AdvSimd.LoadVector128(condU + i + 4));
+            var c2 = AdvSimd.FusedMultiplyAdd(one, w0, AdvSimd.LoadVector128(condU + i + 8));
+            var c3 = AdvSimd.FusedMultiplyAdd(one, w0, AdvSimd.LoadVector128(condU + i + 12));
+            c0 = AdvSimd.FusedMultiplyAdd(c0, w1, AdvSimd.LoadVector128(condU + 1 * width + i));
+            c1 = AdvSimd.FusedMultiplyAdd(c1, w1, AdvSimd.LoadVector128(condU + 1 * width + i + 4));
+            c2 = AdvSimd.FusedMultiplyAdd(c2, w1, AdvSimd.LoadVector128(condU + 1 * width + i + 8));
+            c3 = AdvSimd.FusedMultiplyAdd(c3, w1, AdvSimd.LoadVector128(condU + 1 * width + i + 12));
+            c0 = AdvSimd.FusedMultiplyAdd(c0, w2, AdvSimd.LoadVector128(condU + 2 * width + i));
+            c1 = AdvSimd.FusedMultiplyAdd(c1, w2, AdvSimd.LoadVector128(condU + 2 * width + i + 4));
+            c2 = AdvSimd.FusedMultiplyAdd(c2, w2, AdvSimd.LoadVector128(condU + 2 * width + i + 8));
+            c3 = AdvSimd.FusedMultiplyAdd(c3, w2, AdvSimd.LoadVector128(condU + 2 * width + i + 12));
+            c0 = AdvSimd.FusedMultiplyAdd(c0, w3, AdvSimd.LoadVector128(condU + 3 * width + i));
+            c1 = AdvSimd.FusedMultiplyAdd(c1, w3, AdvSimd.LoadVector128(condU + 3 * width + i + 4));
+            c2 = AdvSimd.FusedMultiplyAdd(c2, w3, AdvSimd.LoadVector128(condU + 3 * width + i + 8));
+            c3 = AdvSimd.FusedMultiplyAdd(c3, w3, AdvSimd.LoadVector128(condU + 3 * width + i + 12));
+            c0 = AdvSimd.FusedMultiplyAdd(c0, w4, AdvSimd.LoadVector128(condU + 4 * width + i));
+            c1 = AdvSimd.FusedMultiplyAdd(c1, w4, AdvSimd.LoadVector128(condU + 4 * width + i + 4));
+            c2 = AdvSimd.FusedMultiplyAdd(c2, w4, AdvSimd.LoadVector128(condU + 4 * width + i + 8));
+            c3 = AdvSimd.FusedMultiplyAdd(c3, w4, AdvSimd.LoadVector128(condU + 4 * width + i + 12));
+            c0 = AdvSimd.FusedMultiplyAdd(c0, w5, AdvSimd.LoadVector128(condU + 5 * width + i));
+            c1 = AdvSimd.FusedMultiplyAdd(c1, w5, AdvSimd.LoadVector128(condU + 5 * width + i + 4));
+            c2 = AdvSimd.FusedMultiplyAdd(c2, w5, AdvSimd.LoadVector128(condU + 5 * width + i + 8));
+            c3 = AdvSimd.FusedMultiplyAdd(c3, w5, AdvSimd.LoadVector128(condU + 5 * width + i + 12));
+            c0 = AdvSimd.FusedMultiplyAdd(c0, w6, AdvSimd.LoadVector128(condU + 6 * width + i));
+            c1 = AdvSimd.FusedMultiplyAdd(c1, w6, AdvSimd.LoadVector128(condU + 6 * width + i + 4));
+            c2 = AdvSimd.FusedMultiplyAdd(c2, w6, AdvSimd.LoadVector128(condU + 6 * width + i + 8));
+            c3 = AdvSimd.FusedMultiplyAdd(c3, w6, AdvSimd.LoadVector128(condU + 6 * width + i + 12));
+            c0 = AdvSimd.FusedMultiplyAdd(c0, w7, AdvSimd.LoadVector128(condU + 7 * width + i));
+            c1 = AdvSimd.FusedMultiplyAdd(c1, w7, AdvSimd.LoadVector128(condU + 7 * width + i + 4));
+            c2 = AdvSimd.FusedMultiplyAdd(c2, w7, AdvSimd.LoadVector128(condU + 7 * width + i + 8));
+            c3 = AdvSimd.FusedMultiplyAdd(c3, w7, AdvSimd.LoadVector128(condU + 7 * width + i + 12));
+            var v0 = AdvSimd.FusedMultiplyAdd(AdvSimd.LoadVector128(b2 + i), AdvSimd.Multiply(AdvSimd.LoadVector128(d2 + i), c0), Gather(source, permutation + i));
+            var v1 = AdvSimd.FusedMultiplyAdd(AdvSimd.LoadVector128(b2 + i + 4), AdvSimd.Multiply(AdvSimd.LoadVector128(d2 + i + 4), c1), Gather(source, permutation + i + 4));
+            var v2 = AdvSimd.FusedMultiplyAdd(AdvSimd.LoadVector128(b2 + i + 8), AdvSimd.Multiply(AdvSimd.LoadVector128(d2 + i + 8), c2), Gather(source, permutation + i + 8));
+            var v3 = AdvSimd.FusedMultiplyAdd(AdvSimd.LoadVector128(b2 + i + 12), AdvSimd.Multiply(AdvSimd.LoadVector128(d2 + i + 12), c3), Gather(source, permutation + i + 12));
+            var e0 = Exp(AdvSimd.Negate(v0));
+            var e1 = Exp(AdvSimd.Negate(v1));
+            var e2 = Exp(AdvSimd.Negate(v2));
+            var e3 = Exp(AdvSimd.Negate(v3));
+            AdvSimd.Store(destination + i, AdvSimd.Multiply(v0, AdvSimd.Arm64.Divide(one, AdvSimd.Add(one, e0))));
+            AdvSimd.Store(destination + i + 4, AdvSimd.Multiply(v1, AdvSimd.Arm64.Divide(one, AdvSimd.Add(one, e1))));
+            AdvSimd.Store(destination + i + 8, AdvSimd.Multiply(v2, AdvSimd.Arm64.Divide(one, AdvSimd.Add(one, e2))));
+            AdvSimd.Store(destination + i + 12, AdvSimd.Multiply(v3, AdvSimd.Arm64.Divide(one, AdvSimd.Add(one, e3))));
+        }
+        for (; i < width; i += 4)
+        {
+            var condition = AdvSimd.FusedMultiplyAdd(one, w0, AdvSimd.LoadVector128(condU + i));
+            condition = AdvSimd.FusedMultiplyAdd(condition, w1, AdvSimd.LoadVector128(condU + width + i));
+            condition = AdvSimd.FusedMultiplyAdd(condition, w2, AdvSimd.LoadVector128(condU + 2 * width + i));
+            condition = AdvSimd.FusedMultiplyAdd(condition, w3, AdvSimd.LoadVector128(condU + 3 * width + i));
+            condition = AdvSimd.FusedMultiplyAdd(condition, w4, AdvSimd.LoadVector128(condU + 4 * width + i));
+            condition = AdvSimd.FusedMultiplyAdd(condition, w5, AdvSimd.LoadVector128(condU + 5 * width + i));
+            condition = AdvSimd.FusedMultiplyAdd(condition, w6, AdvSimd.LoadVector128(condU + 6 * width + i));
+            condition = AdvSimd.FusedMultiplyAdd(condition, w7, AdvSimd.LoadVector128(condU + 7 * width + i));
+            var v = AdvSimd.FusedMultiplyAdd(
+                AdvSimd.LoadVector128(b2 + i),
+                AdvSimd.Multiply(AdvSimd.LoadVector128(d2 + i), condition),
+                Gather(source, permutation + i));
+            AdvSimd.Store(destination + i, AdvSimd.Multiply(v, Sigmoid(v)));
+        }
+    }
+
+    internal static void PermuteModulateActivateSingle(int* permutation, float* source, float* d2, float* weights, float* condU, float* b2, int width, float* destination)
     {
         var w0 = Vector128.Create(weights[0]);
         var w1 = Vector128.Create(weights[1]);
@@ -1126,6 +895,55 @@ internal static unsafe class Neon
         }
     }
 
+    // CombineDiff4 for the four output lanes in one pass over the stream: the same products in the
+    // same order, with each lane's weights read by element from mix.
+    public static void CombineDiff4x4(float* s, int dim, float* mix, float* x, float* u, float* postGate, float* destination)
+    {
+        var m0 = AdvSimd.LoadVector128(mix);
+        var m1 = AdvSimd.LoadVector128(mix + 4);
+        var m2 = AdvSimd.LoadVector128(mix + 8);
+        var m3 = AdvSimd.LoadVector128(mix + 12);
+        var p = AdvSimd.LoadVector128(postGate);
+        var s1 = s + dim;
+        var s2 = s + 2 * dim;
+        var s3 = s + 3 * dim;
+        var d1 = destination + dim;
+        var d2 = destination + 2 * dim;
+        var d3 = destination + 3 * dim;
+        for (var c = 0; c < dim; c += 4)
+        {
+            var diff = AdvSimd.Subtract(AdvSimd.LoadVector128(x + c), AdvSimd.LoadVector128(u + c));
+            var v0 = AdvSimd.LoadVector128(s + c);
+            var v1 = AdvSimd.LoadVector128(s1 + c);
+            var v2 = AdvSimd.LoadVector128(s2 + c);
+            var v3 = AdvSimd.LoadVector128(s3 + c);
+            var a0 = AdvSimd.MultiplyBySelectedScalar(diff, p, 0);
+            var a1 = AdvSimd.MultiplyBySelectedScalar(diff, p, 1);
+            var a2 = AdvSimd.MultiplyBySelectedScalar(diff, p, 2);
+            var a3 = AdvSimd.MultiplyBySelectedScalar(diff, p, 3);
+            a0 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a0, v0, m0, 0);
+            a1 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a1, v0, m1, 0);
+            a2 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a2, v0, m2, 0);
+            a3 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a3, v0, m3, 0);
+            a0 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a0, v1, m0, 1);
+            a1 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a1, v1, m1, 1);
+            a2 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a2, v1, m2, 1);
+            a3 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a3, v1, m3, 1);
+            a0 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a0, v2, m0, 2);
+            a1 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a1, v2, m1, 2);
+            a2 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a2, v2, m2, 2);
+            a3 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a3, v2, m3, 2);
+            a0 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a0, v3, m0, 3);
+            a1 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a1, v3, m1, 3);
+            a2 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a2, v3, m2, 3);
+            a3 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a3, v3, m3, 3);
+            AdvSimd.Store(destination + c, a0);
+            AdvSimd.Store(d1 + c, a1);
+            AdvSimd.Store(d2 + c, a2);
+            AdvSimd.Store(d3 + c, a3);
+        }
+    }
+
     public static void PostNormAdd(float* residual, float* x, float* scale, float gate, int n)
     {
         var scalarInv = 1f / MathF.Sqrt(SumOfSquares(x, n) / n + RmsEpsilon);
@@ -1174,26 +992,23 @@ internal static unsafe class Neon
                     var z1 = AdvSimd.LoadVector128(column + 4);
                     var z2 = AdvSimd.LoadVector128(column + 8);
                     var z3 = AdvSimd.LoadVector128(column + 12);
-                    var l0 = AdvSimd.LoadAndReplicateToVector128(factor);
-                    a00 = AdvSimd.FusedMultiplyAdd(a00, l0, z0);
-                    a01 = AdvSimd.FusedMultiplyAdd(a01, l0, z1);
-                    a02 = AdvSimd.FusedMultiplyAdd(a02, l0, z2);
-                    a03 = AdvSimd.FusedMultiplyAdd(a03, l0, z3);
-                    var l1 = AdvSimd.LoadAndReplicateToVector128(factor + 1);
-                    a10 = AdvSimd.FusedMultiplyAdd(a10, l1, z0);
-                    a11 = AdvSimd.FusedMultiplyAdd(a11, l1, z1);
-                    a12 = AdvSimd.FusedMultiplyAdd(a12, l1, z2);
-                    a13 = AdvSimd.FusedMultiplyAdd(a13, l1, z3);
-                    var l2 = AdvSimd.LoadAndReplicateToVector128(factor + 2);
-                    a20 = AdvSimd.FusedMultiplyAdd(a20, l2, z0);
-                    a21 = AdvSimd.FusedMultiplyAdd(a21, l2, z1);
-                    a22 = AdvSimd.FusedMultiplyAdd(a22, l2, z2);
-                    a23 = AdvSimd.FusedMultiplyAdd(a23, l2, z3);
-                    var l3 = AdvSimd.LoadAndReplicateToVector128(factor + 3);
-                    a30 = AdvSimd.FusedMultiplyAdd(a30, l3, z0);
-                    a31 = AdvSimd.FusedMultiplyAdd(a31, l3, z1);
-                    a32 = AdvSimd.FusedMultiplyAdd(a32, l3, z2);
-                    a33 = AdvSimd.FusedMultiplyAdd(a33, l3, z3);
+                    var l = AdvSimd.LoadVector128(factor);
+                    a00 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a00, z0, l, 0);
+                    a01 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a01, z1, l, 0);
+                    a02 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a02, z2, l, 0);
+                    a03 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a03, z3, l, 0);
+                    a10 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a10, z0, l, 1);
+                    a11 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a11, z1, l, 1);
+                    a12 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a12, z2, l, 1);
+                    a13 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a13, z3, l, 1);
+                    a20 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a20, z0, l, 2);
+                    a21 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a21, z1, l, 2);
+                    a22 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a22, z2, l, 2);
+                    a23 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a23, z3, l, 2);
+                    a30 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a30, z0, l, 3);
+                    a31 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a31, z1, l, 3);
+                    a32 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a32, z2, l, 3);
+                    a33 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a33, z3, l, 3);
                     column += cols;
                     factor += rows;
                 }
@@ -1201,18 +1016,18 @@ internal static unsafe class Neon
                 AdvSimd.Store(tile + c + 4, a01);
                 AdvSimd.Store(tile + c + 8, a02);
                 AdvSimd.Store(tile + c + 12, a03);
-                AdvSimd.Store(tile + stride1 + c, a10);
-                AdvSimd.Store(tile + stride1 + c + 4, a11);
-                AdvSimd.Store(tile + stride1 + c + 8, a12);
-                AdvSimd.Store(tile + stride1 + c + 12, a13);
-                AdvSimd.Store(tile + stride2 + c, a20);
-                AdvSimd.Store(tile + stride2 + c + 4, a21);
-                AdvSimd.Store(tile + stride2 + c + 8, a22);
-                AdvSimd.Store(tile + stride2 + c + 12, a23);
-                AdvSimd.Store(tile + stride3 + c, a30);
-                AdvSimd.Store(tile + stride3 + c + 4, a31);
-                AdvSimd.Store(tile + stride3 + c + 8, a32);
-                AdvSimd.Store(tile + stride3 + c + 12, a33);
+                AdvSimd.Store(tile + c + stride1, a10);
+                AdvSimd.Store(tile + c + stride1 + 4, a11);
+                AdvSimd.Store(tile + c + stride1 + 8, a12);
+                AdvSimd.Store(tile + c + stride1 + 12, a13);
+                AdvSimd.Store(tile + c + stride2, a20);
+                AdvSimd.Store(tile + c + stride2 + 4, a21);
+                AdvSimd.Store(tile + c + stride2 + 8, a22);
+                AdvSimd.Store(tile + c + stride2 + 12, a23);
+                AdvSimd.Store(tile + c + stride3, a30);
+                AdvSimd.Store(tile + c + stride3 + 4, a31);
+                AdvSimd.Store(tile + c + stride3 + 8, a32);
+                AdvSimd.Store(tile + c + stride3 + 12, a33);
             }
             for (var c = 0; c < cols; c += 16)
             {
@@ -1234,34 +1049,105 @@ internal static unsafe class Neon
                 var a33 = Vector128<float>.Zero;
                 var row = right + c;
                 var scalars = tile;
-                for (var j = 0; j < cols; j++)
+                for (var j = 0; j < cols; j += 4)
                 {
-                    var r0 = AdvSimd.LoadVector128(row);
-                    var r1 = AdvSimd.LoadVector128(row + 4);
-                    var r2 = AdvSimd.LoadVector128(row + 8);
-                    var r3 = AdvSimd.LoadVector128(row + 12);
-                    var s0 = AdvSimd.LoadAndReplicateToVector128(scalars);
-                    a00 = AdvSimd.FusedMultiplyAdd(a00, s0, r0);
-                    a01 = AdvSimd.FusedMultiplyAdd(a01, s0, r1);
-                    a02 = AdvSimd.FusedMultiplyAdd(a02, s0, r2);
-                    a03 = AdvSimd.FusedMultiplyAdd(a03, s0, r3);
-                    var s1 = AdvSimd.LoadAndReplicateToVector128(scalars + stride1);
-                    a10 = AdvSimd.FusedMultiplyAdd(a10, s1, r0);
-                    a11 = AdvSimd.FusedMultiplyAdd(a11, s1, r1);
-                    a12 = AdvSimd.FusedMultiplyAdd(a12, s1, r2);
-                    a13 = AdvSimd.FusedMultiplyAdd(a13, s1, r3);
-                    var s2 = AdvSimd.LoadAndReplicateToVector128(scalars + stride2);
-                    a20 = AdvSimd.FusedMultiplyAdd(a20, s2, r0);
-                    a21 = AdvSimd.FusedMultiplyAdd(a21, s2, r1);
-                    a22 = AdvSimd.FusedMultiplyAdd(a22, s2, r2);
-                    a23 = AdvSimd.FusedMultiplyAdd(a23, s2, r3);
-                    var s3 = AdvSimd.LoadAndReplicateToVector128(scalars + stride3);
-                    a30 = AdvSimd.FusedMultiplyAdd(a30, s3, r0);
-                    a31 = AdvSimd.FusedMultiplyAdd(a31, s3, r1);
-                    a32 = AdvSimd.FusedMultiplyAdd(a32, s3, r2);
-                    a33 = AdvSimd.FusedMultiplyAdd(a33, s3, r3);
-                    row += cols;
-                    scalars++;
+                    var t0 = AdvSimd.LoadVector128(scalars);
+                    var t1 = AdvSimd.LoadVector128(scalars + stride1);
+                    var t2 = AdvSimd.LoadVector128(scalars + stride2);
+                    var t3 = AdvSimd.LoadVector128(scalars + stride3);
+                    {
+                        var r0 = AdvSimd.LoadVector128(row);
+                        var r1 = AdvSimd.LoadVector128(row + 4);
+                        var r2 = AdvSimd.LoadVector128(row + 8);
+                        var r3 = AdvSimd.LoadVector128(row + 12);
+                        a00 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a00, r0, t0, 0);
+                        a01 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a01, r1, t0, 0);
+                        a02 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a02, r2, t0, 0);
+                        a03 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a03, r3, t0, 0);
+                        a10 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a10, r0, t1, 0);
+                        a11 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a11, r1, t1, 0);
+                        a12 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a12, r2, t1, 0);
+                        a13 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a13, r3, t1, 0);
+                        a20 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a20, r0, t2, 0);
+                        a21 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a21, r1, t2, 0);
+                        a22 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a22, r2, t2, 0);
+                        a23 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a23, r3, t2, 0);
+                        a30 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a30, r0, t3, 0);
+                        a31 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a31, r1, t3, 0);
+                        a32 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a32, r2, t3, 0);
+                        a33 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a33, r3, t3, 0);
+                        row += cols;
+                    }
+                    {
+                        var r0 = AdvSimd.LoadVector128(row);
+                        var r1 = AdvSimd.LoadVector128(row + 4);
+                        var r2 = AdvSimd.LoadVector128(row + 8);
+                        var r3 = AdvSimd.LoadVector128(row + 12);
+                        a00 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a00, r0, t0, 1);
+                        a01 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a01, r1, t0, 1);
+                        a02 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a02, r2, t0, 1);
+                        a03 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a03, r3, t0, 1);
+                        a10 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a10, r0, t1, 1);
+                        a11 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a11, r1, t1, 1);
+                        a12 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a12, r2, t1, 1);
+                        a13 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a13, r3, t1, 1);
+                        a20 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a20, r0, t2, 1);
+                        a21 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a21, r1, t2, 1);
+                        a22 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a22, r2, t2, 1);
+                        a23 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a23, r3, t2, 1);
+                        a30 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a30, r0, t3, 1);
+                        a31 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a31, r1, t3, 1);
+                        a32 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a32, r2, t3, 1);
+                        a33 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a33, r3, t3, 1);
+                        row += cols;
+                    }
+                    {
+                        var r0 = AdvSimd.LoadVector128(row);
+                        var r1 = AdvSimd.LoadVector128(row + 4);
+                        var r2 = AdvSimd.LoadVector128(row + 8);
+                        var r3 = AdvSimd.LoadVector128(row + 12);
+                        a00 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a00, r0, t0, 2);
+                        a01 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a01, r1, t0, 2);
+                        a02 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a02, r2, t0, 2);
+                        a03 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a03, r3, t0, 2);
+                        a10 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a10, r0, t1, 2);
+                        a11 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a11, r1, t1, 2);
+                        a12 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a12, r2, t1, 2);
+                        a13 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a13, r3, t1, 2);
+                        a20 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a20, r0, t2, 2);
+                        a21 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a21, r1, t2, 2);
+                        a22 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a22, r2, t2, 2);
+                        a23 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a23, r3, t2, 2);
+                        a30 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a30, r0, t3, 2);
+                        a31 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a31, r1, t3, 2);
+                        a32 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a32, r2, t3, 2);
+                        a33 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a33, r3, t3, 2);
+                        row += cols;
+                    }
+                    {
+                        var r0 = AdvSimd.LoadVector128(row);
+                        var r1 = AdvSimd.LoadVector128(row + 4);
+                        var r2 = AdvSimd.LoadVector128(row + 8);
+                        var r3 = AdvSimd.LoadVector128(row + 12);
+                        a00 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a00, r0, t0, 3);
+                        a01 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a01, r1, t0, 3);
+                        a02 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a02, r2, t0, 3);
+                        a03 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a03, r3, t0, 3);
+                        a10 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a10, r0, t1, 3);
+                        a11 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a11, r1, t1, 3);
+                        a12 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a12, r2, t1, 3);
+                        a13 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a13, r3, t1, 3);
+                        a20 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a20, r0, t2, 3);
+                        a21 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a21, r1, t2, 3);
+                        a22 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a22, r2, t2, 3);
+                        a23 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a23, r3, t2, 3);
+                        a30 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a30, r0, t3, 3);
+                        a31 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a31, r1, t3, 3);
+                        a32 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a32, r2, t3, 3);
+                        a33 = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(a33, r3, t3, 3);
+                        row += cols;
+                    }
+                    scalars += 4;
                 }
                 var output = result + k * cols + c;
                 AdvSimd.Store(output, a00);
@@ -1366,7 +1252,10 @@ internal static unsafe class Neon
         Store4(output + 48, a12, a13, a14, a15);
     }
 
-    public static void AttentionTile(in AttentionTile tile)
+    public static void AttentionTile(in AttentionTile tile) => NeonAttention.Tile(tile);
+
+    // The per-head tile NeonAttention replaced, kept as the bit-exact reference for its tests.
+    internal static void AttentionTilePerHead(in AttentionTile tile)
     {
         var count = tile.Count;
         for (var h = 0; h < tile.Heads; h++)

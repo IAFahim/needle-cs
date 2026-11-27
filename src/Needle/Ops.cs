@@ -51,6 +51,7 @@ internal static unsafe class Ops
 
     internal static void ApplyGateAndHeadPeaks(float* output, float* gate, int heads, int vDim, float* peaks)
     {
+        if (Simd.UseNeon) { Neon.ApplyGateAndHeadPeaks(output, gate, heads, vDim, peaks); return; }
         for (var h = 0; h < heads; h++)
         {
             var x = output + h * vDim;
@@ -512,6 +513,7 @@ internal static unsafe class Ops
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static void RmsStats(float* x, int n, out float inverse, out float rawPeak)
     {
+        if (Simd.UseNeon) { NeonPrepare.RmsStats(x, n, out inverse, out rawPeak); return; }
         var s0 = Vector256<float>.Zero;
         var s1 = Vector256<float>.Zero;
         var s2 = Vector256<float>.Zero;
@@ -800,6 +802,7 @@ internal static unsafe class Ops
     public static void CombineDiff4x4(float* s, int dim, float* mix, float* x, float* u, float* postGate, float* destination)
     {
 #if NEEDLE_SIMD
+        if (Simd.UseNeon && dim % 4 == 0) { Neon.CombineDiff4x4(s, dim, mix, x, u, postGate, destination); return; }
         if (!Simd.UseNeon && Simd.Enabled && (void*)Kernels.Active.CombineDiff4 == null)
         {
             CombineDiff4x4Range(s, dim, mix, x, u, postGate, destination, 0, dim);

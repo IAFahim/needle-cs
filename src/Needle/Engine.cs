@@ -944,7 +944,7 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         var tileStride = Math.Max(128, 4 * g.HadaCols);
         var tileScratch = (float*)(((nuint)(job.MlpScratch + HadamardMlp.ScratchFloats(dim, g.HadaRows * g.HadaCols)) + 31) & ~(nuint)31) + member * tileStride;
 #if NEEDLE_SIMD
-        var simdAttnGate = Simd.UseAvx && (void*)Kernels.Active.Prepare == null && (void*)Kernels.Active.GateFakeA8 == null && g.OutputWidth == g.Heads * g.VDim;
+        var simdAttnGate = (Simd.UseNeon || (Simd.UseAvx && (void*)Kernels.Active.Prepare == null && (void*)Kernels.Active.GateFakeA8 == null)) && g.OutputWidth == g.Heads * g.VDim;
         var parallelPool = members > 1 && job.Confidence != null;
 #else
         var parallelPool = members > 1 && job.Confidence != null;
@@ -1302,6 +1302,7 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
     static void TapsHead(float* taps, int stride, float* h0, float* h1, float* h2, float* dst, float* live0, float* live1, int n)
     {
 #if NEEDLE_SIMD
+        if (Simd.UseNeon) { Neon.TapsHead(taps, stride, h0, h1, h2, dst, live0, live1, n); return; }
         if ((void*)Kernels.Active.Taps3 == null && Simd.Enabled && !Simd.UseNeon && Avx.IsSupported && Fma.IsSupported)
         {
             for (var c = 0; c < n; c += 8)
