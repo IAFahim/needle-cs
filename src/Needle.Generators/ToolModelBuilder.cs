@@ -36,7 +36,7 @@ public sealed class NeedleToolsGenerator : IIncrementalGenerator
             {
                 var qualified = model.GlobalNamespace ? model.CommandsName : model.Namespace + "." + model.CommandsName;
                 if (compilation.GetTypeByMetadataName(qualified) is not null) return;
-                context.AddSource(model.InterfaceName + "Tools.g.cs", Emitter.Emit(model, built.Right, triple.Right));
+                context.AddSource(model.HintName + "Tools.g.cs", Emitter.Emit(model, built.Right && triple.Right, triple.Right));
             }
         });
     }
@@ -78,10 +78,7 @@ internal sealed record ToolArg(
 
 internal sealed record ToolEntry(string Name, string Alias, string Description, ImmutableArray<ToolArg> Args);
 
-internal sealed record ToolSetModel(string InterfaceName, string CommandName, string CommandsName, string Namespace, bool GlobalNamespace, ImmutableArray<ToolEntry> Tools)
-{
-    public string Q(string type) => GlobalNamespace ? type : "global::" + Namespace + "." + type;
-}
+internal sealed record ToolSetModel(string InterfaceName, string InterfaceType, string HintName, string CommandName, string CommandsName, string Namespace, bool GlobalNamespace, ImmutableArray<ToolEntry> Tools);
 
 internal sealed record DiagnosticInfo(string Id, string Title, string Severity, string Message, string FilePath, Microsoft.CodeAnalysis.Text.TextSpan Span, Microsoft.CodeAnalysis.Text.LinePositionSpan LineSpan)
 {
@@ -121,6 +118,11 @@ internal static class ToolModelBuilder
                 diagnostics.Add(Info("NDG007", method.Locations.FirstOrDefault(), $"Tool '{method.Name}' must not be generic."));
                 continue;
             }
+            if (method.Name is "None" or "Kind" or "Presence")
+            {
+                diagnostics.Add(Info("NDG009", method.Locations.FirstOrDefault(), $"Tool name '{method.Name}' is reserved by the generated command types."));
+                continue;
+            }
             var alias = SnakeCase(method.Name);
             if (!seenAliases.Add(alias))
             {
@@ -136,21 +138,31 @@ internal static class ToolModelBuilder
                 args.Add(arg);
             }
             if (!valid) continue;
+            if (args.Select(a => a.Alias).Distinct(StringComparer.Ordinal).Count() != args.Count ||
+                args.Select(a => char.ToUpperInvariant(a.Name[0]) + a.Name.Substring(1)).Distinct(StringComparer.Ordinal).Count() != args.Count)
+            {
+                diagnostics.Add(Info("NDG009", method.Locations.FirstOrDefault(), $"Tool '{method.Name}' has parameters whose names collide after snake_casing or PascalCasing."));
+                continue;
+            }
             if (args.Count > 32)
             {
                 diagnostics.Add(Info("NDG003", method.Locations.FirstOrDefault(), $"Tool '{method.Name}' has more than 32 parameters."));
                 continue;
             }
-            tools.Add(new ToolEntry(method.Name, alias, description, args.ToImmutable()));
+            tools.Add(new ToolEntry(Identifier(method.Name), alias, description, args.ToImmutable()));
         }
         var name = symbol.Name;
-        var stem = name.StartsWith("I", StringComparison.Ordinal) && name.Length > 1 ? name.Substring(1) : name;
+        var stem = name.Length > 1 && name[0] == 'I' && char.IsUpper(name[1]) ? name.Substring(1) : name;
         var commandName = stem.EndsWith("Commands", StringComparison.Ordinal) ? stem.Substring(0, stem.Length - "Commands".Length) + "Command" : stem + "Command";
         var commandsName = commandName.EndsWith("Command", StringComparison.Ordinal) ? commandName.Substring(0, commandName.Length - "Command".Length) + "Commands" : commandName + "Commands";
         var containing = symbol.ContainingNamespace;
         var globalNamespace = containing is null or { IsGlobalNamespace: true };
+        var hint = new StringBuilder();
+        foreach (var c in symbol.ToDisplayString()) hint.Append(char.IsLetterOrDigit(c) || c == '_' ? c : '.');
         var model = new ToolSetModel(
             name,
+            symbol.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat),
+            hint.ToString(),
             commandName,
             commandsName,
             globalNamespace ? "" : containing!.ToDisplayString(),
@@ -229,12 +241,21 @@ internal static class ToolModelBuilder
         {
             SpecialType.System_Int32 => value is int i ? i.ToString(CultureInfo.InvariantCulture) : null,
             SpecialType.System_Int64 => value is long l ? l.ToString(CultureInfo.InvariantCulture) + "L" : null,
-            SpecialType.System_Single => value is float f ? f.ToString("R", CultureInfo.InvariantCulture) + "f" : null,
-            SpecialType.System_Double => value is double d ? d.ToString("R", CultureInfo.InvariantCulture) + "d" : null,
+            SpecialType.System_Single => value is float f ? FloatLiteral(f, "float", "f") : null,
+            SpecialType.System_Double => value is double d ? FloatLiteral(d, "double", "d") : null,
             SpecialType.System_Boolean => value is bool b ? (b ? "true" : "false") : null,
             _ => type.TypeKind == TypeKind.Enum && value is not null ? EnumLiteral(type, value) : null,
         };
     }
+
+    static string FloatLiteral(double value, string type, string suffix) =>
+        double.IsNaN(value) ? type + ".NaN" :
+        double.IsPositiveInfinity(value) ? type + ".PositiveInfinity" :
+        double.IsNegativeInfinity(value) ? type + ".NegativeInfinity" :
+        (suffix == "f" ? ((float)value).ToString("R", CultureInfo.InvariantCulture) : value.ToString("R", CultureInfo.InvariantCulture)) + suffix;
+
+    static string Identifier(string name) =>
+        SyntaxFacts.GetKeywordKind(name) != SyntaxKind.None || SyntaxFacts.GetContextualKeywordKind(name) != SyntaxKind.None ? "@" + name : name;
 
     static string EnumLiteral(ITypeSymbol type, object value)
     {
@@ -255,9 +276,10 @@ internal static class ToolModelBuilder
             "NDG005" => "Unsupported default value",
             "NDG006" => "Duplicate tool name",
             "NDG007" => "Generic tool method",
+            "NDG009" => "Reserved or colliding name",
             _ => "Duplicate enum literal",
         },
-        id is "NDG001" or "NDG002" or "NDG003" or "NDG004" or "NDG005" ? "Error" : "Warning",
+        id is "NDG001" or "NDG002" or "NDG003" or "NDG004" or "NDG005" or "NDG009" ? "Error" : "Warning",
         message,
         location?.SourceTree?.FilePath ?? "",
         location?.SourceSpan ?? default,

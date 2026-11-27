@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -94,7 +95,18 @@ public sealed unsafe class Tokenizer : IDisposable
     {
         maxInput = maxInputBytes;
         blob = model.TokenizerBlob;
+        var length = model.TokenizerLength;
+        if (length < HeaderBytes) throw Corrupt($"the blob has {length} bytes, shorter than its {HeaderBytes}-byte header");
         var header = (uint*)blob;
+        if (header[0] > (length - HeaderBytes) / RecordBytes) throw Corrupt($"the header declares {header[0]} pieces, more than its {length} bytes can hold");
+        var end = blob + length;
+        var walk = blob + HeaderBytes;
+        for (var id = 0; id < header[0]; id++)
+        {
+            if (end - walk < RecordBytes || end - walk - RecordBytes < *(ushort*)(walk + 5)) throw Corrupt($"piece {id} runs past the end of the {length}-byte blob");
+            if (walk[4] == ByteType && (*(ushort*)(walk + 5) < 5 || !IsHex(walk[RecordBytes + 3]) || !IsHex(walk[RecordBytes + 4]))) throw Corrupt($"piece {id} is a byte piece but does not spell <0xHH>");
+            walk += RecordBytes + *(ushort*)(walk + 5);
+        }
         pieceCount = (int)header[0];
         PadId = (int)header[1];
         EndId = (int)header[2];
@@ -139,6 +151,10 @@ public sealed unsafe class Tokenizer : IDisposable
     }
 
     byte* Piece(int id) => blob + pieceOffset[id];
+
+    static bool IsHex(byte c) => (c >= (byte)'0' && c <= (byte)'9') || ((c | 0x20) >= 'a' && (c | 0x20) <= 'f');
+
+    static InvalidDataException Corrupt(string facts) => Model.Malformed($"corrupt tokenizer blob: {facts}");
 
     static int HexValue(byte c) => c <= (byte)'9' ? c - '0' : (c | 0x20) - 'a' + 10;
 
@@ -277,7 +293,7 @@ public sealed unsafe class Tokenizer : IDisposable
         var right = nextSymbol[left];
         if (right < 0) return;
         var id = Lookup(escaped + left, symbolEnd[right] - left);
-        if (id < 0) return;
+        if (id < 0 || pieceType[id] is ControlType or UnknownType or ByteType) return;
         var i = size++;
         var entry = new Merge { Score = pieceScore[id], Left = left, Right = right, RightEnd = symbolEnd[right] };
         while (i > 0)

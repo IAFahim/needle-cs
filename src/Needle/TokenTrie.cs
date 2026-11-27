@@ -25,6 +25,7 @@ internal sealed unsafe class TokenTrie : IDisposable
     byte* pool;
     const int MaskCacheSlots = 64;
     readonly nuint* cacheProgram;
+    readonly long* cacheSerial;
     readonly ulong* cacheHash;
     readonly int* cacheDepth;
     readonly ulong* cacheFrames;
@@ -50,6 +51,7 @@ internal sealed unsafe class TokenTrie : IDisposable
         specialLength = source.specialLength;
         pool = source.pool;
         cacheProgram = (nuint*)Mem.AllocZeroed((nuint)MaskCacheSlots * (nuint)sizeof(nuint));
+        cacheSerial = (long*)Mem.AllocZeroed((nuint)MaskCacheSlots * sizeof(long));
         cacheHash = (ulong*)Mem.AllocZeroed((nuint)MaskCacheSlots * sizeof(ulong));
         cacheDepth = (int*)Mem.AllocZeroed((nuint)MaskCacheSlots * 4);
         cacheFrames = (ulong*)Mem.AllocZeroed((nuint)MaskCacheSlots * GrammarState.MaxDepth * 3 * sizeof(ulong));
@@ -74,6 +76,7 @@ internal sealed unsafe class TokenTrie : IDisposable
         var specialLengths = new List<int>();
         for (var id = 0; id < Math.Min(vocab, tokenizer.PieceCount); id++)
         {
+            if (tokenizer.PieceByteLength(id) > 256) continue;
             var length = tokenizer.ConstraintBytes(id, scratch);
             if (length == 0) continue;
             var node = 0;
@@ -137,6 +140,7 @@ internal sealed unsafe class TokenTrie : IDisposable
             specialBytes[i] = pool + specialOffsets[i];
         }
         cacheProgram = (nuint*)Mem.AllocZeroed((nuint)MaskCacheSlots * (nuint)sizeof(nuint));
+        cacheSerial = (long*)Mem.AllocZeroed((nuint)MaskCacheSlots * sizeof(long));
         cacheHash = (ulong*)Mem.AllocZeroed((nuint)MaskCacheSlots * sizeof(ulong));
         cacheDepth = (int*)Mem.AllocZeroed((nuint)MaskCacheSlots * 4);
         cacheFrames = (ulong*)Mem.AllocZeroed((nuint)MaskCacheSlots * GrammarState.MaxDepth * 3 * sizeof(ulong));
@@ -168,7 +172,7 @@ internal sealed unsafe class TokenTrie : IDisposable
             var hash = MaskSignature(g, keyPtr, out var depth);
             var slot = (int)(hash & (ulong)(MaskCacheSlots - 1));
             var maskBytes = (nuint)maskWords * 4;
-            if (cacheProgram[slot] == (nuint)g && cacheDepth[slot] == depth && cacheHash[slot] == hash && FramesEqual(slot, keyPtr, depth))
+            if (cacheProgram[slot] == (nuint)g && cacheSerial[slot] == g->Serial && cacheDepth[slot] == depth && cacheHash[slot] == hash && FramesEqual(slot, keyPtr, depth))
             {
                 Buffer.MemoryCopy(cacheMasks + (long)slot * maskWords, mask, maskBytes, maskBytes);
                 return;
@@ -191,6 +195,7 @@ internal sealed unsafe class TokenTrie : IDisposable
                 Walk(g, keyPtr, mask);
             }
             cacheProgram[slot] = (nuint)g;
+            cacheSerial[slot] = g->Serial;
             cacheDepth[slot] = depth;
             cacheHash[slot] = hash;
             var frames = (ulong*)keyPtr->Frames;
@@ -251,6 +256,7 @@ internal sealed unsafe class TokenTrie : IDisposable
     {
         Mem.Free(walkStates);
         Mem.Free(cacheProgram);
+        Mem.Free(cacheSerial);
         Mem.Free(cacheHash);
         Mem.Free(cacheDepth);
         Mem.Free(cacheFrames);

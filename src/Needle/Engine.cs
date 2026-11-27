@@ -719,7 +719,7 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
     {
         Barrier = barrier,
         Clock = clock,
-        Members = pool.Members,
+        Members = pool.TeamSize,
         Count = count,
         Position = position,
         Capacity = capacity,
@@ -802,7 +802,7 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         var job = BuildTeamJob(1, position, wantLogits);
         clock.PoolRun();
         var useSidecar = typeof(TClock) == typeof(NoClock) && (void*)Kernels.SidecarDecodeTeam != null && Kernels.Provider == "net10-unmanaged";
-        pool.RunTeam(useSidecar ? &RunSidecarDecodeTeam : &ExecuteDecodeTeam, Unsafe.AsPointer(ref job), barrier);
+        pool.RunTeam(useSidecar ? &RunSidecarDecodeTeam : &ExecuteDecodeTeam, Unsafe.AsPointer(ref job), barrier, job.Members);
         if ((g.Layers & 1) != 0)
         {
             var swap = stream;
@@ -816,7 +816,7 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         var job = BuildTeamJob(count, position, wantLogits);
         clock.PoolRun();
         var useSidecar = typeof(TClock) == typeof(NoClock) && (void*)Kernels.SidecarPrefillTeam != null && Kernels.Provider == "net10-unmanaged";
-        pool.RunTeam(useSidecar ? &RunSidecarPrefillTeam : &ExecutePrefillTeam, Unsafe.AsPointer(ref job), barrier);
+        pool.RunTeam(useSidecar ? &RunSidecarPrefillTeam : &ExecutePrefillTeam, Unsafe.AsPointer(ref job), barrier, job.Members);
         if ((g.Layers & 1) != 0)
         {
             var swap = stream;
@@ -1398,7 +1398,7 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         {
             Barrier = barrier,
             Clock = clock,
-            Members = pool.Members,
+            Members = pool.TeamSize,
             Layer = l,
             Lane = l % Lanes,
             Count = count,
@@ -1454,7 +1454,7 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         };
         if (site >= 0) job.Engram = model.Sites[site];
         clock.PoolRun();
-        pool.RunTeam(&ExecuteLayer, System.Runtime.CompilerServices.Unsafe.AsPointer(ref job), barrier);
+        pool.RunTeam(&ExecuteLayer, System.Runtime.CompilerServices.Unsafe.AsPointer(ref job), barrier, job.Members);
         var swap = stream;
         stream = nextStream;
         nextStream = swap;
@@ -2744,12 +2744,15 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
 
     internal Pool SharedPool => pool;
 
+    int disposed;
+
     public void Pause() => pool.Pause();
 
     public void Resume() => pool.Resume();
 
     public void Dispose()
     {
+        if (Interlocked.Exchange(ref disposed, 1) != 0) return;
         if (ownsPool) pool.Dispose();
         arena.Free();
         Mem.Free(specSnapshot);

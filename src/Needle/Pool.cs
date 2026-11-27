@@ -52,7 +52,6 @@ internal sealed unsafe class Pool : IDisposable
         [FieldOffset(4 * CacheLine + 8)] public delegate*<void*, int, void> TeamFunction;
         [FieldOffset(4 * CacheLine + 16)] public void* TeamContext;
         [FieldOffset(4 * CacheLine + 24)] public int TeamDone;
-        [FieldOffset(4 * CacheLine + 28)] public int TeamActive;
     }
 
     readonly Control* control;
@@ -61,6 +60,7 @@ internal sealed unsafe class Pool : IDisposable
     readonly int[] nativeWorkerIds;
     readonly long spinTicks;
     readonly object gate = new();
+    int disposed;
 
     public int Threads => policy.Threads;
 
@@ -69,6 +69,8 @@ internal sealed unsafe class Pool : IDisposable
     public int[] NativeWorkerIds => nativeWorkerIds;
 
     public bool IsPaused => Volatile.Read(ref control->Paused) != 0;
+
+    public int TeamSize => IsPaused ? 1 : Members;
 
     public Pool(int threads) : this(ThreadPolicy.Default.WithThreads(threads))
     {
@@ -135,21 +137,20 @@ internal sealed unsafe class Pool : IDisposable
         }
     }
 
-    public void RunTeam(delegate*<void*, int, void> function, void* context, TeamBarrier* barrier)
+    public void RunTeam(delegate*<void*, int, void> function, void* context, TeamBarrier* barrier, int members)
     {
-        var members = Members;
-        if (members <= 1 || workers.Length == 0 || IsPaused)
+        if (members <= 1 || workers.Length == 0)
         {
             barrier->Participants = 1;
-            for (var m = 0; m < Math.Max(1, members); m++) function(context, m);
+            function(context, 0);
             return;
         }
+        if (members != Members) throw new ArgumentOutOfRangeException(nameof(members), $"a team has 1 or {Members} members");
         barrier->Participants = members;
         var generation = Volatile.Read(ref control->TeamTicket) + 1;
         control->TeamFunction = function;
         control->TeamContext = context;
         Volatile.Write(ref control->TeamDone, 0);
-        Volatile.Write(ref control->TeamActive, 1);
         Interlocked.Exchange(ref control->TeamTicket, generation);
         if (Volatile.Read(ref control->Sleeping) > 0) WakeAll();
         if (policy.Caller == CallerRole.Participates)
@@ -166,7 +167,6 @@ internal sealed unsafe class Pool : IDisposable
 #endif
             else Thread.SpinWait(1);
         }
-        Volatile.Write(ref control->TeamActive, 0);
     }
 
     public static void Barrier(TeamBarrier* barrier)
@@ -215,14 +215,12 @@ internal sealed unsafe class Pool : IDisposable
 
     bool HasWork() => (int)Volatile.Read(ref control->Ticket) < control->Count;
 
-    bool HasTeamWork() => Volatile.Read(ref control->TeamActive) != 0;
-
-    void Park()
+    void Park(long teamSeen)
     {
         lock (gate)
         {
             Interlocked.Increment(ref control->Sleeping);
-            while (Volatile.Read(ref control->Stopping) == 0 && (IsPaused || (!HasWork() && !HasTeamWork()))) Monitor.Wait(gate);
+            while (Volatile.Read(ref control->Stopping) == 0 && Volatile.Read(ref control->TeamTicket) == teamSeen && !HasWork()) Monitor.Wait(gate);
             Interlocked.Decrement(ref control->Sleeping);
         }
     }
@@ -236,9 +234,8 @@ internal sealed unsafe class Pool : IDisposable
         var spins = 0;
         while (Volatile.Read(ref control->Stopping) == 0)
         {
-            var paused = IsPaused;
             var teamTicket = Volatile.Read(ref control->TeamTicket);
-            if (!paused && teamTicket != teamSeen)
+            if (teamTicket != teamSeen)
             {
                 teamSeen = teamTicket;
                 var teamFunction = control->TeamFunction;
@@ -249,8 +246,8 @@ internal sealed unsafe class Pool : IDisposable
                 spins = 0;
                 continue;
             }
-            if (!paused && Drain()) { deadline = Stopwatch.GetTimestamp() + spinTicks; spins = 0; continue; }
-            if (!paused && (((++spins & 63) != 0 && spinTicks > 0) || Stopwatch.GetTimestamp() < deadline))
+            if (Drain()) { deadline = Stopwatch.GetTimestamp() + spinTicks; spins = 0; continue; }
+            if (!IsPaused && (((++spins & 63) != 0 && spinTicks > 0) || Stopwatch.GetTimestamp() < deadline))
             {
 #if NET8_0_OR_GREATER
                 if (System.Runtime.Intrinsics.X86.X86Base.IsSupported) System.Runtime.Intrinsics.X86.X86Base.Pause();
@@ -260,7 +257,7 @@ internal sealed unsafe class Pool : IDisposable
 #endif
                 continue;
             }
-            Park();
+            Park(teamSeen);
             deadline = Stopwatch.GetTimestamp() + spinTicks;
             spins = 0;
         }
@@ -268,6 +265,7 @@ internal sealed unsafe class Pool : IDisposable
 
     public void Dispose()
     {
+        if (Interlocked.Exchange(ref disposed, 1) != 0) return;
         Volatile.Write(ref control->Stopping, 1);
         WakeAll();
         foreach (var worker in workers) worker.Join();
