@@ -17,20 +17,20 @@ jobs:
       - uses: actions/upload-artifact@v4
         with: { name: ref-fixtures, path: ref, retention-days: 1, compression-level: 1 }
   test:
-    name: arm64 ${{ matrix.sha }}
+    name: arm64 ${{ matrix.mode }}
     needs: fixtures
     runs-on: ubuntu-24.04-arm
     strategy:
       fail-fast: false
       matrix:
-        sha: [a243987, 63b5974]
+        mode: [simd, scalar]
     defaults: { run: { shell: bash } }
     steps:
       - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
-      - run: rm -rf src tests && git checkout ${{ matrix.sha }} -- src tests && git checkout ${{ matrix.sha }} -- Directory.Build.props || true
       - uses: actions/setup-dotnet@v4
         with: { dotnet-version: "10.0.x" }
       - uses: actions/download-artifact@v4
         with: { name: ref-fixtures, path: ref }
-      - run: dotnet test tests/Needle.Tests -c Release --filter "FullyQualifiedName~ChunkParityTests|FullyQualifiedName~BatchedDecodeTests" --logger "console;verbosity=normal" -- xUnit.ParallelizeTestCollections=false
+      - run: |
+          if [ "${{ matrix.mode }}" = scalar ]; then export NEEDLE_SCALAR=1; fi
+          dotnet test tests/Needle.Tests -c Release --filter "FullyQualifiedName~ChunkDiagTests|FullyQualifiedName~ChunkParityTests" --logger "console;verbosity=detailed" -- xUnit.ParallelizeTestCollections=false
