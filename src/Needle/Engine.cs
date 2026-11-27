@@ -2862,12 +2862,15 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
 
     internal Pool SharedPool => pool;
 
+    int disposed;
+
     public void Pause() => pool.Pause();
 
     public void Resume() => pool.Resume();
 
     public void Dispose()
     {
+        if (Interlocked.Exchange(ref disposed, 1) != 0) return;
         if (ownsPool) pool.Dispose();
         arena.Free();
         Mem.Free(specSnapshot);

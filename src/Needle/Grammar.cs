@@ -22,6 +22,7 @@ internal unsafe struct GrammarProgram
     public byte* Bytes;
     public int Root;
     public int ToolCount;
+    public long Serial;
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -103,12 +104,17 @@ internal sealed unsafe class Grammar : IDisposable
         for (var i = 0; i < bytes.Count; i++) Program->Bytes[i] = bytes[i];
         Program->Root = root;
         Program->ToolCount = toolSchemas.Count;
+        Program->Serial = NextSerial();
         TableLengths = (nodes.Count, properties.Count, literals.Count, unions.Count, tools.Count, bytes.Count);
     }
 
     internal readonly (int Nodes, int Properties, int Literals, int Unions, int Tools, int Bytes) TableLengths;
 
     internal Grammar(GrammarProgram* adopted) => Program = adopted;
+
+    static long serials;
+
+    internal static long NextSerial() => System.Threading.Interlocked.Increment(ref serials);
 
     static int* Copy(List<int> list)
     {
@@ -175,7 +181,7 @@ internal sealed unsafe class Grammar : IDisposable
     int Compile(JsonValue schema)
     {
         if (schema.Kind != JsonKind.Object) return Kind.AnyNode;
-        if (schema.Get("enum") is { Kind: JsonKind.Array } options && options.Items.Count is > 0 and <= 64) return CompileEnum(options.Items);
+        if (schema.Get("enum") is { Kind: JsonKind.Array } options && options.Items.Count > 0) return CompileEnum(options.Items);
         if (schema.Get("const") is { } constant) return CompileEnum(new List<JsonValue> { constant });
         var branches = schema.Get("anyOf") ?? schema.Get("oneOf");
         if (branches is { Kind: JsonKind.Array } && branches.Items.Count is > 0 and <= 16) return CompileUnion(branches.Items.ConvertAll(Compile));
@@ -223,6 +229,8 @@ internal sealed unsafe class Grammar : IDisposable
 
     int CompileUnion(List<int> branches)
     {
+        if (branches.Contains(Kind.NumNode)) branches.RemoveAll(b => b == Kind.IntNode);
+        if (branches.Count == 1) return branches[0];
         var first = unions.Count;
         unions.AddRange(branches);
         return AddNode(Kind.Union, branches.Count, first, 0, 0);
@@ -373,20 +381,28 @@ internal sealed unsafe class Grammar : IDisposable
                 return Consumed;
             case 1:
             {
+                if (g->ToolCount > 64) return StepWideName(g, f, root, c, ref sink);
                 var candidates = 0UL;
+                var entries = g->Tools + root[2] * 4;
                 if (c == '"')
                 {
                     for (var t = 0; t < g->ToolCount; t++)
-                        if ((f->Bits >> t & 1) != 0 && g->Tools[(root[2] + t) * 4 + 1] == f->Aux) { f->Aux2 = t; f->Phase = 2; f->Aux = 0; sink.ToolSelected(t); return Consumed; }
+                        if (Alive(g, f, entries, 4, g->ToolCount, t) && entries[t * 4 + 1] == f->Aux) { f->Aux2 = t; f->Phase = 2; f->Aux = 0; sink.ToolSelected(t); return Consumed; }
                     return Reject;
                 }
+                var first = -1;
                 for (var t = 0; t < g->ToolCount; t++)
                 {
-                    var tool = g->Tools + (root[2] + t) * 4;
-                    if ((f->Bits >> t & 1) != 0 && tool[1] > f->Aux && g->Bytes[tool[0] + f->Aux] == c) candidates |= 1UL << t;
+                    var tool = entries + t * 4;
+                    if (Alive(g, f, entries, 4, g->ToolCount, t) && tool[1] > f->Aux && g->Bytes[tool[0] + f->Aux] == c)
+                    {
+                        candidates |= 1UL << (t & 63);
+                        if (first < 0) first = t;
+                    }
                 }
                 if (candidates == 0) return Reject;
                 f->Bits = candidates;
+                if (g->ToolCount > 64) f->Aux2 = first;
                 f->Aux++;
                 return Consumed;
             }
@@ -406,7 +422,34 @@ internal sealed unsafe class Grammar : IDisposable
         }
     }
 
+    static bool Alive(GrammarProgram* g, Frame* f, int* entries, int stride, int count, int i)
+    {
+        if ((f->Bits >> (i & 63) & 1) == 0) return false;
+        if (count <= 64 || f->Aux == 0 || i == f->Aux2) return true;
+        var a = g->Bytes + entries[i * stride];
+        var b = g->Bytes + entries[f->Aux2 * stride];
+        if (entries[i * stride + 1] < f->Aux) return false;
+        for (var k = 0; k < f->Aux; k++) if (a[k] != b[k]) return false;
+        return true;
+    }
+
     static ulong ToolMask(GrammarProgram* g) => g->ToolCount >= 64 ? ulong.MaxValue : (1UL << g->ToolCount) - 1;
+
+    static int StepWideName<TSink>(GrammarProgram* g, Frame* f, int* root, byte c, ref TSink sink) where TSink : struct, Tools.IGrammarSink
+    {
+        var lead = f->Aux == 0 ? null : g->Tools + (root[2] + (int)f->Bits) * 4;
+        for (var t = 0; t < g->ToolCount; t++)
+        {
+            var tool = g->Tools + (root[2] + t) * 4;
+            if (c == '"' ? tool[1] != f->Aux : tool[1] <= f->Aux || g->Bytes[tool[0] + f->Aux] != c) continue;
+            if (lead != null && !new ReadOnlySpan<byte>(g->Bytes + tool[0], f->Aux).SequenceEqual(new ReadOnlySpan<byte>(g->Bytes + lead[0], f->Aux))) continue;
+            if (c == '"') { f->Aux2 = t; f->Phase = 2; f->Aux = 0; sink.ToolSelected(t); return Consumed; }
+            f->Bits = (ulong)t;
+            f->Aux++;
+            return Consumed;
+        }
+        return Reject;
+    }
 
     static int StepObject<TSink>(GrammarProgram* g, GrammarState* s, Frame* f, int* n, byte c, ref TSink sink) where TSink : struct, Tools.IGrammarSink
     {
@@ -532,6 +575,7 @@ internal sealed unsafe class Grammar : IDisposable
                 if (c == '"')
                 {
                     if (f->Aux < n[2]) return Reject;
+                    FlushSurrogate(f, ref sink);
                     sink.ValueCompleted();
                     return Pop(s, Consumed);
                 }
@@ -547,11 +591,13 @@ internal sealed unsafe class Grammar : IDisposable
                     if (max >= 0 && f->Aux >= max) return Reject;
                     f->Aux++;
                 }
+                FlushSurrogate(f, ref sink);
                 sink.StringByte(c);
                 return Consumed;
             case 2:
-                if (c == 'u') { f->Phase = 3; f->Aux2 = 0; f->Bits = 0; return Consumed; }
+                if (c == 'u') { f->Phase = 3; f->Aux2 = 0; f->Bits &= ~0xFFFFUL; return Consumed; }
                 if (c != '"' && c != '\\' && c != '/' && c != 'b' && c != 'f' && c != 'n' && c != 'r' && c != 't') return Reject;
+                FlushSurrogate(f, ref sink);
                 f->Aux++;
                 f->Phase = 1;
                 sink.StringByte(c switch
@@ -566,15 +612,39 @@ internal sealed unsafe class Grammar : IDisposable
                 return Consumed;
             default:
                 if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) return Reject;
-                f->Bits = f->Bits * 16 + HexValue(c);
+                f->Bits = (f->Bits & ~0xFFFFUL) | ((f->Bits & 0xFFFF) * 16 + HexValue(c));
                 if (++f->Aux2 == 4)
                 {
-                    EmitUnit((int)f->Bits, ref sink);
-                    f->Aux++;
+                    var unit = (int)(f->Bits & 0xFFFF);
+                    var pending = (int)(f->Bits >> 16);
                     f->Phase = 1;
+                    if (pending != 0 && unit is >= 0xDC00 and <= 0xDFFF)
+                    {
+                        EmitSupplementary(0x10000 + ((pending - 0xD800) << 10) + (unit - 0xDC00), ref sink);
+                        f->Bits = 0;
+                        return Consumed;
+                    }
+                    FlushSurrogate(f, ref sink);
+                    f->Aux++;
+                    if (unit is >= 0xD800 and <= 0xDBFF) f->Bits = (ulong)unit << 16;
+                    else EmitUnit(unit, ref sink);
                 }
                 return Consumed;
         }
+    }
+
+    static void FlushSurrogate<TSink>(Frame* f, ref TSink sink) where TSink : struct, Tools.IGrammarSink
+    {
+        if (f->Bits >> 16 != 0) EmitUnit(0xFFFD, ref sink);
+        f->Bits = 0;
+    }
+
+    static void EmitSupplementary<TSink>(int point, ref TSink sink) where TSink : struct, Tools.IGrammarSink
+    {
+        sink.StringByte((byte)(0xF0 | (point >> 18)));
+        sink.StringByte((byte)(0x80 | ((point >> 12) & 0x3F)));
+        sink.StringByte((byte)(0x80 | ((point >> 6) & 0x3F)));
+        sink.StringByte((byte)(0x80 | (point & 0x3F)));
     }
 
     static ulong HexValue(byte c) => c <= '9' ? (ulong)(c - '0') : (ulong)((c & 0xDF) - 'A' + 10);
@@ -688,12 +758,18 @@ internal sealed unsafe class Grammar : IDisposable
         var candidates = 0UL;
         var complete = false;
         var completed = 0;
+        var first = -1;
+        var entries = g->Literals + n[2] * 2;
         for (var i = 0; i < n[1]; i++)
         {
-            if ((f->Bits >> i & 1) == 0) continue;
-            var literal = g->Literals + (n[2] + i) * 2;
+            if (!Alive(g, f, entries, 2, n[1], i)) continue;
+            var literal = entries + i * 2;
             if (literal[1] == f->Aux) { complete = true; completed = i; }
-            else if (g->Bytes[literal[0] + f->Aux] == c) candidates |= 1UL << i;
+            else if (g->Bytes[literal[0] + f->Aux] == c)
+            {
+                candidates |= 1UL << (i & 63);
+                if (first < 0) first = i;
+            }
         }
         if (candidates == 0)
         {
@@ -703,12 +779,13 @@ internal sealed unsafe class Grammar : IDisposable
             return Pop(s, Reprocess);
         }
         f->Bits = candidates;
+        if (n[1] > 64) f->Aux2 = first;
         f->Aux++;
         var longer = false;
         var exact = -1;
         for (var i = 0; i < n[1]; i++)
         {
-            if ((candidates >> i & 1) == 0) continue;
+            if (!Alive(g, f, entries, 2, n[1], i)) continue;
             var length = g->Literals[(n[2] + i) * 2 + 1];
             if (length == f->Aux) exact = i; else longer = true;
         }

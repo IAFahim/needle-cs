@@ -201,8 +201,9 @@ internal static unsafe class NeonGemv
             var f1 = RowFactor(norms + groups, v, groups, vectorGroups, multiplier, byteScale);
             var f2 = RowFactor(norms + 2 * groups, v, groups, vectorGroups, multiplier, byteScale);
             var f3 = RowFactor(norms + 3 * groups, v, groups, vectorGroups, multiplier, byteScale);
-            var sc = AdvSimd.LoadVector128(scales + v);
-            var of = AdvSimd.LoadVector128(offsets + v);
+            var left = groups - v;
+            var sc = left >= 4 ? AdvSimd.LoadVector128(scales + v) : left > 0 ? Neon.Partial(scales + v, left) : Vector128<float>.Zero;
+            var of = left >= 4 ? AdvSimd.LoadVector128(offsets + v) : left > 0 ? Neon.Partial(offsets + v, left) : Vector128<float>.Zero;
             f0 = AdvSimd.Multiply(f0, sc);
             f1 = AdvSimd.Multiply(f1, sc);
             f2 = AdvSimd.Multiply(f2, sc);
@@ -232,9 +233,8 @@ internal static unsafe class NeonGemv
             var wide = AdvSimd.ZeroExtendWideningLower(AdvSimd.LoadVector64(norms + v));
             var magnitude = AdvSimd.And(wide, Vector128.Create(0x7FFFu));
             var sign = AdvSimd.ShiftLeftLogical(AdvSimd.And(wide, Vector128.Create(0x8000u)), 16);
-            var bits = AdvSimd.Add(AdvSimd.ShiftLeftLogical(magnitude, 13), Vector128.Create(0x38000000u));
-            var nonZero = AdvSimd.CompareGreaterThan(magnitude.AsInt32(), Vector128<int>.Zero).AsUInt32();
-            var single = AdvSimd.Or(AdvSimd.And(bits, nonZero), sign).AsSingle();
+            var rebased = AdvSimd.Multiply(AdvSimd.ShiftLeftLogical(magnitude, 13).AsSingle(), Vector128.Create(5.192296858534828e33f));
+            var single = AdvSimd.Or(rebased.AsUInt32(), sign).AsSingle();
             return AdvSimd.Multiply(single, multiplier);
         }
         if (v < groups && groups >= 4) return AdvSimd.Multiply(Neon.HalfTail(norms, groups), multiplier);
@@ -325,7 +325,7 @@ internal static unsafe class NeonGemv
         var groups = w.Groups;
         var stride = a.Stride;
         Neon.LoadFactors(w.Norms + (long)row * groups, groups, w.Book->ByteScale, rowFactors);
-        var bias = Neon.ScaleFactors(rowFactors, scaled, a.Scales + token * stride, a.Offsets + token * stride, stride);
+        var bias = Neon.ScaleFactors(rowFactors, scaled, a.Scales + token * stride, a.Offsets + token * stride, a.Groups);
         var rowBytes = w.RowBytes;
         var groupBytes = rowBytes / groups;
         var packed = w.Indices + (long)row * rowBytes;
@@ -358,15 +358,15 @@ internal static unsafe class NeonGemv
         var offsets = a.Offsets + token * stride;
         // scaled row-major: [r * 4 + k] * stride for row r and token k
         var bias0 = Vector128.Create(
-            Neon.ScaleFactors(rowFactors, scaled, scales, offsets, stride),
-            Neon.ScaleFactors(rowFactors, scaled + stride, scales + stride, offsets + stride, stride),
-            Neon.ScaleFactors(rowFactors, scaled + 2 * stride, scales + 2 * stride, offsets + 2 * stride, stride),
-            Neon.ScaleFactors(rowFactors, scaled + 3 * stride, scales + 3 * stride, offsets + 3 * stride, stride));
+            Neon.ScaleFactors(rowFactors, scaled, scales, offsets, a.Groups),
+            Neon.ScaleFactors(rowFactors, scaled + stride, scales + stride, offsets + stride, a.Groups),
+            Neon.ScaleFactors(rowFactors, scaled + 2 * stride, scales + 2 * stride, offsets + 2 * stride, a.Groups),
+            Neon.ScaleFactors(rowFactors, scaled + 3 * stride, scales + 3 * stride, offsets + 3 * stride, a.Groups));
         var bias1 = Vector128.Create(
-            Neon.ScaleFactors(rowFactors + stride, scaled + 4 * stride, scales, offsets, stride),
-            Neon.ScaleFactors(rowFactors + stride, scaled + 5 * stride, scales + stride, offsets + stride, stride),
-            Neon.ScaleFactors(rowFactors + stride, scaled + 6 * stride, scales + 2 * stride, offsets + 2 * stride, stride),
-            Neon.ScaleFactors(rowFactors + stride, scaled + 7 * stride, scales + 3 * stride, offsets + 3 * stride, stride));
+            Neon.ScaleFactors(rowFactors + stride, scaled + 4 * stride, scales, offsets, a.Groups),
+            Neon.ScaleFactors(rowFactors + stride, scaled + 5 * stride, scales + stride, offsets + stride, a.Groups),
+            Neon.ScaleFactors(rowFactors + stride, scaled + 6 * stride, scales + 2 * stride, offsets + 2 * stride, a.Groups),
+            Neon.ScaleFactors(rowFactors + stride, scaled + 7 * stride, scales + 3 * stride, offsets + 3 * stride, a.Groups));
         Interleave4(scaled, stride, quads);
         Interleave4(scaled + 4 * stride, stride, quads + 4 * stride);
         var rowBytes = w.RowBytes;
@@ -461,10 +461,10 @@ internal static unsafe class NeonGemv
         var scales = a.Scales + token * stride;
         var offsets = a.Offsets + token * stride;
         var bias = Vector128.Create(
-            Neon.ScaleFactors(rowFactors, scaled, scales, offsets, stride),
-            Neon.ScaleFactors(rowFactors, scaled + stride, scales + stride, offsets + stride, stride),
-            Neon.ScaleFactors(rowFactors, scaled + 2 * stride, scales + 2 * stride, offsets + 2 * stride, stride),
-            Neon.ScaleFactors(rowFactors, scaled + 3 * stride, scales + 3 * stride, offsets + 3 * stride, stride));
+            Neon.ScaleFactors(rowFactors, scaled, scales, offsets, a.Groups),
+            Neon.ScaleFactors(rowFactors, scaled + stride, scales + stride, offsets + stride, a.Groups),
+            Neon.ScaleFactors(rowFactors, scaled + 2 * stride, scales + 2 * stride, offsets + 2 * stride, a.Groups),
+            Neon.ScaleFactors(rowFactors, scaled + 3 * stride, scales + 3 * stride, offsets + 3 * stride, a.Groups));
         Interleave4(scaled, stride, quads);
         var rowBytes = w.RowBytes;
         var groupBytes = rowBytes / groups;

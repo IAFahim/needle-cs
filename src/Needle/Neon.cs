@@ -451,9 +451,8 @@ internal static unsafe class Neon
             var wide = AdvSimd.ZeroExtendWideningLower(AdvSimd.LoadVector64(norms + g));
             var magnitude = AdvSimd.And(wide, Vector128.Create(0x7FFFu));
             var sign = AdvSimd.ShiftLeftLogical(AdvSimd.And(wide, Vector128.Create(0x8000u)), 16);
-            var bits = AdvSimd.Add(AdvSimd.ShiftLeftLogical(magnitude, 13), Vector128.Create(0x38000000u));
-            var nonZero = AdvSimd.CompareGreaterThan(magnitude.AsInt32(), Vector128<int>.Zero).AsUInt32();
-            var single = AdvSimd.Or(AdvSimd.And(bits, nonZero), sign).AsSingle();
+            var rebased = AdvSimd.Multiply(AdvSimd.ShiftLeftLogical(magnitude, 13).AsSingle(), Vector128.Create(5.192296858534828e33f));
+            var single = AdvSimd.Or(rebased.AsUInt32(), sign).AsSingle();
             AdvSimd.Store(factors + g, AdvSimd.Multiply(single, multiplier));
         }
         if (g < groups && groups >= 4) AdvSimd.Store(factors + g, AdvSimd.Multiply(HalfTail(norms, groups), multiplier));
@@ -482,17 +481,29 @@ internal static unsafe class Neon
         return AdvSimd.And(value, AdvSimd.CompareGreaterThan(magnitude, Vector128<uint>.Zero)).AsSingle();
     }
 
-    public static float ScaleFactors(float* factors, float* scaled, float* scales, float* offsets, int stride)
+    public static float ScaleFactors(float* factors, float* scaled, float* scales, float* offsets, int groups)
     {
         var bias = Vector128<float>.Zero;
-        for (var v = 0; v < stride; v += 4)
+        var v = 0;
+        for (; v + 4 <= groups; v += 4)
         {
             var f = AdvSimd.Multiply(AdvSimd.LoadVector128(factors + v), AdvSimd.LoadVector128(scales + v));
             AdvSimd.Store(scaled + v, f);
             bias = AdvSimd.FusedMultiplyAdd(bias, f, AdvSimd.LoadVector128(offsets + v));
         }
+        if (v < groups)
+        {
+            var left = groups - v;
+            var f = AdvSimd.Multiply(AdvSimd.LoadVector128(factors + v), Partial(scales + v, left));
+            AdvSimd.Store(scaled + v, f);
+            bias = AdvSimd.FusedMultiplyAdd(bias, f, Partial(offsets + v, left));
+        }
         return HorizontalSum(bias);
     }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static Vector128<float> Partial(float* source, int count) =>
+        Vector128.Create(source[0], count > 1 ? source[1] : 0f, count > 2 ? source[2] : 0f, 0f);
 
     public static void DecodeRow(in Cq w, int row, float* destination)
     {

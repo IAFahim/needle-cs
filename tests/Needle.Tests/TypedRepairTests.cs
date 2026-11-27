@@ -254,7 +254,7 @@ public sealed unsafe class TypedRepairTests
             """;
         var set = new ToolSet(tools);
         using var grammar = new Grammar(set.Tools);
-        var generated = Encoding.UTF8.GetBytes("""[{"name":"cancel_order","arguments":{"order_id":"A\"7"}},{"name":"place_order","arguments":{"item":{"qty":2,"name_2":"tea"},"name":"Ada","rush_delivery":null}}]""");
+        var generated = Encoding.UTF8.GetBytes("""[{"name":"cancel_order","arguments":{"order_id":"A\"7"}},{"name":"place_order","arguments":{"item":{"qty":2,"name":"tea"},"name":"Ada","rush_delivery":null}}]""");
         var direct = new TraceSink { Events = new List<string>() };
         var state = Grammar.Start(grammar.Program);
         foreach (var b in generated) Assert.True(Grammar.Advance(grammar.Program, &state, b, ref direct));
