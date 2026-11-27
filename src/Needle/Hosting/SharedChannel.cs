@@ -34,7 +34,7 @@ public sealed unsafe class SharedChannel : IDisposable
     {
         if (string.IsNullOrEmpty(path)) throw new ArgumentNullException(nameof(path));
         NeedleChannel.ComputeLayout(requestCapacity, replyCapacity, out var requestCells, out var replyCells, out var words, out var total);
-        var file = MemoryMappedFile.CreateFromFile(path, FileMode.Create, null, total, MemoryMappedFileAccess.ReadWrite);
+        var file = Map(path, FileMode.Create, total);
         try
         {
             var view = file.CreateViewAccessor(0, total, MemoryMappedFileAccess.ReadWrite);
@@ -61,12 +61,26 @@ public sealed unsafe class SharedChannel : IDisposable
         }
     }
 
+    static MemoryMappedFile Map(string path, FileMode mode, long capacity)
+    {
+        var stream = new FileStream(path, mode, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete);
+        try
+        {
+            return MemoryMappedFile.CreateFromFile(stream, null, capacity, MemoryMappedFileAccess.ReadWrite, HandleInheritability.None, leaveOpen: false);
+        }
+        catch
+        {
+            stream.Dispose();
+            throw;
+        }
+    }
+
     public static SharedChannel Open(string path)
     {
         if (string.IsNullOrEmpty(path)) throw new ArgumentNullException(nameof(path));
         var length = new FileInfo(path).Length;
         if (length <= 0) throw new InvalidDataException($"Shared channel file \"{path}\" is missing or empty.");
-        var file = MemoryMappedFile.CreateFromFile(path, FileMode.Open, null, length, MemoryMappedFileAccess.ReadWrite);
+        var file = Map(path, FileMode.Open, length);
         try
         {
             var view = file.CreateViewAccessor(0, 0, MemoryMappedFileAccess.ReadWrite);

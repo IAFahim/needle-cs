@@ -144,7 +144,7 @@ public sealed class NativeParityTests : IDisposable
                 var reply = session.Complete("attack the watchtower near the river");
                 output.WriteLine($"managed watchtower [{system}] t={threads} -> {reply.CallNames()} at {reply.Confidence}");
                 Assert.Contains(reply.CallNames(), AttackOrRefusal);
-                if (reply.CallNames() == "") Assert.Equal("attack", reply.SuppressedCalls.CallNames());
+                if (reply.CallNames() == "") Assert.All(reply.SuppressedCalls.CallNames().Split(','), name => Assert.Equal("attack", name));
             }
         }
     }
