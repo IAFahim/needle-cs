@@ -407,6 +407,8 @@ internal static class ArgumentRepair
             ref var arg = ref s.Args[a];
             if (arg.Param < 0 || arg.Removed) continue;
             var param = tool.Params[arg.Param];
+            // An inferred value is the game's, not the player's: the request need not state it.
+            if (param.Inferred) continue;
             if (param.Kind is ParamKind.Integer or ParamKind.Number && arg.Kind == ValueKind.Number && param.Options.Length == 0)
             {
                 var stated = Utf8Parser.TryParse(Value(s, json, arg), out double number, out _) && history.HasNumber(number);
@@ -458,7 +460,7 @@ internal static class ArgumentRepair
                         return true;
                     }
         }
-        if (!param.Required && current >= 0 && param.OptionWords[current].Length > 0 && !Stated(s, history, param.OptionWords[current], false))
+        if (!param.Required && !param.Inferred && current >= 0 && param.OptionWords[current].Length > 0 && !Stated(s, history, param.OptionWords[current], false))
         {
             arg.Removed = true;
             return true;
@@ -1144,7 +1146,7 @@ internal static class ArgumentRepair
                 if (!SkipValue(output, ref at, end, out var kind)) break;
                 var value = output.Slice(valueStart, at - valueStart);
                 var p = tool.FindParam(key);
-                var param = p >= 0 ? tool.Params[p] : null;
+                var param = p >= 0 && !tool.Params[p].Inferred ? tool.Params[p] : null;
                 var flagged = false;
                 if (kind == ValueKind.Number && param is { Options.Length: 0 } && Utf8Parser.TryParse(value, out double number, out _) &&
                     !Stated(number, request, history) && !(param.DefaultJson != null && value.SequenceEqual(param.DefaultJson)))

@@ -35,6 +35,8 @@ internal sealed class RepairParam
     // Every option is a proper name ("Maya", "Dr. Patel"): a closed set of people or places.
     public bool NameOptions;
     public ParamRole Role;
+    // The game infers it ([Arg(Inferred = true)], or the tool's "inferred" list): no grounding gate, no evidence repair.
+    public bool Inferred;
 }
 
 internal sealed class RepairTool
@@ -103,6 +105,7 @@ internal sealed class RepairPlan
     public RepairPlan(ToolSet tools, string rawToolsJson)
     {
         var raw = RawTriggers(rawToolsJson);
+        var inferred = RawLists(rawToolsJson, "inferred");
         Tools = new RepairTool[tools.Tools.Count];
         var longest = 16;
         for (var t = 0; t < Tools.Length; t++)
@@ -112,6 +115,7 @@ internal sealed class RepairPlan
             var original = tools.OriginalName(alias);
             var tool = new RepairTool { Name = Encoding.UTF8.GetBytes(original), EscapedName = EscapedUtf8(original), NameWords = SplitWords(original) };
             if (raw.TryGetValue(original, out var triggers)) tool.Triggers = triggers;
+            inferred.TryGetValue(original, out var inferredNames);
             var parameters = schema.Get("parameters");
             var properties = parameters?.Get("properties");
             var required = new HashSet<string>();
@@ -121,7 +125,9 @@ internal sealed class RepairPlan
             if (properties is { Kind: JsonKind.Object })
                 foreach (var member in properties.Members)
                 {
-                    var param = BuildParam(tools.OriginalProperty(alias, member.Key), member.Value, required.Contains(member.Key));
+                    var key = tools.OriginalProperty(alias, member.Key);
+                    var param = BuildParam(key, member.Value, required.Contains(member.Key));
+                    param.Inferred = inferredNames != null && Array.IndexOf(inferredNames, key) >= 0;
                     foreach (var option in param.Options) longest = Math.Max(longest, option.Length);
                     if (param.DefaultJson != null) longest = Math.Max(longest, param.DefaultJson.Length);
                     built.Add(param);
@@ -136,7 +142,11 @@ internal sealed class RepairPlan
         foreach (var tool in Tools) HasTriggers |= tool.Triggers.Length > 0;
     }
 
-    internal static Dictionary<string, string[]> RawTriggers(string toolsJson)
+    internal static Dictionary<string, string[]> RawTriggers(string toolsJson) => RawLists(toolsJson, "triggers");
+
+    // A tool-level list of strings that the model never sees: ToolSet keeps only name, description and parameters.
+    // "triggers" holds patterns that route a request to the tool; "inferred" names parameters the game fills in.
+    internal static Dictionary<string, string[]> RawLists(string toolsJson, string listKey)
     {
         var map = new Dictionary<string, string[]>();
         JsonValue parsed;
@@ -146,10 +156,10 @@ internal sealed class RepairPlan
         {
             var tool = entry.Get("function") is { Kind: JsonKind.Object } wrapped ? wrapped : entry;
             var name = tool.GetString("name");
-            var triggers = tool.Get("triggers") ?? entry.Get("triggers");
-            if (name == null || triggers is not { Kind: JsonKind.Array }) continue;
+            var list = tool.Get(listKey) ?? entry.Get(listKey);
+            if (name == null || list is not { Kind: JsonKind.Array }) continue;
             var patterns = new List<string>();
-            foreach (var item in triggers.Items)
+            foreach (var item in list.Items)
                 if (item.Kind == JsonKind.String && item.Text.Length > 0) patterns.Add(item.Text);
             if (patterns.Count > 0) map[name] = patterns.ToArray();
         }

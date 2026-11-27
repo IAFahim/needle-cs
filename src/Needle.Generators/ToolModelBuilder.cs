@@ -67,8 +67,15 @@ internal sealed record ToolArg(
     bool FixedText,
     string? Description,
     bool Optional,
-    string? DefaultLiteral)
+    string? DefaultLiteral,
+    double? Minimum = null,
+    double? Maximum = null,
+    int MaxLength = 0,
+    bool Inferred = false)
 {
+    /// <summary>The longest text the grammar and schema allow, in bytes; -1 for no limit.</summary>
+    public int TextLimit => Type != ArgType.Text ? -1 : FixedText ? (MaxLength > 0 ? Math.Min(MaxLength, TextCapacity) : TextCapacity) : MaxLength > 0 ? MaxLength : -1;
+
     public bool PassTextThrough => Type == ArgType.Text && FixedText;
     public string SlotTypeName => Type switch
     {
@@ -114,6 +121,7 @@ internal sealed record BuiltToolSet(ToolSetModel? Model, ImmutableArray<Diagnost
 internal static class ToolModelBuilder
 {
     const string DescriptionAttributeName = "System.ComponentModel.DescriptionAttribute";
+    internal const string ArgAttributeName = "Needle.ArgAttribute";
 
     public static BuiltToolSet Build(INamedTypeSymbol symbol, bool modern = false)
     {
@@ -179,6 +187,76 @@ internal static class ToolModelBuilder
     }
 
     static ToolArg? BuildArg(IParameterSymbol parameter, ImmutableArray<DiagnosticInfo>.Builder diagnostics)
+    {
+        if (BuildType(parameter, diagnostics) is not { } arg) return null;
+        return ApplyLimits(parameter, arg, diagnostics);
+    }
+
+    // [Arg(Min, Max, MaxLength, Inferred)]: checked here so a bad limit is an error at the parameter, never a schema
+    // the model reads one way and the repair step another.
+    static ToolArg? ApplyLimits(IParameterSymbol parameter, ToolArg arg, ImmutableArray<DiagnosticInfo>.Builder diagnostics)
+    {
+        var attribute = parameter.GetAttributes().FirstOrDefault(a => a.AttributeClass?.ToDisplayString() == ArgAttributeName);
+        if (attribute == null) return arg;
+        double? min = null, max = null;
+        var maxLength = 0;
+        var inferred = false;
+        foreach (var named in attribute.NamedArguments)
+        {
+            var value = named.Value.Value;
+            switch (named.Key)
+            {
+                case "Min" when value is double d && !double.IsNaN(d): min = d; break;
+                case "Max" when value is double d && !double.IsNaN(d): max = d; break;
+                case "MaxLength" when value is int i: maxLength = i; break;
+                case "Inferred" when value is bool b: inferred = b; break;
+            }
+        }
+        var location = parameter.Locations.FirstOrDefault();
+        var numeric = arg.Type is ArgType.Int or ArgType.Long or ArgType.Float or ArgType.Double;
+        if ((min.HasValue || max.HasValue) && !numeric)
+        {
+            diagnostics.Add(Info("NDG012", location, $"[Arg] Min and Max apply to numeric parameters; '{parameter.Name}' is {parameter.Type.ToDisplayString()}."));
+            return null;
+        }
+        if (min is { } low && max is { } high && low > high)
+        {
+            diagnostics.Add(Info("NDG012", location, $"[Arg] on '{parameter.Name}' has Min {Number(low)} above Max {Number(high)}."));
+            return null;
+        }
+        if (min is { } m && double.IsInfinity(m) || max is { } x && double.IsInfinity(x))
+        {
+            diagnostics.Add(Info("NDG012", location, $"[Arg] on '{parameter.Name}' needs finite Min and Max; leave a side unset for no limit."));
+            return null;
+        }
+        if (maxLength != 0 && (arg.Type != ArgType.Text || maxLength < 0))
+        {
+            diagnostics.Add(Info("NDG012", location, arg.Type != ArgType.Text
+                ? $"[Arg] MaxLength applies to text parameters; '{parameter.Name}' is {parameter.Type.ToDisplayString()}."
+                : $"[Arg] MaxLength on '{parameter.Name}' must be positive."));
+            return null;
+        }
+        if (arg.FixedText && maxLength > arg.TextCapacity)
+        {
+            diagnostics.Add(Info("NDG011", location,
+                $"Parameter '{parameter.Name}' is {parameter.Type.Name}, which holds {arg.TextCapacity} UTF-8 bytes, but [Arg(MaxLength = {maxLength})] allows {maxLength}; " +
+                $"text past byte {arg.TextCapacity} would be cut. Use {LargerText(maxLength)} or lower MaxLength."));
+            return null;
+        }
+        return arg with { Minimum = min, Maximum = max, MaxLength = maxLength, Inferred = inferred };
+    }
+
+    static string LargerText(int bytes)
+    {
+        foreach (var capacity in new[] { 8, 16, 32, 64, 128, 256 })
+            if (capacity >= bytes) return "Utf8Text" + capacity.ToString(CultureInfo.InvariantCulture);
+        return "string";
+    }
+
+    internal static string Number(double value) =>
+        value == Math.Floor(value) && Math.Abs(value) < 1e15 ? ((long)value).ToString(CultureInfo.InvariantCulture) : value.ToString("R", CultureInfo.InvariantCulture);
+
+    static ToolArg? BuildType(IParameterSymbol parameter, ImmutableArray<DiagnosticInfo>.Builder diagnostics)
     {
         if (parameter.RefKind != RefKind.None)
         {
@@ -279,9 +357,11 @@ internal static class ToolModelBuilder
             "NDG006" => "Duplicate tool name",
             "NDG007" => "Generic tool method",
             "NDG009" => "Tool without a description",
+            "NDG011" => "Text limit larger than the fixed-size text",
+            "NDG012" => "Invalid [Arg] limits",
             _ => "Duplicate enum literal",
         },
-        id is "NDG001" or "NDG002" or "NDG003" or "NDG004" or "NDG005" ? "Error" : "Warning",
+        id is "NDG001" or "NDG002" or "NDG003" or "NDG004" or "NDG005" or "NDG011" or "NDG012" ? "Error" : "Warning",
         message,
         location?.SourceTree?.FilePath ?? "",
         location?.SourceSpan ?? default,
