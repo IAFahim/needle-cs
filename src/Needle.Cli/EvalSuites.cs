@@ -58,7 +58,7 @@ internal static class EvalSuites
                     default: throw new ArgumentException($"unknown option {args[i]}");
                 }
             }
-            if (threads < 1) throw new ArgumentException("needle-cs has no automatic thread count yet (threads 0); pass --threads 1 or more");
+            if (threads < 0) throw new ArgumentException("--threads must be 0 (automatic) or more");
             if (suites.Count == 0 || suites.Contains("all")) suites = Names.ToList();
             foreach (var name in suites)
                 if (!Names.Contains(name)) throw new ArgumentException($"unknown suite {name}; expected one of {string.Join(", ", Names)} or all");

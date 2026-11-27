@@ -52,7 +52,7 @@ internal sealed record BenchE2EOptions
                 var unknown => throw new ArgumentException($"unknown option {unknown}"),
             };
         }
-        if (options.Threads.Length == 0 || options.Threads.Any(t => t < 1)) throw new ArgumentException("--threads needs positive integers");
+        if (options.Threads.Length == 0 || options.Threads.Any(t => t < 0)) throw new ArgumentException("--threads needs integers, 0 for the automatic count");
         if (options.Reps < 1) throw new ArgumentException("--reps must be at least 1");
         if (options.Api is not ("text" or "span")) throw new ArgumentException("--api needs span or text");
         return options;

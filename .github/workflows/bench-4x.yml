@@ -84,20 +84,19 @@ jobs:
           if [ "${{ runner.arch }}" = "X64" ]; then
             engines+=(--engine "upstream-3.3.3" "python3 tools/native_bench.py ref/hf/wheel ref/hf/needle3.cact tools/tools.json --json --reps 3")
           fi
-          engines+=(--engine "needle-cs" "out/aot/needle bench-e2e ref/hf/needle3.cact tools/tools.json --threads 1,2,4 --reps 3 --json")
+          engines+=(--engine "needle-cs" "out/aot/needle bench-e2e ref/hf/needle3.cact tools/tools.json --threads 1,2,4,0 --reps 3 --json")
           python3 tools/bench_engines.py --rounds "$rounds" --json bench.json --title "Engine parity (same schema bytes, empty system, no date fact)" "${engines[@]}" | tee bench.md
 
       - name: Product default vs product default
         run: |
           rounds="${{ github.event.inputs.rounds || '5' }}"
-          cli=$(( $(nproc) / 2 )); [ "$cli" -lt 1 ] && cli=1; [ "$cli" -gt 8 ] && cli=8
           # upstream: what cactus.Needle does by default (automatic thread count, date fact as the system text);
-          # needle-cs: NeedleOptions defaults (library: 1 thread) and the CLI's default thread count.
+          # needle-cs: NeedleOptions defaults (library default: 1 thread) and the same with threads 0 (automatic).
           python3 tools/bench_engines.py --rounds "$rounds" --json product.json --single-row "product default" \
-            --title "Product default vs product default (upstream: threads 0 + auto_date; needle-cs: NeedleOptions defaults at 1 thread and at the CLI's $cli threads)" \
+            --title "Product default vs product default (upstream: threads 0 + auto_date; needle-cs: NeedleOptions defaults at 1 thread and at threads 0)" \
             --engine "upstream-4.x" "python3 tools/native_bench.py ref/native4 ref/hf/needle3.cact tools/tools.json --json --reps 3 --threads 0 --system auto-date --probe-tokens" \
             --engine "needle-cs 1 thread" "out/aot/needle bench-e2e ref/hf/needle3.cact tools/tools.json --threads 1 --reps 3 --json --product" \
-            --engine "needle-cs ${cli} threads" "out/aot/needle bench-e2e ref/hf/needle3.cact tools/tools.json --threads $cli --reps 3 --json --product" \
+            --engine "needle-cs auto" "out/aot/needle bench-e2e ref/hf/needle3.cact tools/tools.json --threads 0 --reps 3 --json --product" \
             | tee product.md
           { echo "# ${{ matrix.os }}"; echo; cat threads.md; echo; cat bench.md; echo; cat product.md; } >> "$GITHUB_STEP_SUMMARY"
 
