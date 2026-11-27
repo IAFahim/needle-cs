@@ -265,6 +265,32 @@ internal static unsafe class Neon
         }
     }
 
+    public static void TapsHead(float* taps, int stride, float* h0, float* h1, float* h2, float* destination, float* live0, float* live1, int n)
+    {
+        var c = 0;
+        for (; c + 4 <= n; c += 4)
+        {
+            var x2 = AdvSimd.LoadVector128(h2 + c);
+            var x1 = AdvSimd.LoadVector128(h1 + c);
+            var acc = AdvSimd.Multiply(AdvSimd.LoadVector128(taps + c), x2);
+            acc = AdvSimd.FusedMultiplyAdd(acc, AdvSimd.LoadVector128(taps + stride + c), x1);
+            acc = AdvSimd.FusedMultiplyAdd(acc, AdvSimd.LoadVector128(taps + 2 * stride + c), AdvSimd.LoadVector128(h0 + c));
+            AdvSimd.Store(destination + c, acc);
+            AdvSimd.Store(live0 + c, x1);
+            AdvSimd.Store(live1 + c, x2);
+        }
+        for (; c < n; c++)
+        {
+            var x2 = h2[c];
+            var x1 = h1[c];
+            var acc = taps[c] * x2;
+            acc = MathF.FusedMultiplyAdd(taps[stride + c], x1, acc);
+            destination[c] = MathF.FusedMultiplyAdd(taps[2 * stride + c], h0[c], acc);
+            live0[c] = x1;
+            live1[c] = x2;
+        }
+    }
+
     public static float AbsMax(float* x, int n)
     {
         var peak = Vector128<float>.Zero;

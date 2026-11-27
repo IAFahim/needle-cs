@@ -33,4 +33,4 @@ jobs:
         with: { name: ref-fixtures, path: ref }
       - run: |
           if [ "${{ matrix.mode }}" = scalar ]; then export NEEDLE_SCALAR=1; fi
-          dotnet test tests/Needle.Tests -c Release --filter "FullyQualifiedName~ChunkDiag2Tests|FullyQualifiedName~ChunkParityTests" --logger "console;verbosity=detailed" -- xUnit.ParallelizeTestCollections=false
+          dotnet test tests/Needle.Tests -c Release --filter "FullyQualifiedName~ChunkDiag2Tests|FullyQualifiedName~ChunkDiagTests|FullyQualifiedName~ChunkParityTests|FullyQualifiedName~BatchedDecodeTests" --logger "console;verbosity=detailed" -- xUnit.ParallelizeTestCollections=false
