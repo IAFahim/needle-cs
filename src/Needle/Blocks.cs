@@ -829,7 +829,7 @@ internal static unsafe class Attention
 
 internal unsafe struct AttentionBatch
 {
-    const int MaxChunks = 8;
+    const int InvariantChunks = 4;
     const int MinChunkPositions = 16;
 
     public sbyte* Queries;
@@ -871,9 +871,9 @@ internal unsafe struct AttentionBatch
             tilesPerGroup = (group + Attention.MaxTileHeads - 1) / Attention.MaxTileHeads;
             tileHeads = (group + tilesPerGroup - 1) / tilesPerGroup;
             planGroups = tokens * KvHeads;
-            chunks = tilesPerGroup == 1 ? Math.Clamp((threads + planGroups - 1) / planGroups, 1, MaxChunks) : 1;
-            if (chunks > 1 && tokens == 1)
-                chunks = Math.Min(chunks, Math.Max(1, firstCount / MinChunkPositions));
+            // The split depends on the positions only, never on the thread count: a split changes the
+            // softmax's summation order, so a thread-dependent split made calls differ between thread counts.
+            chunks = tilesPerGroup == 1 && tokens == 1 ? Math.Clamp(firstCount / (4 * MinChunkPositions), 1, InvariantChunks) : 1;
         }
         else
         {

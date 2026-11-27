@@ -108,7 +108,10 @@ internal sealed class RepairText
             else if (c == (byte)'.' && inWord && IsDigit(src[i - 1]) && i + 1 < src.Length && IsDigit(src[i + 1])) mapped = c;
             else
             {
-                if (c is (byte)',' or (byte)';' or (byte)'.' or (byte)'!' or (byte)'?' or (byte)':' or (byte)'\n' or (byte)'(' or (byte)')') breakPending = true;
+                // "Dr. Patel" is one name, not two clauses: a period after a title abbreviation does not end a clause.
+                if ((c is (byte)',' or (byte)';' or (byte)'.' or (byte)'!' or (byte)'?' or (byte)':' or (byte)'\n' or (byte)'(' or (byte)')') &&
+                    !(c == (byte)'.' && inWord && IsTitle(new ReadOnlySpan<byte>(Norm, WordStart[Words], Length - WordStart[Words]))))
+                    breakPending = true;
                 EndWord(ref inWord);
                 continue;
             }
@@ -150,6 +153,29 @@ internal sealed class RepairText
     static bool IsNegation(ReadOnlySpan<byte> word) =>
         word.SequenceEqual("dont"u8) || word.SequenceEqual("not"u8) || word.SequenceEqual("never"u8) || word.SequenceEqual("neither"u8) ||
         word.SequenceEqual("wont"u8) || word.SequenceEqual("shouldnt"u8) || word.SequenceEqual("cant"u8);
+
+    static bool IsTitle(ReadOnlySpan<byte> word) =>
+        word.SequenceEqual("dr"u8) || word.SequenceEqual("mr"u8) || word.SequenceEqual("mrs"u8) || word.SequenceEqual("ms"u8) ||
+        word.SequenceEqual("prof"u8) || word.SequenceEqual("st"u8) || word.SequenceEqual("mt"u8) || word.SequenceEqual("jr"u8) || word.SequenceEqual("sr"u8);
+
+    // A word of a value counts as present when the text holds it, or holds it split in two or three
+    // adjacent words ("6 pm" grounds "6pm").
+    public bool HasWordOrJoined(ReadOnlySpan<byte> word)
+    {
+        if (HasWord(word)) return true;
+        for (var w = 0; w < Words; w++)
+        {
+            var at = 0;
+            for (var k = w; k < Words && k < w + 3; k++)
+            {
+                var piece = Word(k);
+                if (at + piece.Length > word.Length || !word.Slice(at, piece.Length).SequenceEqual(piece)) break;
+                at += piece.Length;
+                if (at == word.Length) return k > w;
+            }
+        }
+        return false;
+    }
 
     static bool IsConjunction(ReadOnlySpan<byte> word) =>
         word.SequenceEqual("and"u8) || word.SequenceEqual("but"u8) || word.SequenceEqual("then"u8) || word.SequenceEqual("also"u8) ||

@@ -62,6 +62,7 @@ internal sealed class RepairScratch
     public readonly CallSpan[] Spans;
     public int ArenaLength;
     public byte[] PhoneText = Array.Empty<byte>();
+    public readonly RepairText Value = new(1024);
 
     public RepairScratch(int maxCalls, int maxArgs, int callBytes)
     {
@@ -1092,6 +1093,11 @@ internal static class ArgumentRepair
                 else if (kind == ValueKind.String && param is { Date: true } && anyYear && value.Length >= 6 && RepairText.TryParseDecimal(value.Slice(1, 4), out var year) &&
                          !history.HasNumber(year) && !(relative && today.HasValue && today.Value.Year == (int)year))
                     flagged = true;
+                else if (kind == ValueKind.String && param is { FreeText: true } && value.Length > 2 &&
+                         !(param.DefaultJson != null && value.SequenceEqual(param.DefaultJson)) && !WordsGrounded(s.Value, value[1..^1], history))
+                    flagged = true;
+                else if (kind == ValueKind.String && param is { NameOptions: true } && !NamedOption(param, value, history))
+                    flagged = true;
                 if (flagged)
                 {
                     found = true;
@@ -1101,6 +1107,25 @@ internal static class ArgumentRepair
             }
         }
         return found;
+    }
+
+    // 4.x grounding: free text must come from the conversation, every word of it ("05 minutes" for
+    // "negative 5 minutes", or a resolved date for "yesterday", is not); semantics from the Apache-2.0
+    // cactus-compute llms.txt ("Arguments contain only values evidenced in the input").
+    static bool WordsGrounded(RepairText scratch, ReadOnlySpan<byte> text, RepairText history)
+    {
+        scratch.Load(text);
+        for (var w = 0; w < scratch.Words; w++)
+            if (!history.HasWordOrJoined(scratch.Word(w))) return false;
+        return true;
+    }
+
+    // A closed set of names ("Maya", "Dr. Patel") is grounded only when the conversation names the chosen one.
+    static bool NamedOption(RepairParam param, ReadOnlySpan<byte> value, RepairText history)
+    {
+        for (var o = 0; o < param.Options.Length; o++)
+            if (value.SequenceEqual(param.Options[o])) return history.FindPhrase(param.OptionWords[o]) >= 0;
+        return true;
     }
 
     static bool IsYear(double value) => value >= 1900 && value <= 2200 && value == Math.Floor(value);
