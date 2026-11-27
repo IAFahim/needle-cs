@@ -161,6 +161,13 @@ public sealed class BatchedHostTests
         Assert.True(batchedMs < legacyMs, $"batched ({batchedMs:0} ms) should beat legacy singles ({legacyMs:0} ms)");
     }
 
+    static double Time(NeedleChannel channel, string query)
+    {
+        var sw = Stopwatch.StartNew();
+        ReceiveAll(channel, new[] { Submit(channel, query) });
+        return sw.Elapsed.TotalMilliseconds;
+    }
+
     static ulong[] SubmitAll(NeedleChannel channel, string[] queries)
     {
         var tickets = new ulong[queries.Length];
@@ -175,24 +182,19 @@ public sealed class BatchedHostTests
         Assets.Require();
         const int threads = 4;
         const string query = "stop everything";
-        double batchedMs, singleMs;
-        using (var batched = new NeedleHost())
+        // Both hosts stay up and take turns, and each keeps its best round: a 4-core runner's background
+        // noise and whichever host happened to run first then cancel out of the comparison.
+        using var batched = new NeedleHost();
+        using var single = new NeedleHost();
+        var batchedChannel = batched.Start(Options(threads, maxBatch: 16));
+        var singleChannel = single.Start(Options(threads, maxBatch: 1));
+        ReceiveAll(batchedChannel, new[] { Submit(batchedChannel, query) });
+        ReceiveAll(singleChannel, new[] { Submit(singleChannel, query) });
+        double batchedMs = double.MaxValue, singleMs = double.MaxValue;
+        for (var round = 0; round < 5; round++)
         {
-            var channel = batched.Start(Options(threads, maxBatch: 16));
-            ReceiveAll(channel, new[] { Submit(channel, query) });
-            var sw = Stopwatch.StartNew();
-            for (var i = 0; i < 3; i++) ReceiveAll(channel, new[] { Submit(channel, query) });
-            sw.Stop();
-            batchedMs = sw.Elapsed.TotalMilliseconds / 3;
-        }
-        using (var single = new NeedleHost())
-        {
-            var channel = single.Start(Options(threads, maxBatch: 1));
-            ReceiveAll(channel, new[] { Submit(channel, query) });
-            var sw = Stopwatch.StartNew();
-            for (var i = 0; i < 3; i++) ReceiveAll(channel, new[] { Submit(channel, query) });
-            sw.Stop();
-            singleMs = sw.Elapsed.TotalMilliseconds / 3;
+            batchedMs = Math.Min(batchedMs, Time(batchedChannel, query));
+            singleMs = Math.Min(singleMs, Time(singleChannel, query));
         }
         output.WriteLine($"single-request batched {batchedMs:0} ms vs single {singleMs:0} ms (x{batchedMs / singleMs:0.00})");
         Assert.True(batchedMs < 2 * singleMs, $"batched single {batchedMs:0} ms should stay near single {singleMs:0} ms");
