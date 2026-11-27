@@ -846,15 +846,38 @@ internal unsafe struct AttentionBatch
     int* arrivals;
     int tileHeads, tilesPerGroup, chunks, planGroups;
 
-    public static void Run(Pool pool, AttentionBatch* batch, int tokens)
+    // A decode row whose context reaches SplitFrom positions is split into a fixed number of position chunks,
+    // merged in chunk order, so the softmax sums in the same order at every thread count. The count is the
+    // split the thread-dependent planner made at four threads (ceil(4 / kv heads)); threads only decide how the
+    // chunks are spread across workers, never the arithmetic.
+    const int SplitFrom = 4 * MinChunkPositions;
+    public const int MaxSplitChunks = 8;
+
+    /// <summary>Position chunks per (row, kv head) for a model with this many kv heads.</summary>
+    public static int SplitChunks(int kvHeads) => Math.Clamp((4 + kvHeads - 1) / kvHeads, 1, MaxSplitChunks);
+
+    /// <summary>Set by causal self-attention callers: every row of a multi-token batch (prefill, speculative
+    /// verify) is split exactly as that row would be when decoded alone.</summary>
+    public bool CausalRows;
+
+    public static void Run(Pool pool, AttentionBatch* batch, int tokens) => Run(pool, batch, tokens, null, null);
+
+    /// <summary>Runs the batch; partials (tokens × kv heads × MaxSplitChunks × PartialFloats floats) and
+    /// arrivals (tokens × kv heads ints) are the caller's preallocated buffers for a split.</summary>
+    public static void Run(Pool pool, AttentionBatch* batch, int tokens, float* partials, int* arrivals)
     {
-        batch->Plan(pool.Threads, tokens, null, null);
+        batch->Plan(pool.Threads, tokens, partials, arrivals);
         if (batch->chunks == 1)
         {
             pool.Run(&Execute, batch, batch->TeamTasks);
             return;
         }
-        RunChunked(pool, batch);
+        if (partials == null) RunChunked(pool, batch);
+        else
+        {
+            for (var i = 0; i < batch->planGroups; i++) arrivals[i] = 0;
+            pool.Run(&ExecuteChunk, batch, batch->TeamTasks);
+        }
     }
 
     public bool UsesChunks => chunks > 1;
@@ -863,21 +886,27 @@ internal unsafe struct AttentionBatch
     {
         var group = Heads / KvHeads;
         var splittable = Attention.CanSplitPositions && group > 1 && Probabilities == null;
-        // Positions are never split across tasks: a split changes the softmax's summation order, so a split
-        // that depended on the thread count (or only on single-token decode) made calls differ between thread
-        // counts and between the speculative and plain paths. Heads still spread across the team.
-        var chunkByPos = splittable && tokens > 1;
+        planGroups = tokens * KvHeads;
+        // Multi-token rows split only for causal callers that hand in buffers (a per-call stack buffer would
+        // grow with the batch); a single row's buffer is small.
+        var rowsSplit = tokens == 1 || CausalRows && partials != null && arrivals != null;
+        var longest = 0;
+        if (splittable && rowsSplit)
+            for (var t = 0; t < tokens; t++)
+            {
+                Span(t, out _, out var count);
+                longest = Math.Max(longest, count);
+            }
+        var chunkByPos = splittable && (tokens > 1 || longest >= SplitFrom);
         if (chunkByPos)
         {
             tilesPerGroup = (group + Attention.MaxTileHeads - 1) / Attention.MaxTileHeads;
             tileHeads = (group + tilesPerGroup - 1) / tilesPerGroup;
-            planGroups = tokens * KvHeads;
-            chunks = 1;
+            chunks = tilesPerGroup == 1 && rowsSplit && longest >= SplitFrom ? SplitChunks(KvHeads) : 1;
         }
         else
         {
             chunks = 1;
-            planGroups = tokens * KvHeads;
             var desiredTiles = Probabilities == null && tokens == 1 && threads > planGroups
                 ? Math.Clamp((threads + planGroups - 1) / planGroups, 1, group)
                 : 1;
@@ -890,6 +919,9 @@ internal unsafe struct AttentionBatch
         this.partials = partials;
         this.arrivals = arrivals;
     }
+
+    /// <summary>Chunks a row of this many positions is split into: a function of the positions alone.</summary>
+    static int RowChunks(int count, int chunks) => count < SplitFrom ? 1 : Math.Clamp(count / MinChunkPositions, 1, chunks);
 
     public int TeamTasks => planGroups * (chunks == 1 ? tilesPerGroup : chunks);
 
@@ -904,7 +936,8 @@ internal unsafe struct AttentionBatch
     {
         var partials = stackalloc float[batch->planGroups * batch->chunks * Attention.PartialFloats];
         var arrivals = stackalloc int[batch->planGroups];
-        batch->Plan(pool.Threads, batch->planGroups / batch->KvHeads, partials, arrivals);
+        batch->partials = partials;
+        batch->arrivals = arrivals;
         for (var i = 0; i < batch->planGroups; i++) arrivals[i] = 0;
         pool.Run(&ExecuteChunk, batch, batch->TeamTasks);
     }
@@ -935,6 +968,22 @@ internal unsafe struct AttentionBatch
     }
 
     [SkipLocalsInit]
+    static void ExecuteWhole(AttentionBatch* b, int token, int kv, int first, int count)
+    {
+        var group = b->Heads / b->KvHeads;
+        var firstHead = kv * group;
+        var scores = stackalloc float[Attention.ScoreFloats(count)];
+        var work = b->Tile(token, kv, firstHead, group, first, count, scores);
+        work.Output = b->Output + (long)token * b->Heads * b->VDim + firstHead * b->VDim;
+        work.ProbabilityStride = b->Frames;
+        Attention.Run(work);
+#if NEEDLE_SIMD
+        if (b->Gate != null)
+            Ops.ApplyGateAndHeadPeaks(work.Output, b->Gate + ((long)token * b->Heads + firstHead) * b->VDim, group, b->VDim, b->GatePeaks + ((long)token * b->Heads + firstHead) * 16);
+#endif
+    }
+
+    [SkipLocalsInit]
     static void ExecuteChunk(AttentionBatch* b, int task)
     {
         var group = b->Heads / b->KvHeads;
@@ -943,7 +992,13 @@ internal unsafe struct AttentionBatch
         var token = groupIndex / b->KvHeads;
         var kv = groupIndex % b->KvHeads;
         b->Span(token, out var first, out var count);
-        var needed = Math.Clamp(count / MinChunkPositions, 1, b->chunks);
+        var needed = RowChunks(count, b->chunks);
+        if (needed == 1)
+        {
+            // A short row runs whole, exactly as a lone decode row of that length does.
+            if (chunk == 0) ExecuteWhole(b, token, kv, first, count);
+            return;
+        }
         var length = ((count + needed - 1) / needed + 3) & ~3;
         needed = (count + length - 1) / length;
         if (chunk >= needed) return;
