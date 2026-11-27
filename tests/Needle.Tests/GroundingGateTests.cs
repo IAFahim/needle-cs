@@ -13,6 +13,7 @@ public sealed class GroundingGateTests
  {"name":"create_reminder","parameters":{"type":"object","properties":{"message":{"type":"string"},"date_time_human":{"type":"string","description":"The user's date or time phrase copied word for word."}},"required":["message","date_time_human"]}},
  {"name":"reply_to_notification","parameters":{"type":"object","properties":{"notification_match":{"type":"string","enum":["Maya","Leo","Dr. Patel","Cactus Team"]},"text":{"type":"string"}},"required":["notification_match","text"]}},
  {"name":"dismiss_notification","parameters":{"type":"object","properties":{"notification_match":{"type":"string","enum":["Maya","Leo","Dr. Patel","Cactus Team"]}},"required":["notification_match"]}},
+ {"name":"set_cooking_timer","parameters":{"type":"object","properties":{"label":{"type":"string","description":"Label for the timer, copied from the user."},"minutes":{"type":"integer","minimum":1}},"required":["label","minutes"]}},
  {"name":"log_contact","parameters":{"type":"object","properties":{"email":{"type":"string","format":"email"}},"required":["email"]}}]
 """;
 
@@ -84,5 +85,25 @@ public sealed class GroundingGateTests
         var (json, outcome, _) = Run("never dismiss notifications from Dr. Patel", Call("dismiss_notification", """{"notification_match":"Dr. Patel"}"""));
         Assert.Equal("[]", json);
         Assert.True(outcome.HasFlag(RepairOutcome.Negated));
+    }
+
+    [Fact]
+    public void TheSystemTextDoesNotStateANumber()
+    {
+        const string system = "date: 2026-11-27 Fri 02:11; Map each explicit action to exactly one declared call.";
+        var (_, outcome, ungrounded) = Run("set a cooking timer for the rice", Call("set_cooking_timer", """{"label":"rice","minutes":1}"""), system);
+        Assert.True(outcome.HasFlag(RepairOutcome.Ungrounded));
+        Assert.Equal("set_cooking_timer.minutes", ungrounded);
+        Assert.True(Run("set a cooking timer for the rice", Call("set_cooking_timer", """{"label":"rice","minutes":11}"""), system).Outcome.HasFlag(RepairOutcome.Ungrounded));
+        Assert.False(Run("set a rice timer for one minute", Call("set_cooking_timer", """{"label":"rice","minutes":1}"""), system).Outcome.HasFlag(RepairOutcome.Ungrounded));
+    }
+
+    [Fact]
+    public void ALabelThatOnlyRestatesTheToolIsUngrounded()
+    {
+        var (_, outcome, ungrounded) = Run("start a timer for 25 minutes", Call("set_cooking_timer", """{"label":"timer","minutes":25}"""));
+        Assert.True(outcome.HasFlag(RepairOutcome.Ungrounded));
+        Assert.Equal("set_cooking_timer.label", ungrounded);
+        Assert.False(Run("start a pasta timer for 9 minutes", Call("set_cooking_timer", """{"label":"pasta","minutes":9}""")).Outcome.HasFlag(RepairOutcome.Ungrounded));
     }
 }

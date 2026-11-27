@@ -35,9 +35,14 @@ internal sealed class RepairText
 
     public int Capacity => Source.Length;
 
+    /// <summary>Bytes of Source that came from Load (the system text in a conversation history); the
+    /// turns appended after it follow.</summary>
+    public int Preamble;
+
     public void Clear()
     {
         SourceLength = 0;
+        Preamble = 0;
         Length = 0;
         Words = 0;
         Clauses = 0;
@@ -47,7 +52,9 @@ internal sealed class RepairText
     public void Load(ReadOnlySpan<byte> source)
     {
         SourceLength = 0;
+        Preamble = 0;
         Append(source);
+        Preamble = SourceLength;
     }
 
     public void Append(ReadOnlySpan<byte> source)
@@ -58,13 +65,14 @@ internal sealed class RepairText
         if (need > 0)
         {
             // Full: drop the oldest text, on a line boundary, so the newest turn is always kept.
-            if (need >= SourceLength) SourceLength = 0;
+            if (need >= SourceLength) { SourceLength = 0; Preamble = 0; }
             else
             {
                 var cut = Array.IndexOf(Source, (byte)'\n', need, SourceLength - need);
                 cut = cut < 0 ? need : cut + 1;
                 Buffer.BlockCopy(Source, cut, Source, 0, SourceLength - cut);
                 SourceLength -= cut;
+                Preamble = Math.Max(0, Preamble - cut);
             }
         }
         if (SourceLength > 0) Source[SourceLength++] = (byte)'\n';
@@ -221,6 +229,14 @@ internal sealed class RepairText
     }
 
     public bool HasWord(ReadOnlySpan<byte> word, int clause = -1) => FindPhrase(word, clause) >= 0;
+
+    /// <summary>A number stated in the turns after the preamble (the conversation, not the system text).</summary>
+    public bool HasTurnNumber(double value)
+    {
+        for (var i = 0; i < NumberCount; i++)
+            if (Math.Abs(Numbers[i] - value) < 1e-9 && Origin[WordStart[NumberWord[i]]] >= Preamble) return true;
+        return false;
+    }
 
     public bool HasNumber(double value)
     {

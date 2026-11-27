@@ -1088,13 +1088,14 @@ internal static class ArgumentRepair
                 var param = p >= 0 ? tool.Params[p] : null;
                 var flagged = false;
                 if (kind == ValueKind.Number && param is { Options.Length: 0 } && Utf8Parser.TryParse(value, out double number, out _) &&
-                    !history.HasNumber(number) && !(param.DefaultJson != null && value.SequenceEqual(param.DefaultJson)))
+                    !Stated(number, request, history) && !(param.DefaultJson != null && value.SequenceEqual(param.DefaultJson)))
                     flagged = true;
                 else if (kind == ValueKind.String && param is { Date: true } && anyYear && value.Length >= 6 && RepairText.TryParseDecimal(value.Slice(1, 4), out var year) &&
                          !history.HasNumber(year) && !(relative && today.HasValue && today.Value.Year == (int)year))
                     flagged = true;
                 else if (kind == ValueKind.String && param is { FreeText: true } && value.Length > 2 &&
-                         !(param.DefaultJson != null && value.SequenceEqual(param.DefaultJson)) && !WordsGrounded(s.Value, value[1..^1], history))
+                         !(param.DefaultJson != null && value.SequenceEqual(param.DefaultJson)) &&
+                         (!WordsGrounded(s.Value, value[1..^1], request, history) || EchoesToolName(s.Value, tool)))
                     flagged = true;
                 else if (kind == ValueKind.String && param is { NameOptions: true } && !NamedOption(param, value, history))
                     flagged = true;
@@ -1112,7 +1113,7 @@ internal static class ArgumentRepair
     // 4.x grounding: free text must come from the conversation, every word of it ("05 minutes" for
     // "negative 5 minutes", or a resolved date for "yesterday", is not); semantics from the Apache-2.0
     // cactus-compute llms.txt ("Arguments contain only values evidenced in the input").
-    static bool WordsGrounded(RepairText scratch, ReadOnlySpan<byte> text, RepairText history)
+    static bool WordsGrounded(RepairText scratch, ReadOnlySpan<byte> text, RepairText request, RepairText history)
     {
         scratch.Load(text);
         var clock = text.IndexOf((byte)':') >= 0;
@@ -1132,21 +1133,41 @@ internal static class ArgumentRepair
             if (!(suffix.IsEmpty || suffix.SequenceEqual("am"u8) || suffix.SequenceEqual("pm"u8) || suffix.SequenceEqual("st"u8) ||
                   suffix.SequenceEqual("nd"u8) || suffix.SequenceEqual("rd"u8) || suffix.SequenceEqual("th"u8)))
                 return false;
-            if (!NumberGrounded(word[..digits], clock, history)) return false;
+            if (!NumberGrounded(word[..digits], clock, request, history)) return false;
         }
         return true;
     }
 
     // A number restated in digits ("7" for "seven", "07:00" or "19:00" for "seven pm") is evidenced; a padded
     // number outside a clock ("05 minutes" for "negative 5 minutes") is not.
-    static bool NumberGrounded(ReadOnlySpan<byte> digits, bool clock, RepairText history)
+    static bool NumberGrounded(ReadOnlySpan<byte> digits, bool clock, RepairText request, RepairText history)
     {
         if (!RepairText.TryParseDecimal(digits, out var n)) return false;
         if (clock && digits.SequenceEqual("00"u8)) return true;
         if (digits.Length > 1 && digits[0] == (byte)'0' && !clock) return false;
-        if (history.HasNumber(n)) return true;
-        if (clock && n > 12 && n < 24 && history.HasNumber(n - 12)) return true;
+        if (Stated(n, request, history)) return true;
+        if (clock && n > 12 && n < 24 && Stated(n - 12, request, history)) return true;
         return clock && n == 12 && (history.HasWord("noon"u8) || history.HasWord("midnight"u8));
+    }
+
+    // A number is evidenced by the request or an earlier turn, never by the system text's own wording: the
+    // instructions' "exactly one call" or the date fact's clock do not state a timer's minutes.
+    static bool Stated(double number, RepairText request, RepairText history) => request.HasNumber(number) || history.HasTurnNumber(number);
+
+    // A value made only of the tool's own name words ("timer" for set_cooking_timer) restates the call, not a
+    // value the user gave: the model filled the slot itself.
+    static bool EchoesToolName(RepairText value, RepairTool tool)
+    {
+        if (value.Words == 0 || tool.NameWords.Length == 0) return false;
+        for (var w = 0; w < value.Words; w++)
+        {
+            var word = value.Word(w);
+            var found = false;
+            foreach (var name in tool.NameWords)
+                if (word.SequenceEqual(name)) { found = true; break; }
+            if (!found) return false;
+        }
+        return true;
     }
 
     // A closed set of names ("Maya", "Dr. Patel") is grounded only when the conversation names the chosen one.
