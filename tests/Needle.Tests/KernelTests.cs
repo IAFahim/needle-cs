@@ -79,6 +79,10 @@ public sealed class TierSelectionTests
                 Assert.True(System.Runtime.Intrinsics.X86.Avx512F.IsSupported);
                 Assert.True(System.Runtime.Intrinsics.X86.Avx512BW.IsSupported);
                 break;
+            case CpuTier.Avx512Vnni:
+                Assert.True(EvexVnni.CpuHasAvx512Vnni);
+                Assert.True(EvexVnni.Ready);
+                break;
             case CpuTier.Neon:
             case CpuTier.NeonDot: Assert.True(System.Runtime.Intrinsics.Arm.AdvSimd.IsSupported); break;
             default: Assert.Fail("Unknown tier."); break;
