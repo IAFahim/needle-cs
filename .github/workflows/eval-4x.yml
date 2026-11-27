@@ -55,6 +55,7 @@ jobs:
           threads="${{ github.event.inputs.threads || '4' }}"
           date_fact="$(date -u '+%Y-%m-%d %a %H:%M')"
           echo "date fact: $date_fact, threads: $threads"
+          echo "$date_fact" > date-fact.txt
           set +e
           out/aot/needle eval ref/hf/needle3.cact --suite all --threads "$threads" --date "$date_fact" --json needle-cs.json
           echo "needle-cs exit $?"
@@ -63,6 +64,33 @@ jobs:
           set -e
           python3 tools/eval_compare.py needle-cs.json upstream-4x.json --out eval.md
           { echo "## 4.x acceptance suites (ubuntu-latest, run ${{ github.run_id }})"; echo; cat eval.md; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: needle-cs thread invariance (same calls, suppressed calls and tokens at every thread count)
+        run: |
+          date_fact="$(cat date-fact.txt)"
+          for t in 1 2 3 6 8 0; do
+            out/aot/needle eval ref/hf/needle3.cact --suite all --threads "$t" --date "$date_fact" --quiet --json "needle-cs-t$t.json" > /dev/null || true
+          done
+          python3 - needle-cs.json needle-cs-t1.json needle-cs-t2.json needle-cs-t3.json needle-cs-t6.json needle-cs-t8.json needle-cs-t0.json <<'PY' | tee threads.md
+          import json, sys
+          def cases(path):
+              return {(s["suite"], c["query"]): c for s in json.load(open(path))["suites"] for c in s["cases"]}
+          base = cases(sys.argv[1])
+          print("| threads (0 = auto) | cases | calls differ | tokens differ | max confidence delta |")
+          print("|---|---|---|---|---|")
+          bad = 0
+          for path in sys.argv[2:]:
+              other = cases(path)
+              calls = [k for k in base if (base[k]["raw_calls"], base[k]["suppressed_calls"], base[k]["got"]) != (other[k]["raw_calls"], other[k]["suppressed_calls"], other[k]["got"])]
+              tokens = [k for k in base if base[k]["decode_tokens"] != other[k]["decode_tokens"]]
+              delta = max(abs((base[k]["confidence"] or 0) - (other[k]["confidence"] or 0)) for k in base)
+              print(f"| {path.split('-t')[-1].split('.')[0]} vs 4 | {len(base)} | {len(calls)} | {len(tokens)} | {delta:.4f} |")
+              for k in calls[:5]:
+                  print(f"|   {k[0]}: {k[1]} | | {json.dumps(other[k]['got'])} | | |")
+              bad += len(calls)
+          sys.exit(1 if bad else 0)
+          PY
+          { echo "## needle-cs thread invariance"; echo; cat threads.md; } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Show one raw upstream envelope per suite
         if: always()
@@ -75,5 +103,6 @@ jobs:
           name: eval-4x
           path: |
             eval.md
+            threads.md
             needle-cs.json
             upstream-4x.json
