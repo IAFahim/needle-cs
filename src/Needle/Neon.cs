@@ -290,7 +290,8 @@ internal static unsafe class Neon
     // decoded alone matches the same token inside a prefill chunk bit for bit.
     public static void TapsHead(float* taps, int stride, float* h0, float* h1, float* h2, float* destination, float* live0, float* live1, int n)
     {
-        for (var c = 0; c < n; c += 4)
+        var c = 0;
+        for (; c + 4 <= n; c += 4)
         {
             var x2 = AdvSimd.LoadVector128(h2 + c);
             var x1 = AdvSimd.LoadVector128(h1 + c);
@@ -300,6 +301,16 @@ internal static unsafe class Neon
             AdvSimd.Store(destination + c, acc);
             AdvSimd.Store(live0 + c, x1);
             AdvSimd.Store(live1 + c, x2);
+        }
+        for (; c < n; c++)
+        {
+            var x2 = h2[c];
+            var x1 = h1[c];
+            var acc = taps[c] * x2;
+            acc = MathF.FusedMultiplyAdd(taps[stride + c], x1, acc);
+            destination[c] = MathF.FusedMultiplyAdd(taps[2 * stride + c], h0[c], acc);
+            live0[c] = x1;
+            live1[c] = x2;
         }
     }
 
