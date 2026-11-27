@@ -1,327 +1,35 @@
 name: CI
-
 on:
-  push:
-    branches: [master, main]
-  pull_request:
   workflow_dispatch:
-
-concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
+    inputs:
+      branch: { required: true, type: string }
+      head: { required: true, type: string }
 permissions:
-  contents: read
-
-env:
-  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
-  DOTNET_NOLOGO: "1"
-  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: "1"
-
+  contents: write
 jobs:
-  fixtures:
-    name: Model and golden fixtures
+  merge-and-pack:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Restore cached ref directory
-        id: ref-cache
-        uses: actions/cache@v4
-        with:
-          path: ref
-          key: ref-v2-${{ hashFiles('tools/fetch.sh', 'tools/ref.lock', 'tools/golden.py', 'tools/golden_confidence.py', 'tools/golden_whistle.py') }}
-
-      - name: Set up Python
-        if: steps.ref-cache.outputs.cache-hit != 'true'
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install Python dependencies
-        if: steps.ref-cache.outputs.cache-hit != 'true'
-        run: pip install numpy sentencepiece soxr
-
-      - name: Download models, tokenizer and audio clips
-        if: steps.ref-cache.outputs.cache-hit != 'true'
-        run: bash tools/fetch.sh
-
-      - name: Generate golden logits and greedy decode (40 tokens)
-        if: steps.ref-cache.outputs.cache-hit != 'true'
-        run: python3 tools/golden.py 40
-
-      - name: Generate golden confidence-head fixtures
-        if: steps.ref-cache.outputs.cache-hit != 'true'
-        run: python3 tools/golden_confidence.py
-
-      - name: Generate Whistle stage goldens
-        if: steps.ref-cache.outputs.cache-hit != 'true'
-        run: python3 tools/golden_whistle.py
-
-      - name: Verify fixtures are present
+      - uses: actions/checkout@v4
+        with: { ref: "${{ inputs.branch }}", fetch-depth: 0 }
+      - uses: actions/setup-dotnet@v4
+        with: { dotnet-version: "10.0.x" }
+      - env:
+          BRANCH: ${{ inputs.branch }}
+          HEAD_SHA: ${{ inputs.head }}
         run: |
-          test -s ref/hf/needle3.cact
-          test -s ref/hf/tokenizer/tokenizer.model
-          test -s ref/hf/whistle/whistle.cact
-          test -s ref/audio/record.wav
-          test -s ref/golden/golden.json
-          test -s ref/golden/case0/logits.bin
-          for clip in record hotword; do
-            test -s "ref/golden/whistle/$clip/mel.f32"
-            test -s "ref/golden/whistle/$clip/encoder.f32"
-            test -s "ref/golden/whistle/$clip/memory.f32"
-            test -s "ref/golden/whistle/$clip/logits_bos.f32"
-            test -s "ref/golden/whistle/$clip/meta.json"
-          done
-          du -sh ref
-
-      - name: Publish fixtures for the test matrix
-        uses: actions/upload-artifact@v4
-        with:
-          name: ref-fixtures
-          path: ref
-          if-no-files-found: error
-          retention-days: 1
-          compression-level: 1
-
-  test:
-    name: Test (${{ matrix.name }} / ${{ matrix.shard }})
-    needs: fixtures
-    runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.expected-fail }}
-    timeout-minutes: 90
-    # Per-job policy (never a blanket flag; originally for issue #32). Every
-    # leg below is required-green; expected-fail returns only for new,
-    # unobserved probes, and only with an issue link. Evidence is completed
-    # runs on master (cancelled legs are cancel-in-progress scheduling
-    # fallout, not results):
-    #  - linux-x64 is the primary gate (suite + NEEDLE_SCALAR=1 rerun +
-    #    netstandard2.1 + NativeAOT publish/smoke).
-    #  - linux-arm64 covers NeonTests natively plus the NEON widening
-    #    fallback tier (NEEDLE_NODP=1); tier log on 41375210271: NeonDot.
-    #  - windows-x64 runs the AVX tier matrix it supports (tier log: Avx2,
-    #    no VNNI/512 on windows-latest). Heavy joined unit+core as
-    #    required-green: green on every completed run since 41348708967
-    #    (verified 6/6 across 41366006614-41427532179). The #38/#48
-    #    speech-numerics flake cited before (LongClip failed once on
-    #    41348708967) has not recurred on windows since.
-    #  - macos-arm64 unit (6/6 green) and core (3/3 executed) promoted;
-    #    heavy promoted on two consecutive green completions (41372129451,
-    #    41375210271). Tier log: NeonDot (AdvSimd+Dp), so NeonTests execute
-    #    natively here too; unit+core now also run the NEEDLE_NODP=1
-    #    fallback. Heavy stays neon:false: it already runs longest and the
-    #    fallback is covered by unit+core. History: 41366006614 heavy
-    #    failed WhistleStageTests.StagesMatchTheNumpyReference plus two
-    #    ZeroAllocation 5-minute timeouts (see #40); watch for recurrence.
-    #    The hang watchdog now covers macos-arm64 for the same reason
-    #    (BSD top lacks the per-thread flags, so only the dotnet-stack
-    #    dumps apply there).
-    #  - linux-x64-noavx512 (DOTNET_EnableAVX512F=0 experiment, AVX2
-    #    fallback path) promoted after 5 consecutive green runs; history:
-    #    41366006614 failed GenerationMatchesReferenceGreedyDecode +
-    #    LongContextStaysCloseToNative, the same flake family as the
-    #    required legs, not tier-specific.
-    # No macos-x64 leg: the last stable Intel image (macos-13) retired Dec
-    # 2025; Intel-only coverage stays on windows/linux x64. No
-    # windows-arm64 leg yet (image GA Aug 2026): unobserved with no owner,
-    # so no probe leg either — see plan.md for the validation plan.
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: linux-x64
-            os: ubuntu-latest
-            expected-fail: false
-            scalar: true
-            netstandard: true
-            neon: false
-            shard: unit
-          - name: linux-x64
-            os: ubuntu-latest
-            expected-fail: false
-            scalar: true
-            netstandard: true
-            neon: false
-            shard: core
-          - name: linux-x64
-            os: ubuntu-latest
-            expected-fail: false
-            scalar: true
-            netstandard: true
-            neon: false
-            shard: heavy
-          - name: linux-x64-noavx512
-            os: ubuntu-latest
-            expected-fail: false
-            scalar: false
-            netstandard: false
-            neon: false
-            shard: core
-            noavx512: true
-          - name: linux-arm64
-            os: ubuntu-24.04-arm
-            expected-fail: false
-            scalar: false
-            netstandard: false
-            neon: true
-            shard: unit
-          - name: linux-arm64
-            os: ubuntu-24.04-arm
-            expected-fail: false
-            scalar: false
-            netstandard: false
-            neon: true
-            shard: core
-          - name: linux-arm64
-            os: ubuntu-24.04-arm
-            expected-fail: false
-            scalar: false
-            netstandard: false
-            neon: true
-            shard: heavy
-          - name: windows-x64
-            os: windows-latest
-            expected-fail: false
-            scalar: false
-            netstandard: false
-            neon: false
-            shard: unit
-          - name: windows-x64
-            os: windows-latest
-            expected-fail: false
-            scalar: false
-            netstandard: false
-            neon: false
-            shard: core
-          - name: windows-x64
-            os: windows-latest
-            expected-fail: false
-            scalar: false
-            netstandard: false
-            neon: false
-            shard: heavy
-          - name: macos-arm64
-            os: macos-14
-            expected-fail: false
-            scalar: false
-            netstandard: false
-            neon: true
-            shard: unit
-          - name: macos-arm64
-            os: macos-14
-            expected-fail: false
-            scalar: false
-            netstandard: false
-            neon: true
-            shard: core
-          - name: macos-arm64
-            os: macos-14
-            expected-fail: false
-            scalar: false
-            netstandard: false
-            neon: false
-            shard: heavy
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Set up .NET 10 SDK
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: "10.0.x"
-
-      - name: Download fixtures into ref
-        uses: actions/download-artifact@v4
-        with:
-          name: ref-fixtures
-          path: ref
-
-
-      - name: Log host SIMD capabilities
-        run: |
-          grep -o 'avx512[a-z0-9]*\|avx2\|vnni\|fma' /proc/cpuinfo 2>/dev/null | sort -u || lscpu 2>/dev/null | grep -i 'flags\|arch' || sysctl -a 2>/dev/null | grep -iE 'machdep.cpu.features|hw.optional.arm' || echo NO_CPUINFO
-          # Model name distinguishes runner hardware that shares the same flag set.
-          grep -m1 'model name' /proc/cpuinfo 2>/dev/null || sysctl -n machdep.cpu.brand_string 2>/dev/null || powershell -NoProfile -Command '(Get-CimInstance Win32_Processor).Name' 2>/dev/null || true
-
-      - name: Hang watchdog (stacks + per-thread CPU before the blame fuse)
-        if: matrix.shard != 'unit' && (startsWith(matrix.name, 'linux-x64') || matrix.name == 'linux-arm64' || matrix.name == 'macos-arm64')
-        run: |
-          dotnet tool install dotnet-stack --tool-path "$RUNNER_TEMP/diag"
-          mkdir -p hang-snapshots
-          ( sleep 1200
-            for pid in $(pgrep -f testhost); do
-              "$RUNNER_TEMP/diag/dotnet-stack" report -p "$pid" > "hang-snapshots/$pid-a.txt" 2>&1
-              top -H -b -n1 -p "$pid" > "hang-snapshots/$pid-top.txt" 2>&1
-              sleep 15
-              "$RUNNER_TEMP/diag/dotnet-stack" report -p "$pid" > "hang-snapshots/$pid-b.txt" 2>&1
-            done ) &
-      - name: Select shard filter
-        run: |
-          case "${{ matrix.shard }}" in
-            unit) echo 'FILTER=FullyQualifiedName~AttentionBatchTests|FullyQualifiedName~AttentionTileTests|FullyQualifiedName~Avx512OpsTests|FullyQualifiedName~BackendTests|FullyQualifiedName~CallRestorerTests|FullyQualifiedName~Needle.Tests.Conformance.|FullyQualifiedName~EvalDatasetTests|FullyQualifiedName~ForcedTierTests|FullyQualifiedName~FormatTests|FullyQualifiedName~FusedKernelTests|FullyQualifiedName~GrammarTests|FullyQualifiedName~HadamardMlpTests|FullyQualifiedName~Int8DotTierTests|FullyQualifiedName~KernelTests|FullyQualifiedName~MatMulTests|FullyQualifiedName~NeonTests|FullyQualifiedName~PoolTests|FullyQualifiedName~RopeScheduleTests|FullyQualifiedName~SimdCanaryTests|FullyQualifiedName~TeamBarrierTests|FullyQualifiedName~TelemetryTests|FullyQualifiedName~TierSelectionTests|FullyQualifiedName~ToolGenTests' >> $GITHUB_ENV ;;
-            core) echo 'FILTER=FullyQualifiedName~Needle.Tests.Bughunt.|FullyQualifiedName~ChannelTests|FullyQualifiedName~ChunkParityTests|FullyQualifiedName~EvalTests|FullyQualifiedName~HugePagesTests|FullyQualifiedName~JumpForwardTests|FullyQualifiedName~LoadingTests|FullyQualifiedName~MaskedDecodingTests|FullyQualifiedName~NativeParityTests|FullyQualifiedName~ParityTests|FullyQualifiedName~PrefixSnapshotTests|FullyQualifiedName~RewindTests|FullyQualifiedName~ServiceTests|FullyQualifiedName~SessionStartupTests|FullyQualifiedName~SessionTests|FullyQualifiedName~SpanApiTests|FullyQualifiedName~SpeculativeTests|FullyQualifiedName~ToolGenSessionTests|FullyQualifiedName~TypedHostTests|FullyQualifiedName~TypedSinkTests' >> $GITHUB_ENV ;;
-            heavy) echo 'FILTER=FullyQualifiedName~BatchedDecodeTests|FullyQualifiedName~BatchedHostTests|FullyQualifiedName~BenchHarnessTests|FullyQualifiedName~SpeechTests|FullyQualifiedName~VoiceTests|FullyQualifiedName~WhistleStageTests|FullyQualifiedName~ZeroAllocationTests' >> $GITHUB_ENV ;;
-          esac
-          if [ "${{ matrix.noavx512 }}" = "true" ]; then echo 'DOTNET_EnableAVX512F=0' >> $GITHUB_ENV; fi
-
-      - name: Log the kernel tier this runner selects
-        run: dotnet run -c Release --project src/Needle.Cli -- cpu
-
-      # The suite's sessions run team barriers that busy-wait, so several multi-threaded tests at
-      # once on a 2-core runner starve each other (hang snapshots: load average 11, 67% system
-      # time, 11 spinning needle-* threads). Run test collections one at a time.
-      - name: Run shard tests (Release)
-        run: |
-          BLAME=""
-          if [ "${{ matrix.shard }}" != "unit" ]; then BLAME="--blame-hang --blame-hang-timeout 1500s --blame-hang-dump-type full"; fi
-          dotnet test tests/Needle.Tests -c Release --filter "$FILTER" --logger "console;verbosity=normal" $BLAME -- xUnit.ParallelizeTestCollections=false
-
-      - name: Upload hang dumps and blame sequence
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: hang-dumps-${{ matrix.name }}-${{ matrix.shard }}
-          path: |
-            **/TestResults/**/*.dmp
-            **/TestResults/**/Sequence_*.xml
-            hang-snapshots/
-          compression-level: 1
-
-      - name: Run shard tests on the scalar backend (NEEDLE_SCALAR=1)
-        if: matrix.scalar
-        env:
-          NEEDLE_SCALAR: "1"
-        run: dotnet test tests/Needle.Tests -c Release --no-build --filter "$FILTER" -- xUnit.ParallelizeTestCollections=false
-
-      - name: Run NeonTests natively with verbose output
-        if: matrix.neon
-        run: dotnet test tests/Needle.Tests -c Release --no-build --filter "FullyQualifiedName~NeonTests" --logger "console;verbosity=normal" -- xUnit.ParallelizeTestCollections=false
-
-      - name: Run shard tests on the NEON widening fallback tier (NEEDLE_NODP=1)
-        if: matrix.neon
-        env:
-          NEEDLE_NODP: "1"
-        run: dotnet test tests/Needle.Tests -c Release --no-build --filter "$FILTER" -- xUnit.ParallelizeTestCollections=false
-
-      - name: Build netstandard2.1 library (Release)
-        if: matrix.netstandard
-        run: dotnet build src/Needle -f netstandard2.1 -c Release
-
-      - name: Game-loop sample (zero-allocation hot path on the game thread)
-        if: matrix.name == 'linux-x64' && matrix.shard == 'core'
-        run: dotnet run -c Release --project samples/SquadCommander
-
-      - name: Publish NativeAOT CLI
-        run: dotnet publish src/Needle.Cli -c Release -o out/aot
-
-      - name: NativeAOT smoke run (tool call for a Lagos weather query)
-        run: |
-          exe=out/aot/needle
-          if [ "$RUNNER_OS" = "Windows" ]; then exe=out/aot/needle.exe; fi
-          "$exe" run ref/hf/needle3.cact tools/tools.json "what's it like in Lagos right now?" 1 | tee smoke.txt
-          grep -q "get_weather" smoke.txt
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin master
+          git merge --no-ff --no-commit origin/master || true
+          bad=$(git diff --name-only --diff-filter=U | grep -v -E '^unity/com\.needle\.inference/(Analyzers|Runtime/Plugins)/.*\.dll$' || true)
+          if [ -n "$bad" ]; then echo "non-DLL conflicts: $bad"; exit 1; fi
+          for f in $(git diff --name-only --diff-filter=U); do git checkout --theirs -- "$f"; git add "$f"; done
+          bash tools/pack-unity.sh
+          bash tools/pack-unity.sh --check
+          git add unity/com.needle.inference/Runtime/Plugins unity/com.needle.inference/Analyzers
+          git status --short
+          git commit -m "Merge master into $BRANCH and repack the Unity plugins (tools/pack-unity.sh)"
+          git push origin HEAD:"$BRANCH"
