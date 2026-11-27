@@ -72,8 +72,8 @@ public sealed class SpeechTests : IDisposable
         var greedy = whistle.Transcribe(clip, "en").Text;
         whistle.BeamWidth = 4;
         var beam = whistle.Transcribe(clip, "en").Text;
-        Assert.Contains("queen in victory", greedy);
-        Assert.Contains("queen in Victoria", beam);
+        Assert.True(greedy.Contains("queen in victory"), $"greedy: {greedy}");
+        Assert.True(beam.Contains("queen in Victoria"), $"beam: {beam}\ngreedy: {greedy}");
     }
 
     [Fact]
