@@ -74,25 +74,24 @@ public sealed class ToolSet
             return JsonValue.Array(items);
         }
         if (schema.Kind != JsonKind.Object) return schema;
+        var local = new Dictionary<string, string>();
+        var renamed = new List<KeyValuePair<string, JsonValue>>();
+        if (schema.Get("properties") is { Kind: JsonKind.Object } properties)
+            foreach (var property in properties.Members)
+            {
+                var alias = PropertyAlias(property.Key, aliases);
+                local[property.Key] = alias;
+                renamed.Add(new KeyValuePair<string, JsonValue>(alias, NormalizeSchema(property.Value, aliases)));
+            }
         var members = new List<KeyValuePair<string, JsonValue>>();
-        var taken = new HashSet<string>(aliases.Keys);
         foreach (var member in schema.Members)
         {
             if (member.Key == "properties" && member.Value.Kind == JsonKind.Object)
-            {
-                var renamed = new List<KeyValuePair<string, JsonValue>>();
-                foreach (var property in member.Value.Members)
-                {
-                    var alias = Unique(SnakeCase(property.Key), taken);
-                    aliases[alias] = property.Key;
-                    renamed.Add(new KeyValuePair<string, JsonValue>(alias, NormalizeSchema(property.Value, aliases)));
-                }
                 members.Add(new KeyValuePair<string, JsonValue>("properties", JsonValue.Object(renamed)));
-            }
             else if (member.Key == "required" && member.Value.Kind == JsonKind.Array)
             {
                 var required = new List<JsonValue>();
-                foreach (var name in member.Value.Items) required.Add(JsonValue.Str(AliasFor(aliases, name.Text)));
+                foreach (var name in member.Value.Items) required.Add(JsonValue.Str(local.TryGetValue(name.Text, out var alias) ? alias : SnakeCase(name.Text)));
                 members.Add(new KeyValuePair<string, JsonValue>("required", JsonValue.Array(required)));
             }
             else members.Add(new KeyValuePair<string, JsonValue>(member.Key, member.Value.Kind is JsonKind.Object or JsonKind.Array ? NormalizeSchema(member.Value, aliases) : member.Value));
@@ -100,10 +99,13 @@ public sealed class ToolSet
         return JsonValue.Object(members);
     }
 
-    static string AliasFor(Dictionary<string, string> aliases, string original)
+    static string PropertyAlias(string original, Dictionary<string, string> aliases)
     {
-        foreach (var pair in aliases) if (pair.Value == original) return pair.Key;
-        return SnakeCase(original);
+        var name = SnakeCase(original);
+        var candidate = name;
+        for (var n = 2; aliases.TryGetValue(candidate, out var taken) && taken != original; n++) candidate = name + "_" + n;
+        aliases[candidate] = original;
+        return candidate;
     }
 
     static string Unique(string name, HashSet<string> taken)

@@ -108,6 +108,7 @@ public struct Utf8Text8
     public void Set(ReadOnlySpan<byte> utf8)
     {
         var count = Math.Min(utf8.Length, Capacity);
+        if (count < utf8.Length) while (count > 0 && (utf8[count] & 0xC0) == 0x80) count--;
         utf8[..count].CopyTo(Buffer);
         Length = count;
     }
@@ -155,6 +156,7 @@ public struct Utf8Text16
     public void Set(ReadOnlySpan<byte> utf8)
     {
         var count = Math.Min(utf8.Length, Capacity);
+        if (count < utf8.Length) while (count > 0 && (utf8[count] & 0xC0) == 0x80) count--;
         utf8[..count].CopyTo(Buffer);
         Length = count;
     }
@@ -202,6 +204,7 @@ public struct Utf8Text32
     public void Set(ReadOnlySpan<byte> utf8)
     {
         var count = Math.Min(utf8.Length, Capacity);
+        if (count < utf8.Length) while (count > 0 && (utf8[count] & 0xC0) == 0x80) count--;
         utf8[..count].CopyTo(Buffer);
         Length = count;
     }
@@ -249,6 +252,7 @@ public struct Utf8Text64
     public void Set(ReadOnlySpan<byte> utf8)
     {
         var count = Math.Min(utf8.Length, Capacity);
+        if (count < utf8.Length) while (count > 0 && (utf8[count] & 0xC0) == 0x80) count--;
         utf8[..count].CopyTo(Buffer);
         Length = count;
     }
@@ -296,6 +300,7 @@ public struct Utf8Text128
     public void Set(ReadOnlySpan<byte> utf8)
     {
         var count = Math.Min(utf8.Length, Capacity);
+        if (count < utf8.Length) while (count > 0 && (utf8[count] & 0xC0) == 0x80) count--;
         utf8[..count].CopyTo(Buffer);
         Length = count;
     }
@@ -343,6 +348,7 @@ public struct Utf8Text256
     public void Set(ReadOnlySpan<byte> utf8)
     {
         var count = Math.Min(utf8.Length, Capacity);
+        if (count < utf8.Length) while (count > 0 && (utf8[count] & 0xC0) == 0x80) count--;
         utf8[..count].CopyTo(Buffer);
         Length = count;
     }

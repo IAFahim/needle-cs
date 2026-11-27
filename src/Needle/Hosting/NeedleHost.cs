@@ -62,6 +62,8 @@ public sealed unsafe class NeedleHost : IDisposable
         where TSink : struct, Tools.ICallSink<TCommand>
         where TCommand : unmanaged
     {
+        if (sizeof(TCommand) > ChannelLimits.CallsCapacity)
+            throw new ArgumentException($"{typeof(TCommand).Name} is {sizeof(TCommand)} bytes, larger than the {ChannelLimits.CallsCapacity}-byte calls buffer of a channel reply", nameof(TCommand));
         typedHost = true;
         return StartCore(in options, RunTyped<TSink, TCommand>);
     }
@@ -353,11 +355,14 @@ public sealed unsafe class NeedleHost : IDisposable
             var spin = new SpinWait();
 #endif
             while (!channel.TryPublishReply(in reply))
+            {
+                if (Volatile.Read(ref stopping) != 0) return;
 #if NETSTANDARD2_1
                 spin.SpinOnce();
 #else
                 spin.SpinOnce(-1);
 #endif
+            }
         }
     }
 

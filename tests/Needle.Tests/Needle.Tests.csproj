@@ -3,6 +3,7 @@
     <TargetFramework>net10.0</TargetFramework>
     <IsPackable>false</IsPackable>
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <DefineConstants>$(DefineConstants);NEEDLE_SIMD</DefineConstants>
     <!-- Generated tool sinks must stay warning-free for hosts that build with warnings as errors. -->
     <WarningsAsErrors>$(WarningsAsErrors);CS0414;CS1522;CS0169;CS0649</WarningsAsErrors>
   </PropertyGroup>
@@ -10,6 +11,7 @@
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
     <PackageReference Include="xunit" Version="2.9.3" />
     <PackageReference Include="xunit.runner.visualstudio" Version="3.0.2" />
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.3.1" />
   </ItemGroup>
   <ItemGroup>
     <Compile Include="..\..\src\Needle.Cli\Bench*.cs" LinkBase="Bench" />
