@@ -8,7 +8,13 @@ internal sealed partial class AgentState
 {
     public AgentMailbox? Mailbox;
 
-    public AgentMailbox OpenMailbox() => Mailbox ??= new AgentMailbox(this);
+    public AgentMailbox OpenMailbox()
+    {
+        if (Mailbox != null) return Mailbox;
+        ThrowIfStreaming();
+        OpenLog();
+        return Mailbox = new AgentMailbox(this);
+    }
 
     public void StopMailbox() => Mailbox?.Stop();
 }
@@ -46,11 +52,14 @@ internal sealed class AgentMailbox
     public bool TryPost(ReadOnlySpan<char> text, bool asToolResult)
     {
         if (Busy) return false;
+        state.ThrowIfStreaming();
         var count = Encoding.UTF8.GetByteCount(text);
         if (count > state.Input.Length)
         {
             state.Invalidate();
+            state.Log!.Reset();
             state.Record(NeedleSession.FailedBeforeRun(FailureReason.InputTooLong), state.Calls);
+            state.Log.Finish(state.Kind);
             Volatile.Write(ref phase, Done);
             return true;
         }
@@ -61,10 +70,13 @@ internal sealed class AgentMailbox
     public bool TryPost(ReadOnlySpan<byte> utf8, bool asToolResult)
     {
         if (Busy) return false;
+        state.ThrowIfStreaming();
         if (utf8.Length > state.Input.Length)
         {
             state.Invalidate();
+            state.Log!.Reset();
             state.Record(NeedleSession.FailedBeforeRun(FailureReason.InputTooLong), state.Calls);
+            state.Log.Finish(state.Kind);
             Volatile.Write(ref phase, Done);
             return true;
         }
@@ -78,6 +90,7 @@ internal sealed class AgentMailbox
     bool Enqueue(int bytes, bool asToolResult)
     {
         state.Invalidate();
+        state.Log!.Reset();
         cancelQueued = false;
         length = bytes;
         toolResult = asToolResult;
@@ -118,26 +131,35 @@ internal sealed class AgentMailbox
             if (Volatile.Read(ref phase) != Queued) continue;
             Volatile.Write(ref phase, Running);
             Reply reply;
+            var log = state.Log!;
             if (cancelQueued)
             {
                 reply = new Reply(ReplyStatus.Cancelled, FailureReason.None, ReplyFlags.None, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
                 state.Record(reply, state.Calls);
+                log.Finish(state.Kind);
                 Volatile.Write(ref phase, Done);
                 finished.Set();
                 continue;
             }
             try
             {
-                var input = new ReadOnlySpan<byte>(state.Input, 0, length);
-                reply = toolResult
-                    ? state.Session.CompleteWithToolResult(input, state.Calls, state.Reasoning, state.Response)
-                    : state.Session.Complete(input, state.Calls, state.Reasoning, state.Response);
+                // The same steps Ask runs, one at a time, so the game thread can poll progress between them.
+                var session = state.Session;
+                if (session.BeginStreamed(new ReadOnlySpan<byte>(state.Input, 0, length), toolResult))
+                    while (!session.StepStreamed(state.Calls, state.Reasoning, state.Response))
+                    {
+                        log.Observe(state);
+                        log.Publish();
+                    }
+                log.Observe(state);
+                reply = session.TurnResult;
             }
             catch
             {
                 reply = NeedleSession.FailedBeforeRun(FailureReason.None);
             }
             state.Record(reply, state.Calls);
+            log.Finish(state.Kind);
             Volatile.Write(ref phase, Done);
             finished.Set();
             if (stopping) return;

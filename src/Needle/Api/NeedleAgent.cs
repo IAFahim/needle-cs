@@ -104,6 +104,7 @@ internal sealed partial class AgentState
     public void ThrowIfBusy()
     {
         if (Mailbox != null && Mailbox.Busy) throw new InvalidOperationException("a posted request is still running on this agent; TryTake its answer (or Cancel it) first");
+        ThrowIfStreaming();
     }
 
     public void Invalidate()
@@ -208,6 +209,7 @@ public readonly partial struct NeedleAgent : IDisposable, IEquatable<NeedleAgent
     public void SetSystem(string? facts)
     {
         var state = State;
+        state.AbandonStream();
         state.ThrowIfBusy();
         state.Invalidate();
         state.Session.SetSystem(facts);
@@ -219,6 +221,7 @@ public readonly partial struct NeedleAgent : IDisposable, IEquatable<NeedleAgent
     public void Forget()
     {
         var state = State;
+        state.AbandonStream();
         state.ThrowIfBusy();
         state.Invalidate();
         state.Session.Reset();
@@ -233,7 +236,12 @@ public readonly partial struct NeedleAgent : IDisposable, IEquatable<NeedleAgent
     }
 
     /// <summary>Runs the kernels once so the first real turn is not the slow one.</summary>
-    public void WarmUp() => State.Session.WarmUp();
+    public void WarmUp()
+    {
+        var state = State;
+        state.ThrowIfBusy();
+        state.Session.WarmUp();
+    }
 
     public void Dispose()
     {
@@ -241,6 +249,7 @@ public readonly partial struct NeedleAgent : IDisposable, IEquatable<NeedleAgent
         if (state == null) return;
         state.StopMailbox();
         state.Invalidate();
+        state.Streaming = false;
         state.Disposed = true;
         try
         {
