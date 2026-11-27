@@ -18,6 +18,7 @@ return args switch
     ["stream", var model, var wav, .. var soptions] => StreamClip(model, wav, soptions),
     ["voice", var needle, var whistle, var tools, var wav, .. var voptions] => Voice(needle, whistle, tools, wav, voptions),
     ["embed", var model, var text] => EmbedText(model, text),
+    ["eval", var smodel2, .. var suiteOptions] when suiteOptions.Contains("--suite") => EvalSuites.Run(smodel2, suiteOptions),
     ["eval", var model, var dataset, .. var options] => Eval.Run(model, dataset, options),
     ["call", var model, var tools, .. var queries] => Call(model, tools, queries),
     ["run", var rmodel, var rtools, var query, .. var rrest] => Run(rmodel, rtools, query, rrest),
@@ -32,8 +33,9 @@ static int Usage()
     Console.Error.WriteLine("needle verify <model.cact> <golden-dir>");
     Console.Error.WriteLine("needle run <model.cact> <tools.json> <query> [repeat]");
     Console.Error.WriteLine("needle bench <needle3.cact> [--threads 4] [--json]");
-    Console.Error.WriteLine("needle bench-e2e <needle3.cact> <tools.json> [--threads 1,2,4] [--reps N] [--sets golden|game|all] [--api span|text] [--profile] [--json] [--max-managed-bytes N] [--max-native-allocs N]");
+    Console.Error.WriteLine("needle bench-e2e <needle3.cact> <tools.json> [--threads 1,2,4] [--reps N] [--sets golden|game|all] [--api span|text] [--profile] [--json] [--system TEXT] [--auto-date] [--reasoning N] [--retrieval K] [--product] [--max-managed-bytes N] [--max-native-allocs N]");
     Console.Error.WriteLine(Eval.Usage);
+    Console.Error.WriteLine(EvalSuites.Usage);
     Console.Error.WriteLine("needle serve <needle3.cact> <tools.json> [options] (stdin JSON lines -> stdout replies)");
     Console.Error.WriteLine("needle prime <model.cact> <tools.json> <out.prefix> [--system TEXT] [--context N] [--threads N] [--max-reasoning N] [--max-calls N]");
     Console.Error.WriteLine("needle call <model.cact> <tools.json> [query ...] [--no-date] [--retrieval K] [--prefix <out.prefix>]");

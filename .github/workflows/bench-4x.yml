@@ -2,7 +2,7 @@ name: Bench 4.x
 
 on:
   push:
-    branches: [claude/engine-4x]
+    branches: [claude/engine-4x, claude/engine-4x-eval]
   workflow_dispatch:
     inputs:
       rounds:
@@ -68,20 +68,46 @@ jobs:
           python3 tools/native_bench.py ref/native4 ref/hf/needle3.cact tools/tools.json --sets golden --reps 1 --threads 4
           if [ "${{ runner.arch }}" = "X64" ]; then python3 tools/native_bench.py ref/hf/wheel ref/hf/needle3.cact tools/tools.json --sets golden --reps 1; fi
 
-      - name: Interleaved benchmark
+      - name: Upstream 4.x thread scaling, set_threads before load vs after load
+        run: |
+          python3 tools/bench_engines.py --rounds 2 --json threads.json \
+            --title "Upstream 4.x: set_threads before load (one process per count, as the package does) vs after load (one process)" \
+            --engine "4.x before load" "python3 tools/native_bench.py ref/native4 ref/hf/needle3.cact tools/tools.json --json --reps 3 --threads 1 2 4 0" \
+            --engine "4.x after load" "python3 tools/native_bench.py ref/native4 ref/hf/needle3.cact tools/tools.json --json --reps 3 --threads 1 2 4 0 --threads-after-load" \
+            | tee threads.md
+
+      - name: Engine parity benchmark
         run: |
           rounds="${{ github.event.inputs.rounds || '5' }}"
-          engines=(--engine "upstream-4.x" "python3 tools/native_bench.py ref/native4 ref/hf/needle3.cact tools/tools.json --json --reps 3 --threads 1 2 4 0")
+          # Same schema bytes, empty system text, no date fact, the same prompts; set_threads before load.
+          engines=(--engine "upstream-4.x" "python3 tools/native_bench.py ref/native4 ref/hf/needle3.cact tools/tools.json --json --reps 3 --threads 1 2 4 0 --probe-tokens")
           if [ "${{ runner.arch }}" = "X64" ]; then
             engines+=(--engine "upstream-3.3.3" "python3 tools/native_bench.py ref/hf/wheel ref/hf/needle3.cact tools/tools.json --json --reps 3")
           fi
-          engines+=(--engine "needle-cs" "out/aot/needle bench-e2e ref/hf/needle3.cact tools/tools.json --threads 1,2,4 --reps 3 --json")
-          python3 tools/bench_engines.py --rounds "$rounds" --json bench.json "${engines[@]}" | tee bench.md
-          { echo "## ${{ matrix.os }}"; echo; cat bench.md; } >> "$GITHUB_STEP_SUMMARY"
+          engines+=(--engine "needle-cs" "out/aot/needle bench-e2e ref/hf/needle3.cact tools/tools.json --threads 1,2,4,0 --reps 3 --json")
+          python3 tools/bench_engines.py --rounds "$rounds" --json bench.json --title "Engine parity (same schema bytes, empty system, no date fact)" "${engines[@]}" | tee bench.md
+
+      - name: Product default vs product default
+        run: |
+          rounds="${{ github.event.inputs.rounds || '5' }}"
+          # upstream: what cactus.Needle does by default (automatic thread count, date fact as the system text);
+          # needle-cs: NeedleOptions defaults (library default: 1 thread) and the same with threads 0 (automatic).
+          python3 tools/bench_engines.py --rounds "$rounds" --json product.json --single-row "product default" \
+            --title "Product default vs product default (upstream: threads 0 + auto_date; needle-cs: NeedleOptions defaults at 1 thread and at threads 0)" \
+            --engine "upstream-4.x" "python3 tools/native_bench.py ref/native4 ref/hf/needle3.cact tools/tools.json --json --reps 3 --threads 0 --system auto-date --probe-tokens" \
+            --engine "needle-cs 1 thread" "out/aot/needle bench-e2e ref/hf/needle3.cact tools/tools.json --threads 1 --reps 3 --json --product" \
+            --engine "needle-cs auto" "out/aot/needle bench-e2e ref/hf/needle3.cact tools/tools.json --threads 0 --reps 3 --json --product" \
+            | tee product.md
+          { echo "# ${{ matrix.os }}"; echo; cat threads.md; echo; cat bench.md; echo; cat product.md; } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: bench-${{ matrix.os }}
           path: |
             bench.md
             bench.json
+            threads.md
+            threads.json
+            product.md
+            product.json

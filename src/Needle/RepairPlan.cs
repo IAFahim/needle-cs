@@ -30,6 +30,10 @@ internal sealed class RepairParam
     public bool MaximumExclusive;
     public bool Date;
     public bool Phone;
+    // Free text the request must supply word for word (no enum, format or pattern).
+    public bool FreeText;
+    // Every option is a proper name ("Maya", "Dr. Patel"): a closed set of people or places.
+    public bool NameOptions;
     public ParamRole Role;
 }
 
@@ -176,6 +180,10 @@ internal sealed class RepairPlan
             }
             param.Options = values.ToArray();
             param.OptionWords = words.ToArray();
+            param.NameOptions = values.Count > 0;
+            foreach (var option in options.Items)
+                if (option.Kind != JsonKind.Null && !(option.Kind == JsonKind.String && option.Text.Length > 0 && option.Text[0] is >= 'A' and <= 'Z'))
+                    param.NameOptions = false;
             if (param.Kind == ParamKind.Other) param.Kind = ParamKind.String;
             ClassifyOptions(param);
         }
@@ -185,10 +193,15 @@ internal sealed class RepairPlan
         if (Number(resolved, "exclusiveMaximum") is { } xmax) { param.Maximum = xmax; param.MaximumExclusive = true; }
         var lower = name.ToLowerInvariant();
         var format = resolved.GetString("format");
+        // A "_human" phrase or one the schema says to copy word for word stays as the user wrote it.
+        var verbatim = lower.Contains("human") || Mentions(schema, resolved, "word for word", "verbatim");
         param.Date = param.Kind == ParamKind.String && param.Options.Length == 0 &&
-            (format is "date" or "date-time" || lower == "date" || lower == "day" || lower.EndsWith("_date") || lower.StartsWith("date_") || name.EndsWith("Date", StringComparison.Ordinal));
+            (format is "date" or "date-time" || !verbatim && format == null &&
+             (lower == "date" || lower == "day" || lower.EndsWith("_date") || lower.StartsWith("date_") || name.EndsWith("Date", StringComparison.Ordinal)));
         param.Phone = param.Kind == ParamKind.String && param.Options.Length == 0 &&
             (lower.Contains("phone") || lower == "tel" || lower.Contains("mobile") || (lower == "number" || lower.EndsWith("_number") && lower.Contains("contact")) && Mentions(schema, resolved, "phone"));
+        param.FreeText = param.Kind == ParamKind.String && param.Options.Length == 0 && !param.Date && !param.Phone && format == null &&
+            resolved.GetString("pattern") == null && schema.GetString("pattern") == null;
         if (param.Kind == ParamKind.Boolean) param.BoolPolar = BoolFamily(lower);
         param.Role = param.Kind != ParamKind.String || param.Options.Length > 0 ? ParamRole.None : lower switch
         {

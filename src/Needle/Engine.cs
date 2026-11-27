@@ -1815,6 +1815,7 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
             Position = job.Position,
             Window = job.Geometry.IsGlobal(job.Layer) ? 0 : job.Geometry.SlidingWindow,
             Capacity = job.Capacity,
+            CausalRows = true,
         };
         batch.Plan(members, job.Count, job.AttnPartials, job.AttnArrivals);
         RunAttentionTasks(&batch, cursor, member, members);
@@ -2071,11 +2072,11 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
             Queries = queryInt8, QueryScales = queryScale, Keys = layerKeys, KeyScales = layerKeyScales,
             Values = layerValues, ValueScales = layerValueScales, Output = attnOut,
             Heads = g.Heads, KvHeads = g.KvHeads, QkDim = g.QkDim, VDim = g.VDim, Position = position,
-            Window = g.IsGlobal(l) ? 0 : g.SlidingWindow, Capacity = capacity,
+            Window = g.IsGlobal(l) ? 0 : g.SlidingWindow, Capacity = capacity, CausalRows = true,
         };
         clock.Lap(Stage.AttentionPostProjection);
         clock.PoolRun();
-        AttentionBatch.Run(pool, &attention, count);
+        AttentionBatch.Run(pool, &attention, count, attnPartials, attnArrivals);
         clock.Lap(Stage.AttentionCore);
 
         for (var t = 0; t < count; t++)
@@ -2574,11 +2575,11 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
                 Keys = layerKeys, KeyScales = layerKeyScales,
                 Values = layerValues, ValueScales = layerValueScales, Output = attnOut + (long)rs * g.OutputWidth,
                 Heads = g.Heads, KvHeads = g.KvHeads, QkDim = g.QkDim, VDim = g.VDim, Position = enter,
-                Window = g.IsGlobal(l) ? 0 : g.SlidingWindow, Capacity = capacity,
+                Window = g.IsGlobal(l) ? 0 : g.SlidingWindow, Capacity = capacity, CausalRows = true,
             };
             clock.Lap(Stage.AttentionPostProjection);
             clock.PoolRun();
-            AttentionBatch.Run(pool, &attention, rk - rs + 1);
+            AttentionBatch.Run(pool, &attention, rk - rs + 1, attnPartials, attnArrivals);
             clock.Lap(Stage.AttentionCore);
             rs = rk + 1;
         }
