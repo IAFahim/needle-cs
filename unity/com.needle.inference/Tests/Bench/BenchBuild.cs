@@ -19,7 +19,7 @@ namespace Needle.Bench.Tests
             options.scenes = new string[] { scene };
             options.locationPathName = output;
             options.target = BuildTarget.StandaloneLinux64;
-            options.options = BuildOptions.None;
+            options.options = BuildOptions.IncludeTestAssemblies; // Needle.Bench only compiles with UNITY_INCLUDE_TESTS.
             BuildReport report = BuildPipeline.BuildPlayer(options);
             if (report.summary.result != BuildResult.Succeeded)
                 throw new Exception("bench player build failed: " + report.summary.result);
@@ -37,7 +37,7 @@ namespace Needle.Bench.Tests
             options.scenes = new string[] { scene };
             options.locationPathName = output;
             options.target = BuildTarget.StandaloneLinux64;
-            options.options = BuildOptions.None;
+            options.options = BuildOptions.IncludeTestAssemblies; // Needle.Bench only compiles with UNITY_INCLUDE_TESTS.
             BuildReport report = BuildPipeline.BuildPlayer(options);
             if (report.summary.result != BuildResult.Succeeded)
                 throw new Exception("bench player build failed: " + report.summary.result);
