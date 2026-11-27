@@ -531,4 +531,148 @@ public sealed unsafe class NeonTests
         }
         FreeWeights(w);
     }
+
+    static void AssertBits(float* actual, float* expected, int n, string what)
+    {
+        for (var i = 0; i < n; i++)
+            Assert.True(BitConverter.SingleToInt32Bits(actual[i]) == BitConverter.SingleToInt32Bits(expected[i]),
+                $"{what}[{i}]: {actual[i]} vs {expected[i]}");
+    }
+
+    [Theory]
+    [InlineData(1, 1)]
+    [InlineData(1, 7)]
+    [InlineData(2, 9)]
+    [InlineData(3, 37)]
+    [InlineData(4, 16)]
+    [InlineData(5, 30)]
+    [InlineData(6, 131)]
+    [InlineData(7, 22)]
+    [InlineData(12, 45)]
+    public void AttentionTileIsBitExactToPerHeadTile(int heads, int count)
+    {
+        if (!Simd.UseNeon) return;
+        const int kvHeads = 2;
+        const int first = 3;
+        var positions = first + count;
+        var random = new Random(heads * 1000 + count);
+        var queries = (sbyte*)NativeMemory.Alloc((nuint)(heads * 48));
+        var queryScales = (float*)NativeMemory.Alloc((nuint)(heads * 4));
+        var keys = (sbyte*)NativeMemory.Alloc((nuint)(positions * kvHeads * 48));
+        var values = (sbyte*)NativeMemory.Alloc((nuint)(positions * kvHeads * 64));
+        var keyScales = (float*)NativeMemory.Alloc((nuint)(positions * kvHeads * 4));
+        var valueScales = (float*)NativeMemory.Alloc((nuint)(positions * kvHeads * 4));
+        var scoreFloats = heads * count + 64;
+        var expectedScores = (float*)NativeMemory.AllocZeroed((nuint)(scoreFloats * 4));
+        var actualScores = (float*)NativeMemory.AllocZeroed((nuint)(scoreFloats * 4));
+        var expectedOut = (float*)NativeMemory.AllocZeroed((nuint)(heads * 64 * 4));
+        var actualOut = (float*)NativeMemory.AllocZeroed((nuint)(heads * 64 * 4));
+        var expectedProbabilities = (float*)NativeMemory.AllocZeroed((nuint)(heads * positions * 4));
+        var actualProbabilities = (float*)NativeMemory.AllocZeroed((nuint)(heads * positions * 4));
+        try
+        {
+            for (var i = 0; i < heads * 48; i++) queries[i] = (sbyte)random.Next(-127, 128);
+            for (var h = 0; h < heads; h++) queryScales[h] = 0.01f + 0.05f * (float)random.NextDouble();
+            for (var i = 0; i < positions * kvHeads * 48; i++) keys[i] = (sbyte)random.Next(-127, 128);
+            for (var i = 0; i < positions * kvHeads * 64; i++) values[i] = (sbyte)random.Next(-127, 128);
+            for (var i = 0; i < positions * kvHeads; i++)
+            {
+                keyScales[i] = 0.001f + 0.01f * (float)random.NextDouble();
+                valueScales[i] = 0.001f + 0.01f * (float)random.NextDouble();
+            }
+            AttentionTile Make(float* scores, float* output, float* probabilities) => new()
+            {
+                Queries = queries, QueryScales = queryScales, Heads = heads,
+                Keys = keys + 48, KeyScales = keyScales + 1,
+                Values = values + 64, ValueScales = valueScales + 1,
+                KeyStride = kvHeads * 48, ValueStride = kvHeads * 64, ScaleStride = kvHeads,
+                First = first, Count = count, Scores = scores, Output = output,
+                Probabilities = probabilities, ProbabilityStride = positions,
+            };
+            Neon.AttentionTilePerHead(Make(expectedScores, expectedOut, expectedProbabilities));
+            NeonAttention.Tile(Make(actualScores, actualOut, actualProbabilities));
+            AssertBits(actualProbabilities, expectedProbabilities, heads * positions, "Probabilities");
+            AssertBits(actualOut, expectedOut, heads * 64, "AttentionTile");
+        }
+        finally
+        {
+            NativeMemory.Free(queries); NativeMemory.Free(queryScales); NativeMemory.Free(keys); NativeMemory.Free(values);
+            NativeMemory.Free(keyScales); NativeMemory.Free(valueScales); NativeMemory.Free(expectedScores); NativeMemory.Free(actualScores);
+            NativeMemory.Free(expectedOut); NativeMemory.Free(actualOut); NativeMemory.Free(expectedProbabilities); NativeMemory.Free(actualProbabilities);
+        }
+    }
+
+    // Neon.Kron is one fused multiply-add per term, accumulated in index order from zero; this is that
+    // order written with MathF.FusedMultiplyAdd, so the comparison is bit for bit.
+    [Theory]
+    [InlineData(24, 32, 32, 32)]
+    [InlineData(32, 32, 32, 16)]
+    [InlineData(5, 8, 16, 8)]
+    public void KronIsBitExactToFusedOrder(int activeRows, int rows, int cols, int resultRows)
+    {
+        if (!Simd.UseNeon) return;
+        var random = new Random(activeRows * 7 + cols);
+        var z = (float*)NativeMemory.Alloc((nuint)(rows * cols * 4));
+        var left = (float*)NativeMemory.Alloc((nuint)(rows * rows * 4));
+        var right = (float*)NativeMemory.Alloc((nuint)(cols * cols * 4));
+        var expected = (float*)NativeMemory.Alloc((nuint)(rows * cols * 4));
+        var actual = (float*)NativeMemory.Alloc((nuint)(rows * cols * 4));
+        var tile = new float[cols];
+        try
+        {
+            for (var i = 0; i < rows * cols; i++) z[i] = (float)(random.NextDouble() * 2 - 1);
+            for (var i = 0; i < rows * rows; i++) left[i] = (float)(random.NextDouble() * 2 - 1);
+            for (var i = 0; i < cols * cols; i++) right[i] = (float)(random.NextDouble() * 2 - 1);
+            for (var k = 0; k < resultRows; k++)
+            {
+                for (var c = 0; c < cols; c++)
+                {
+                    var sum = 0f;
+                    for (var i = 0; i < activeRows; i++) sum = MathF.FusedMultiplyAdd(left[i * rows + k], z[i * cols + c], sum);
+                    tile[c] = sum;
+                }
+                for (var c = 0; c < cols; c++)
+                {
+                    var sum = 0f;
+                    for (var j = 0; j < cols; j++) sum = MathF.FusedMultiplyAdd(tile[j], right[j * cols + c], sum);
+                    expected[k * cols + c] = sum;
+                }
+            }
+            Neon.Kron(z, activeRows, left, right, rows, cols, resultRows, actual);
+            AssertBits(actual, expected, resultRows * cols, "Kron");
+        }
+        finally
+        {
+            NativeMemory.Free(z); NativeMemory.Free(left); NativeMemory.Free(right); NativeMemory.Free(expected); NativeMemory.Free(actual);
+        }
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(3)]
+    [InlineData(4)]
+    [InlineData(13)]
+    [InlineData(64)]
+    [InlineData(8193)]
+    public void PeakMatchesScalarMax(int n)
+    {
+        if (!Simd.UseNeon) return;
+        var x = (float*)NativeMemory.Alloc((nuint)(n * 4));
+        try
+        {
+            Fill(x, n, n, 30f);
+            for (var round = 0; round < 3; round++)
+            {
+                if (round == 1) for (var i = 0; i < n; i++) x[i] = i % 2 == 0 ? -0f : -1f;
+                if (round == 2) x[n - 1] = 1e30f;
+                var expected = float.NegativeInfinity;
+                for (var i = 0; i < n; i++) expected = MathF.Max(expected, x[i]);
+                Assert.Equal(BitConverter.SingleToInt32Bits(expected), BitConverter.SingleToInt32Bits(Neon.Peak(x, n)));
+            }
+        }
+        finally
+        {
+            NativeMemory.Free(x);
+        }
+    }
 }
