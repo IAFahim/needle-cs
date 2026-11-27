@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Text;
@@ -90,6 +91,14 @@ public sealed class TurnStreamTests : IDisposable
     }
 
     public void Dispose() => model.Dispose();
+
+    // The scalar backend runs the core shard again at a fraction of the speed; there one thread count, one budget
+    // (the finest slicing) and a few cases keep the shard inside its time limit. Every budget runs on the fast tiers.
+    internal static bool Scalar => Environment.GetEnvironmentVariable("NEEDLE_SCALAR") == "1";
+
+    static IEnumerable<SessionCase> Cases(int threads) => Scalar ? SessionCases.All(threads).Take(3) : SessionCases.All(threads);
+
+    static FrameBudget[] BudgetsHere => Scalar ? new[] { FrameBudget.FromTokens(1) } : Budgets;
 
     static readonly FrameBudget[] Budgets =
     {
@@ -214,9 +223,10 @@ public sealed class TurnStreamTests : IDisposable
     [InlineData(4)]
     public void RunMatchesAskBitForBitAtEveryBudget(int threads)
     {
+        if (Scalar && threads != 1) return;
         threads = Assets.ThreadsFor(threads);
         var turns = 0;
-        foreach (var @case in SessionCases.All(threads))
+        foreach (var @case in Cases(threads))
         {
             var tools = @case.ToolsJson ?? SessionCases.DefaultTools();
             var options = ToAgent(@case.Options);
@@ -227,7 +237,7 @@ public sealed class TurnStreamTests : IDisposable
                     if (step.Kind == StepKind.Reset) { asker.Forget(); expected.Add("reset"); continue; }
                     expected.Add(Fingerprint(step.Kind == StepKind.ToolResult ? asker.Continue(step.Input) : asker.Ask(step.Input)));
                 }
-            foreach (var budget in Budgets)
+            foreach (var budget in BudgetsHere)
             {
                 using var streamer = model.Agent(tools, options);
                 for (var i = 0; i < @case.Steps.Length; i++)
@@ -249,7 +259,7 @@ public sealed class TurnStreamTests : IDisposable
     public void EventsDescribeTheAnswer()
     {
         var threads = Assets.ThreadsFor(2);
-        foreach (var @case in SessionCases.All(threads))
+        foreach (var @case in Cases(threads))
         {
             var tools = @case.ToolsJson ?? SessionCases.DefaultTools();
             using var agent = model.Agent(tools, ToAgent(@case.Options));

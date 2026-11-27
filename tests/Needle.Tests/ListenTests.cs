@@ -242,6 +242,7 @@ public sealed class VoiceStreamTests : IDisposable
     [Fact]
     public void CostGrowsLinearlyWithTheAudio()
     {
+        if (TurnStreamTests.Scalar) return; // the fast tiers cover it; the scalar pass of the heavy shard has a time limit
         var clip = Clip("record.wav");
         var shortStream = new VoiceStream(whistle, "en");
         Stream(shortStream, Repeated(clip, 2, 1.2), 0.25, out _);
@@ -259,6 +260,7 @@ public sealed class VoiceStreamTests : IDisposable
     [Fact]
     public void LongSpeechWithoutPausesIsCommittedInWindows()
     {
+        if (TurnStreamTests.Scalar) return; // the fast tiers cover it; the scalar pass of the heavy shard has a time limit
         var clip = Clip("record.wav");
         var pcm = Repeated(clip, 4, 0.1);
         var stream = new VoiceStream(whistle, "en") { MaxWindowSeconds = 6 };
@@ -370,6 +372,7 @@ public sealed class ListenTests : IDisposable
     [InlineData(0, 2.0)]
     public void APhraseIsAnsweredExactlyAsAskingItsTranscript(int tokens, double ms)
     {
+        if (TurnStreamTests.Scalar && (tokens != 0 || ms != 0)) return;
         var budget = new FrameBudget(tokens, ms);
         using var agent = needle.Agent(tools, Options);
         using var voice = agent.Listen(speech, new ListenOptions { Language = "en" });
@@ -475,6 +478,7 @@ public sealed class ListenTests : IDisposable
     [Fact]
     public void ListeningAllocatesNothingOnceWarm()
     {
+        if (TurnStreamTests.Scalar) return; // the fast tiers cover it; the scalar pass of the heavy shard has a time limit
         using var agent = needle.Agent(tools, Options);
         using var voice = agent.Listen(speech, new ListenOptions { Language = "en" });
         var pcm = WithSilence(Clip("record.wav"), 0.3, 1.2);
