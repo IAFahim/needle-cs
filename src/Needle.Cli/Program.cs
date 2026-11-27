@@ -49,7 +49,7 @@ static int Usage()
     Console.Error.WriteLine(Eval.Usage);
     Console.Error.WriteLine("needle serve <needle3.cact> <tools.json> [options] (stdin JSON lines -> stdout replies)");
     Console.Error.WriteLine("needle prime <model.cact> <tools.json> <out.prefix> [--system TEXT] [--context N] [--threads N] [--max-reasoning N] [--max-calls N]");
-    Console.Error.WriteLine("needle call <model.cact> <tools.json> [query ...] [--no-date] [--no-retrieval] [--prefix <out.prefix>]");
+    Console.Error.WriteLine("needle call <model.cact> <tools.json> [query ...] [--no-date] [--retrieval K] [--prefix <out.prefix>]");
     Console.Error.WriteLine("needle transcribe <whistle.cact> <clip.wav> [--language xx] [--words] [--keywords a,b] [--repeat n] [--threads n]");
     Console.Error.WriteLine("needle stream <whistle.cact> <clip.wav> [--threads n]");
     Console.Error.WriteLine("needle voice <needle3.cact> <whistle.cact> <tools.json> <clip.wav> [--threads n]");
@@ -140,7 +140,7 @@ static int Call(string modelPath, string toolsPath, string[] rest)
     var threads = int.Parse(Environment.GetEnvironmentVariable("NEEDLE_THREADS") ?? Math.Clamp(Environment.ProcessorCount / 2, 1, 8).ToString());
     var system = Environment.GetEnvironmentVariable("NEEDLE_SYSTEM");
     var autoDate = !rest.Contains("--no-date");
-    var topK = rest.Contains("--no-retrieval") ? int.MaxValue : 5;
+    var topK = int.MaxValue;
     string? prefixPath = null;
     var queries = new System.Collections.Generic.List<string>();
     for (var i = 0; i < rest.Length; i++)
@@ -149,6 +149,10 @@ static int Call(string modelPath, string toolsPath, string[] rest)
         {
             if (i + 1 >= rest.Length) { Console.Error.WriteLine("needle call: --prefix needs a file"); return 2; }
             prefixPath = rest[++i];
+        }
+        else if (rest[i] == "--retrieval")
+        {
+            if (i + 1 >= rest.Length || !int.TryParse(rest[++i], out topK) || topK < 1) { Console.Error.WriteLine("needle call: --retrieval needs a tool count of 1 or more"); return 2; }
         }
         else if (rest[i] != "--no-date" && rest[i] != "--no-retrieval") queries.Add(rest[i]);
     }

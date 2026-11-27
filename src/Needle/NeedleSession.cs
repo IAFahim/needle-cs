@@ -20,7 +20,7 @@ public sealed class NeedleOptions
     public string? System { get; init; }
     public bool AutoDate { get; init; }
     public float RefuseBelow { get; init; } = 0.1f;
-    public int RetrievalTopK { get; init; } = 5;
+    public int RetrievalTopK { get; init; } = int.MaxValue;
     public bool JumpForward { get; init; }
 
     public bool PromptLookup { get; init; }
