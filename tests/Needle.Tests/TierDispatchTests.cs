@@ -57,6 +57,30 @@ public sealed class TierDispatchTests
         Assert.Equal(CpuTier.Scalar, Tiers.Resolve(null, CpuFeatures.SapphireRapids, new TierSwitches { Scalar = true }));
     }
 
+    [Fact]
+    public void NoEvexSwitchFallsBackAndRefusesTheForcedTier()
+    {
+        var off = new TierSwitches { NoEvex = true };
+        Assert.Equal(CpuTier.Avx2, Tiers.Resolve(null, CpuFeatures.Zen4, off));
+        Assert.Equal(CpuTier.AvxVnni, Tiers.Resolve(null, CpuFeatures.SapphireRapids, off));
+        Assert.Throws<InvalidOperationException>(() => Tiers.Resolve("avx512vnni", CpuFeatures.Zen4, off));
+        Assert.Equal(CpuTier.Avx512Bw, Tiers.Resolve("avx512", CpuFeatures.Zen4, off));
+    }
+
+    [Fact]
+    public void Zen5WithBothVnniFormsPicksEvexVnni()
+    {
+        var zen5 = new CpuFeatures { Avx2 = true, AvxVnni = true, Avx512 = true, Avx512Vnni = true };
+        Assert.Equal(CpuTier.Avx512Vnni, Tiers.Resolve(null, zen5, None));
+    }
+
+    [Fact]
+    public void IceLakeWithEvexVnniOnlyPicksEvexVnni()
+    {
+        var iceLake = new CpuFeatures { Avx2 = true, Avx512 = true, Avx512Vnni = true };
+        Assert.Equal(CpuTier.Avx512Vnni, Tiers.Resolve(null, iceLake, None));
+    }
+
     public static IEnumerable<object[]> Overrides() => new[]
     {
         new object[] { "zen4", "avx2", "Avx2" },
@@ -106,7 +130,8 @@ public sealed class TierDispatchTests
     public void DetectedFeaturesAgreeWithTheActiveTier()
     {
         if (Environment.GetEnvironmentVariable("NEEDLE_TIER") != null || Environment.GetEnvironmentVariable("NEEDLE_SCALAR") != null
-            || Environment.GetEnvironmentVariable("NEEDLE_NOVNNI") != null || Environment.GetEnvironmentVariable("NEEDLE_NODP") != null)
+            || Environment.GetEnvironmentVariable("NEEDLE_NOVNNI") != null || Environment.GetEnvironmentVariable("NEEDLE_NODP") != null
+            || Environment.GetEnvironmentVariable("NEEDLE_NOEVEX") != null)
             return;
         Assert.Equal(Tiers.Resolve(null, Tiers.Detected, None), Tiers.Active);
         Assert.Equal(EvexVnni.Ready, Tiers.Detected.Avx512Vnni);

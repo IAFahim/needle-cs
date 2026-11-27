@@ -40,12 +40,14 @@ internal readonly struct CpuFeatures
         $"Avx2 {Avx2}, AvxVnni {AvxVnni}, AvxVnniInt8 {AvxVnniInt8}, Avx512 {Avx512}, Avx512Vnni {Avx512Vnni}, AdvSimd {AdvSimd}, Dp {Dp}";
 }
 
-// Environment switches that steer the auto pick (NEEDLE_SCALAR, NEEDLE_NOVNNI, NEEDLE_NODP).
+// Environment switches that steer the auto pick (NEEDLE_SCALAR, NEEDLE_NOVNNI, NEEDLE_NODP) and
+// NEEDLE_NOEVEX, which keeps the AVX512-VNNI machine code off even when NEEDLE_TIER asks for it.
 internal readonly struct TierSwitches
 {
     public bool Scalar { get; init; }
     public bool NoVnni { get; init; }
     public bool NoDp { get; init; }
+    public bool NoEvex { get; init; }
 }
 
 #if NEEDLE_SIMD
@@ -148,6 +150,7 @@ internal static class Tiers
         Scalar = Environment.GetEnvironmentVariable("NEEDLE_SCALAR") != null,
         NoVnni = Environment.GetEnvironmentVariable("NEEDLE_NOVNNI") != null,
         NoDp = Environment.GetEnvironmentVariable("NEEDLE_NODP") != null,
+        NoEvex = Environment.GetEnvironmentVariable("NEEDLE_NOEVEX") != null,
     };
 
     static CpuTier Select() => Resolve(Environment.GetEnvironmentVariable("NEEDLE_TIER"));
@@ -158,10 +161,10 @@ internal static class Tiers
 #endif
 
     // Pure dispatch: the tier for a CPU, the NEEDLE_TIER override and the environment switches.
-    // Ranking (fastest first) is measured, see plan.md "x86 tier selection": EVEX VNNI beats the
-    // AVX2 madd pair on Zen 4 and the VEX AvxVnni tier on Sapphire Rapids.
-    internal static CpuTier Resolve(string? raw, in CpuFeatures cpu, in TierSwitches switches)
+    // Ranking (fastest first) is measured, see plan.md "x86 tier selection (Avx512Vnni)".
+    internal static CpuTier Resolve(string? raw, CpuFeatures cpu, in TierSwitches switches)
     {
+        if (switches.NoEvex) cpu = cpu with { Avx512Vnni = false };
         if (string.IsNullOrWhiteSpace(raw))
             return Auto(cpu, switches);
         if (TryParseTier(raw, out var forced) && Supported(forced, cpu))
