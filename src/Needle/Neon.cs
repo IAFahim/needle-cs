@@ -474,15 +474,19 @@ internal static unsafe class Neon
             AdvSimd.Store(scaled + v, f);
             bias = AdvSimd.FusedMultiplyAdd(bias, f, AdvSimd.LoadVector128(offsets + v));
         }
-        var total = HorizontalSum(bias);
-        for (; v < groups; v++)
+        if (v < groups)
         {
-            var f = factors[v] * scales[v];
-            scaled[v] = f;
-            total = MathF.FusedMultiplyAdd(f, offsets[v], total);
+            var left = groups - v;
+            var f = AdvSimd.Multiply(AdvSimd.LoadVector128(factors + v), Partial(scales + v, left));
+            AdvSimd.Store(scaled + v, f);
+            bias = AdvSimd.FusedMultiplyAdd(bias, f, Partial(offsets + v, left));
         }
-        return total;
+        return HorizontalSum(bias);
     }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    static Vector128<float> Partial(float* source, int count) =>
+        Vector128.Create(source[0], count > 1 ? source[1] : 0f, count > 2 ? source[2] : 0f, 0f);
 
     public static void DecodeRow(in Cq w, int row, float* destination)
     {

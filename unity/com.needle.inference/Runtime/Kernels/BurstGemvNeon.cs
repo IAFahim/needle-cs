@@ -166,15 +166,18 @@ namespace Needle.BurstKernels
                 Arm.Neon.vst1q_f32(scaled + v, f);
                 bias = Arm.Neon.vfmaq_f32(bias, f, Arm.Neon.vld1q_f32(offsets + v));
             }
-            float total = HorizontalSumNeon(bias);
-            for (; v < groups; v++)
+            if (v < groups)
             {
-                float f = factors[v] * scales[v];
-                scaled[v] = f;
-                total += f * offsets[v];
+                var left = groups - v;
+                v128 f = Arm.Neon.vmulq_f32(Arm.Neon.vld1q_f32(factors + v), Partial(scales + v, left));
+                Arm.Neon.vst1q_f32(scaled + v, f);
+                bias = Arm.Neon.vfmaq_f32(bias, f, Partial(offsets + v, left));
             }
-            return total;
+            return HorizontalSumNeon(bias);
         }
+
+        static v128 Partial(float* source, int count) =>
+            new v128(source[0], count > 1 ? source[1] : 0f, count > 2 ? source[2] : 0f, 0f);
 
         static v128 Weights(v128 table, v128 index)
         {
