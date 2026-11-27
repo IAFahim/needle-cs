@@ -32,6 +32,10 @@ public sealed unsafe partial class NeedleSession
 
     internal byte[] CallTextBuffer => callText;
 
+    internal ToolSet ToolSet => allTools;
+
+    internal ThreadPolicy Threading => options.ResolvedThreading;
+
     /// <summary>The tool behind a generated (aliased) tool name.</summary>
     internal bool TryFindToolAlias(ReadOnlySpan<byte> alias, out int tool) => allTools.Aliases.TryFindTool(alias, out tool);
 
