@@ -14,6 +14,7 @@ public sealed class GroundingGateTests
  {"name":"reply_to_notification","parameters":{"type":"object","properties":{"notification_match":{"type":"string","enum":["Maya","Leo","Dr. Patel","Cactus Team"]},"text":{"type":"string"}},"required":["notification_match","text"]}},
  {"name":"dismiss_notification","parameters":{"type":"object","properties":{"notification_match":{"type":"string","enum":["Maya","Leo","Dr. Patel","Cactus Team"]}},"required":["notification_match"]}},
  {"name":"set_cooking_timer","parameters":{"type":"object","properties":{"label":{"type":"string","description":"Label for the timer, copied from the user."},"minutes":{"type":"integer","minimum":1}},"required":["label","minutes"]}},
+ {"name":"log_meal","parameters":{"type":"object","properties":{"description":{"type":"string"},"meal_type":{"type":"string","enum":["breakfast","lunch","dinner","snack"]}},"required":["description"]}},
  {"name":"log_contact","parameters":{"type":"object","properties":{"email":{"type":"string","format":"email"}},"required":["email"]}}]
 """;
 
@@ -107,5 +108,16 @@ public sealed class GroundingGateTests
         Assert.True(outcome.HasFlag(RepairOutcome.Ungrounded));
         Assert.Equal("set_cooking_timer.label", ungrounded);
         Assert.False(Run("start a pasta timer for 9 minutes", Call("set_cooking_timer", """{"label":"pasta","minutes":9}""")).Outcome.HasFlag(RepairOutcome.Ungrounded));
+    }
+
+    [Fact]
+    public void APieceOfAnEarlierCallsTextIsADuplicate()
+    {
+        var generated = """[{"name":"log_meal","arguments":{"description":"turkey sandwich on rye","meal_type":"lunch"}},{"name":"log_meal","arguments":{"description":"rye","meal_type":"lunch"}}]""";
+        var (json, outcome, _) = Run("log lunch, turkey sandwich on rye", generated);
+        Assert.Equal("""[{"name":"log_meal","arguments":{"description":"turkey sandwich on rye","meal_type":"lunch"}}]""", json);
+        Assert.True(outcome.HasFlag(RepairOutcome.Duplicate));
+        var both = """[{"name":"log_meal","arguments":{"description":"oat milk","meal_type":"snack"}},{"name":"log_meal","arguments":{"description":"milk","meal_type":"snack"}}]""";
+        Assert.Contains("\"milk\"", Run("log a snack of oat milk and milk", both).Json);
     }
 }

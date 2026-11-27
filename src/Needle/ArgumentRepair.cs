@@ -63,6 +63,7 @@ internal sealed class RepairScratch
     public int ArenaLength;
     public byte[] PhoneText = Array.Empty<byte>();
     public readonly RepairText Value = new(1024);
+    public readonly RepairText Whole = new(1024);
 
     public RepairScratch(int maxCalls, int maxArgs, int callBytes)
     {
@@ -133,7 +134,7 @@ internal static class ArgumentRepair
                 outcome |= RepairOutcome.Invalid;
             }
         }
-        var written = Write(plan, s, source, callCount, out var kept, ref outcome);
+        var written = Write(plan, s, source, request, callCount, out var kept, ref outcome);
         if (written < 0) return RepairOutcome.None;
         if (Ungrounded(plan, s, history, request, today, kept)) outcome |= RepairOutcome.Ungrounded;
         if ((outcome & (RepairOutcome.Repaired | RepairOutcome.Negated | RepairOutcome.Invalid | RepairOutcome.Duplicate)) == 0) return outcome;
@@ -1002,7 +1003,7 @@ internal static class ArgumentRepair
         return true;
     }
 
-    static int Write(RepairPlan plan, RepairScratch s, ReadOnlySpan<byte> json, int callCount, out int kept, ref RepairOutcome outcome)
+    static int Write(RepairPlan plan, RepairScratch s, ReadOnlySpan<byte> json, RepairText request, int callCount, out int kept, ref RepairOutcome outcome)
     {
         var spans = s.Spans;
         var o = s.Output;
@@ -1035,7 +1036,8 @@ internal static class ArgumentRepair
             if (!Put(o, ref at, "}"u8)) return -1;
             var duplicate = false;
             for (var k = 0; k < kept; k++)
-                if (spans[k].Tool == call.Tool && new ReadOnlySpan<byte>(o, spans[k].ArgumentsStart, spans[k].ArgumentsLength).SequenceEqual(new ReadOnlySpan<byte>(o, argsStart, argsLength)))
+                if (spans[k].Tool == call.Tool && (new ReadOnlySpan<byte>(o, spans[k].ArgumentsStart, spans[k].ArgumentsLength).SequenceEqual(new ReadOnlySpan<byte>(o, argsStart, argsLength)) ||
+                    Fragment(s, request, new ReadOnlySpan<byte>(o, spans[k].ArgumentsStart, spans[k].ArgumentsLength), new ReadOnlySpan<byte>(o, argsStart, argsLength))))
                 {
                     duplicate = true;
                     break;
@@ -1052,6 +1054,63 @@ internal static class ArgumentRepair
         }
         if (!Put(o, ref at, "]"u8)) return -1;
         return at;
+    }
+
+    // A second call to the same tool whose text is only a piece of an earlier call's text ("rye" after
+    // "turkey sandwich on rye"), with every other argument the same, repeats that call: the request names the
+    // piece once, inside the earlier value. Duplicate calls are dropped (Apache-2.0 cactus-compute llms.txt).
+    static bool Fragment(RepairScratch s, RepairText request, ReadOnlySpan<byte> kept, ReadOnlySpan<byte> candidate)
+    {
+        var fragments = 0;
+        var at = 1;
+        var end = candidate.Length - 1;
+        while (at < end)
+        {
+            var keyStart = at;
+            if (!SkipString(candidate, ref at, end + 1)) return false;
+            var key = candidate.Slice(keyStart, at - keyStart);
+            at++;
+            var valueStart = at;
+            if (!SkipValue(candidate, ref at, end, out var kind)) return false;
+            var value = candidate.Slice(valueStart, at - valueStart);
+            if (at < end && candidate[at] == (byte)',') at++;
+            if (!FindValue(kept, key, out var other, out var otherKind)) return false;
+            if (value.SequenceEqual(other)) continue;
+            if (kind != ValueKind.String || otherKind != ValueKind.String || value.Length <= 2) return false;
+            s.Value.Load(value[1..^1]);
+            s.Whole.Load(other[1..^1]);
+            if (s.Value.Length == 0 || s.Value.Length >= s.Whole.Length) return false;
+            var phrase = new ReadOnlySpan<byte>(s.Value.Norm, 0, s.Value.Length);
+            if (s.Whole.FindPhrase(phrase) < 0) return false;
+            var first = request.FindPhrase(phrase);
+            if (first < 0 || request.FindPhrase(phrase, -1, first + 1) >= 0) return false;
+            fragments++;
+        }
+        return fragments > 0;
+    }
+
+    static bool FindValue(ReadOnlySpan<byte> args, ReadOnlySpan<byte> key, out ReadOnlySpan<byte> value, out ValueKind kind)
+    {
+        value = default;
+        kind = default;
+        var at = 1;
+        var end = args.Length - 1;
+        while (at < end)
+        {
+            var keyStart = at;
+            if (!SkipString(args, ref at, end + 1)) return false;
+            var current = args.Slice(keyStart, at - keyStart);
+            at++;
+            var valueStart = at;
+            if (!SkipValue(args, ref at, end, out kind)) return false;
+            if (current.SequenceEqual(key))
+            {
+                value = args.Slice(valueStart, at - valueStart);
+                return true;
+            }
+            if (at < end && args[at] == (byte)',') at++;
+        }
+        return false;
     }
 
     static bool Put(byte[] output, ref int at, ReadOnlySpan<byte> bytes)
