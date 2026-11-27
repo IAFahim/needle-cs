@@ -49,6 +49,10 @@ public sealed class GroundingGateTests
     {
         Assert.False(Run("start a timer for 25 minutes", Call("set_timer", """{"time_human":"25 minutes"}""")).Outcome.HasFlag(RepairOutcome.Ungrounded));
         Assert.False(Run("set a timer that goes off at 9:15 pm", Call("set_timer", """{"time_human":"9:15pm"}""")).Outcome.HasFlag(RepairOutcome.Ungrounded));
+        Assert.False(Run("set an alarm for seven in the morning", Call("set_timer", """{"time_human":"7:00 AM"}""")).Outcome.HasFlag(RepairOutcome.Ungrounded));
+        Assert.False(Run("wake me at seven pm", Call("set_timer", """{"time_human":"19:00"}""")).Outcome.HasFlag(RepairOutcome.Ungrounded));
+        Assert.False(Run("timer until noon", Call("set_timer", """{"time_human":"12:00 pm"}""")).Outcome.HasFlag(RepairOutcome.Ungrounded));
+        Assert.True(Run("set a timer for 5 minutes", Call("set_timer", """{"time_human":"8 minutes"}""")).Outcome.HasFlag(RepairOutcome.Ungrounded));
         Assert.False(Run("log jane.doe@example.com", Call("log_contact", """{"email":"jane.doe@example.com"}""")).Outcome.HasFlag(RepairOutcome.Ungrounded));
     }
 

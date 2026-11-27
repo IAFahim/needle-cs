@@ -1115,9 +1115,38 @@ internal static class ArgumentRepair
     static bool WordsGrounded(RepairText scratch, ReadOnlySpan<byte> text, RepairText history)
     {
         scratch.Load(text);
+        var clock = text.IndexOf((byte)':') >= 0;
         for (var w = 0; w < scratch.Words; w++)
-            if (!history.HasWordOrJoined(scratch.Word(w))) return false;
+        {
+            var word = scratch.Word(w);
+            if (history.HasWordOrJoined(word)) continue;
+            var digits = 0;
+            while (digits < word.Length && RepairText.IsDigit(word[digits])) digits++;
+            if (digits == 0)
+            {
+                // A clock's am/pm restates the hour's half of the day; it adds no value of its own.
+                if (word.SequenceEqual("am"u8) || word.SequenceEqual("pm"u8)) continue;
+                return false;
+            }
+            var suffix = word[digits..];
+            if (!(suffix.IsEmpty || suffix.SequenceEqual("am"u8) || suffix.SequenceEqual("pm"u8) || suffix.SequenceEqual("st"u8) ||
+                  suffix.SequenceEqual("nd"u8) || suffix.SequenceEqual("rd"u8) || suffix.SequenceEqual("th"u8)))
+                return false;
+            if (!NumberGrounded(word[..digits], clock, history)) return false;
+        }
         return true;
+    }
+
+    // A number restated in digits ("7" for "seven", "07:00" or "19:00" for "seven pm") is evidenced; a padded
+    // number outside a clock ("05 minutes" for "negative 5 minutes") is not.
+    static bool NumberGrounded(ReadOnlySpan<byte> digits, bool clock, RepairText history)
+    {
+        if (!RepairText.TryParseDecimal(digits, out var n)) return false;
+        if (clock && digits.SequenceEqual("00"u8)) return true;
+        if (digits.Length > 1 && digits[0] == (byte)'0' && !clock) return false;
+        if (history.HasNumber(n)) return true;
+        if (clock && n > 12 && n < 24 && history.HasNumber(n - 12)) return true;
+        return clock && n == 12 && (history.HasWord("noon"u8) || history.HasWord("midnight"u8));
     }
 
     // A closed set of names ("Maya", "Dr. Patel") is grounded only when the conversation names the chosen one.
