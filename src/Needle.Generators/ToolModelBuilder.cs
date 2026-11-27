@@ -33,7 +33,9 @@ public sealed class NeedleToolsGenerator : IIncrementalGenerator
         {
             foreach (var diagnostic in built.Diagnostics)
                 context.ReportDiagnostic(Diagnostic.Create(diagnostic.Descriptor, Location.Create(diagnostic.FilePath, diagnostic.Span, diagnostic.LineSpan)));
-            if (built.Model is { } model)
+            // A [Tools] interface that is not partial gets NDG010 from ToolsAnalyzer; emitting the other half would
+            // only add CS0260 on top of it.
+            if (built.Model is { IsPartial: true } model)
                 context.AddSource(model.InterfaceName + ".Tools.g.cs", ModernEmitter.Emit(model));
         });
         var combined = models.Combine(hasToolSet).Combine(useUtf8Literals);
@@ -97,7 +99,7 @@ internal sealed record ToolArg(
 
 internal sealed record ToolEntry(string Name, string Alias, string Description, ImmutableArray<ToolArg> Args);
 
-internal sealed record ToolSetModel(string InterfaceName, string CommandName, string CommandsName, string Namespace, bool GlobalNamespace, ImmutableArray<ToolEntry> Tools)
+internal sealed record ToolSetModel(string InterfaceName, string CommandName, string CommandsName, string Namespace, bool GlobalNamespace, ImmutableArray<ToolEntry> Tools, bool IsPartial = true)
 {
     public string Q(string type) => GlobalNamespace ? type : "global::" + Namespace + "." + type;
 }
@@ -182,8 +184,17 @@ internal static class ToolModelBuilder
             commandsName,
             globalNamespace ? "" : containing!.ToDisplayString(),
             globalNamespace,
-            tools.ToImmutable());
+            tools.ToImmutable(),
+            IsPartial(symbol));
         return new BuiltToolSet(model, diagnostics.ToImmutable());
+    }
+
+    internal static bool IsPartial(INamedTypeSymbol symbol)
+    {
+        foreach (var reference in symbol.DeclaringSyntaxReferences)
+            if (reference.GetSyntax() is TypeDeclarationSyntax declaration && !declaration.Modifiers.Any(SyntaxKind.PartialKeyword))
+                return false;
+        return true;
     }
 
     static ToolArg? BuildArg(IParameterSymbol parameter, ImmutableArray<DiagnosticInfo>.Builder diagnostics)
