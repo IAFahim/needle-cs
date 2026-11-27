@@ -151,7 +151,7 @@ internal sealed class AgentMailbox
                         log.Observe(state);
                         log.Publish();
                     }
-                log.Observe(state);
+                log.Observe(state, final: true);
                 reply = session.TurnResult;
             }
             catch

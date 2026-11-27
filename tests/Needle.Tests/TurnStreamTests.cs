@@ -12,6 +12,25 @@ namespace Needle.Tests;
 /// <summary>Model-free checks of the pieces behind streamed turns.</summary>
 public class CallScannerTests
 {
+    [Fact]
+    public void TextIsCutOnlyBetweenWholeCharacters()
+    {
+        var text = System.Text.Encoding.UTF8.GetBytes("27°C ✓ 😀!");
+        var cuts = new List<int>();
+        for (var length = 0; length <= text.Length; length++)
+        {
+            var whole = TurnLog.WholeCharacters(text, length);
+            Assert.InRange(whole, Math.Max(0, length - 3), length);
+            // Whatever is reported decodes cleanly and is a prefix of the text.
+            var decoded = System.Text.Encoding.UTF8.GetString(text, 0, whole);
+            Assert.DoesNotContain('\uFFFD', decoded);
+            cuts.Add(whole);
+        }
+        Assert.Equal(text.Length, cuts[^1]);
+        Assert.Equal(2, TurnLog.WholeCharacters(text, 3)); // "27" and the first byte of the degree sign
+        Assert.Equal(4, TurnLog.WholeCharacters(text, 4));
+    }
+
     const string Text = "[{\"name\":\"set_timer\",\"arguments\":{\"minutes\":12}},{\"name\":\"send_message\",\"arguments\":{\"to\":\"Zo\\\"}{ë\",\"nested\":{\"a\":[1,{\"b\":\"]}\"}]}}},{\"name\":\"stop\",\"arguments\":{}}]";
 
     [Theory]
@@ -359,11 +378,14 @@ public sealed class TurnStreamTests : IDisposable
         var tools = SessionCases.DefaultTools();
         var options = new AgentOptions { Threads = Assets.ThreadsFor(2), AutoDate = Toggle.Off, Stateless = true };
         const string query = "set a timer for 12 minutes and play some Miles Davis";
-        string expected;
-        using (var asker = model.Agent(tools, options)) expected = Fingerprint(asker.Ask(query));
+        // Each round is compared with the same round asked directly: the second turn sees the first.
+        var expectedRounds = new string[2];
+        using (var asker = model.Agent(tools, options))
+            for (var round = 0; round < 2; round++) expectedRounds[round] = Fingerprint(asker.Ask(query));
         using var agent = model.Agent(tools, options);
         for (var round = 0; round < 2; round++)
         {
+            var expected = expectedRounds[round];
             Assert.True(agent.TryPost(query));
             var collected = new Collected();
             var clock = Stopwatch.StartNew();

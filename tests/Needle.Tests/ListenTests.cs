@@ -263,7 +263,8 @@ public sealed class VoiceStreamTests : IDisposable
         if (TurnStreamTests.Scalar) return; // the fast tiers cover it; the scalar pass of the heavy shard has a time limit
         var clip = Clip("record.wav");
         var pcm = Repeated(clip, 4, 0.1);
-        var stream = new VoiceStream(whistle, "en") { MaxWindowSeconds = 6 };
+        // With pause commits off, only the window limit commits words before Stop.
+        var stream = new VoiceStream(whistle, "en") { MaxWindowSeconds = 6, EndpointSeconds = 0 };
         var passes = Stream(stream, pcm, 0.25, out var transcript);
         output.WriteLine(transcript);
         Assert.Contains(passes, p => !p.Final && p.Committed.Length > 0);

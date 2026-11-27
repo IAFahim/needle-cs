@@ -96,17 +96,20 @@ internal sealed class TurnLog
 
     public void Publish() => Volatile.Write(ref published, count);
 
-    /// <summary>Turns what the last step produced into events.</summary>
-    public void Observe(AgentState state)
+    /// <summary>
+    /// Turns what the last step produced into events. Thinking and speaking text is reported in whole UTF-8
+    /// characters: a character whose bytes are still arriving waits for the next step (or the turn's end).
+    /// </summary>
+    public void Observe(AgentState state, bool final = false)
     {
         var session = state.Session;
-        var reasoning = session.TurnReasoningLength;
+        var reasoning = final ? session.TurnReasoningLength : WholeCharacters(state.Reasoning, session.TurnReasoningLength);
         if (reasoning > reasoningSeen)
         {
             Grow(TurnEventKind.Thinking, reasoningSeen, reasoning - reasoningSeen);
             reasoningSeen = reasoning;
         }
-        var response = session.TurnResponseLength;
+        var response = final ? session.TurnResponseLength : WholeCharacters(state.Response, session.TurnResponseLength);
         if (response > responseSeen)
         {
             Grow(TurnEventKind.Speaking, responseSeen, response - responseSeen);
@@ -127,6 +130,18 @@ internal sealed class TurnLog
             if (scan == CallScan.None) return;
             Closed(session, at);
         }
+    }
+
+    /// <summary>How much of the first <paramref name="length"/> bytes ends on a character boundary.</summary>
+    internal static int WholeCharacters(ReadOnlySpan<byte> text, int length)
+    {
+        length = Math.Min(length, text.Length);
+        var i = length - 1;
+        while (i >= 0 && length - i < 4 && (text[i] & 0xC0) == 0x80) i--;
+        if (i < 0) return length;
+        var lead = text[i];
+        var need = lead < 0x80 ? 1 : (lead & 0xE0) == 0xC0 ? 2 : (lead & 0xF0) == 0xE0 ? 3 : (lead & 0xF8) == 0xF0 ? 4 : 1;
+        return length - i < need ? i : length;
     }
 
     void Progress(ReadOnlySpan<byte> text)
@@ -247,7 +262,7 @@ internal sealed partial class AgentState
         {
             var stepStarted = Stopwatch.GetTimestamp();
             var ended = session.StepStreamed(Calls, Reasoning, Response);
-            log.Observe(this);
+            log.Observe(this, final: ended);
             if (ended)
             {
                 EndStream();
