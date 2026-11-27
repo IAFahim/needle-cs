@@ -782,4 +782,23 @@ public sealed unsafe class NeonTests
         for (var g = (groups & ~3); g < groups; g++)
             Assert.Equal(BitConverter.SingleToInt32Bits(Scalar.HalfToSingle(norms[g]) * 0.37f), BitConverter.SingleToInt32Bits(factors[g]));
     }
+
+    // A token decoded alone (TapsHead) and inside a prefill chunk (Taps3) must convolve identically.
+    [Fact]
+    public void TapsHeadIsBitExactToTaps3()
+    {
+        if (!Simd.UseNeon) return;
+        const int width = 96;
+        var taps = stackalloc float[3 * width];
+        var rows = stackalloc float[3 * width];
+        var expected = stackalloc float[width];
+        var actual = stackalloc float[width];
+        var live = stackalloc float[2 * width];
+        Fill(taps, 3 * width, 61);
+        Fill(rows, 3 * width, 62, 5f);
+        Neon.Taps3(taps, width, rows + 2 * width, expected);
+        Neon.TapsHead(taps, width, rows, rows + width, rows + 2 * width, actual, live, live + width, width);
+        AssertBits(actual, expected, width, "TapsHead");
+        AssertBits(live, rows + width, 2 * width, "TapsHead history");
+    }
 }

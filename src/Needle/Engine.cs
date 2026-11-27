@@ -1302,6 +1302,7 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
     static void TapsHead(float* taps, int stride, float* h0, float* h1, float* h2, float* dst, float* live0, float* live1, int n)
     {
 #if NEEDLE_SIMD
+        if (Simd.UseNeon) { Neon.TapsHead(taps, stride, h0, h1, h2, dst, live0, live1, n); return; }
         if ((void*)Kernels.Active.Taps3 == null && Simd.Enabled && !Simd.UseNeon && Avx.IsSupported && Fma.IsSupported)
         {
             for (var c = 0; c < n; c += 8)
