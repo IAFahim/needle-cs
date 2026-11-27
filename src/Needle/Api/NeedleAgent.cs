@@ -76,7 +76,7 @@ internal sealed partial class AgentState
         {
             case ReplyStatus.Called: return (AnswerKind.Calls, AnswerWhy.None);
             case ReplyStatus.Responded: return (AnswerKind.Text, AnswerWhy.None);
-            case ReplyStatus.Declined: return (AnswerKind.Declined, AnswerWhy.Declined);
+            case ReplyStatus.Declined: return (AnswerKind.Declined, (reply.Flags & ReplyFlags.Invalid) != 0 ? AnswerWhy.OutOfRange : AnswerWhy.Declined);
             case ReplyStatus.Cancelled: return (AnswerKind.Cancelled, AnswerWhy.Cancelled);
             case ReplyStatus.Refused: return (AnswerKind.Refused, Session.LastWasUngrounded ? AnswerWhy.Ungrounded : AnswerWhy.LowConfidence);
         }

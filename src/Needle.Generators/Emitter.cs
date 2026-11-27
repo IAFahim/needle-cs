@@ -395,7 +395,7 @@ internal static class Emitter
             case ArgType.Float:
             case ArgType.Double: return 3;
             case ArgType.Bool: return 4;
-            case ArgType.Text: return AddNode(nodes, 1, arg.FixedText ? arg.TextCapacity : -1, 0, 0, 0);
+            case ArgType.Text: return AddNode(nodes, 1, arg.TextLimit, 0, 0, 0);
         }
         var first = literals.Count / 2;
         foreach (var literal in arg.EnumLiterals)
@@ -635,7 +635,13 @@ internal static class Emitter
             foreach (var arg in tool.Args)
                 if (!arg.Optional) required.Add(Quote(arg.Alias));
             if (required.Count > 0) builder.Append(",\"required\":[").Append(string.Join(",", required)).Append(']');
-            builder.Append("}}");
+            builder.Append('}');
+            // Tool-level, beside "triggers": ToolSet drops it from the prompt, and RepairPlan reads it from the raw JSON.
+            var inferred = new List<string>();
+            foreach (var arg in tool.Args)
+                if (arg.Inferred) inferred.Add(Quote(arg.Alias));
+            if (inferred.Count > 0) builder.Append(",\"inferred\":[").Append(string.Join(",", inferred)).Append(']');
+            builder.Append('}');
         }
         builder.Append(']');
         return builder.ToString();
@@ -673,7 +679,9 @@ internal static class Emitter
             }
             builder.Append(']');
         }
-        if (arg.Type == ArgType.Text && arg.FixedText) builder.Append(",\"maxLength\":").Append(arg.TextCapacity.ToString(CultureInfo.InvariantCulture));
+        if (arg.Minimum is { } minimum) builder.Append(",\"minimum\":").Append(ToolModelBuilder.Number(minimum));
+        if (arg.Maximum is { } maximum) builder.Append(",\"maximum\":").Append(ToolModelBuilder.Number(maximum));
+        if (arg.TextLimit > 0) builder.Append(",\"maxLength\":").Append(arg.TextLimit.ToString(CultureInfo.InvariantCulture));
         builder.Append('}');
         return builder.ToString();
     }

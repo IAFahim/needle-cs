@@ -36,7 +36,7 @@ namespace Needle.Samples.Playground
         public string ModelFile = "needle3.cact";
         public string WhistleFile = "whistle.cact";
         public float MoveSpeed = 7.5f;
-        public float MinConfidence = 0.08f;
+        public float MinConfidence = 0.3f;
         public int Threads = 4;
         public bool AutoDemo = true;
 
@@ -307,6 +307,7 @@ namespace Needle.Samples.Playground
                             {
                                 Threading = ThreadPolicy.Game.WithThreads(threads),
                                 RetrievalTopK = SquadCommands.GrammarToolCount,
+                                RefuseBelow = MinConfidence,
                             },
                         });
                         lock (stateGate)
@@ -329,6 +330,7 @@ namespace Needle.Samples.Playground
                             Session = new NeedleOptions
                             {
                                 Threading = ThreadPolicy.Game.WithThreads(threads),
+                                RefuseBelow = MinConfidence,
                             },
                         });
                         lock (stateGate)
@@ -354,6 +356,7 @@ namespace Needle.Samples.Playground
                             {
                                 Threading = ThreadPolicy.Game.WithThreads(threads),
                                 Stateless = true,
+                                RefuseBelow = MinConfidence,
                             },
                         });
                         lock (stateGate)
