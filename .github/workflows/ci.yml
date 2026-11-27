@@ -123,6 +123,9 @@ jobs:
     #    41366006614 failed GenerationMatchesReferenceGreedyDecode +
     #    LongContextStaysCloseToNative, the same flake family as the
     #    required legs, not tier-specific.
+    # macos-arm64 moved from macos-14 to macos-15 on 2026-11-27: GitHub now
+    # rejects the macos-14 image ('macos-14-arm64-us-default' is not
+    # supported), so all three macos legs were cancelled before starting.
     # No macos-x64 leg: the last stable Intel image (macos-13) retired Dec
     # 2025; Intel-only coverage stays on windows/linux x64. No
     # windows-arm64 leg yet (image GA Aug 2026): unobserved with no owner,
@@ -203,21 +206,21 @@ jobs:
             neon: false
             shard: heavy
           - name: macos-arm64
-            os: macos-14
+            os: macos-15
             expected-fail: false
             scalar: false
             netstandard: false
             neon: true
             shard: unit
           - name: macos-arm64
-            os: macos-14
+            os: macos-15
             expected-fail: false
             scalar: false
             netstandard: false
             neon: true
             shard: core
           - name: macos-arm64
-            os: macos-14
+            os: macos-15
             expected-fail: false
             scalar: false
             netstandard: false
