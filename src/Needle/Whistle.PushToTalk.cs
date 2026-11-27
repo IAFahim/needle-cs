@@ -7,46 +7,66 @@ namespace Needle;
 
 public sealed class PushToTalk
 {
-    readonly float[] buffer;
-    int count;
+    const long CountMask = 0xFFFFFFFFL;
+    readonly float[] first;
+    readonly float[] second;
+    long state;
 
     public PushToTalk(int maxSeconds = Whistle.MaxSeconds)
     {
         if (maxSeconds < 1 || maxSeconds > Whistle.MaxSeconds) throw new ArgumentOutOfRangeException(nameof(maxSeconds));
-        buffer = new float[maxSeconds * Wav.SampleRate];
+        first = new float[maxSeconds * Wav.SampleRate];
+        second = new float[maxSeconds * Wav.SampleRate];
     }
 
-    public int CapacitySamples => buffer.Length;
+    public int CapacitySamples => first.Length;
 
-    public int BufferedSamples => Volatile.Read(ref count);
+    public int BufferedSamples => (int)(Volatile.Read(ref state) & CountMask);
 
     public double BufferedSeconds => BufferedSamples / (double)Wav.SampleRate;
 
     public bool IsHeld => BufferedSamples > 0;
 
-    public void Hold() => Volatile.Write(ref count, 0);
+    float[] Buffer(long snapshot) => (snapshot >> 32) == 0 ? first : second;
+
+    public void Hold()
+    {
+        for (;;)
+        {
+            var snapshot = Volatile.Read(ref state);
+            if (Interlocked.CompareExchange(ref state, snapshot & ~CountMask, snapshot) == snapshot) return;
+        }
+    }
 
     public bool Write(ReadOnlySpan<float> pcm)
     {
-        var current = Volatile.Read(ref count);
         if (pcm.Length == 0) return true;
-        if (current + pcm.Length > buffer.Length) return false;
-        pcm.CopyTo(buffer.AsSpan(current));
-        Volatile.Write(ref count, current + pcm.Length);
-        return true;
+        for (;;)
+        {
+            var snapshot = Volatile.Read(ref state);
+            var current = (int)(snapshot & CountMask);
+            if (pcm.Length > first.Length - current) return false;
+            pcm.CopyTo(Buffer(snapshot).AsSpan(current));
+            if (Interlocked.CompareExchange(ref state, snapshot + pcm.Length, snapshot) == snapshot) return true;
+        }
     }
 
     public SpeechSpan Preview(Whistle whistle, Span<byte> utf8, Span<WordSlice> words, string? language = null, IReadOnlyList<string>? keywords = null)
     {
-        var n = Volatile.Read(ref count);
-        return whistle.TranscribeUtf8(buffer.AsSpan(0, n), utf8, words, language, keywords);
+        var snapshot = Volatile.Read(ref state);
+        return whistle.TranscribeUtf8(Buffer(snapshot).AsSpan(0, (int)(snapshot & CountMask)), utf8, words, language, keywords);
     }
 
     public SpeechSpan Release(Whistle whistle, Span<byte> utf8, Span<WordSlice> words, string? language = null, IReadOnlyList<string>? keywords = null)
     {
-        var speech = Preview(whistle, utf8, words, language, keywords);
-        Volatile.Write(ref count, 0);
-        return speech;
+        long snapshot;
+        for (;;)
+        {
+            snapshot = Volatile.Read(ref state);
+            var swapped = ((snapshot >> 32) ^ 1) << 32;
+            if (Interlocked.CompareExchange(ref state, swapped, snapshot) == snapshot) break;
+        }
+        return whistle.TranscribeUtf8(Buffer(snapshot).AsSpan(0, (int)(snapshot & CountMask)), utf8, words, language, keywords);
     }
 }
 

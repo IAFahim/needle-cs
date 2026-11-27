@@ -94,7 +94,7 @@ flowchart LR
 7. **Whistle Speech-to-Text & Voice-to-Tool (`Whistle.cs`, `Whistle.Decode.cs`, `Whistle.Span.cs`, `Whistle.PushToTalk.cs`, `Voice.cs`, `VoiceHost.cs`)**
    - `Wav.Read` / `Wav.Decode` / `Wav.Resample` converts WAV (8/16/24/32-bit PCM & IEEE float) to mono 16 kHz float32 PCM (window max `Whistle.MaxSeconds = 30`).
    - Mel-filterbank log frontend + convolutional stem + hyper-connected transformer encoder builds INT8 (`sbyte` + float scale) cross-attention memory (`CrossMemory`), reused across all decoder steps.
-   - Decoder supports **beam search** (`BeamWidth = 3`, length penalty `BeamLengthPenalty = 1f`), **greedy zero-alloc UTF-8 span decoding** (`BeamWidth = 1` + `TranscribeUtf8`), **keyword biasing** (`FirstKeywordBias = 3f`, `ContinuedKeywordBias = 8f`), DTW **word timestamps** (`Word` / `WordSlice`), sliding >30 s clips (`TranscribeLong`), `PushToTalk`, `VoiceStream`/`WhistleStream`, synchronous `VoiceSession` (automatically harvests enum values from `toolsJson` as Whisper bias keywords), and asynchronous `VoiceHost`/`VoiceChannel`.
+   - Decoder supports **beam search** (`BeamWidth = 3`, length penalty `BeamLengthPenalty = 1f`), **zero-alloc UTF-8 span decoding** (`TranscribeUtf8`, beam or greedy), **keyword biasing** (`FirstKeywordBias = 3f`, `ContinuedKeywordBias = 8f`), DTW **word timestamps** (`Word` / `WordSlice`), sliding >30 s clips (`TranscribeLong`), `PushToTalk`, `VoiceStream`/`WhistleStream`, synchronous `VoiceSession` (automatically harvests enum values from `toolsJson` as Whisper bias keywords), and asynchronous `VoiceHost`/`VoiceChannel`.
 
 ---
 
@@ -935,8 +935,7 @@ using var whistle = new Whistle(speechModel, ThreadPolicy.Default.WithThreads(4)
 Transcription tr = whistle.Transcribe(pcm, keywords: new[] { "Omeprazole", "Lyra" }, wordTimestamps: true);
 Console.WriteLine($"[{tr.Language}] {tr.Text} ({tr.DecodeTps:0} tok/s)");
 
-// 2) Zero-alloc greedy PushToTalk:
-whistle.BeamWidth = 1;
+// 2) Zero-alloc PushToTalk (beam search by default; BeamWidth = 1 for greedy):
 var ptt = new PushToTalk();
 ptt.Hold();
 ptt.Write(pcm);
