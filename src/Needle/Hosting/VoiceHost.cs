@@ -12,6 +12,7 @@ public readonly struct VoiceHostOptions
     public string ToolsJson { get; init; }
     public NeedleOptions? Session { get; init; }
     public int WhistleThreads { get; init; }
+    public int WhistleBeamWidth { get; init; }
     public string? Language { get; init; }
     public int ReplyCapacity { get; init; }
     public int WorkCapacity { get; init; }
@@ -246,7 +247,11 @@ public sealed unsafe class VoiceHost : IDisposable
             var sessionOptions = options.Session ?? new NeedleOptions();
             policy = sessionOptions.ResolvedThreading;
             whistleModel = Model.Open(options.WhistleModelPath);
-            whistle = new Whistle(whistleModel, Math.Max(1, options.WhistleThreads == 0 ? 4 : options.WhistleThreads)) { BeamWidth = 1 };
+            if (options.WhistleBeamWidth < 0) throw new ArgumentOutOfRangeException(nameof(options), "WhistleBeamWidth must be 0 (default) or more");
+            whistle = new Whistle(whistleModel, Math.Max(1, options.WhistleThreads == 0 ? 4 : options.WhistleThreads));
+            if (options.WhistleBeamWidth > 0) whistle.BeamWidth = options.WhistleBeamWidth;
+            if (options.Language != null && !Contains(whistle.Languages, options.Language))
+                throw new ArgumentException($"language is one of {string.Join(" ", whistle.Languages)}", nameof(options));
             textScratch = new byte[whistle.MaxTranscriptTokens * 64];
             wordScratch = new WordSlice[whistle.MaxTranscriptTokens + 1];
             keywords = VoiceSession.EnumKeywords(options.ToolsJson ?? "");
@@ -294,11 +299,36 @@ public sealed unsafe class VoiceHost : IDisposable
         return false;
     }
 
+    static bool Contains(IReadOnlyList<string> values, string value)
+    {
+        for (var i = 0; i < values.Count; i++) if (values[i] == value) return true;
+        return false;
+    }
+
+    static int Utf8Boundary(ReadOnlySpan<byte> text, int limit)
+    {
+        if (limit >= text.Length) return text.Length;
+        var at = limit;
+        while (at > 0 && (text[at] & 0xC0) == 0x80) at--;
+        return at;
+    }
+
     void ProcessJob(VoiceWork job)
     {
-        var speech = whistle!.TranscribeUtf8(channel.SlotPcm(job.Slot, job.Length), textScratch!, wordScratch!, transcribeLanguage, keywords);
+        SpeechSpan speech;
+        try
+        {
+            speech = whistle!.TranscribeUtf8(channel.SlotPcm(job.Slot, job.Length), textScratch!, wordScratch!, transcribeLanguage, keywords);
+        }
+        catch (Exception)
+        {
+            channel.FreeSlot(job.Slot);
+            if (Volatile.Read(ref stopping) == 0) PublishFailure(job.Utterance);
+            return;
+        }
         channel.FreeSlot(job.Slot);
-        var length = Math.Min(speech.Utf8Length, ChannelLimits.QueryCapacity);
+        var transcript = new ReadOnlySpan<byte>(textScratch!, 0, speech.Utf8Length);
+        var length = Utf8Boundary(transcript, ChannelLimits.QueryCapacity);
         var ticket = 0ul;
 #if NETSTANDARD2_1
         var spin = new Spinner();
@@ -306,12 +336,15 @@ public sealed unsafe class VoiceHost : IDisposable
         var spin = new SpinWait();
 #endif
         while (!hubChannel.TrySubmitQuery(new ReadOnlySpan<byte>(textScratch!, 0, length), out ticket))
+        {
+            if (Volatile.Read(ref stopping) != 0) return;
 #if NETSTANDARD2_1
             spin.SpinOnce();
 #else
             spin.SpinOnce(-1);
 #endif
-        var stored = Math.Min(speech.Utf8Length, 2048);
+        }
+        var stored = Utf8Boundary(transcript, 2048);
         var slot = (pendingHead + pendingCount) % PendingCapacity;
         if (pendingCount < PendingCapacity)
         {
@@ -353,11 +386,14 @@ public sealed unsafe class VoiceHost : IDisposable
             var spin = new SpinWait();
 #endif
             while (!channel.TryPublishReply(in voice))
+            {
+                if (Volatile.Read(ref stopping) != 0) return;
 #if NETSTANDARD2_1
                 spin.SpinOnce();
 #else
                 spin.SpinOnce(-1);
 #endif
+            }
             pendingHead = (slot + 1) % PendingCapacity;
             pendingCount -= i + 1;
             return;
@@ -368,11 +404,35 @@ public sealed unsafe class VoiceHost : IDisposable
         var forward = new SpinWait();
 #endif
         while (!channel.TryPublishDirect(in reply))
+        {
+            if (Volatile.Read(ref stopping) != 0) return;
 #if NETSTANDARD2_1
             forward.SpinOnce();
 #else
             forward.SpinOnce(-1);
 #endif
+        }
+    }
+
+    void PublishFailure(ulong utterance)
+    {
+        VoiceReply voice = default;
+        voice.Utterance = utterance;
+        voice.Reply = new Reply(ReplyStatus.Failed, FailureReason.TranscriptionFailed, ReplyFlags.None, 0f, 0f, 0f, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+#if NETSTANDARD2_1
+        var spin = new Spinner();
+#else
+        var spin = new SpinWait();
+#endif
+        while (!channel.TryPublishReply(in voice))
+        {
+            if (Volatile.Read(ref stopping) != 0) return;
+#if NETSTANDARD2_1
+            spin.SpinOnce();
+#else
+            spin.SpinOnce(-1);
+#endif
+        }
     }
 
     void Loop()
