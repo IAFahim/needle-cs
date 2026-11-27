@@ -234,8 +234,24 @@ internal sealed class RepairText
     public bool HasTurnNumber(double value)
     {
         for (var i = 0; i < NumberCount; i++)
-            if (Math.Abs(Numbers[i] - value) < 1e-9 && Origin[WordStart[NumberWord[i]]] >= Preamble) return true;
+            if (Math.Abs(Numbers[i] - value) < 1e-9 && Origin[WordStart[NumberWord[i]]] >= Preamble && !SignDropped(i, value)) return true;
         return false;
+    }
+
+    /// <summary>Whether a number is stated as written: "negative 5" states -5, not 5.</summary>
+    public bool HasSignedNumber(double value)
+    {
+        for (var i = 0; i < NumberCount; i++)
+            if (Math.Abs(Numbers[i] - value) < 1e-9 && !SignDropped(i, value)) return true;
+        return false;
+    }
+
+    bool SignDropped(int number, double value)
+    {
+        var w = NumberWord[number];
+        if (value <= 0 || w == 0) return false;
+        var previous = Word(w - 1);
+        return previous.SequenceEqual("negative"u8) || previous.SequenceEqual("minus"u8);
     }
 
     public bool HasNumber(double value)

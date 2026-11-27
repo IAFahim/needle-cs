@@ -43,6 +43,8 @@ public sealed class GroundingGateTests
         var (_, outcome, ungrounded) = Run("set a timer for negative 5 minutes", Call("set_timer", """{"time_human":"05 minutes"}"""));
         Assert.True(outcome.HasFlag(RepairOutcome.Ungrounded));
         Assert.Equal("set_timer.time_human", ungrounded);
+        Assert.True(Run("set a timer for negative 5 minutes", Call("set_timer", """{"time_human":"5 minutes"}""")).Outcome.HasFlag(RepairOutcome.Ungrounded));
+        Assert.True(Run("set a cooking timer for minus 5 minutes for the rice", Call("set_cooking_timer", """{"label":"rice","minutes":5}""")).Outcome.HasFlag(RepairOutcome.Ungrounded));
     }
 
     [Fact]

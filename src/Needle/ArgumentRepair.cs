@@ -1120,9 +1120,11 @@ internal static class ArgumentRepair
         for (var w = 0; w < scratch.Words; w++)
         {
             var word = scratch.Word(w);
-            if (history.HasWordOrJoined(word)) continue;
             var digits = 0;
             while (digits < word.Length && RepairText.IsDigit(word[digits])) digits++;
+            if (digits > 0 && RepairText.TryParseDecimal(word[..digits], out var stated) && request.HasNumber(stated) && !Stated(stated, request, history))
+                return false;
+            if (history.HasWordOrJoined(word)) continue;
             if (digits == 0)
             {
                 // A clock's am/pm restates the hour's half of the day; it adds no value of its own.
@@ -1152,7 +1154,8 @@ internal static class ArgumentRepair
 
     // A number is evidenced by the request or an earlier turn, never by the system text's own wording: the
     // instructions' "exactly one call" or the date fact's clock do not state a timer's minutes.
-    static bool Stated(double number, RepairText request, RepairText history) => request.HasNumber(number) || history.HasTurnNumber(number);
+    // "negative 5" states -5: a value that keeps the 5 and drops the sign is not what the request said.
+    static bool Stated(double number, RepairText request, RepairText history) => request.HasSignedNumber(number) || history.HasTurnNumber(number);
 
     // A value made only of the tool's own name words ("timer" for set_cooking_timer) restates the call, not a
     // value the user gave: the model filled the slot itself.
