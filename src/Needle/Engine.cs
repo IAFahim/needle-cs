@@ -944,7 +944,7 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
         var tileStride = Math.Max(128, 4 * g.HadaCols);
         var tileScratch = (float*)(((nuint)(job.MlpScratch + HadamardMlp.ScratchFloats(dim, g.HadaRows * g.HadaCols)) + 31) & ~(nuint)31) + member * tileStride;
 #if NEEDLE_SIMD
-        var simdAttnGate = Simd.UseAvx && (void*)Kernels.Active.Prepare == null && (void*)Kernels.Active.GateFakeA8 == null && g.OutputWidth == g.Heads * g.VDim;
+        var simdAttnGate = (Simd.UseNeon || (Simd.UseAvx && (void*)Kernels.Active.Prepare == null && (void*)Kernels.Active.GateFakeA8 == null)) && g.OutputWidth == g.Heads * g.VDim;
         var parallelPool = members > 1 && job.Confidence != null;
 #else
         var parallelPool = members > 1 && job.Confidence != null;
