@@ -35,9 +35,14 @@ internal sealed class RepairText
 
     public int Capacity => Source.Length;
 
+    /// <summary>Bytes of Source that came from Load (the system text in a conversation history); the
+    /// turns appended after it follow.</summary>
+    public int Preamble;
+
     public void Clear()
     {
         SourceLength = 0;
+        Preamble = 0;
         Length = 0;
         Words = 0;
         Clauses = 0;
@@ -47,7 +52,9 @@ internal sealed class RepairText
     public void Load(ReadOnlySpan<byte> source)
     {
         SourceLength = 0;
+        Preamble = 0;
         Append(source);
+        Preamble = SourceLength;
     }
 
     public void Append(ReadOnlySpan<byte> source)
@@ -58,13 +65,14 @@ internal sealed class RepairText
         if (need > 0)
         {
             // Full: drop the oldest text, on a line boundary, so the newest turn is always kept.
-            if (need >= SourceLength) SourceLength = 0;
+            if (need >= SourceLength) { SourceLength = 0; Preamble = 0; }
             else
             {
                 var cut = Array.IndexOf(Source, (byte)'\n', need, SourceLength - need);
                 cut = cut < 0 ? need : cut + 1;
                 Buffer.BlockCopy(Source, cut, Source, 0, SourceLength - cut);
                 SourceLength -= cut;
+                Preamble = Math.Max(0, Preamble - cut);
             }
         }
         if (SourceLength > 0) Source[SourceLength++] = (byte)'\n';
@@ -108,7 +116,10 @@ internal sealed class RepairText
             else if (c == (byte)'.' && inWord && IsDigit(src[i - 1]) && i + 1 < src.Length && IsDigit(src[i + 1])) mapped = c;
             else
             {
-                if (c is (byte)',' or (byte)';' or (byte)'.' or (byte)'!' or (byte)'?' or (byte)':' or (byte)'\n' or (byte)'(' or (byte)')') breakPending = true;
+                // "Dr. Patel" is one name, not two clauses: a period after a title abbreviation does not end a clause.
+                if ((c is (byte)',' or (byte)';' or (byte)'.' or (byte)'!' or (byte)'?' or (byte)':' or (byte)'\n' or (byte)'(' or (byte)')') &&
+                    !(c == (byte)'.' && inWord && IsTitle(new ReadOnlySpan<byte>(Norm, WordStart[Words], Length - WordStart[Words]))))
+                    breakPending = true;
                 EndWord(ref inWord);
                 continue;
             }
@@ -150,6 +161,29 @@ internal sealed class RepairText
     static bool IsNegation(ReadOnlySpan<byte> word) =>
         word.SequenceEqual("dont"u8) || word.SequenceEqual("not"u8) || word.SequenceEqual("never"u8) || word.SequenceEqual("neither"u8) ||
         word.SequenceEqual("wont"u8) || word.SequenceEqual("shouldnt"u8) || word.SequenceEqual("cant"u8);
+
+    static bool IsTitle(ReadOnlySpan<byte> word) =>
+        word.SequenceEqual("dr"u8) || word.SequenceEqual("mr"u8) || word.SequenceEqual("mrs"u8) || word.SequenceEqual("ms"u8) ||
+        word.SequenceEqual("prof"u8) || word.SequenceEqual("st"u8) || word.SequenceEqual("mt"u8) || word.SequenceEqual("jr"u8) || word.SequenceEqual("sr"u8);
+
+    // A word of a value counts as present when the text holds it, or holds it split in two or three
+    // adjacent words ("6 pm" grounds "6pm").
+    public bool HasWordOrJoined(ReadOnlySpan<byte> word)
+    {
+        if (HasWord(word)) return true;
+        for (var w = 0; w < Words; w++)
+        {
+            var at = 0;
+            for (var k = w; k < Words && k < w + 3; k++)
+            {
+                var piece = Word(k);
+                if (at + piece.Length > word.Length || !word.Slice(at, piece.Length).SequenceEqual(piece)) break;
+                at += piece.Length;
+                if (at == word.Length) return k > w;
+            }
+        }
+        return false;
+    }
 
     static bool IsConjunction(ReadOnlySpan<byte> word) =>
         word.SequenceEqual("and"u8) || word.SequenceEqual("but"u8) || word.SequenceEqual("then"u8) || word.SequenceEqual("also"u8) ||
@@ -195,6 +229,30 @@ internal sealed class RepairText
     }
 
     public bool HasWord(ReadOnlySpan<byte> word, int clause = -1) => FindPhrase(word, clause) >= 0;
+
+    /// <summary>A number stated in the turns after the preamble (the conversation, not the system text).</summary>
+    public bool HasTurnNumber(double value)
+    {
+        for (var i = 0; i < NumberCount; i++)
+            if (Math.Abs(Numbers[i] - value) < 1e-9 && Origin[WordStart[NumberWord[i]]] >= Preamble && !SignDropped(i, value)) return true;
+        return false;
+    }
+
+    /// <summary>Whether a number is stated as written: "negative 5" states -5, not 5.</summary>
+    public bool HasSignedNumber(double value)
+    {
+        for (var i = 0; i < NumberCount; i++)
+            if (Math.Abs(Numbers[i] - value) < 1e-9 && !SignDropped(i, value)) return true;
+        return false;
+    }
+
+    bool SignDropped(int number, double value)
+    {
+        var w = NumberWord[number];
+        if (value <= 0 || w == 0) return false;
+        var previous = Word(w - 1);
+        return previous.SequenceEqual("negative"u8) || previous.SequenceEqual("minus"u8);
+    }
 
     public bool HasNumber(double value)
     {
