@@ -89,6 +89,9 @@ public unsafe class EngineCore<TClock> : IDisposable where TClock : struct, ISta
     int prefixVersion;
     int specVersion;
     int lastForwardCount;
+
+    /// <summary>The most tokens one forward pass takes; <see cref="Feed"/> walks a longer input in chunks of this size.</summary>
+    public int ChunkSize => chunk;
     float* poolMax, poolSum, poolAcc, cell;
     bool pooling;
     CrossMemory cross;

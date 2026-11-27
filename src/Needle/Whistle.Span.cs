@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Threading;
 
 namespace Needle;
 
@@ -190,7 +191,44 @@ public sealed unsafe partial class Whistle
         return false;
     }
 
+    enum SpanStage : byte { Idle, Stem, EncoderStart, EncoderLayer, EncoderFinish, Memory, Prime, Decode, Done }
+
+    // Everything one greedy pass carries from one step to the next. TranscribeUtf8 runs the steps back to back; a
+    // speech stream runs them a slice at a time. Same code, same order, so the transcripts are the same bit for bit.
+    struct SpanPass
+    {
+        public SpanStage Stage;
+        public int L0;
+        public int Layer;
+        public int Count;
+        public FrameJob Job;
+        public long Started;
+        public long DecodeStart;
+        public double TtftMs;
+        public double Tps;
+        public double EncodeMs;
+        public string? Language;
+        public string? Detected;
+        public bool Empty;
+        public bool HasKeywords;
+    }
+
+    SpanPass span;
+
     int DecodeSpan(ReadOnlySpan<float> pcm, string? language, out string? detected, out double ttftMs, out double tps, out double encodeMs, out bool empty)
+    {
+        if (BeamWidth > 1) return BeamSpan(pcm, language, out detected, out ttftMs, out tps, out encodeMs, out empty);
+        if (BeginSpanPass(pcm, language))
+            while (!StepSpanPass()) { }
+        detected = span.Detected;
+        ttftMs = span.TtftMs;
+        tps = span.Tps;
+        encodeMs = span.EncodeMs;
+        empty = span.Empty;
+        return span.Empty ? 0 : span.Count;
+    }
+
+    int BeamSpan(ReadOnlySpan<float> pcm, string? language, out string? detected, out double ttftMs, out double tps, out double encodeMs, out bool empty)
     {
         detected = null;
         ttftMs = 0;
@@ -203,60 +241,148 @@ public sealed unsafe partial class Whistle
         BuildCrossMemory();
         encodeMs = (Stopwatch.GetTimestamp() - started) * 1000.0 / Stopwatch.Frequency;
         detected = PrimeSpan(language);
-        var tokens = spanTokens!;
-        var probs = spanProbs!;
-        var count = 0;
-        var one = stackalloc int[1];
-        var firstToken = Stopwatch.GetTimestamp();
-        var decodeStart = firstToken;
-        if (BeamWidth > 1)
-        {
-            count = BeamSearch(true);
-            ttftMs = (Stopwatch.GetTimestamp() - started) * 1000.0 / Stopwatch.Frequency;
-            if (spanAlign) FeedForAlignment(count);
-            tps = count / Math.Max(1e-9, (Stopwatch.GetTimestamp() - decodeStart) / (double)Stopwatch.Frequency);
-            empty = false;
-            return count;
-        }
-        var hasKeywords = spanKeywordStrings.Length > 0;
-        for (var step = 0; step < g.MaxSeq - 3; step++)
-        {
-            if (CancelPending()) break;
-            var logits = decoder.Logits;
-            int best;
-            float prob;
-            if (!hasKeywords)
-            {
-                var lp = 0f;
-                var p = 0f;
-                fixed (float* src = logits)
-                    Ops.TopKLogSoftmax(src, textVocab, 1, &best, &lp, &p, true);
-                prob = p;
-            }
-            else
-            {
-                logits.Slice(0, textVocab).CopyTo(new Span<float>(scores, textVocab));
-                scores[0] = scores[2] = scores[3] = -1e30f;
-                ApplyKeywordBiasSpan(new ReadOnlySpan<int>(tokens, 0, count), scores);
-                best = Ops.ArgMax(scores, textVocab);
-                prob = Ops.BestProbability(scores, textVocab, scores[best]);
-            }
-            if (step == 0) ttftMs = (Stopwatch.GetTimestamp() - started) * 1000.0 / Stopwatch.Frequency;
-            probs[count] = prob;
-            if (best == Eos)
-            {
-                one[0] = Eos;
-                decoder.Feed(new ReadOnlySpan<int>(one, 1));
-                break;
-            }
-            tokens[count++] = best;
-            one[0] = best;
-            decoder.Feed(new ReadOnlySpan<int>(one, 1));
-        }
-        var seconds = Math.Max(1e-9, (Stopwatch.GetTimestamp() - decodeStart) / (double)Stopwatch.Frequency);
-        tps = count / seconds;
+        var decodeStart = Stopwatch.GetTimestamp();
+        var count = BeamSearch(true);
+        ttftMs = (Stopwatch.GetTimestamp() - started) * 1000.0 / Stopwatch.Frequency;
+        if (spanAlign) FeedForAlignment(count);
+        tps = count / Math.Max(1e-9, (Stopwatch.GetTimestamp() - decodeStart) / (double)Stopwatch.Frequency);
         empty = false;
         return count;
+    }
+
+    /// <summary>
+    /// Starts a greedy pass over <paramref name="pcm"/> (at most <see cref="MaxSeconds"/>): the audio is copied and
+    /// turned into features at once, the rest runs in <see cref="StepSpanPass"/>. False when the pass already ended
+    /// (silence or too little audio).
+    /// </summary>
+    bool BeginSpanPass(ReadOnlySpan<float> pcm, string? language)
+    {
+        span = default;
+        span.Language = language;
+        span.Empty = true;
+        span.Stage = SpanStage.Done;
+        if (Silent(pcm)) return false;
+        span.Started = Stopwatch.GetTimestamp();
+        var l0 = EncodeFeatures(pcm);
+        if (l0 < 1) return false;
+        span.L0 = l0;
+        span.Stage = SpanStage.Stem;
+        return true;
+    }
+
+    /// <summary>Runs one stage of the pass: the stem, one encoder layer, the cross memory, priming or one token. True when done.</summary>
+    bool StepSpanPass()
+    {
+        switch (span.Stage)
+        {
+            case SpanStage.Stem:
+                EncodeStem(span.L0);
+                span.Stage = SpanStage.EncoderStart;
+                return false;
+            case SpanStage.EncoderStart:
+                span.Job = EncoderStart(frames);
+                span.Layer = 0;
+                span.Stage = audio->EncoderLayers > 0 ? SpanStage.EncoderLayer : SpanStage.EncoderFinish;
+                return false;
+            case SpanStage.EncoderLayer:
+                EncoderLayerStep(ref span.Job, span.Layer, frames);
+                if (++span.Layer >= audio->EncoderLayers) span.Stage = SpanStage.EncoderFinish;
+                return false;
+            case SpanStage.EncoderFinish:
+                EncoderFinish(ref span.Job, frames);
+                span.Stage = SpanStage.Memory;
+                return false;
+            case SpanStage.Memory:
+                BuildCrossMemory();
+                span.EncodeMs = (Stopwatch.GetTimestamp() - span.Started) * 1000.0 / Stopwatch.Frequency;
+                span.Stage = SpanStage.Prime;
+                return false;
+            case SpanStage.Prime:
+                span.Detected = PrimeSpan(span.Language);
+                span.Count = 0;
+                span.HasKeywords = spanKeywordStrings.Length > 0;
+                span.DecodeStart = Stopwatch.GetTimestamp();
+                span.Stage = SpanStage.Decode;
+                return false;
+            case SpanStage.Decode:
+                return DecodeSpanStep();
+            default:
+                return true;
+        }
+    }
+
+    bool DecodeSpanStep()
+    {
+        var tokens = spanTokens!;
+        var probs = spanProbs!;
+        var step = span.Count;
+        if (step >= g.MaxSeq - 3) return FinishSpanPass();
+        if (CancelPending()) return FinishSpanPass();
+        var one = stackalloc int[1];
+        var logits = decoder.Logits;
+        int best;
+        float prob;
+        if (!span.HasKeywords)
+        {
+            var lp = 0f;
+            var p = 0f;
+            fixed (float* src = logits)
+                Ops.TopKLogSoftmax(src, textVocab, 1, &best, &lp, &p, true);
+            prob = p;
+        }
+        else
+        {
+            logits.Slice(0, textVocab).CopyTo(new Span<float>(scores, textVocab));
+            scores[0] = scores[2] = scores[3] = -1e30f;
+            ApplyKeywordBiasSpan(new ReadOnlySpan<int>(tokens, 0, span.Count), scores);
+            best = Ops.ArgMax(scores, textVocab);
+            prob = Ops.BestProbability(scores, textVocab, scores[best]);
+        }
+        if (step == 0) span.TtftMs = (Stopwatch.GetTimestamp() - span.Started) * 1000.0 / Stopwatch.Frequency;
+        probs[span.Count] = prob;
+        if (best == Eos)
+        {
+            one[0] = Eos;
+            decoder.Feed(new ReadOnlySpan<int>(one, 1));
+            return FinishSpanPass();
+        }
+        tokens[span.Count++] = best;
+        one[0] = best;
+        decoder.Feed(new ReadOnlySpan<int>(one, 1));
+        return false;
+    }
+
+    bool FinishSpanPass()
+    {
+        var seconds = Math.Max(1e-9, (Stopwatch.GetTimestamp() - span.DecodeStart) / (double)Stopwatch.Frequency);
+        span.Tps = span.Count / seconds;
+        span.Empty = false;
+        span.Stage = SpanStage.Done;
+        return true;
+    }
+
+    /// <summary>Starts a greedy pass to be run with <see cref="StepSpan"/>. False when it ended at once (silence).</summary>
+    internal bool BeginSpan(ReadOnlySpan<float> pcm, string? language, IReadOnlyList<string>? keywords)
+    {
+        if (language != null && Array.IndexOf(languages, language) < 0) throw new ArgumentException($"language is one of {string.Join(" ", languages)}");
+        if (pcm.Length > MaxSeconds * audio->SampleRate) throw new ArgumentException("a stepped pass takes at most MaxSeconds of audio");
+        EnsureDecoderBuffers();
+        EnsureSpanBuffers();
+        CacheKeywords(keywords);
+        Volatile.Write(ref cancelRequested, 0);
+        cancelled = false;
+        return BeginSpanPass(pcm, language);
+    }
+
+    internal bool StepSpan() => StepSpanPass();
+
+    internal bool SpanDone => span.Stage == SpanStage.Done;
+
+    /// <summary>Writes the finished pass's words, with times shifted by <paramref name="shift"/> seconds.</summary>
+    internal SpeechSpan FinishSpan(Span<byte> utf8, Span<WordSlice> words, double shift)
+    {
+        if (span.Empty) return new SpeechSpan(0, 0, null, 0, 0, 0, false);
+        return RenderSpan(span.Count, span.Detected, utf8, words, shift, span.TtftMs, span.Tps, span.EncodeMs);
     }
 
     string PrimeSpan(string? language)

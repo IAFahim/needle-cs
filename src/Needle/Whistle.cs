@@ -205,6 +205,15 @@ public sealed unsafe partial class Whistle : IDisposable
 
     int EncodeCore(ReadOnlySpan<float> pcm)
     {
+        var l0 = EncodeFeatures(pcm);
+        if (l0 < 1) return 0;
+        EncodeStem(l0);
+        RunEncoder(frames);
+        return frames;
+    }
+
+    int EncodeFeatures(ReadOnlySpan<float> pcm)
+    {
         var samples = Math.Min(pcm.Length, MaxSeconds * audio->SampleRate);
         var l0 = samples / audio->Hop;
         frames = 0;
@@ -220,10 +229,13 @@ public sealed unsafe partial class Whistle : IDisposable
         }
         Normalize(features, l0, audio->Mels);
         Observer?.Invoke("mel", new ReadOnlySpan<float>(features, l0 * audio->Mels));
+        return l0;
+    }
+
+    void EncodeStem(int l0)
+    {
         frames = Stem(l0);
         Observer?.Invoke("stem", new ReadOnlySpan<float>(stemOut, frames * dim));
-        RunEncoder(frames);
-        return frames;
     }
 
     static void SliceRange(int task, int tasks, int total, out int first, out int end)
@@ -820,12 +832,23 @@ public sealed unsafe partial class Whistle : IDisposable
 
     void RunEncoder(int count)
     {
-        var width = 4 * dim;
+        var job = EncoderStart(count);
+        for (var l = 0; l < audio->EncoderLayers; l++) EncoderLayerStep(ref job, l, count);
+        EncoderFinish(ref job, count);
+    }
+
+    FrameJob EncoderStart(int count)
+    {
         var job = CreateFrameJob(count);
         job.Stream = streamA;
         job.Next = streamB;
         RunFrames(&ExecuteCopyLanes, ref job, count);
-        for (var l = 0; l < audio->EncoderLayers; l++)
+        return job;
+    }
+
+    void EncoderLayerStep(ref FrameJob job, int l, int count)
+    {
+        var width = 4 * dim;
         {
             EncoderLayer* w = audio->Encoder + l;
             job.Layer = l;
@@ -850,6 +873,10 @@ public sealed unsafe partial class Whistle : IDisposable
             job.Next = swap;
             Observer?.Invoke("layer" + l, new ReadOnlySpan<float>(job.Stream, count * width));
         }
+    }
+
+    void EncoderFinish(ref FrameJob job, int count)
+    {
         RunFrames(&ExecuteEncoderFinal, ref job, count);
         Observer?.Invoke("encoder", new ReadOnlySpan<float>(encoderOutput, count * dim));
     }

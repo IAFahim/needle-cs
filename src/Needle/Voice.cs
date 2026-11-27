@@ -64,7 +64,7 @@ public sealed class VoiceSession : IDisposable
 
     internal static System.Collections.Generic.List<string> EnumKeywords(string toolsJson) => EnumValues(new ToolSet(toolsJson));
 
-    static List<string> EnumValues(ToolSet tools)
+    internal static List<string> EnumValues(ToolSet tools)
     {
 
         var found = new List<string>();
