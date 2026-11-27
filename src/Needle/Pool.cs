@@ -191,7 +191,7 @@ internal sealed unsafe class Pool : IDisposable
         {
             if (IsPaused || workers.Length == 0) return 1;
             if (pinnedTeam > 0) return Math.Min(pinnedTeam, Members);
-            return Fit(teamSize);
+            return Fit(teamSize, adopt: false);
         }
     }
 
@@ -393,7 +393,9 @@ internal sealed unsafe class Pool : IDisposable
     // Shrinks a run that needs more workers than the cores they could get, before it starts. Without
     // this the first runs on a saturated machine (a prefill, before any decode has been timed) wait on
     // workers that never get a core; with BelowNormal workers on Windows that is seconds per barrier.
-    int Fit(int members)
+    // adopt: a smaller fit becomes the adaptive size, which only timed (adaptive) runs grow back. Runs that
+    // are not timed (prefill, batched layers) must not adopt it, or one busy moment would pin them small.
+    int Fit(int members, bool adopt = true)
     {
         if (members <= 1 || pinnedTeam > 0 || IsPaused) return members;
         SampleIdle(FitWindowTicks);
@@ -402,7 +404,7 @@ internal sealed unsafe class Pool : IDisposable
         var fit = 1;
         foreach (var size in chain)
             if (size <= members && (size - 1) * 0.6 <= available) { fit = size; break; }
-        if (fit < teamSize)
+        if (adopt && fit < teamSize)
         {
             teamSize = fit;
             probeSize = 0;
