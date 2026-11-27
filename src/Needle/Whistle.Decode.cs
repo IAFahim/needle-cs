@@ -277,16 +277,33 @@ public sealed unsafe partial class Whistle
     float[]? beamLiveScores;
     BeamCandidate[]? beamCandidates;
     float* beamScores;
+    bool beamParallel;
+    GCHandle beamSelf;
+    Engine[]? beamTaskEngines;
+    Engine[]? beamTaskSources;
+    int[]? beamTaskTokens;
+
+    bool ParallelBeams(int width)
+    {
+        if (width < 2 || policy.Threads < 2) return false;
+        var choice = Environment.GetEnvironmentVariable("NEEDLE_BEAM_PARALLEL");
+        if (choice != null) return choice != "0";
+        return policy.Threads >= width || RuntimeInformation.ProcessArchitecture != Architecture.Arm64;
+    }
 
     void EnsureBeams(int width)
     {
         if (width < 1) throw new InvalidOperationException("BeamWidth must be at least 1");
         if (beamEngines != null && beamEngines.Length == 2 * width) return;
         DisposeBeams();
+        var parallel = ParallelBeams(width);
         var engines = new Engine[2 * width];
         try
         {
-            for (var i = 0; i < engines.Length; i++) engines[i] = new Engine(model, g.MaxSeq, 64, policy, pool);
+            for (var i = 0; i < engines.Length; i++)
+                engines[i] = parallel
+                    ? new Engine(model, g.MaxSeq, 64, policy.WithThreads(1).WithCaller(CallerRole.Participates), null)
+                    : new Engine(model, g.MaxSeq, 64, policy, pool);
         }
         catch
         {
@@ -305,6 +322,36 @@ public sealed unsafe partial class Whistle
         beamLiveScores = new float[width];
         beamCandidates = new BeamCandidate[width * width];
         beamScores = (float*)Mem.Alloc((nuint)(width * textVocab) * 4);
+        beamParallel = parallel;
+        if (parallel)
+        {
+            beamTaskEngines = new Engine[width];
+            beamTaskSources = new Engine[width];
+            beamTaskTokens = new int[width];
+            beamSelf = GCHandle.Alloc(this, GCHandleType.Weak);
+        }
+    }
+
+    void RunBeamTasks(delegate*<void*, int, void> function, int count)
+    {
+        if (count == 0) return;
+        if (count == 1) { function((void*)GCHandle.ToIntPtr(beamSelf), 0); return; }
+        pool.Run(function, (void*)GCHandle.ToIntPtr(beamSelf), count);
+    }
+
+    static Whistle BeamOwner(void* context) => (Whistle)GCHandle.FromIntPtr((IntPtr)context).Target!;
+
+    static void ExecuteBeamCopy(void* context, int task)
+    {
+        var owner = BeamOwner(context);
+        owner.beamTaskEngines![task].CopyFrom(owner.beamTaskSources![task], copyLogits: false);
+    }
+
+    static void ExecuteBeamFeed(void* context, int task)
+    {
+        var owner = BeamOwner(context);
+        var token = owner.beamTaskTokens![task];
+        owner.beamTaskEngines![task].Feed(new ReadOnlySpan<int>(&token, 1));
     }
 
     void DisposeBeams()
@@ -315,6 +362,8 @@ public sealed unsafe partial class Whistle
         beamLive = null;
         beamNext = null;
         beamScores = null;
+        if (beamSelf.IsAllocated) beamSelf.Free();
+        beamParallel = false;
     }
 
     float Normalized(float score, int length) => BeamLengthPenalty == 0f ? score : score / MathF.Pow(length, BeamLengthPenalty);
@@ -422,21 +471,50 @@ public sealed unsafe partial class Whistle
             }
             for (var p = 0; p < liveCount; p++) lastChild[p] = -1;
             for (var j = 0; j < kept; j++) lastChild[parents[j]] = j;
-            for (var j = 0; j < kept; j++)
+            if (beamParallel)
             {
-                var p = parents[j];
-                if (j == lastChild[p]) continue;
-                next[j].CopyFrom(live[p], copyLogits: false);
-                one[0] = picks[j];
-                next[j].Feed(new ReadOnlySpan<int>(one, 1));
+                var taskEngines = beamTaskEngines!;
+                var tasks = 0;
+                for (var j = 0; j < kept; j++)
+                {
+                    var p = parents[j];
+                    if (j == lastChild[p]) continue;
+                    taskEngines[tasks] = next[j];
+                    beamTaskSources![tasks] = live[p];
+                    tasks++;
+                }
+                RunBeamTasks(&ExecuteBeamCopy, tasks);
+                for (var j = 0; j < kept; j++)
+                {
+                    var p = parents[j];
+                    taskEngines[j] = j == lastChild[p] ? live[p] : next[j];
+                    beamTaskTokens![j] = picks[j];
+                }
+                RunBeamTasks(&ExecuteBeamFeed, kept);
+                for (var j = 0; j < kept; j++)
+                {
+                    var p = parents[j];
+                    if (j == lastChild[p]) (next[j], live[p]) = (live[p], next[j]);
+                }
             }
-            for (var j = 0; j < kept; j++)
+            else
             {
-                var p = parents[j];
-                if (j != lastChild[p]) continue;
-                one[0] = picks[j];
-                live[p].Feed(new ReadOnlySpan<int>(one, 1));
-                (next[j], live[p]) = (live[p], next[j]);
+                for (var j = 0; j < kept; j++)
+                {
+                    var p = parents[j];
+                    if (j == lastChild[p]) continue;
+                    next[j].CopyFrom(live[p], copyLogits: false);
+                    one[0] = picks[j];
+                    next[j].Feed(new ReadOnlySpan<int>(one, 1));
+                }
+                for (var j = 0; j < kept; j++)
+                {
+                    var p = parents[j];
+                    if (j != lastChild[p]) continue;
+                    one[0] = picks[j];
+                    live[p].Feed(new ReadOnlySpan<int>(one, 1));
+                    (next[j], live[p]) = (live[p], next[j]);
+                }
             }
             for (var j = 0; j < kept; j++)
             {
