@@ -266,7 +266,7 @@ public sealed unsafe class PoolTests
         Assert.Equal(0, default(ThreadPolicy).Workers);
         Assert.Equal(3, ThreadPolicy.Default.WithThreads(4).Workers);
         Assert.Equal(4, ThreadPolicy.Default.WithThreads(4).WithCaller(CallerRole.Waits).Workers);
-        Assert.Equal(1, ThreadPolicy.Default.WithThreads(-5).Threads);
+        Assert.Equal(ThreadPolicy.AutoThreads, ThreadPolicy.Default.WithThreads(-5).Threads);
         Assert.Equal(0, ThreadPolicy.Default.WithSpinMicroseconds(-1).SpinMicroseconds);
         Assert.Equal(ThreadPolicy.DefaultSpinMicroseconds, ThreadPolicy.Default.SpinMicroseconds);
         Assert.Equal(CorePlacement.Any, new ThreadPolicy(2, 50, WorkerPriority.Normal, CorePlacement.Explicit, CallerRole.Participates, 0).Placement);
