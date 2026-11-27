@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.Arm;
@@ -895,5 +896,60 @@ public sealed unsafe class NeonTests
             NativeMemory.Free(x); NativeMemory.Free(fused); NativeMemory.Free(gate); NativeMemory.Free(peaks);
             NativeMemory.Free(expectedValues); NativeMemory.Free(actualValues); NativeMemory.Free(expectedScales); NativeMemory.Free(actualScales);
         }
+    }
+
+    [Fact]
+    public void LoadFactorsConvertsEveryHalfExactlyIncludingSubnormals()
+    {
+        if (!Simd.UseNeon) return;
+        var norms = (ushort*)Marshal.AllocHGlobal(65536 * 2);
+        var factors = (float*)Marshal.AllocHGlobal(65536 * 4);
+        for (var i = 0; i < 65536; i++) norms[i] = (ushort)i;
+        Neon.LoadFactors(norms, 65536, 0.75f, factors);
+        for (var i = 0; i < 65536; i++)
+        {
+            var expected = Scalar.HalfToSingle((ushort)i) * 0.75f;
+            Assert.True(factors[i] == expected || (float.IsNaN(expected) && float.IsNaN(factors[i])),
+                $"half 0x{i:X4}: {factors[i]} vs {expected}");
+        }
+        Marshal.FreeHGlobal((nint)norms);
+        Marshal.FreeHGlobal((nint)factors);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static float PoisonStack()
+    {
+        var poison = stackalloc float[16384];
+        for (var i = 0; i < 16384; i++) poison[i] = float.NaN;
+        return poison[16383];
+    }
+
+    [Theory]
+    [InlineData(2, 9, 768, 1)]
+    [InlineData(4, 9, 768, 3)]
+    [InlineData(2, 5, 384, 2)]
+    [InlineData(4, 13, 640, 5)]
+    public void MatMulIgnoresWhateverWasOnTheStackBeforeIt(int bits, int rows, int cols, int tokens)
+    {
+        if (!Simd.UseNeon) return;
+        var w = MakeWeights(rows, cols, bits, rows * 7 + cols + bits);
+        var groups = cols / Cq.GroupSize;
+        var stride = (groups + 7) & ~7;
+        var x = (float*)Marshal.AllocHGlobal(tokens * cols * 4);
+        Fill(x, tokens * cols, rows * 3 + tokens);
+        var values = (sbyte*)Marshal.AllocHGlobal(tokens * cols);
+        var scales = (float*)Marshal.AllocHGlobal(tokens * stride * 4);
+        var offsets = (float*)Marshal.AllocHGlobal(tokens * stride * 4);
+        var activations = new Activations(values, scales, offsets, cols);
+        Quant.Prepare(x, tokens, cols, bits, activations);
+        var expected = (float*)Marshal.AllocHGlobal(tokens * rows * 4);
+        var actual = (float*)Marshal.AllocHGlobal(tokens * rows * 4);
+        Scalar.MatMulRows(w, activations, tokens, expected, rows, 0, rows);
+        PoisonStack();
+        Neon.MatMulRows(w, activations, tokens, actual, rows, 0, rows);
+        for (var i = 0; i < tokens * rows; i++) Assert.False(float.IsNaN(actual[i]), $"output {i} is NaN");
+        AssertMatMulClose(actual, expected, tokens * rows, $"PoisonedStack{bits} {rows}x{cols}x{tokens}");
+        foreach (var pointer in new[] { (nint)x, (nint)values, (nint)scales, (nint)offsets, (nint)expected, (nint)actual }) Marshal.FreeHGlobal(pointer);
+        FreeWeights(w);
     }
 }

@@ -7,27 +7,40 @@ using System.Runtime.InteropServices;
 using Needle;
 using Needle.Cli;
 
-return args switch
+try
 {
-    ["cpu"] => CpuInfo.Run(),
-    ["verify", var model, var golden] => Verify(model, golden),
-    ["bench", var model, .. var options] => BenchKernels.Run(model, options),
-    ["bench-e2e", var model, var tools, .. var options] => BenchE2E.Run(model, tools, options),
-    ["decode-hash", var hmodel, var htools, .. var hoptions] => DecodeHash.Run(hmodel, htools, hoptions),
-    ["bench-contention", var cmodel, var ctools, .. var coptions] => BenchContention.Run(cmodel, ctools, coptions),
-    ["generate", var model, var text, .. var count] => Generate(model, text, count.Length > 0 ? int.Parse(count[0]) : 80),
-    ["transcribe", var model, var wav, .. var options] => Transcribe(model, wav, options),
-    ["stream", var model, var wav, .. var soptions] => StreamClip(model, wav, soptions),
-    ["voice", var needle, var whistle, var tools, var wav, .. var voptions] => Voice(needle, whistle, tools, wav, voptions),
-    ["embed", var model, var text] => EmbedText(model, text),
-    ["eval", var smodel2, .. var suiteOptions] when suiteOptions.Contains("--suite") => EvalSuites.Run(smodel2, suiteOptions),
-    ["eval", var model, var dataset, .. var options] => Eval.Run(model, dataset, options),
-    ["call", var model, var tools, .. var queries] => Call(model, tools, queries),
-    ["run", var rmodel, var rtools, var query, .. var rrest] => Run(rmodel, rtools, query, rrest),
-    ["serve", var smodel, var stools, .. var srest] => Serve.Run(smodel, stools, srest),
-    ["prime", var pmodel, var ptools, var pout, .. var prest] => Prime.Run(pmodel, ptools, pout, prest),
-    _ => Usage(),
-};
+    return args switch
+    {
+        ["cpu"] => CpuInfo.Run(),
+        ["verify", var model, var golden] => Verify(model, golden),
+        ["bench", var model, .. var options] => BenchKernels.Run(model, options),
+        ["bench-e2e", var model, var tools, .. var options] => BenchE2E.Run(model, tools, options),
+        ["decode-hash", var hmodel, var htools, .. var hoptions] => DecodeHash.Run(hmodel, htools, hoptions),
+        ["bench-contention", var cmodel, var ctools, .. var coptions] => BenchContention.Run(cmodel, ctools, coptions),
+        ["generate", var model, var text, .. var count] => Generate(model, text, count.Length > 0 ? int.Parse(count[0]) : 80),
+        ["transcribe", var model, var wav, .. var options] => Transcribe(model, wav, options),
+        ["stream", var model, var wav, .. var soptions] => StreamClip(model, wav, soptions),
+        ["voice", var needle, var whistle, var tools, var wav, .. var voptions] => Voice(needle, whistle, tools, wav, voptions),
+        ["embed", var model, var text] => EmbedText(model, text),
+        ["eval", var smodel2, .. var suiteOptions] when suiteOptions.Contains("--suite") => EvalSuites.Run(smodel2, suiteOptions),
+        ["eval", var model, var dataset, .. var options] => Eval.Run(model, dataset, options),
+        ["call", var model, var tools, .. var queries] => Call(model, tools, queries),
+        ["run", var rmodel, var rtools, var query, .. var rrest] => Run(rmodel, rtools, query, rrest),
+        ["serve", var smodel, var stools, .. var srest] => Serve.Run(smodel, stools, srest),
+        ["prime", var pmodel, var ptools, var pout, .. var prest] => Prime.Run(pmodel, ptools, pout, prest),
+        _ => Usage(),
+    };
+}
+catch (Exception e) when (e is FormatException or OverflowException or ArgumentException)
+{
+    Console.Error.WriteLine(e.Message);
+    return Usage();
+}
+catch (Exception e) when (e is IOException or UnauthorizedAccessException or InvalidDataException or InvalidOperationException or IndexOutOfRangeException)
+{
+    Console.Error.WriteLine($"needle: {e.GetType().Name}: {e.Message}");
+    return 1;
+}
 
 static int Usage()
 {
@@ -54,6 +67,7 @@ static int Usage()
 static int Run(string modelPath, string toolsPath, string query, string[] rest)
 {
     var repeat = rest.Length > 0 ? int.Parse(rest[0]) : 1;
+    if (repeat < 1) throw new ArgumentException("repeat must be at least 1");
     var tools = File.ReadAllBytes(toolsPath);
     var queryBytes = System.Text.Encoding.UTF8.GetBytes(query);
     var output = new byte[16384];
@@ -180,14 +194,18 @@ static int Transcribe(string modelPath, string wavPath, string[] options)
     var repeat = 1;
     var keywords = new List<string>();
     for (var i = 0; i < options.Length; i++)
+    {
+        string Next() => i + 1 < options.Length ? options[++i] : throw new ArgumentException($"{options[i]} needs a value");
         switch (options[i])
         {
-            case "--language": language = options[++i]; break;
+            case "--language": language = Next(); break;
             case "--words": words = true; break;
-            case "--repeat": repeat = int.Parse(options[++i]); break;
-            case "--threads": threads = int.Parse(options[++i]); break;
-            case "--keywords": keywords.AddRange(options[++i].Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)); break;
+            case "--repeat": repeat = int.Parse(Next()); break;
+            case "--threads": threads = int.Parse(Next()); break;
+            case "--keywords": keywords.AddRange(Next().Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)); break;
         }
+    }
+    if (repeat < 1) throw new ArgumentException("--repeat must be at least 1");
     var pcm = Wav.Read(wavPath);
     using var model = Model.Open(modelPath);
     var load = Stopwatch.GetTimestamp();

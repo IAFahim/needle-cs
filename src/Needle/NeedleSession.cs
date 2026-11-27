@@ -149,7 +149,7 @@ public sealed unsafe partial class NeedleSession : IDisposable
     const int EmbedderContext = 512;
     const int MinKeyScratchBytes = 64;
 
-    static readonly Regex DateKey = new(@"\bdate\s*:", RegexOptions.IgnoreCase);
+    static readonly Regex DateKey = new(@"(?<![A-Za-z])date:");
     static readonly Regex IsoStamp = new(@"\d{4}-\d{2}-\d{2}");
 
     static ReadOnlySpan<byte> ToolResultHead => "<|im_start|>tool\n<tool_result>"u8;
@@ -204,6 +204,7 @@ public sealed unsafe partial class NeedleSession : IDisposable
     int callTextLength;
     int restoredCallCount;
     int cancelRequested;
+    int disposed;
     Engine? embedder;
     ToolSet active;
     Grammar grammar;
@@ -813,7 +814,7 @@ public sealed unsafe partial class NeedleSession : IDisposable
                 }
                 chunkCount = draftStart + accepted;
                 specFed = accepted == drafts;
-                if (accepted > 0) maskFresh = false;
+                maskFresh = false;
             }
         }
         var chunk = new ReadOnlySpan<int>(chunkIds, chunkCount);
@@ -1029,7 +1030,7 @@ public sealed unsafe partial class NeedleSession : IDisposable
                     }
                     chunkCount = draftStart + accepted;
                     specFed = accepted == drafts;
-                    if (accepted > 0) maskFresh = false;
+                    maskFresh = false;
                 }
             }
             var chunk = new ReadOnlySpan<int>(chunkIds, chunkCount);
@@ -1430,6 +1431,7 @@ public sealed unsafe partial class NeedleSession : IDisposable
 
     public void Dispose()
     {
+        if (System.Threading.Interlocked.Exchange(ref disposed, 1) != 0) return;
         engine.Dispose();
         embedder?.Dispose();
         tokenizer.Dispose();

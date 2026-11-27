@@ -76,6 +76,7 @@ internal sealed unsafe class Pool : IDisposable
     static readonly long FitWindowTicks = Stopwatch.Frequency / 20;
     const int MinWaitMicroseconds = 20;
     const int MaxWaitMicroseconds = 200;
+    int disposed;
 
     public int Threads => policy.Threads;
 
@@ -84,6 +85,8 @@ internal sealed unsafe class Pool : IDisposable
     public int[] NativeWorkerIds => nativeWorkerIds;
 
     public bool IsPaused => Volatile.Read(ref control->Paused) != 0;
+
+    public int TeamSize => IsPaused ? 1 : Members;
 
     public Pool(int threads) : this(ThreadPolicy.Default.WithThreads(threads))
     {
@@ -230,7 +233,9 @@ internal sealed unsafe class Pool : IDisposable
     void RunTeam(delegate*<void*, int, void> function, void* context, TeamBarrier* barrier, int members, bool adapt)
     {
         members = Math.Min(members, Members);
-        if (members <= 1 || workers.Length == 0 || IsPaused)
+        // A paused pool still runs a team on its workers: running the members one after another on the
+        // caller would break a team function whose phases meet at barriers.
+        if (members <= 1 || workers.Length == 0)
         {
             barrier->Participants = 1;
             var inline = Stopwatch.GetTimestamp();
@@ -248,7 +253,6 @@ internal sealed unsafe class Pool : IDisposable
         control->TeamContext = context;
         control->TeamMembers = participates ? members - 1 : members;
         Volatile.Write(ref control->TeamDone, 0);
-        Volatile.Write(ref control->TeamActive, 1);
         Interlocked.Exchange(ref control->TeamTicket, generation);
         if (Volatile.Read(ref control->Sleeping) > 0) WakeAll();
         if (participates)
@@ -258,7 +262,7 @@ internal sealed unsafe class Pool : IDisposable
         }
         WaitForWorkers(ref control->TeamDone, members);
         Volatile.Write(ref control->TeamActive, 0);
-        if (adapt) Adapt(members, Stopwatch.GetTimestamp() - started);
+        if (adapt && !IsPaused) Adapt(members, Stopwatch.GetTimestamp() - started);
     }
 
     void Adapt(int members, long ticks)
@@ -526,7 +530,7 @@ internal sealed unsafe class Pool : IDisposable
         lock (gate)
         {
             Interlocked.Increment(ref control->Sleeping);
-            while (Volatile.Read(ref control->Stopping) == 0 && (IsPaused || (!HasWork(index) && Volatile.Read(ref control->TeamTicket) == teamSeen && Volatile.Read(ref control->PingTicket) == pingSeen))) Monitor.Wait(gate);
+            while (Volatile.Read(ref control->Stopping) == 0 && Volatile.Read(ref control->TeamTicket) == teamSeen && (IsPaused || (!HasWork(index) && Volatile.Read(ref control->PingTicket) == pingSeen))) Monitor.Wait(gate);
             Interlocked.Decrement(ref control->Sleeping);
         }
     }
@@ -549,7 +553,7 @@ internal sealed unsafe class Pool : IDisposable
             }
             var paused = IsPaused;
             var teamTicket = Volatile.Read(ref control->TeamTicket);
-            if (!paused && teamTicket != teamSeen)
+            if (teamTicket != teamSeen)
             {
                 teamSeen = teamTicket;
                 if (index >= control->TeamMembers) continue;
@@ -581,6 +585,7 @@ internal sealed unsafe class Pool : IDisposable
 
     public void Dispose()
     {
+        if (Interlocked.Exchange(ref disposed, 1) != 0) return;
         Volatile.Write(ref control->Stopping, 1);
         WakeAll();
         foreach (var worker in workers) worker.Join();
