@@ -30,8 +30,9 @@ public sealed class ArgAttribute : Attribute
     public double Max { get; set; } = double.NaN;
 
     /// <summary>
-    /// The longest text allowed, in UTF-8 bytes. Text parameters only; 0 means the type's own limit (the capacity of a
-    /// <c>Utf8TextN</c>, none for <c>string</c>). It may not exceed a fixed-size text's capacity.
+    /// The longest text allowed, in characters: the schema's <c>maxLength</c>, which the grammar enforces. Text parameters
+    /// only; 0 means the type's own limit (the capacity of a <c>Utf8TextN</c>, none for <c>string</c>). A <c>Utf8TextN</c>
+    /// holds N UTF-8 bytes, so it may not exceed N, and text with multi-byte characters can still fill the bytes first.
     /// </summary>
     public int MaxLength { get; set; }
 

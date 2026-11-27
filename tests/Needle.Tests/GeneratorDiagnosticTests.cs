@@ -180,7 +180,7 @@ public sealed class GeneratorDiagnosticTests
             """), "NDG011");
         Assert.Equal(DiagnosticSeverity.Error, diagnostic.Severity);
         Assert.Equal("member", Marked(diagnostic));
-        Assert.Equal("Parameter 'member' is Utf8Text32, which holds 32 UTF-8 bytes, but [Arg(MaxLength = 40)] allows 40; text past byte 32 would be cut. Use Utf8Text64 or lower MaxLength.",
+        Assert.Equal("Parameter 'member' is Utf8Text32, which holds 32 UTF-8 bytes, but [Arg(MaxLength = 40)] allows 40 characters; text past byte 32 would be cut. Use Utf8Text64 or lower MaxLength.",
             diagnostic.GetMessage());
     }
 

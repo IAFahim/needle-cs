@@ -75,7 +75,7 @@ internal sealed record ToolArg(
     int MaxLength = 0,
     bool Inferred = false)
 {
-    /// <summary>The longest text the grammar and schema allow, in bytes; -1 for no limit.</summary>
+    /// <summary>The longest text the grammar and schema allow, in characters; -1 for no limit.</summary>
     public int TextLimit => Type != ArgType.Text ? -1 : FixedText ? (MaxLength > 0 ? Math.Min(MaxLength, TextCapacity) : TextCapacity) : MaxLength > 0 ? MaxLength : -1;
 
     public bool PassTextThrough => Type == ArgType.Text && FixedText;
@@ -250,7 +250,7 @@ internal static class ToolModelBuilder
         if (arg.FixedText && maxLength > arg.TextCapacity)
         {
             diagnostics.Add(Info("NDG011", location,
-                $"Parameter '{parameter.Name}' is {parameter.Type.Name}, which holds {arg.TextCapacity} UTF-8 bytes, but [Arg(MaxLength = {maxLength})] allows {maxLength}; " +
+                $"Parameter '{parameter.Name}' is {parameter.Type.Name}, which holds {arg.TextCapacity} UTF-8 bytes, but [Arg(MaxLength = {maxLength})] allows {maxLength} characters; " +
                 $"text past byte {arg.TextCapacity} would be cut. Use {LargerText(maxLength)} or lower MaxLength."));
             return null;
         }
