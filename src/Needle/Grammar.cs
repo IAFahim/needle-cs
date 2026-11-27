@@ -237,6 +237,26 @@ internal sealed unsafe class Grammar : IDisposable
 
     public static bool Complete(in GrammarState state) => state.Depth == 0;
 
+    // True when the innermost frame is a schema object waiting for a property name (just after '{' or ','),
+    // so a replay can translate an original key into the alias this object expects.
+    internal static bool AwaitsKey(GrammarProgram* g, GrammarState* s, out int first, out int count, out uint used)
+    {
+        first = 0;
+        count = 0;
+        used = 0;
+        if (s->Depth == 0) return false;
+        var f = s->Frames + s->Depth - 1;
+        var n = g->Nodes + f->Node * Kind.Fields;
+        if (n[0] != Kind.Obj || n[4] != 0 || f->Phase is not (1 or 5)) return false;
+        first = n[2];
+        count = n[1];
+        used = (uint)f->Aux2;
+        return true;
+    }
+
+    internal static ReadOnlySpan<byte> PropertyName(GrammarProgram* g, int property) =>
+        new(g->Bytes + g->Properties[property * 4], g->Properties[property * 4 + 1]);
+
     static bool Push(GrammarState* s, int node)
     {
         if (s->Depth >= GrammarState.MaxDepth) return false;
