@@ -10,13 +10,11 @@ namespace Needle.Bench.Tests
         [Test]
         public void BenchGoldenReproducesCallsAndEmitsBenchE2EJson()
         {
-            string model = Environment.GetEnvironmentVariable("NEEDLE_MODEL") ?? "";
-            string tools = Environment.GetEnvironmentVariable("NEEDLE_TOOLS") ?? "";
-            string gameTools = Environment.GetEnvironmentVariable("NEEDLE_GAME_TOOLS") ?? "";
-            if (string.IsNullOrEmpty(model) || !File.Exists(model))
-                Assert.Fail("NEEDLE_MODEL is missing or unreadable: '" + model + "'. Run tools/bench-ns21.sh editmode.");
-            if (string.IsNullOrEmpty(tools) || !File.Exists(tools))
-                Assert.Fail("NEEDLE_TOOLS is missing or unreadable: '" + tools + "'. Run tools/bench-ns21.sh editmode.");
+            string model = FromEnvOrRepo("NEEDLE_MODEL", "ref/hf/needle3.cact");
+            string tools = FromEnvOrRepo("NEEDLE_TOOLS", "tools/tools.json");
+            string gameTools = FromEnvOrRepo("NEEDLE_GAME_TOOLS", "tools/game_tools.json");
+            Require(model, "NEEDLE_MODEL (needle3.cact)");
+            Require(tools, "NEEDLE_TOOLS (tools/tools.json)");
 
             int[] threads = ParseThreads(Environment.GetEnvironmentVariable("NEEDLE_THREADS") ?? "4");
             int reps = ParseInt(Environment.GetEnvironmentVariable("NEEDLE_REPS"), 2);
@@ -38,9 +36,45 @@ namespace Needle.Bench.Tests
                 sets,
                 out json);
 
+            // TestContext.Progress reaches neither the -logFile nor the NUnit XML of a batch run.
+            Debug.Log("[bench-ns21] " + json);
             TestContext.Progress.WriteLine(json);
+            string output = Environment.GetEnvironmentVariable("NEEDLE_BENCH_OUT");
+            if (!string.IsNullOrEmpty(output))
+            {
+                string directory = Path.GetDirectoryName(Path.GetFullPath(output));
+                if (!string.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
+                File.WriteAllText(output, json);
+            }
             Assert.That(json, Does.Contain("needle.bench-e2e/1"), "runner must print needle.bench-e2e/1 JSON");
             Assert.That(failures, Is.EqualTo(0), "golden-set call outputs did not reproduce");
+        }
+
+        // The bench needs the weights. Without them it is Ignored, so projects that list the package
+        // in "testables" still pass; CI sets NEEDLE_REQUIRE_MODEL=1 to make a missing file a failure.
+        static void Require(string path, string what)
+        {
+            if (!string.IsNullOrEmpty(path) && File.Exists(path)) return;
+            string message = what + " is missing or unreadable: '" + path + "'. Run tools/fetch.sh, or tools/bench-ns21.sh editmode.";
+            if (Environment.GetEnvironmentVariable("NEEDLE_REQUIRE_MODEL") == "1") Assert.Fail(message);
+            Assert.Ignore(message);
+        }
+
+        static string FromEnvOrRepo(string variable, string relative)
+        {
+            string fromEnv = Environment.GetEnvironmentVariable(variable);
+            if (!string.IsNullOrEmpty(fromEnv)) return fromEnv;
+            string root = Environment.GetEnvironmentVariable("NEEDLE_REPO");
+            if (string.IsNullOrEmpty(root)) root = FindRepoRoot(Directory.GetCurrentDirectory()) ?? FindRepoRoot(Path.GetDirectoryName(Application.dataPath));
+            return string.IsNullOrEmpty(root) ? relative : Path.Combine(root, relative);
+        }
+
+        static string FindRepoRoot(string start)
+        {
+            for (var dir = string.IsNullOrEmpty(start) ? null : new DirectoryInfo(start); dir != null; dir = dir.Parent)
+                if (File.Exists(Path.Combine(dir.FullName, "tools", "ref.lock")) && File.Exists(Path.Combine(dir.FullName, "Directory.Build.props")))
+                    return dir.FullName;
+            return null;
         }
 
         static int[] ParseThreads(string text)
