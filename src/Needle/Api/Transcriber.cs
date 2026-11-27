@@ -29,7 +29,7 @@ public enum TranscriptWhy : byte
     Failed,
 }
 
-internal sealed class TranscriberState
+internal sealed partial class TranscriberState
 {
     public readonly ModelState Model;
     public readonly Whistle Whistle;
@@ -113,7 +113,7 @@ internal sealed class TranscriberState
 /// <c>default</c> transcriber throws <see cref="ObjectDisposedException"/>. One transcriber serves one thread at a time;
 /// after the first call on each audio length it allocates nothing.
 /// </summary>
-public readonly struct Transcriber : IDisposable, IEquatable<Transcriber>
+public readonly partial struct Transcriber : IDisposable, IEquatable<Transcriber>
 {
     readonly int slot;
     readonly int generation;
@@ -152,6 +152,16 @@ public readonly struct Transcriber : IDisposable, IEquatable<Transcriber>
 
     TranscriberState State => HandleTable<TranscriberState>.Get(slot, generation, nameof(Transcriber));
 
+    TranscriberState Idle
+    {
+        get
+        {
+            var state = State;
+            if (state.Mailbox is { Busy: true }) throw new InvalidOperationException("a posted transcription is still running on this transcriber; TryTake it first");
+            return state;
+        }
+    }
+
     /// <summary>The engine-level transcriber, for APIs that still take one.</summary>
     public Whistle Engine => State.Whistle;
 
@@ -161,12 +171,12 @@ public readonly struct Transcriber : IDisposable, IEquatable<Transcriber>
     public Utf8Span Language(int index) => new(State.LanguagesUtf8[index]);
 
     /// <summary>Transcribes 16 kHz mono audio. The transcript stays readable until the next call on this transcriber.</summary>
-    public Transcript Transcribe(ReadOnlySpan<float> pcm16k) => Run(State, pcm16k, -1, pcm16k.Length / (double)Wav.SampleRate);
+    public Transcript Transcribe(ReadOnlySpan<float> pcm16k) => Run(Idle, pcm16k, -1, pcm16k.Length / (double)Wav.SampleRate);
 
     /// <summary>Transcribes 16 kHz mono audio in a given language, such as <c>"en"u8</c>. An empty code detects the language.</summary>
     public Transcript Transcribe(ReadOnlySpan<float> pcm16k, ReadOnlySpan<byte> language)
     {
-        var state = State;
+        var state = Idle;
         var index = -1;
         if (!language.IsEmpty && (index = state.FindLanguage(language)) < 0)
         {
@@ -180,7 +190,7 @@ public readonly struct Transcriber : IDisposable, IEquatable<Transcriber>
     /// <summary>Transcribes mono audio at any sample rate, such as a 48 kHz microphone. It is resampled into the transcriber's own buffer.</summary>
     public Transcript Transcribe(ReadOnlySpan<float> pcm, int sampleRate, ReadOnlySpan<byte> language = default)
     {
-        var state = State;
+        var state = Idle;
         if (sampleRate == Wav.SampleRate) return Transcribe(pcm, language);
         var seconds = sampleRate > 0 ? pcm.Length / (double)sampleRate : 0;
         if (sampleRate < 1000 || sampleRate > 768000)
@@ -203,7 +213,7 @@ public readonly struct Transcriber : IDisposable, IEquatable<Transcriber>
     /// <summary>Words to listen for, such as character and place names. Set them once; each call then allocates nothing.</summary>
     public void SetKeywords(params string[]? keywords)
     {
-        var state = State;
+        var state = Idle;
         state.Invalidate();
         state.Keywords = keywords == null || keywords.Length == 0 ? null : (string[])keywords.Clone();
     }
@@ -211,13 +221,15 @@ public readonly struct Transcriber : IDisposable, IEquatable<Transcriber>
     /// <summary>Stops a transcription running on another thread as soon as it can. Safe to call from any thread.</summary>
     public void Cancel()
     {
-        if (HandleTable<TranscriberState>.TryGet(slot, generation, out var state)) state.Whistle.Cancel();
+        if (!HandleTable<TranscriberState>.TryGet(slot, generation, out var state)) return;
+        state.Mailbox?.Cancel();
+        state.Whistle.Cancel();
     }
 
     /// <summary>Runs the model once on silence-free noise so the first real call is not the slow one.</summary>
     public void WarmUp()
     {
-        var state = State;
+        var state = Idle;
         Span<float> noise = stackalloc float[Wav.SampleRate / 2];
         var seed = 12345u;
         for (var i = 0; i < noise.Length; i++)
@@ -233,8 +245,15 @@ public readonly struct Transcriber : IDisposable, IEquatable<Transcriber>
     {
         var state = HandleTable<TranscriberState>.Remove(slot, generation);
         if (state == null) return;
-        state.Invalidate();
-        state.Disposed = true;
+        try
+        {
+            state.StopMailbox();
+        }
+        finally
+        {
+            state.Invalidate();
+            state.Disposed = true;
+        }
         try
         {
             state.Whistle.Dispose();
@@ -245,7 +264,7 @@ public readonly struct Transcriber : IDisposable, IEquatable<Transcriber>
         }
     }
 
-    static Transcript Run(TranscriberState state, ReadOnlySpan<float> pcm, int language, double seconds)
+    internal static Transcript Run(TranscriberState state, ReadOnlySpan<float> pcm, int language, double seconds)
     {
         state.Invalidate();
         SpeechSpan span;

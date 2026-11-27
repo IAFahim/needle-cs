@@ -1,6 +1,8 @@
 using System;
+using System.Diagnostics;
 using System.IO;
 using System.Text;
+using System.Threading;
 using Xunit;
 
 namespace Needle.Tests;
@@ -192,5 +194,100 @@ public sealed class TranscriberSpeechTests
         copy.Dispose();
         Assert.False(copy.IsOpen);
         Assert.Throws<ObjectDisposedException>(() => { copy.Transcribe(new float[16]); });
+    }
+
+    static string TakeText(Transcriber ears)
+    {
+        var clock = Stopwatch.StartNew();
+        while (clock.Elapsed < TimeSpan.FromMinutes(2))
+        {
+            if (ears.TryTake(out var heard)) return heard.Ok ? Read(heard.Text) : heard.ToString();
+            Thread.Sleep(1);
+        }
+        throw new TimeoutException("the posted transcription did not finish");
+    }
+
+    [Fact]
+    public void PostedTranscriptsMatchTranscribing()
+    {
+        using var model = OpenModel();
+        using var ears = model.Transcriber(new TranscriberOptions { Threads = 2 });
+        var pcm = Clip("record.wav");
+        var direct = Read(ears.Transcribe(pcm).Text);
+        Assert.Equal(RecordText, direct);
+
+        Assert.False(ears.TryTake(out _));
+        Assert.True(ears.TryPost(pcm));
+        Array.Clear(pcm, 0, pcm.Length);
+        Assert.False(ears.TryPost(pcm));
+        if (ears.IsBusy) Assert.Throws<InvalidOperationException>(() => { ears.Transcribe(pcm); });
+        Assert.Equal(direct, TakeText(ears));
+        Assert.False(ears.IsBusy);
+        Assert.False(ears.TryTake(out _));
+
+        var mic = Wav.Resample(Clip("record.wav"), Wav.SampleRate, 48000);
+        ears.Post(mic, 48000, "en"u8);
+        var heard = ears.Take();
+        Assert.True(heard.Ok);
+        Assert.True(heard.Language.Equals("en"));
+        Assert.Contains("speed of sound at sea level", Read(heard.Text));
+
+        Assert.True(ears.TryPost(pcm, "xx"u8));
+        Assert.True(ears.TryTake(out var refused));
+        Assert.Equal(TranscriptWhy.UnknownLanguage, refused.Why);
+        Assert.Throws<InvalidOperationException>(() => { ears.Take(); });
+    }
+
+    [Fact]
+    public void PostingAllocatesNothingOnTheCallingThread()
+    {
+        using var model = OpenModel();
+        using var ears = model.Transcriber(new TranscriberOptions { Threads = 2 });
+        var pcm = Clip("record.wav");
+        var mic = Wav.Resample(pcm, Wav.SampleRate, 48000);
+        for (var i = 0; i < 2; i++)
+        {
+            ears.Post(pcm);
+            ears.Take();
+            ears.Post(mic, 48000);
+            ears.Take();
+        }
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        var bytes = 0;
+        for (var i = 0; i < 3; i++)
+        {
+            ears.Post(i % 2 == 0 ? pcm : mic, i % 2 == 0 ? Wav.SampleRate : 48000);
+            Transcript heard;
+            while (!ears.TryTake(out heard)) Thread.SpinWait(64);
+            bytes += heard.Text.Length;
+        }
+        Assert.Equal(0, GC.GetAllocatedBytesForCurrentThread() - before);
+        Assert.True(bytes > 0);
+    }
+
+    [Fact]
+    public void CancelAndDisposeStopAPostedTranscription()
+    {
+        using var model = OpenModel();
+        var ears = model.Transcriber(new TranscriberOptions { Threads = 2 });
+        try
+        {
+            var queen = Clip("test_long.wav");
+            ears.Engine.Observer = (stage, _) => { if (stage == "mel") ears.Cancel(); };
+            ears.Post(queen);
+            var heard = ears.Take();
+            Assert.Equal(TranscriptKind.Cancelled, heard.Kind);
+            ears.Engine.Observer = null;
+            Assert.Equal(RecordText, Read(ears.Transcribe(Clip("record.wav")).Text));
+            ears.Post(queen);
+            var clock = Stopwatch.StartNew();
+            ears.Dispose();
+            Assert.True(clock.Elapsed < TimeSpan.FromSeconds(30));
+            Assert.False(ears.IsOpen);
+        }
+        finally
+        {
+            ears.Dispose();
+        }
     }
 }
