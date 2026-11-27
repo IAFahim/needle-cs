@@ -22,8 +22,12 @@ env:
 
 jobs:
   eval:
-    name: 4.x acceptance suites, needle-cs vs upstream 4.x
-    runs-on: ubuntu-latest
+    name: 4.x acceptance suites, needle-cs vs upstream 4.x (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -45,7 +49,8 @@ jobs:
       - name: Download models and the 4.x engine
         run: |
           bash tools/fetch.sh
-          bash tools/fetch.sh --engine4 manylinux2014_x86_64
+          if [ "${{ runner.arch }}" = "ARM64" ]; then tag=manylinux2014_aarch64; else tag=manylinux2014_x86_64; fi
+          bash tools/fetch.sh --engine4 "$tag"
 
       - name: Publish the NativeAOT CLI
         run: dotnet publish src/Needle.Cli -c Release -o out/aot
@@ -63,7 +68,7 @@ jobs:
           echo "upstream exit $?"
           set -e
           python3 tools/eval_compare.py needle-cs.json upstream-4x.json --out eval.md
-          { echo "## 4.x acceptance suites (ubuntu-latest, run ${{ github.run_id }})"; echo; cat eval.md; } >> "$GITHUB_STEP_SUMMARY"
+          { echo "## 4.x acceptance suites (${{ matrix.os }}, run ${{ github.run_id }})"; echo; cat eval.md; } >> "$GITHUB_STEP_SUMMARY"
 
       - name: needle-cs thread invariance (same calls, suppressed calls and tokens at every thread count)
         run: |
@@ -90,7 +95,7 @@ jobs:
               bad += len(calls)
           sys.exit(1 if bad else 0)
           PY
-          { echo "## needle-cs thread invariance"; echo; cat threads.md; } >> "$GITHUB_STEP_SUMMARY"
+          { echo "## needle-cs thread invariance (${{ matrix.os }})"; echo; cat threads.md; } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Show one raw upstream envelope per suite
         if: always()
@@ -100,7 +105,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: eval-4x
+          name: eval-4x-${{ matrix.os }}
           path: |
             eval.md
             threads.md
