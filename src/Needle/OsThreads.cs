@@ -49,6 +49,24 @@ internal static unsafe class OsThreads
     [DllImport("kernel32", EntryPoint = "GetSystemCpuSetInformation")]
     static extern int WindowsGetCpuSetInformation(byte* buffer, uint bytes, uint* returned, IntPtr process, uint flags);
 
+    [DllImport("kernel32", EntryPoint = "GetSystemTimes")]
+    static extern int WindowsGetSystemTimes(long* idle, long* kernel, long* user);
+
+    [DllImport("kernel32", EntryPoint = "GetThreadTimes")]
+    static extern int WindowsGetThreadTimes(IntPtr thread, long* creation, long* exit, long* kernel, long* user);
+
+    [DllImport("libc", EntryPoint = "clock_gettime")]
+    static extern int LinuxClockGetTime(int clock, long* timespec);
+
+    [DllImport("libc", EntryPoint = "open")]
+    static extern int LinuxOpen(byte* path, int flags);
+
+    [DllImport("libc", EntryPoint = "read")]
+    static extern nint LinuxRead(int fd, byte* buffer, nint count);
+
+    [DllImport("libc", EntryPoint = "close")]
+    static extern int LinuxClose(int fd);
+
     [DllImport("libSystem", EntryPoint = "pthread_set_qos_class_self_np")]
     static extern int MacSetQosClass(uint qosClass, int relativePriority);
 
@@ -56,6 +74,85 @@ internal static unsafe class OsThreads
     {
         try { return IsLinux ? LinuxThreadId() : Environment.CurrentManagedThreadId; }
         catch (Exception) { return Environment.CurrentManagedThreadId; }
+    }
+
+    /// <summary>
+    /// Idle CPU time of the whole machine, summed over every logical CPU, in seconds since boot
+    /// (Windows: GetSystemTimes; Linux: /proc/stat idle plus iowait). False where the OS does not
+    /// say (macOS, or a sandbox that hides /proc/stat). No allocation.
+    /// </summary>
+    public static bool TrySystemIdleSeconds(out double seconds)
+    {
+        seconds = 0;
+        try
+        {
+            if (IsWindows)
+            {
+                long idle, kernel, user;
+                if (WindowsGetSystemTimes(&idle, &kernel, &user) == 0) return false;
+                seconds = idle * 1e-7;
+                return true;
+            }
+            if (IsLinux) return TryLinuxIdle(out seconds);
+        }
+        catch (Exception) { }
+        return false;
+    }
+
+    /// <summary>CPU time the calling thread has used, in 100 ns units; false where not known. No allocation.</summary>
+    public static bool TryCurrentThreadCpu(out long ticks)
+    {
+        ticks = 0;
+        try
+        {
+            if (IsWindows)
+            {
+                long creation, exit, kernel, user;
+                if (WindowsGetThreadTimes(WindowsCurrentThread(), &creation, &exit, &kernel, &user) == 0) return false;
+                ticks = kernel + user;
+                return true;
+            }
+            if (IsLinux)
+            {
+                const int ClockThreadCpuTime = 3;
+                var timespec = stackalloc long[2];
+                if (LinuxClockGetTime(ClockThreadCpuTime, timespec) != 0) return false;
+                ticks = timespec[0] * 10_000_000 + timespec[1] / 100;
+                return true;
+            }
+        }
+        catch (Exception) { }
+        return false;
+    }
+
+    static bool TryLinuxIdle(out double seconds)
+    {
+        seconds = 0;
+        var path = stackalloc byte[] { (byte)'/', (byte)'p', (byte)'r', (byte)'o', (byte)'c', (byte)'/', (byte)'s', (byte)'t', (byte)'a', (byte)'t', 0 };
+        var fd = LinuxOpen(path, 0);
+        if (fd < 0) return false;
+        const int Size = 256;
+        var buffer = stackalloc byte[Size];
+        var length = LinuxRead(fd, buffer, Size);
+        LinuxClose(fd);
+        // First line: "cpu  user nice system idle iowait ..." in clock ticks (USER_HZ, 100 per second).
+        if (length < 8 || buffer[0] != (byte)'c' || buffer[1] != (byte)'p' || buffer[2] != (byte)'u' || buffer[3] != (byte)' ') return false;
+        var field = 0;
+        long idle = 0;
+        var i = 4;
+        while (i < length && buffer[i] != (byte)'\n' && field < 5)
+        {
+            while (i < length && buffer[i] == (byte)' ') i++;
+            long value = 0;
+            var digits = 0;
+            while (i < length && buffer[i] >= (byte)'0' && buffer[i] <= (byte)'9') { value = value * 10 + (buffer[i] - (byte)'0'); i++; digits++; }
+            if (digits == 0) return false;
+            if (field == 3 || field == 4) idle += value;
+            field++;
+        }
+        if (field < 5) return false;
+        seconds = idle * 0.01;
+        return true;
     }
 
     public static int[]? AllowedLinuxCpus()

@@ -403,7 +403,10 @@ public sealed unsafe class NeedleHost : IDisposable
 
     void Loop()
     {
-        OsThreads.ConfigureCurrentThread(policy.Priority, policy.Placement, -1);
+        // This thread is the team's caller member: every barrier waits for it, so a lowered priority
+        // here (Game's BelowNormal) stalls the whole team on a busy machine. Run it like a direct caller.
+        var priority = policy.Priority == WorkerPriority.AboveNormal ? WorkerPriority.AboveNormal : WorkerPriority.Normal;
+        OsThreads.ConfigureCurrentThread(priority, policy.Placement, -1);
         while (Volatile.Read(ref stopping) == 0)
             if (!TryProcessBatch()) Park();
     }

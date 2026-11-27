@@ -38,6 +38,37 @@ public sealed class SpeechTests : IDisposable
     }
 
     [Fact]
+    public void TranscriptIsBitIdenticalAtEveryThreadCount()
+    {
+        // Every encoder stage bit for bit, plus the transcript and every word probability (from the decode logits).
+        var clip = Clip("test_long.wav").AsSpan(0, 25 * 16000).ToArray();
+        string? expected = null;
+        System.Collections.Generic.List<(string Stage, float[] Values)>? expectedStages = null;
+        foreach (var threads in new[] { 1, 2, 3, 4, 6, 8 })
+        {
+            using var local = new Whistle(model, threads);
+            var stages = new System.Collections.Generic.List<(string Stage, float[] Values)>();
+            local.Observer = (stage, values) => stages.Add((stage, values.ToArray()));
+            var result = local.Transcribe(clip, "en", wordTimestamps: true);
+            var words = string.Join("|", (result.Words ?? Array.Empty<Word>()).Select(w => $"{w.Text}:{BitConverter.DoubleToInt64Bits(w.Probability):x}:{w.Start}:{w.End}"));
+            var fingerprint = $"{result.Text} {words}";
+            if (expected == null) { expected = fingerprint; expectedStages = stages; continue; }
+            Assert.Equal(expectedStages!.Count, stages.Count);
+            for (var i = 0; i < stages.Count; i++)
+            {
+                var (stage, values) = stages[i];
+                var reference = expectedStages[i].Values;
+                Assert.Equal(expectedStages[i].Stage, stage);
+                Assert.Equal(reference.Length, values.Length);
+                for (var v = 0; v < values.Length; v++)
+                    if (BitConverter.SingleToInt32Bits(reference[v]) != BitConverter.SingleToInt32Bits(values[v]))
+                        Assert.Fail($"threads {threads}: stage {i} ({stage}) value {v} of {values.Length}: {values[v]} vs {reference[v]} at 1 thread");
+            }
+            Assert.True(expected == fingerprint, $"threads {threads}:\n{fingerprint}\nexpected (1 thread):\n{expected}");
+        }
+    }
+
+    [Fact]
     public void RecordMatchesUpstreamExactly()
     {
         Assert.Equal("In one short sentence, what is the speed of sound at sea level?", whistle.Transcribe(Clip("record.wav")).Text);
