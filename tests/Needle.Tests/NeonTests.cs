@@ -675,4 +675,91 @@ public sealed unsafe class NeonTests
             NativeMemory.Free(x);
         }
     }
+
+    // Neon.Prepare against Neon.Hadamard (the original vector rotation) and the original truncating
+    // quantiser, bit for bit, including tokens after the first.
+    [Theory]
+    [InlineData(2)]
+    [InlineData(4)]
+    public void PrepareIsBitExactToHadamardAndTruncation(int bits)
+    {
+        if (!Simd.UseNeon) return;
+        const int cols = 768;
+        const int tokens = 3;
+        const int groups = cols / 128;
+        var x = (float*)NativeMemory.Alloc(cols * tokens * 4);
+        var values = (sbyte*)NativeMemory.Alloc(cols * tokens);
+        var scales = (float*)NativeMemory.Alloc(8 * tokens * 4);
+        var offsets = (float*)NativeMemory.Alloc(8 * tokens * 4);
+        var rotated = stackalloc float[128];
+        var quantized = stackalloc sbyte[128];
+        var planes = stackalloc sbyte[128];
+        try
+        {
+            Fill(x, cols * tokens, 90 + bits, 3f);
+            x[5] = 0f;
+            var activations = new Activations(values, scales, offsets, cols);
+            Neon.Prepare(x, tokens, cols, bits, activations);
+            for (var t = 0; t < tokens; t++)
+            {
+                var slice = activations.Slice(t);
+                for (var g = 0; g < groups; g++)
+                {
+                    Neon.Hadamard(x + t * cols + g * 128, rotated);
+                    var peak = 0f;
+                    for (var i = 0; i < 128; i++) peak = MathF.Max(peak, MathF.Abs(rotated[i]));
+                    var scale = peak > 0f ? peak / 127f : 1f;
+                    var inverse = 1f / scale;
+                    for (var i = 0; i < 128; i++) quantized[i] = (sbyte)Math.Clamp((int)(rotated[i] * inverse), -128, 127);
+                    Scalar.Planes(quantized, bits, planes, out var sum);
+                    Assert.Equal(BitConverter.SingleToInt32Bits(scale), BitConverter.SingleToInt32Bits(slice.Scales[g]));
+                    Assert.Equal(Codebook.Bias * sum, slice.Offsets[g]);
+                    for (var i = 0; i < 128; i++)
+                        Assert.True(planes[i] == slice.Values[g * 128 + i], $"prepare{bits} t{t} g{g}[{i}]: {slice.Values[g * 128 + i]} vs {planes[i]}");
+                }
+            }
+        }
+        finally
+        {
+            NativeMemory.Free(x); NativeMemory.Free(values); NativeMemory.Free(scales); NativeMemory.Free(offsets);
+        }
+    }
+
+    // Sharding the hyper prepare by groups (Ops.RmsStats, then PrepareFakeGroupsRange per shard)
+    // must reproduce PrepareRmsFakeA8 bit for bit wherever Quant.CanSplitRmsFakeA8 says so.
+    [Theory]
+    [InlineData(2, 768)]
+    [InlineData(4, 3072)]
+    public void SplitRmsFakeA8IsBitExact(int bits, int cols)
+    {
+        if (!Simd.Enabled || !Quant.CanSplitRmsFakeA8) return;
+        var groups = cols / 128;
+        var stride = (groups + 7) & ~7;
+        var x = (float*)NativeMemory.Alloc((nuint)(cols * 4));
+        var scratch = (float*)NativeMemory.Alloc((nuint)(cols * 4));
+        var expectedValues = (sbyte*)NativeMemory.Alloc((nuint)cols);
+        var actualValues = (sbyte*)NativeMemory.Alloc((nuint)cols);
+        var expectedScales = (float*)NativeMemory.AllocZeroed((nuint)(stride * 8));
+        var actualScales = (float*)NativeMemory.AllocZeroed((nuint)(stride * 8));
+        try
+        {
+            Fill(x, cols, 500 + bits, 4f);
+            var expected = new Activations(expectedValues, expectedScales, expectedScales + stride, cols);
+            var actual = new Activations(actualValues, actualScales, actualScales + stride, cols);
+            Quant.PrepareRmsFakeA8(x, scratch, cols, bits, expected);
+            Ops.RmsStats(x, cols, out var inverse, out var rawPeak);
+            var cut0 = groups / 3;
+            var cut1 = 2 * groups / 3 + 1;
+            Quant.PrepareFakeGroupsRange(x, rawPeak * inverse, inverse, bits, actual, cut1, groups);
+            Quant.PrepareFakeGroupsRange(x, rawPeak * inverse, inverse, bits, actual, 0, cut0);
+            Quant.PrepareFakeGroupsRange(x, rawPeak * inverse, inverse, bits, actual, cut0, cut1);
+            for (var i = 0; i < cols; i++) Assert.True(expectedValues[i] == actualValues[i], $"values[{i}]");
+            AssertBits(actualScales, expectedScales, 2 * stride, "scales and offsets");
+        }
+        finally
+        {
+            NativeMemory.Free(x); NativeMemory.Free(scratch); NativeMemory.Free(expectedValues); NativeMemory.Free(actualValues);
+            NativeMemory.Free(expectedScales); NativeMemory.Free(actualScales);
+        }
+    }
 }

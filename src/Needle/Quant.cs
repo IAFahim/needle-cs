@@ -285,9 +285,15 @@ internal static unsafe class Quant
     static void PrepareFakeGroups(float* x, float a8Peak, float rmsInv, int bits, in Activations a) =>
         PrepareFakeGroupsRange(x, a8Peak, rmsInv, bits, a, 0, a.Groups);
 
+    // Whether Ops.RmsStats plus PrepareFakeGroupsRange over any split of the groups reproduces
+    // PrepareRmsFakeA8 bit for bit on this machine, so a caller may shard the hyper prepare.
+    internal static bool CanSplitRmsFakeA8 =>
+        Simd.UseNeon || (Simd.UseAvx && (void*)Kernels.Active.Prepare == null && (void*)Kernels.Active.RmsFakeA8 == null);
+
     [SkipLocalsInit]
     internal static void PrepareFakeGroupsRange(float* x, float a8Peak, float rmsInv, int bits, in Activations a, int groupStart, int groupEnd)
     {
+        if (Simd.UseNeon) { NeonPrepare.FakeGroupsRange(x, a8Peak, rmsInv, bits, a, groupStart, groupEnd); return; }
         var a8Scale = a8Peak > 0f ? a8Peak / 127f : 1f;
         var vRmsInv = Vector256.Create(rmsInv);
         var vA8Inv = Vector256.Create(1f / a8Scale);

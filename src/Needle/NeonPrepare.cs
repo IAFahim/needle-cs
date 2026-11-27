@@ -20,14 +20,26 @@ internal static unsafe class NeonPrepare
     // Neon.RmsFakeA8(x, n, scratch) then Neon.Prepare(scratch, 1, n, bits, a).
     public static void RmsFakeA8(float* x, int n, int bits, in Activations a)
     {
-        SumOfSquaresAndPeak(x, null, n, out var sumOfSquares, out var rawPeak);
-        var scalarInv = 1f / MathF.Sqrt(sumOfSquares / n + RmsEpsilon);
+        RmsStats(x, n, out var inverse, out var rawPeak);
         // |x * inv| is monotonic in |x|, so the peak of the scaled values is the scaled raw peak.
-        var peak = rawPeak * scalarInv;
-        var fake = FakeScale(peak);
-        var inverse = Vector128.Create(scalarInv);
+        FakeGroupsRange(x, rawPeak * inverse, inverse, bits, a, 0, a.Groups);
+    }
+
+    // The rms inverse Neon.RmsFakeA8 uses and the peak of |x|, for callers that split the groups.
+    public static void RmsStats(float* x, int n, out float inverse, out float rawPeak)
+    {
+        SumOfSquaresAndPeak(x, null, n, out var sumOfSquares, out rawPeak);
+        inverse = 1f / MathF.Sqrt(sumOfSquares / n + RmsEpsilon);
+    }
+
+    // Groups [groupStart, groupEnd) of RmsFakeA8 given its stats: each group is fake-quantised with the
+    // whole row's a8Peak and packed exactly as RmsFakeA8 packs it, so any split is bit-identical.
+    public static void FakeGroupsRange(float* x, float a8Peak, float rmsInverse, int bits, in Activations a, int groupStart, int groupEnd)
+    {
+        var fake = FakeScale(a8Peak);
+        var inverse = Vector128.Create(rmsInverse);
         var p = stackalloc float[Cq.GroupSize];
-        for (var g = 0; g < a.Groups; g++)
+        for (var g = groupStart; g < groupEnd; g++)
         {
             var source = x + g * Cq.GroupSize;
             for (var i = 0; i < Cq.GroupSize; i += 4)
@@ -115,7 +127,7 @@ internal static unsafe class NeonPrepare
         return f;
     }
 
-    // Neon.SumOfSquares(x, n) (n a multiple of 8) plus the peak of |x| or of |(1 + scale) * x|.
+    // Neon.SumOfSquares(x, n) plus the peak of |x| or of |(1 + scale) * x|.
     static void SumOfSquaresAndPeak(float* x, float* scale, int n, out float sumOfSquares, out float peak)
     {
         var s0 = Vector128<float>.Zero;
@@ -123,7 +135,8 @@ internal static unsafe class NeonPrepare
         var m0 = Vector128<float>.Zero;
         var m1 = Vector128<float>.Zero;
         var one = Vector128.Create(1f);
-        for (var i = 0; i < n; i += 8)
+        var i = 0;
+        for (; i + 8 <= n; i += 8)
         {
             var a = AdvSimd.LoadVector128(x + i);
             var b = AdvSimd.LoadVector128(x + i + 4);
@@ -137,8 +150,15 @@ internal static unsafe class NeonPrepare
             m0 = AdvSimd.Max(m0, AdvSimd.Abs(a));
             m1 = AdvSimd.Max(m1, AdvSimd.Abs(b));
         }
-        sumOfSquares = Neon.HorizontalSum(AdvSimd.Add(s0, s1)) + 0f;
-        peak = AdvSimd.Arm64.MaxAcross(AdvSimd.Max(m0, m1)).ToScalar();
+        var tail = 0f;
+        var tailPeak = 0f;
+        for (; i < n; i++)
+        {
+            tail = MathF.FusedMultiplyAdd(x[i], x[i], tail);
+            tailPeak = MathF.Max(tailPeak, MathF.Abs(scale == null ? x[i] : (1f + scale[i]) * x[i]));
+        }
+        sumOfSquares = Neon.HorizontalSum(AdvSimd.Add(s0, s1)) + tail;
+        peak = MathF.Max(AdvSimd.Arm64.MaxAcross(AdvSimd.Max(m0, m1)).ToScalar(), tailPeak);
     }
 
     // Rotates the group at source into p (source may equal p), then quantises it into slot g of a.
@@ -146,61 +166,97 @@ internal static unsafe class NeonPrepare
     {
         StridedStages(source, p, 0);
         StridedStages(source, p, 1);
+        // The 4-element stage pairs neighbouring vectors; a 4x4 transpose then turns the 2- and
+        // 1-element stages into vector adds. Each output is the same sum as Neon.Hadamard's in-vector
+        // butterflies, and the result lands in plane order: planar[(k * 8 + m) * 4 + j] holds
+        // element 16m + 4j + k, which is exactly what the 2-bit and 4-bit layouts interleave.
         var scale = Vector128.Create(HadamardScale);
         var peak = Vector128<float>.Zero;
-        for (var i = 0; i < Cq.GroupSize; i += 8)
+        var planar = stackalloc float[Cq.GroupSize];
+        for (var m = 0; m < 8; m++)
         {
-            var x = AdvSimd.LoadVector128(p + i);
-            var y = AdvSimd.LoadVector128(p + i + 4);
-            var r0 = AdvSimd.Multiply(Butterfly8(AdvSimd.Add(x, y)), scale);
-            var r1 = AdvSimd.Multiply(Butterfly8(AdvSimd.Subtract(x, y)), scale);
-            AdvSimd.Store(p + i, r0);
-            AdvSimd.Store(p + i + 4, r1);
-            peak = AdvSimd.Max(peak, AdvSimd.Max(AdvSimd.Abs(r0), AdvSimd.Abs(r1)));
+            var block = p + m * 16;
+            var v0 = AdvSimd.LoadVector128(block);
+            var v1 = AdvSimd.LoadVector128(block + 4);
+            var v2 = AdvSimd.LoadVector128(block + 8);
+            var v3 = AdvSimd.LoadVector128(block + 12);
+            var w0 = AdvSimd.Add(v0, v1);
+            var w1 = AdvSimd.Subtract(v0, v1);
+            var w2 = AdvSimd.Add(v2, v3);
+            var w3 = AdvSimd.Subtract(v2, v3);
+            var t0 = AdvSimd.Arm64.TransposeEven(w0, w1).AsUInt64();
+            var t1 = AdvSimd.Arm64.TransposeOdd(w0, w1).AsUInt64();
+            var t2 = AdvSimd.Arm64.TransposeEven(w2, w3).AsUInt64();
+            var t3 = AdvSimd.Arm64.TransposeOdd(w2, w3).AsUInt64();
+            var u0 = AdvSimd.Arm64.TransposeEven(t0, t2).AsSingle();
+            var u2 = AdvSimd.Arm64.TransposeOdd(t0, t2).AsSingle();
+            var u1 = AdvSimd.Arm64.TransposeEven(t1, t3).AsSingle();
+            var u3 = AdvSimd.Arm64.TransposeOdd(t1, t3).AsSingle();
+            var e0 = AdvSimd.Add(u0, u2);
+            var e1 = AdvSimd.Add(u1, u3);
+            var o0 = AdvSimd.Subtract(u0, u2);
+            var o1 = AdvSimd.Subtract(u1, u3);
+            var r0 = AdvSimd.Multiply(AdvSimd.Add(e0, e1), scale);
+            var r1 = AdvSimd.Multiply(AdvSimd.Subtract(e0, e1), scale);
+            var r2 = AdvSimd.Multiply(AdvSimd.Add(o0, o1), scale);
+            var r3 = AdvSimd.Multiply(AdvSimd.Subtract(o0, o1), scale);
+            AdvSimd.Store(planar + m * 4, r0);
+            AdvSimd.Store(planar + 32 + m * 4, r1);
+            AdvSimd.Store(planar + 64 + m * 4, r2);
+            AdvSimd.Store(planar + 96 + m * 4, r3);
+            peak = AdvSimd.Max(peak, AdvSimd.Max(AdvSimd.Max(AdvSimd.Abs(r0), AdvSimd.Abs(r1)), AdvSimd.Max(AdvSimd.Abs(r2), AdvSimd.Abs(r3))));
         }
         var groupPeak = AdvSimd.Arm64.MaxAcross(peak).ToScalar();
         var groupScale = groupPeak > 0f ? groupPeak / 127f : 1f;
         var inv = Vector128.Create(1f / groupScale);
-        var quantized = stackalloc sbyte[Cq.GroupSize];
         var sums = Vector128<short>.Zero;
-        for (var i = 0; i < Cq.GroupSize; i += 16)
-        {
-            var w0 = AdvSimd.ConvertToInt32RoundToZero(AdvSimd.Multiply(AdvSimd.LoadVector128(p + i), inv));
-            var w1 = AdvSimd.ConvertToInt32RoundToZero(AdvSimd.Multiply(AdvSimd.LoadVector128(p + i + 4), inv));
-            var w2 = AdvSimd.ConvertToInt32RoundToZero(AdvSimd.Multiply(AdvSimd.LoadVector128(p + i + 8), inv));
-            var w3 = AdvSimd.ConvertToInt32RoundToZero(AdvSimd.Multiply(AdvSimd.LoadVector128(p + i + 12), inv));
-            var h0 = AdvSimd.ExtractNarrowingSaturateUpper(AdvSimd.ExtractNarrowingSaturateLower(w0), w1);
-            var h1 = AdvSimd.ExtractNarrowingSaturateUpper(AdvSimd.ExtractNarrowingSaturateLower(w2), w3);
-            var q = AdvSimd.ExtractNarrowingSaturateUpper(AdvSimd.ExtractNarrowingSaturateLower(h0), h1);
-            AdvSimd.Store(quantized + i, q);
-            sums = AdvSimd.AddPairwiseWideningAndAdd(sums, q);
-        }
-        var slot = g;
-        a.Scales[slot] = groupScale;
-        a.Offsets[slot] = Codebook.Bias * AdvSimd.Arm64.AddAcrossWidening(sums).ToScalar();
         var destination = a.Values + (long)g * Cq.GroupSize;
         if (bits == 2)
         {
+            // Plane k of half h holds elements 64h + 4i + k: sixteen consecutive planar floats.
             for (var half = 0; half < 2; half++)
-            {
-                var (p0, p1, p2, p3) = AdvSimd.Arm64.Load4xVector128AndUnzip(quantized + half * 64);
-                AdvSimd.Store(destination + half * 16, p0);
-                AdvSimd.Store(destination + half * 16 + 32, p1);
-                AdvSimd.Store(destination + half * 16 + 64, p2);
-                AdvSimd.Store(destination + half * 16 + 96, p3);
-            }
+                for (var k = 0; k < 4; k++)
+                {
+                    var q = Quantize16(planar + k * 32 + half * 16, inv);
+                    AdvSimd.Store(destination + half * 16 + k * 32, q);
+                    sums = AdvSimd.AddPairwiseWideningAndAdd(sums, q);
+                }
         }
         else
         {
+            // The even elements of quarter q interleave planes 0 and 2, the odd ones planes 1 and 3.
             for (var quarter = 0; quarter < 4; quarter++)
             {
-                var (even, odd) = AdvSimd.Arm64.Load2xVector128AndUnzip(quantized + quarter * 32);
+                var n0 = Quantize8(planar + quarter * 8, inv);
+                var n1 = Quantize8(planar + 32 + quarter * 8, inv);
+                var n2 = Quantize8(planar + 64 + quarter * 8, inv);
+                var n3 = Quantize8(planar + 96 + quarter * 8, inv);
+                var even = AdvSimd.ExtractNarrowingSaturateUpper(
+                    AdvSimd.ExtractNarrowingSaturateLower(AdvSimd.Arm64.ZipLow(n0, n2)), AdvSimd.Arm64.ZipHigh(n0, n2));
+                var odd = AdvSimd.ExtractNarrowingSaturateUpper(
+                    AdvSimd.ExtractNarrowingSaturateLower(AdvSimd.Arm64.ZipLow(n1, n3)), AdvSimd.Arm64.ZipHigh(n1, n3));
                 var column = (quarter >> 1) * 64 + (quarter & 1) * 16;
                 AdvSimd.Store(destination + column, even);
                 AdvSimd.Store(destination + column + 32, odd);
+                sums = AdvSimd.AddPairwiseWideningAndAdd(sums, even);
+                sums = AdvSimd.AddPairwiseWideningAndAdd(sums, odd);
             }
         }
+        a.Scales[g] = groupScale;
+        a.Offsets[g] = Codebook.Bias * AdvSimd.Arm64.AddAcrossWidening(sums).ToScalar();
     }
+
+    // Eight floats times inv, truncated to int32 and saturated to int16, as Neon.Prepare quantises.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    static Vector128<short> Quantize8(float* x, Vector128<float> inv) =>
+        AdvSimd.ExtractNarrowingSaturateUpper(
+            AdvSimd.ExtractNarrowingSaturateLower(AdvSimd.ConvertToInt32RoundToZero(AdvSimd.Multiply(AdvSimd.LoadVector128(x), inv))),
+            AdvSimd.ConvertToInt32RoundToZero(AdvSimd.Multiply(AdvSimd.LoadVector128(x + 4), inv)));
+
+    // Sixteen floats quantised as Quantize8 and saturated to int8.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    static Vector128<sbyte> Quantize16(float* x, Vector128<float> inv) =>
+        AdvSimd.ExtractNarrowingSaturateUpper(AdvSimd.ExtractNarrowingSaturateLower(Quantize8(x, inv)), Quantize8(x + 8, inv));
 
     // The 64/32/16/8-element butterfly stages of Neon.Hadamard for the vectors of one parity
     // (vector j covers elements 4j..4j+3; these stages pair vectors whose indices differ by an even
@@ -258,19 +314,6 @@ internal static unsafe class NeonPrepare
         var sum = AdvSimd.Add(a, b);
         b = AdvSimd.Subtract(a, b);
         a = sum;
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    static Vector128<float> Butterfly8(Vector128<float> t)
-    {
-        var rotated = Vector128.Shuffle(t, Vector128.Create(2, 3, 0, 1));
-        var even = AdvSimd.Add(t, rotated).GetLower();
-        var odd = AdvSimd.Subtract(t, rotated).GetLower();
-        var sums = AdvSimd.AddPairwise(even, odd);
-        var diffs = AdvSimd.Arm64.ZipLow(
-            AdvSimd.Subtract(even, Vector64.Shuffle(even, Vector64.Create(1, 0))),
-            AdvSimd.Subtract(odd, Vector64.Shuffle(odd, Vector64.Create(1, 0))));
-        return AdvSimd.Arm64.ZipLow(sums.ToVector128(), diffs.ToVector128());
     }
 }
 #endif

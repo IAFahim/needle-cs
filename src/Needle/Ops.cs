@@ -512,6 +512,7 @@ internal static unsafe class Ops
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static void RmsStats(float* x, int n, out float inverse, out float rawPeak)
     {
+        if (Simd.UseNeon) { NeonPrepare.RmsStats(x, n, out inverse, out rawPeak); return; }
         var s0 = Vector256<float>.Zero;
         var s1 = Vector256<float>.Zero;
         var s2 = Vector256<float>.Zero;
