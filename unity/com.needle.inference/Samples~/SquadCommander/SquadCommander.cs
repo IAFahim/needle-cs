@@ -12,7 +12,8 @@ namespace Needle.Samples.SquadCommander
         public string ModelFile = "needle3.cact";
         public Transform Squad;
         public float Speed = 6f;
-        [Range(0f, 1f)] public float MinConfidence = 0.1f;
+        [Tooltip("Calls below this confidence are refused. Games use 0.3; the engine default is upstream 4.x's 0.1.")]
+        [Range(0f, 1f)] public float MinConfidence = 0.3f;
         [Tooltip("Needle worker threads. 0 = automatic: half the logical cores, capped at 4 (4 threads where the box has headroom, 2 on a 4-core laptop). Set 1-4 to force a count.")]
         public int Threads = 0;
 
@@ -38,7 +39,7 @@ namespace Needle.Samples.SquadCommander
                 ModelPath = path,
                 ToolsJson = Encoding.UTF8.GetString(SquadCommands.Schema.ToArray()),
                 StatelessQueries = true,
-                Session = new NeedleOptions { Threading = ThreadPolicy.Game.WithThreads(ResolveThreads()), RetrievalTopK = SquadCommands.GrammarToolCount },
+                Session = new NeedleOptions { Threading = ThreadPolicy.Game.WithThreads(ResolveThreads()), RetrievalTopK = SquadCommands.GrammarToolCount, RefuseBelow = MinConfidence },
             });
         }
 

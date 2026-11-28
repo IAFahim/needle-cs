@@ -1,0 +1,13 @@
+The six acceptance suites in this folder (smart_home, media_player, productivity,
+wearable, kitchen_appliance, data_capture: tools, system prompt, 32 cases each with
+expected calls and critical flags) are derived from cactus-compute 4.2.0,
+cactus/environments/*.py, Copyright Cactus Compute, licensed under the Apache
+License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0).
+
+The scoring rule (needle eval --suite, src/Needle.Cli/EvalSuites.cs, and
+tools/eval_rule.py) follows the same package's cactus/environments/_harness.py,
+and the date fact and client-side year grounding follow cactus/agent/grounding.py.
+
+<suite>.tools.json holds the exact bytes the package hands to cactus_init
+(json.dumps of the schemas its cactus.tool decorator builds); regenerate with
+  python3 -I tools/gen_environments.py <extracted cactus-compute wheel>

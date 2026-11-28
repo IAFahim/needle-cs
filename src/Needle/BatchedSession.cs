@@ -24,7 +24,7 @@ public sealed unsafe class BatchedSession : IDisposable
     static ReadOnlySpan<byte> LaterQueryHead => "<|im_start|>user\n"u8;
     static ReadOnlySpan<byte> QueryTail => "<|im_end|>\n<|im_start|>assistant\n"u8;
 
-    static readonly Regex DateKey = new(@"\bdate\s*:", RegexOptions.IgnoreCase);
+    static readonly Regex DateKey = new(@"(?<![A-Za-z])date:");
     static readonly Regex IsoStamp = new(@"\d{4}-\d{2}-\d{2}");
 
     enum Phase : byte { Reasoning, ThinkTail, Call, CallClosingFeed, CallClosing, Respond, RespondClosing }
@@ -108,6 +108,7 @@ public sealed unsafe class BatchedSession : IDisposable
     readonly byte[] historySeed;
     readonly DateTime? today;
     int laneCount;
+    int disposed;
     internal long TurnGate;
 
     public BatchedSession(Model model, NeedleOptions? options = null, int maxSequences = 8)
@@ -787,6 +788,7 @@ public sealed unsafe class BatchedSession : IDisposable
 
     public void Dispose()
     {
+        if (System.Threading.Interlocked.Exchange(ref disposed, 1) != 0) return;
         for (var i = 0; i < laneCount; i++)
         {
             lanes[i].Grammar.Dispose();

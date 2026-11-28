@@ -62,6 +62,8 @@ public sealed unsafe class NeedleHost : IDisposable
         where TSink : struct, Tools.ICallSink<TCommand>
         where TCommand : unmanaged
     {
+        if (sizeof(TCommand) > ChannelLimits.CallsCapacity)
+            throw new ArgumentException($"{typeof(TCommand).Name} is {sizeof(TCommand)} bytes, larger than the {ChannelLimits.CallsCapacity}-byte calls buffer of a channel reply", nameof(TCommand));
         typedHost = true;
         return StartCore(in options, RunTyped<TSink, TCommand>);
     }
@@ -353,11 +355,14 @@ public sealed unsafe class NeedleHost : IDisposable
             var spin = new SpinWait();
 #endif
             while (!channel.TryPublishReply(in reply))
+            {
+                if (Volatile.Read(ref stopping) != 0) return;
 #if NETSTANDARD2_1
                 spin.SpinOnce();
 #else
                 spin.SpinOnce(-1);
 #endif
+            }
         }
     }
 
@@ -403,7 +408,10 @@ public sealed unsafe class NeedleHost : IDisposable
 
     void Loop()
     {
-        OsThreads.ConfigureCurrentThread(policy.Priority, policy.Placement, -1);
+        // This thread is the team's caller member: every barrier waits for it, so a lowered priority
+        // here (Game's BelowNormal) stalls the whole team on a busy machine. Run it like a direct caller.
+        var priority = policy.Priority == WorkerPriority.AboveNormal ? WorkerPriority.AboveNormal : WorkerPriority.Normal;
+        OsThreads.ConfigureCurrentThread(priority, policy.Placement, -1);
         while (Volatile.Read(ref stopping) == 0)
             if (!TryProcessBatch()) Park();
     }

@@ -430,7 +430,7 @@ foreach (var call in agent.Ask("set a timer for 12 minutes"))
     if (call.Is(out IKitchen.SetTimerArgs t)) Console.WriteLine($"timer: {t.Minutes} min");
 ```
 
-## 11. What is built (phases 1 to 3)
+## 11. What is built (phases 1 to 3, and speech from phase 4)
 
 The quickstart above compiles as written under C# 9 against the netstandard2.1 build, and runs on .NET 10.
 
@@ -438,12 +438,74 @@ The quickstart above compiles as written under C# 9 against the netstandard2.1 b
 | --- | --- | --- |
 | Model | `NeedleModel` (readonly struct handle) | `Open`, `TryOpen`, `FromMemory`, `FromBytes`, `FromStream`. Reference counted: the weights live until the last agent made from them is disposed. |
 | Agent | `NeedleAgent` (readonly struct handle) | `model.Agent(json)`, `model.Agent<TTools>()`, `NeedleAgent.Open<TTools>(path)`. A default or disposed handle throws `ObjectDisposedException`. |
-| Options | `AgentOptions` (struct, no references) | Every default is upstream 4.x: automatic threads, `auto_date` on, repair on, floor 0.1, 96 reasoning tokens, 2048 context. `Toggle` for three-way switches. |
+| Options | `AgentOptions` (struct, no references) | Every default is upstream 4.x: automatic threads, `auto_date` on, repair on, floor 0.1, 96 reasoning tokens, 2048 context. `Toggle` for three-way switches. The Unity samples set a floor of 0.3. |
 | Asking | `Ask`, `Continue` | UTF-8, `ReadOnlySpan<char>` and `string` overloads. A caller-buffer `Ask(utf8, Span<byte>, out Reply)` returns `OperationStatus`. |
 | Answer | `Answer` (ref struct) | `Kind`, `Ok`, `Why`, `Calls`, `Suppressed`, `Text`, `Thinking`, `Confidence`, `Ungrounded`, `Details`. A view over the agent's buffers: no allocation, and it throws once a later call replaces it. |
 | Call | `Call` (ref struct) | `Name`, `Arguments` (`Utf8Span`), `Is("name")`, `Is(out TArgs)`, `TryGetInt32`/`Int64`/`Single`/`Double`/`Boolean`/`Text`/`String`. |
 | Tools | `[Tools] partial interface` | Methods and parameters described with `System.ComponentModel.Description`. Generated: `[ToolSchema]`, `XxxArgs` structs, `Calls.Schema`, `Calls.Dispatch(call or answer, handler)`. |
+| Limits | `[Arg(Min, Max, MaxLength, Inferred)]` | `Min`/`Max` become the schema's `minimum`/`maximum`, `MaxLength` its `maxLength` (characters, as the grammar counts them). Repair checks every call on both paths: a number out of range withholds that call, not clamps it, as 4.x never returns arguments that break the schema nor invents a value; the answer has `ReplyFlags.Invalid`, and `AnswerWhy.OutOfRange` when no call is left. `Inferred = true` lists the field in a tool-level `"inferred"` array the model never sees, and exempts it from the grounding gate and from dropping unstated values; ranges still apply. No allocation per turn. |
+| Diagnostics | generator and `ToolsAnalyzer` | Errors: NDG001 parameter type the generator cannot bind, NDG002 `[Tools]` on a non-interface or generic type, NDG004 `ref`/`out`/`in`, NDG010 interface not `partial`, NDG011 `MaxLength` past a `Utf8TextN` capacity, NDG012 bad `[Arg]` limits, NDG014 reserved or colliding names. Warnings: NDG007 generic method, NDG009 no description, NDG013 `Ask`/`Continue` in `Update`, `LateUpdate` or `FixedUpdate` (use `TryPost` and `TryTake`). Netstandard2.0, C# 9 sources. |
 | Game path | `TryPost`, `TryTake`, `IsBusy`, `Take`, `Cancel` | One request in flight per agent, run on the agent's own thread, which sleeps on an event while idle. |
 | System facts | `SetSystem` | Copies the facts in and re-primes; the tools stay. |
 
-Not built yet: `[Arg(Min, Max, Inferred)]`, streaming events per frame (`turn.Run(budget)`), the speech additions and the analyzers named in phase 2.
+| Streamed turn | `NeedleTurn` (readonly struct handle) | `agent.Begin(text)` or `BeginContinue(json)`, then `turn.Run(budget)` once a frame, `IsDone`, `Answer`, `Cancel`. Goes stale (throws) when the agent starts another turn. |
+| Turn events | `TurnEvents`, `TurnEvent` (ref structs) | One slice's events: `Thinking`, `Speaking`, `CallStarted`, `ArgumentProgress`, `CallClosed`, then one final `Done`, `Refused`, `Failed` or `Cancelled` that carries the `Answer`. Valid until the next turn. |
+| Polling the game path | `TryPoll(out TurnEvents)` | The same events for a posted request, read without blocking while the agent's own thread computes. |
+| Listening | `agent.Listen(speech, in ListenOptions)` returns `NeedleVoice` (readonly struct handle) | `Write` (any one audio thread), `Hold`, `Release`, `EndPhrase`, `Step(budget, out Hearing)`, `Cancel`, `IsBusy`, `DroppedSamples`. |
+| Hearing | `Hearing` (ref struct), `HearingKind` | `SpeechStarted`, `Partial`, `CallReady`, `Unsure`, `Done`; `Transcript`, `Committed`, `LowestWordConfidence`, `Call` (a `TurnEvent`), `HasAnswer`, `Answer`. Valid until the next `Step`. |
+| Streaming speech | `VoiceStream` (class, kept) | Same `Write`/`Update`/`Stop` as before, now incremental; `StreamDelta` gains `PassStartSeconds`, `PassSeconds` and `Final`. |
+
+### Turns a slice at a time
+
+```csharp
+var turn = agent.Begin("send squad two to the bridge");
+// every frame:
+foreach (var e in turn.Run(FrameBudget.FromMilliseconds(2)))
+{
+    if (e.Kind == TurnEventKind.Thinking) ui.ShowThinking(e.Text);
+    if (e.Kind == TurnEventKind.CallClosed && !e.IsWithheld) Preview(e.Name, e.Arguments);  // provisional
+}
+if (turn.IsDone) Apply(turn.Answer);    // the same answer, bit for bit, as agent.Ask would give
+```
+
+- Ask and a streamed turn run one resumable stepper, the same steps in the same order, so the answer is identical at every budget, thread count and lossless speed-up. `TurnStreamTests` checks this over every session case at budgets of 1 token, 16 tokens, 0.5 ms and unlimited, at 1 and 4 threads.
+- A budget is a `FrameBudget`: at most `MaxTokensPerSlice` tokens (prompt tokens fed plus tokens generated) and/or about `MaxMillisecondsPerSlice`. A time slice stops before a step that would likely overrun it, judging by the step just taken. A step is never split: prefill runs in engine chunks of up to 64 tokens, and every `Run` takes at least one step, so it always makes progress. `options.FrameBudget` keeps its old meaning, a hard cap on a whole turn.
+- `CallClosed` restores and repairs the calls closed so far with buffers of its own. It is provisional: the final repair sees the whole list and can still change or drop a call (`IsWithheld` says the repair already drops it). Act on it for previews, and on the answer for effects.
+- While a turn runs, other work on the agent throws until it ends or is cancelled. Cancelling, like any cancelled turn, forgets the conversation.
+- The event log is sized when the agent is made, so a streamed turn allocates nothing.
+
+### Listening
+
+```csharp
+using var voice = agent.Listen(speechModel, new ListenOptions { Language = "en" });
+// audio thread:
+voice.Write(micSamples16k);
+// every frame:
+while (voice.Step(FrameBudget.FromMilliseconds(3), out Hearing e))
+{
+    switch (e.Kind)
+    {
+        case HearingKind.Partial:   subtitles.Show(e.Transcript); break;
+        case HearingKind.CallReady: Preview(e.Call); break;
+        case HearingKind.Unsure:    AskToRepeat(e.Transcript); break;
+        case HearingKind.Done:      Apply(e.Answer); break;   // == agent.Ask(e.Transcript)
+    }
+}
+```
+
+- Speech goes into the same agent, so the answer to a phrase is exactly `agent.Ask` of its transcript (checked by `ListenTests`).
+- A phrase ends at a pause (energy voice activity over 20 ms frames, an adaptive noise floor, 0.7 s by default), at `Release` in push-to-talk, or at `EndPhrase`. Silence before speech is dropped down to a 0.3 s pre-roll and never transcribed.
+- `Step` spends its budget on one speech step (the stem, one encoder layer, the cross memory, priming, or one decoded token) or one model step at a time; the token budget counts both alike. Speech uses greedy decoding (beam 1), the same as `VoiceSession`, and the tools' enum values as keywords.
+- `Unsure` means nothing was heard, the agent refused, or (when `ListenOptions.UnsureBelow` is set) a word's confidence fell below it; the transcript and, where the agent ran, the answer are still there, so the game can ask "did you say Lyra?".
+- `Write` goes through a single-producer, single-consumer ring (10 s by default); samples that do not fit are dropped and counted.
+
+### Why streaming speech is incremental per phrase, not per frame
+
+Whistle's encoder attends over the whole window and normalises features over the whole window, so the encoding of second 3 depends on second 9. An exact frame-incremental encoder does not exist for this model; any reuse of old encoder states would change transcripts. So the stream is incremental at the phrase level instead:
+
+- Committed audio is dropped and never encoded again. Words are committed at a pause, at `Stop`, or when the uncommitted window outgrows `MaxWindowSeconds` (8 s; the words ending more than 2 s before the window's end are committed and the audio cut halfway through the next gap).
+- Until then the window is re-read for partial words at most every `PartialSeconds` (0.5 s) of new audio.
+- Every second of audio is therefore encoded a bounded number of times and the total cost grows linearly. The old stream re-read the whole uncommitted window on every update, which grew quadratically. `VoiceStream.EncodedSeconds` reports the total, and `VoiceStreamTests` checks that six phrases cost no more per second than two.
+- A committing pass reads exactly the audio between two commit points with the same code as `TranscribeUtf8`, so its words equal `whistle.TranscribeUtf8` of that audio bit for bit (`VoiceStreamTests`). The Whistle pass itself is now resumable a stage at a time, and the offline path runs the same stepper, so offline transcripts are unchanged.
+
+Not built yet: command-mode grammar decoding of speech, `[Spoken]` hotwords, semantic endpointing (closing a phrase early when the grammar sees a complete call), a native microphone ring shared across agents, and the Unity agent asset and its listening additions (until then the samples carry the 0.3 floor). `Text32` still counts bytes while the schema's `maxLength` counts characters, so multi-byte text can be cut below the schema's limit; NDG011 only catches a limit larger than the type.

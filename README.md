@@ -17,7 +17,7 @@ Early but usable for a showcase: everything below works on Linux x64 today and i
 | Threading | `ThreadPolicy` presets, the library never pins your calling thread, workers park when idle, `Pause`/`Resume` |
 | Speed | Faster than the upstream native engine on the reference VM (73-84 ms vs 95-129 ms per call, 4 threads). A further 3x is planned, see below |
 | Per-call allocations | About 6 KB of managed allocations per call today. Zero-allocation API and typed C# calls are planned |
-| Voice | Whistle transcription matches the upstream library on record, test and hotword; long25 keeps the queen passage but differs by one short phrase (issue #38). Beam search is on by default (`BeamWidth = 3`), `BeamWidth = 1` gives faster greedy decoding |
+| Voice | Whistle transcription matches the upstream library on record, test and hotword; long25 keeps the queen passage but differs by one short phrase (issue #38). Beam search is on by default (`BeamWidth = 3`) on every path, including the allocation-free `TranscribeUtf8`, `PushToTalk`, `VoiceStream`, `VoiceSession` and `VoiceHost`; `BeamWidth = 1` gives faster greedy decoding. One `Whistle` instance runs one call at a time and throws if a second thread overlaps it |
 | Evaluating tool sets | `needle eval` with 208 game prompts, see below |
 | Unity | Package with a plain `MonoBehaviour` sample (Squad commander) and an Entities `ISystem` sample, see below |
 
@@ -65,7 +65,7 @@ order latency          : median 3 frames (50 ms)
 
 The same code as a Unity `MonoBehaviour` (no ECS, no Burst needed) is the **Squad commander** sample of the `com.needle.inference` package (Package Manager, Samples). Three things worth knowing:
 
-- Describe your commands as an interface with `[NeedleTools]`; the source generator produces the schema, the grammar and a blittable command struct. Short parameter descriptions (`[Param]`) noticeably raise confidence.
+- Describe your commands as an interface with `[NeedleTools]`; the source generator produces the schema, the grammar and a blittable command struct. Short parameter descriptions (`[Param]`) noticeably raise confidence, and `[Arg(Min = 0, Max = 100)]` puts limits in the schema that repair enforces; mark values the game works out itself (coordinates, target ids) `[Arg(Inferred = true)]` so the grounding gate does not refuse them.
 - Set `HostOptions.StatelessQueries = true` when each order is independent (almost always in a game). Otherwise every query continues the previous conversation and confidence decays.
 - Replies below `NeedleOptions.RefuseBelow` arrive as `Refused` but still carry their calls. Ask the player to rephrase instead of acting on them.
 
@@ -300,7 +300,7 @@ How to read the report:
 - **calibration** groups every reply that carries a call by its confidence. A usable threshold sits where accuracy in the bin clearly beats the bins below it. The model is monotone but not sharp: in the reference run, calls under 0.1 are right 7% of the time and calls above 0.5 are right 86% to 100% of the time.
 - **RefuseBelow curve** re-scores the same replies at each threshold. *Coverage* is the share of in-domain prompts that still execute, *precision* the share of executed calls that are exactly right, *false-call* the share of out-of-domain prompts that still execute a call, and *wrong executed* the count of executed calls that are wrong. Pick the row whose wrong-executed count your game can tolerate.
 
-Reference run (needle3, 4 threads, `AutoDate=false RetrievalTopK=64`, greedy, 208 prompts): exact 65.9%, tool 77.2%, args 72.7%, no-call 78.1%, median 200 ms per prompt. By set: chains 73.5%, dialogue 60.6%, rpg 47.2%, rts 63.9%, settings 83.8%. The default threshold 0.1 gives the best overall accuracy (67.8%) but still executes 40 wrong calls; 0.3 executes 22 (precision 82%, coverage 68%) and 0.5 executes 7 (precision 92%, coverage 47%). For commands where a wrong action is worse than a repeated prompt, start at `RefuseBelow = 0.3` and raise it for destructive commands.
+Reference run (needle3, 4 threads, `AutoDate=false RetrievalTopK=64`, greedy, 208 prompts): exact 65.9%, tool 77.2%, args 72.7%, no-call 78.1%, median 200 ms per prompt. By set: chains 73.5%, dialogue 60.6%, rpg 47.2%, rts 63.9%, settings 83.8%. The default threshold 0.1 gives the best overall accuracy (67.8%) but still executes 40 wrong calls; 0.3 executes 22 (precision 82%, coverage 68%) and 0.5 executes 7 (precision 92%, coverage 47%). For commands where a wrong action is worse than a repeated prompt, start at `RefuseBelow = 0.3` and raise it for destructive commands. The Unity samples use 0.3; the engine default stays upstream's 0.1.
 
 ### Tool design tips
 

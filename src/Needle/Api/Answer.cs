@@ -39,6 +39,12 @@ public enum AnswerWhy : byte
     ToolContextFailed,
     FrameBudget,
     Failed,
+    /// <summary>
+    /// Every call broke a schema <c>minimum</c> or <c>maximum</c> (an <see cref="ArgAttribute"/> limit) and was withheld.
+    /// The kind is <see cref="AnswerKind.Declined"/>; a turn that kept some calls is <see cref="AnswerKind.Calls"/> with
+    /// <see cref="ReplyFlags.Invalid"/> in <see cref="Answer.Details"/>.
+    /// </summary>
+    OutOfRange,
 }
 
 /// <summary>

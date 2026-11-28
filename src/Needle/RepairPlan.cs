@@ -30,7 +30,13 @@ internal sealed class RepairParam
     public bool MaximumExclusive;
     public bool Date;
     public bool Phone;
+    // Free text the request must supply word for word (no enum, format or pattern).
+    public bool FreeText;
+    // Every option is a proper name ("Maya", "Dr. Patel"): a closed set of people or places.
+    public bool NameOptions;
     public ParamRole Role;
+    // The game infers it ([Arg(Inferred = true)], or the tool's "inferred" list): no grounding gate, no evidence repair.
+    public bool Inferred;
 }
 
 internal sealed class RepairTool
@@ -99,6 +105,7 @@ internal sealed class RepairPlan
     public RepairPlan(ToolSet tools, string rawToolsJson)
     {
         var raw = RawTriggers(rawToolsJson);
+        var inferred = RawLists(rawToolsJson, "inferred");
         Tools = new RepairTool[tools.Tools.Count];
         var longest = 16;
         for (var t = 0; t < Tools.Length; t++)
@@ -108,6 +115,7 @@ internal sealed class RepairPlan
             var original = tools.OriginalName(alias);
             var tool = new RepairTool { Name = Encoding.UTF8.GetBytes(original), EscapedName = EscapedUtf8(original), NameWords = SplitWords(original) };
             if (raw.TryGetValue(original, out var triggers)) tool.Triggers = triggers;
+            inferred.TryGetValue(original, out var inferredNames);
             var parameters = schema.Get("parameters");
             var properties = parameters?.Get("properties");
             var required = new HashSet<string>();
@@ -117,7 +125,9 @@ internal sealed class RepairPlan
             if (properties is { Kind: JsonKind.Object })
                 foreach (var member in properties.Members)
                 {
-                    var param = BuildParam(tools.OriginalProperty(alias, member.Key), member.Value, required.Contains(member.Key));
+                    var key = tools.OriginalProperty(alias, member.Key);
+                    var param = BuildParam(key, member.Value, required.Contains(member.Key));
+                    param.Inferred = inferredNames != null && Array.IndexOf(inferredNames, key) >= 0;
                     foreach (var option in param.Options) longest = Math.Max(longest, option.Length);
                     if (param.DefaultJson != null) longest = Math.Max(longest, param.DefaultJson.Length);
                     built.Add(param);
@@ -132,7 +142,11 @@ internal sealed class RepairPlan
         foreach (var tool in Tools) HasTriggers |= tool.Triggers.Length > 0;
     }
 
-    internal static Dictionary<string, string[]> RawTriggers(string toolsJson)
+    internal static Dictionary<string, string[]> RawTriggers(string toolsJson) => RawLists(toolsJson, "triggers");
+
+    // A tool-level list of strings that the model never sees: ToolSet keeps only name, description and parameters.
+    // "triggers" holds patterns that route a request to the tool; "inferred" names parameters the game fills in.
+    internal static Dictionary<string, string[]> RawLists(string toolsJson, string listKey)
     {
         var map = new Dictionary<string, string[]>();
         JsonValue parsed;
@@ -142,10 +156,10 @@ internal sealed class RepairPlan
         {
             var tool = entry.Get("function") is { Kind: JsonKind.Object } wrapped ? wrapped : entry;
             var name = tool.GetString("name");
-            var triggers = tool.Get("triggers") ?? entry.Get("triggers");
-            if (name == null || triggers is not { Kind: JsonKind.Array }) continue;
+            var list = tool.Get(listKey) ?? entry.Get(listKey);
+            if (name == null || list is not { Kind: JsonKind.Array }) continue;
             var patterns = new List<string>();
-            foreach (var item in triggers.Items)
+            foreach (var item in list.Items)
                 if (item.Kind == JsonKind.String && item.Text.Length > 0) patterns.Add(item.Text);
             if (patterns.Count > 0) map[name] = patterns.ToArray();
         }
@@ -176,6 +190,10 @@ internal sealed class RepairPlan
             }
             param.Options = values.ToArray();
             param.OptionWords = words.ToArray();
+            param.NameOptions = values.Count > 0;
+            foreach (var option in options.Items)
+                if (option.Kind != JsonKind.Null && !(option.Kind == JsonKind.String && option.Text.Length > 0 && option.Text[0] is >= 'A' and <= 'Z'))
+                    param.NameOptions = false;
             if (param.Kind == ParamKind.Other) param.Kind = ParamKind.String;
             ClassifyOptions(param);
         }
@@ -185,10 +203,15 @@ internal sealed class RepairPlan
         if (Number(resolved, "exclusiveMaximum") is { } xmax) { param.Maximum = xmax; param.MaximumExclusive = true; }
         var lower = name.ToLowerInvariant();
         var format = resolved.GetString("format");
+        // A "_human" phrase or one the schema says to copy word for word stays as the user wrote it.
+        var verbatim = lower.Contains("human") || Mentions(schema, resolved, "word for word", "verbatim");
         param.Date = param.Kind == ParamKind.String && param.Options.Length == 0 &&
-            (format is "date" or "date-time" || lower == "date" || lower == "day" || lower.EndsWith("_date") || lower.StartsWith("date_") || name.EndsWith("Date", StringComparison.Ordinal));
+            (format is "date" or "date-time" || !verbatim && format == null &&
+             (lower == "date" || lower == "day" || lower.EndsWith("_date") || lower.StartsWith("date_") || name.EndsWith("Date", StringComparison.Ordinal)));
         param.Phone = param.Kind == ParamKind.String && param.Options.Length == 0 &&
             (lower.Contains("phone") || lower == "tel" || lower.Contains("mobile") || (lower == "number" || lower.EndsWith("_number") && lower.Contains("contact")) && Mentions(schema, resolved, "phone"));
+        param.FreeText = param.Kind == ParamKind.String && param.Options.Length == 0 && !param.Date && !param.Phone && format == null &&
+            resolved.GetString("pattern") == null && schema.GetString("pattern") == null;
         if (param.Kind == ParamKind.Boolean) param.BoolPolar = BoolFamily(lower);
         param.Role = param.Kind != ParamKind.String || param.Options.Length > 0 ? ParamRole.None : lower switch
         {

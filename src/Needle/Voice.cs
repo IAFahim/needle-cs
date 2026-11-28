@@ -44,19 +44,7 @@ public sealed class VoiceSession : IDisposable
 
     public NeedleSession Needle => needle;
 
-    public SpeechSpan TranscribeSpan(ReadOnlySpan<float> pcm, Span<byte> utf8, Span<WordSlice> words, string? language = null)
-    {
-        var previousBeam = whistle.BeamWidth;
-        whistle.BeamWidth = 1;
-        try
-        {
-            return whistle.TranscribeUtf8(pcm, utf8, words, language, vocabulary);
-        }
-        finally
-        {
-            whistle.BeamWidth = previousBeam;
-        }
-    }
+    public SpeechSpan TranscribeSpan(ReadOnlySpan<float> pcm, Span<byte> utf8, Span<WordSlice> words, string? language = null) => whistle.TranscribeUtf8(pcm, utf8, words, language, vocabulary);
 
     public (Reply Reply, SpeechSpan Speech) CompleteSpan(ReadOnlySpan<float> pcm, Span<byte> calls, Span<byte> reasoning, Span<byte> response, Span<byte> transcriptUtf8, Span<WordSlice> transcriptWords, string? language = null)
     {
@@ -76,7 +64,7 @@ public sealed class VoiceSession : IDisposable
 
     internal static System.Collections.Generic.List<string> EnumKeywords(string toolsJson) => EnumValues(new ToolSet(toolsJson));
 
-    static List<string> EnumValues(ToolSet tools)
+    internal static List<string> EnumValues(ToolSet tools)
     {
 
         var found = new List<string>();

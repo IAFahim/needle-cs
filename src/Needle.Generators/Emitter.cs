@@ -245,7 +245,7 @@ internal static class Emitter
     {
         var arg = tool.Args[p];
         var target = $"Command.{tool.Name}.{Pascal(arg.Name)}";
-        var bit = "0x" + (1u << p) + "u";
+        var bit = "0x" + (1u << p).ToString("x", CultureInfo.InvariantCulture) + "u";
         builder.Append(indent).Append("                    case ").Append(p).Append(":\n");
         builder.Append(indent).Append("                    {\n");
         switch (arg.Type)
@@ -395,7 +395,7 @@ internal static class Emitter
             case ArgType.Float:
             case ArgType.Double: return 3;
             case ArgType.Bool: return 4;
-            case ArgType.Text: return AddNode(nodes, 1, arg.FixedText ? arg.TextCapacity : -1, 0, 0, 0);
+            case ArgType.Text: return AddNode(nodes, 1, arg.TextLimit, 0, 0, 0);
         }
         var first = literals.Count / 2;
         foreach (var literal in arg.EnumLiterals)
@@ -425,7 +425,7 @@ internal static class Emitter
     static void EmitDispatch(StringBuilder builder, ToolSetModel model, string indent)
     {
         builder.Append(indent).Append("    public static void Dispatch<THandler>(ref THandler handler, in ").Append(model.CommandName)
-            .Append(" command) where THandler : struct, ").Append(model.Q(model.InterfaceName)).Append('\n');
+            .Append(" command) where THandler : struct, ").Append(model.InterfaceType).Append('\n');
         builder.Append(indent).Append("    {\n");
         builder.Append(indent).Append("        switch (command.Kind)\n");
         builder.Append(indent).Append("        {\n");
@@ -473,11 +473,15 @@ internal static class Emitter
             builder.Append(indent).Append("                    {\n");
             builder.Append(indent).Append("                        switch (member.Key)\n");
             builder.Append(indent).Append("                        {\n");
+            var labels = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var arg in tool.Args) labels.Add(arg.Alias);
             for (var p = 0; p < tool.Args.Length; p++)
             {
                 var arg = tool.Args[p];
                 var target = $"command.{tool.Name}.{Pascal(arg.Name)}";
-                builder.Append(indent).Append("                            case \"").Append(CSharpEscape(arg.Name)).Append("\":\n");
+                builder.Append(indent).Append("                            case \"").Append(CSharpEscape(arg.Alias)).Append("\":\n");
+                if (labels.Add(arg.Name))
+                    builder.Append(indent).Append("                            case \"").Append(CSharpEscape(arg.Name)).Append("\":\n");
                 switch (arg.Type)
                 {
                     case ArgType.Int:
@@ -539,7 +543,7 @@ internal static class Emitter
     {
         builder.Append(indent);
         for (var i = 0; i < tabs; i++) builder.Append("    ");
-        builder.Append("command.Presence |= 0x").Append(1u << bit).Append("u;\n");
+        builder.Append("command.Presence |= 0x").Append((1u << bit).ToString("x", CultureInfo.InvariantCulture)).Append("u;\n");
     }
 
     static void EmitEnumReaders(StringBuilder builder, ToolSetModel model, string indent)
@@ -564,8 +568,10 @@ internal static class Emitter
     static string EnumReaderName(ToolArg arg)
     {
         var name = arg.EnumTypeName!;
-        var dot = name.LastIndexOf('.');
-        return dot >= 0 ? name.Substring(dot + 1) + "From" : name + "From";
+        if (name.StartsWith("global::", StringComparison.Ordinal)) name = name.Substring("global::".Length);
+        var builder = new StringBuilder(name.Length + 4);
+        foreach (var c in name) builder.Append(char.IsLetterOrDigit(c) || c == '_' ? c : '_');
+        return builder.Append("From").ToString();
     }
 
     static string EnumMemberName(ToolArg arg, int index) => arg.EnumTypeName! + "." + arg.EnumMembers[index];
@@ -583,6 +589,9 @@ internal static class Emitter
                 case '\n': builder.Append("\\n"); break;
                 case '\r': builder.Append("\\r"); break;
                 case '\t': builder.Append("\\t"); break;
+                case '\u0085': builder.Append("\\u0085"); break;
+                case '\u2028': builder.Append("\\u2028"); break;
+                case '\u2029': builder.Append("\\u2029"); break;
                 default: builder.Append(c); break;
             }
         return builder.ToString();
@@ -635,7 +644,13 @@ internal static class Emitter
             foreach (var arg in tool.Args)
                 if (!arg.Optional) required.Add(Quote(arg.Alias));
             if (required.Count > 0) builder.Append(",\"required\":[").Append(string.Join(",", required)).Append(']');
-            builder.Append("}}");
+            builder.Append('}');
+            // Tool-level, beside "triggers": ToolSet drops it from the prompt, and RepairPlan reads it from the raw JSON.
+            var inferred = new List<string>();
+            foreach (var arg in tool.Args)
+                if (arg.Inferred) inferred.Add(Quote(arg.Alias));
+            if (inferred.Count > 0) builder.Append(",\"inferred\":[").Append(string.Join(",", inferred)).Append(']');
+            builder.Append('}');
         }
         builder.Append(']');
         return builder.ToString();
@@ -673,7 +688,9 @@ internal static class Emitter
             }
             builder.Append(']');
         }
-        if (arg.Type == ArgType.Text && arg.FixedText) builder.Append(",\"maxLength\":").Append(arg.TextCapacity.ToString(CultureInfo.InvariantCulture));
+        if (arg.Minimum is { } minimum) builder.Append(",\"minimum\":").Append(ToolModelBuilder.Number(minimum));
+        if (arg.Maximum is { } maximum) builder.Append(",\"maximum\":").Append(ToolModelBuilder.Number(maximum));
+        if (arg.TextLimit > 0) builder.Append(",\"maxLength\":").Append(arg.TextLimit.ToString(CultureInfo.InvariantCulture));
         builder.Append('}');
         return builder.ToString();
     }

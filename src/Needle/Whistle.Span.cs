@@ -1,7 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.Text;
+using System.Threading;
 
 namespace Needle;
 
@@ -62,6 +62,8 @@ public sealed unsafe partial class Whistle
     IReadOnlyList<string>? spanKeywordSource = new List<string>();
     string[] spanKeywordStrings = Array.Empty<string>();
 
+    bool spanAlign = true;
+
     public int MaxTranscriptTokens => g.MaxSeq;
 
     void EnsureSpanBuffers()
@@ -95,44 +97,19 @@ public sealed unsafe partial class Whistle
     public SpeechSpan TranscribeUtf8(ReadOnlySpan<float> pcm, Span<byte> utf8, Span<WordSlice> words, string? language = null, IReadOnlyList<string>? keywords = null)
     {
         if (language != null && Array.IndexOf(languages, language) < 0) throw new ArgumentException($"language is one of {string.Join(" ", languages)}");
-        if (BeamWidth != 1)
-        {
-            var fallback = Transcribe(pcm, language, keywords, true);
-            return CopyFallback(fallback, utf8, words);
-        }
         var maxSamples = MaxSeconds * audio->SampleRate;
-        if (pcm.Length <= maxSamples) return TranscribeShortUtf8(pcm, utf8, words, language, keywords);
-        return TranscribeLongUtf8(pcm, utf8, words, language, keywords);
-    }
-
-    static SpeechSpan CopyFallback(Transcription fallback, Span<byte> utf8, Span<WordSlice> words)
-    {
-        var bytes = Encoding.UTF8.GetBytes(fallback.Text);
-        var truncated = bytes.Length > utf8.Length;
-        var count = Math.Min(bytes.Length, utf8.Length);
-        bytes.AsSpan(0, count).CopyTo(utf8);
-        var kept = 0;
-        var offset = 0;
-        if (fallback.Words != null)
+        Enter();
+        try
         {
-            foreach (var w in fallback.Words)
-            {
-                var start = fallback.Text.IndexOf(w.Text, offset, StringComparison.Ordinal);
-                if (start < 0) break;
-                offset = start + w.Text.Length;
-                if (kept >= words.Length) { truncated = true; break; }
-                var byteStart = Encoding.UTF8.GetByteCount(fallback.Text, 0, start);
-                var byteLength = Encoding.UTF8.GetByteCount(w.Text);
-                if (byteStart + byteLength > count) { truncated = true; break; }
-                words[kept++] = new WordSlice(byteStart, byteLength, w.Start, w.End, w.Probability);
-            }
+            if (pcm.Length <= maxSamples) return TranscribeShortUtf8(pcm, utf8, words, language, keywords);
+            return TranscribeLongUtf8(pcm, utf8, words, language, keywords);
         }
-        return new SpeechSpan(count, kept, fallback.Text.Length > 0 ? fallback.Language : null,
-            fallback.TimeToFirstTokenMs, fallback.DecodeTps, fallback.EncodeMs, truncated);
+        finally { Exit(); }
     }
 
     SpeechSpan TranscribeShortUtf8(ReadOnlySpan<float> pcm, Span<byte> utf8, Span<WordSlice> words, string? language, IReadOnlyList<string>? keywords)
     {
+        spanAlign = words.Length > 0;
         EnsureDecoderBuffers();
         EnsureSpanBuffers();
         CacheKeywords(keywords);
@@ -143,6 +120,7 @@ public sealed unsafe partial class Whistle
 
     SpeechSpan TranscribeLongUtf8(ReadOnlySpan<float> pcm, Span<byte> utf8, Span<WordSlice> words, string? language, IReadOnlyList<string>? keywords)
     {
+        spanAlign = true;
         EnsureDecoderBuffers();
         EnsureSpanBuffers();
         CacheKeywords(keywords);
@@ -153,6 +131,7 @@ public sealed unsafe partial class Whistle
         var totalUtf8 = 0;
         var totalWords = 0;
         var truncated = false;
+        var textOnly = words.Length == 0;
         string? detected = language;
         string? firstLanguage = null;
         double ttftMs = 0, tps = 0, encodeMs = 0;
@@ -160,6 +139,7 @@ public sealed unsafe partial class Whistle
         var first = true;
         while (offset < pcm.Length)
         {
+            if (offset > 0 && CancelPending()) break;
             var length = Math.Min(window, pcm.Length - offset);
             var tokens = DecodeSpan(pcm.Slice(offset, length), detected, out var windowLanguage, out var windowTtft, out var windowTps, out var windowEncode, out _);
             if (first) { firstLanguage = windowLanguage; ttftMs = windowTtft; tps = windowTps; encodeMs = windowEncode; first = false; }
@@ -180,11 +160,11 @@ public sealed unsafe partial class Whistle
             for (var i = 0; i < cut; i++)
             {
                 var w = scratchWords[i];
-                if (totalWords >= words.Length) { truncated = true; break; }
-                if (totalUtf8 + w.Utf8Length + (totalWords > 0 ? 1 : 0) > utf8.Length) { truncated = true; break; }
-                if (totalWords > 0) utf8[totalUtf8++] = (byte)' ';
+                if (!textOnly && totalWords >= words.Length) { truncated = true; break; }
+                if (totalUtf8 + w.Utf8Length + (totalUtf8 > 0 ? 1 : 0) > utf8.Length) { truncated = true; break; }
+                if (totalUtf8 > 0) utf8[totalUtf8++] = (byte)' ';
                 new Span<byte>(scratch, w.Utf8Offset, w.Utf8Length).CopyTo(utf8.Slice(totalUtf8));
-                words[totalWords++] = new WordSlice(totalUtf8, w.Utf8Length, w.Start + base_, w.End + base_, w.Probability);
+                if (!textOnly) words[totalWords++] = new WordSlice(totalUtf8, w.Utf8Length, w.Start + base_, w.End + base_, w.Probability);
                 totalUtf8 += w.Utf8Length;
             }
             if (last) break;
@@ -211,63 +191,198 @@ public sealed unsafe partial class Whistle
         return false;
     }
 
+    enum SpanStage : byte { Idle, Stem, EncoderStart, EncoderLayer, EncoderFinish, Memory, Prime, Decode, Done }
+
+    // Everything one greedy pass carries from one step to the next. TranscribeUtf8 runs the steps back to back; a
+    // speech stream runs them a slice at a time. Same code, same order, so the transcripts are the same bit for bit.
+    struct SpanPass
+    {
+        public SpanStage Stage;
+        public int L0;
+        public int Layer;
+        public int Count;
+        public FrameJob Job;
+        public long Started;
+        public long DecodeStart;
+        public double TtftMs;
+        public double Tps;
+        public double EncodeMs;
+        public string? Language;
+        public string? Detected;
+        public bool Empty;
+        public bool HasKeywords;
+    }
+
+    SpanPass span;
+
     int DecodeSpan(ReadOnlySpan<float> pcm, string? language, out string? detected, out double ttftMs, out double tps, out double encodeMs, out bool empty)
+    {
+        if (BeamWidth > 1) return BeamSpan(pcm, language, out detected, out ttftMs, out tps, out encodeMs, out empty);
+        if (BeginSpanPass(pcm, language))
+            while (!StepSpanPass()) { }
+        detected = span.Detected;
+        ttftMs = span.TtftMs;
+        tps = span.Tps;
+        encodeMs = span.EncodeMs;
+        empty = span.Empty;
+        return span.Empty ? 0 : span.Count;
+    }
+
+    int BeamSpan(ReadOnlySpan<float> pcm, string? language, out string? detected, out double ttftMs, out double tps, out double encodeMs, out bool empty)
     {
         detected = null;
         ttftMs = 0;
         tps = 0;
         encodeMs = 0;
         empty = true;
-        if (Rms(pcm) < SilenceRms) return 0;
+        if (Silent(pcm)) return 0;
         var started = Stopwatch.GetTimestamp();
-        if (Encode(pcm) == 0) return 0;
+        if (EncodeCore(pcm) == 0) return 0;
         BuildCrossMemory();
         encodeMs = (Stopwatch.GetTimestamp() - started) * 1000.0 / Stopwatch.Frequency;
         detected = PrimeSpan(language);
-        var tokens = spanTokens!;
-        var probs = spanProbs!;
-        var count = 0;
-        var one = stackalloc int[1];
-        var firstToken = Stopwatch.GetTimestamp();
-        var decodeStart = firstToken;
-        var hasKeywords = spanKeywordStrings.Length > 0;
-        for (var step = 0; step < g.MaxSeq - 3; step++)
-        {
-            var logits = decoder.Logits;
-            int best;
-            float prob;
-            if (!hasKeywords)
-            {
-                var lp = 0f;
-                var p = 0f;
-                fixed (float* src = logits)
-                    Ops.TopKLogSoftmax(src, textVocab, 1, &best, &lp, &p, true);
-                prob = p;
-            }
-            else
-            {
-                logits.Slice(0, textVocab).CopyTo(new Span<float>(scores, textVocab));
-                scores[0] = scores[2] = scores[3] = -1e30f;
-                ApplyKeywordBiasSpan(new ReadOnlySpan<int>(tokens, 0, count), scores);
-                best = Ops.ArgMax(scores, textVocab);
-                prob = Ops.BestProbability(scores, textVocab, scores[best]);
-            }
-            if (step == 0) ttftMs = (Stopwatch.GetTimestamp() - started) * 1000.0 / Stopwatch.Frequency;
-            probs[count] = prob;
-            if (best == Eos)
-            {
-                one[0] = Eos;
-                decoder.Feed(new ReadOnlySpan<int>(one, 1));
-                break;
-            }
-            tokens[count++] = best;
-            one[0] = best;
-            decoder.Feed(new ReadOnlySpan<int>(one, 1));
-        }
-        var seconds = Math.Max(1e-9, (Stopwatch.GetTimestamp() - decodeStart) / (double)Stopwatch.Frequency);
-        tps = count / seconds;
+        var decodeStart = Stopwatch.GetTimestamp();
+        var count = BeamSearch(true);
+        ttftMs = (Stopwatch.GetTimestamp() - started) * 1000.0 / Stopwatch.Frequency;
+        if (spanAlign) FeedForAlignment(count);
+        tps = count / Math.Max(1e-9, (Stopwatch.GetTimestamp() - decodeStart) / (double)Stopwatch.Frequency);
         empty = false;
         return count;
+    }
+
+    /// <summary>
+    /// Starts a greedy pass over <paramref name="pcm"/> (at most <see cref="MaxSeconds"/>): the audio is copied and
+    /// turned into features at once, the rest runs in <see cref="StepSpanPass"/>. False when the pass already ended
+    /// (silence or too little audio).
+    /// </summary>
+    bool BeginSpanPass(ReadOnlySpan<float> pcm, string? language)
+    {
+        span = default;
+        span.Language = language;
+        span.Empty = true;
+        span.Stage = SpanStage.Done;
+        if (Silent(pcm)) return false;
+        span.Started = Stopwatch.GetTimestamp();
+        var l0 = EncodeFeatures(pcm);
+        if (l0 < 1) return false;
+        span.L0 = l0;
+        span.Stage = SpanStage.Stem;
+        return true;
+    }
+
+    /// <summary>Runs one stage of the pass: the stem, one encoder layer, the cross memory, priming or one token. True when done.</summary>
+    bool StepSpanPass()
+    {
+        switch (span.Stage)
+        {
+            case SpanStage.Stem:
+                EncodeStem(span.L0);
+                span.Stage = SpanStage.EncoderStart;
+                return false;
+            case SpanStage.EncoderStart:
+                span.Job = EncoderStart(frames);
+                span.Layer = 0;
+                span.Stage = audio->EncoderLayers > 0 ? SpanStage.EncoderLayer : SpanStage.EncoderFinish;
+                return false;
+            case SpanStage.EncoderLayer:
+                EncoderLayerStep(ref span.Job, span.Layer, frames);
+                if (++span.Layer >= audio->EncoderLayers) span.Stage = SpanStage.EncoderFinish;
+                return false;
+            case SpanStage.EncoderFinish:
+                EncoderFinish(ref span.Job, frames);
+                span.Stage = SpanStage.Memory;
+                return false;
+            case SpanStage.Memory:
+                BuildCrossMemory();
+                span.EncodeMs = (Stopwatch.GetTimestamp() - span.Started) * 1000.0 / Stopwatch.Frequency;
+                span.Stage = SpanStage.Prime;
+                return false;
+            case SpanStage.Prime:
+                span.Detected = PrimeSpan(span.Language);
+                span.Count = 0;
+                span.HasKeywords = spanKeywordStrings.Length > 0;
+                span.DecodeStart = Stopwatch.GetTimestamp();
+                span.Stage = SpanStage.Decode;
+                return false;
+            case SpanStage.Decode:
+                return DecodeSpanStep();
+            default:
+                return true;
+        }
+    }
+
+    bool DecodeSpanStep()
+    {
+        var tokens = spanTokens!;
+        var probs = spanProbs!;
+        var step = span.Count;
+        if (step >= g.MaxSeq - 3) return FinishSpanPass();
+        if (CancelPending()) return FinishSpanPass();
+        var one = stackalloc int[1];
+        var logits = decoder.Logits;
+        int best;
+        float prob;
+        if (!span.HasKeywords)
+        {
+            var lp = 0f;
+            var p = 0f;
+            fixed (float* src = logits)
+                Ops.TopKLogSoftmax(src, textVocab, 1, &best, &lp, &p, true);
+            prob = p;
+        }
+        else
+        {
+            logits.Slice(0, textVocab).CopyTo(new Span<float>(scores, textVocab));
+            scores[0] = scores[2] = scores[3] = -1e30f;
+            ApplyKeywordBiasSpan(new ReadOnlySpan<int>(tokens, 0, span.Count), scores);
+            best = Ops.ArgMax(scores, textVocab);
+            prob = Ops.BestProbability(scores, textVocab, scores[best]);
+        }
+        if (step == 0) span.TtftMs = (Stopwatch.GetTimestamp() - span.Started) * 1000.0 / Stopwatch.Frequency;
+        probs[span.Count] = prob;
+        if (best == Eos)
+        {
+            one[0] = Eos;
+            decoder.Feed(new ReadOnlySpan<int>(one, 1));
+            return FinishSpanPass();
+        }
+        tokens[span.Count++] = best;
+        one[0] = best;
+        decoder.Feed(new ReadOnlySpan<int>(one, 1));
+        return false;
+    }
+
+    bool FinishSpanPass()
+    {
+        var seconds = Math.Max(1e-9, (Stopwatch.GetTimestamp() - span.DecodeStart) / (double)Stopwatch.Frequency);
+        span.Tps = span.Count / seconds;
+        span.Empty = false;
+        span.Stage = SpanStage.Done;
+        return true;
+    }
+
+    /// <summary>Starts a greedy pass to be run with <see cref="StepSpan"/>. False when it ended at once (silence).</summary>
+    internal bool BeginSpan(ReadOnlySpan<float> pcm, string? language, IReadOnlyList<string>? keywords)
+    {
+        if (language != null && Array.IndexOf(languages, language) < 0) throw new ArgumentException($"language is one of {string.Join(" ", languages)}");
+        if (pcm.Length > MaxSeconds * audio->SampleRate) throw new ArgumentException("a stepped pass takes at most MaxSeconds of audio");
+        EnsureDecoderBuffers();
+        EnsureSpanBuffers();
+        CacheKeywords(keywords);
+        Volatile.Write(ref cancelRequested, 0);
+        cancelled = false;
+        return BeginSpanPass(pcm, language);
+    }
+
+    internal bool StepSpan() => StepSpanPass();
+
+    internal bool SpanDone => span.Stage == SpanStage.Done;
+
+    /// <summary>Writes the finished pass's words, with times shifted by <paramref name="shift"/> seconds.</summary>
+    internal SpeechSpan FinishSpan(Span<byte> utf8, Span<WordSlice> words, double shift)
+    {
+        if (span.Empty) return new SpeechSpan(0, 0, null, 0, 0, 0, false);
+        return RenderSpan(span.Count, span.Detected, utf8, words, shift, span.TtftMs, span.Tps, span.EncodeMs);
     }
 
     string PrimeSpan(string? language)
@@ -363,7 +478,8 @@ public sealed unsafe partial class Whistle
         var probs = spanProbs!;
         var starts = alignStarts!;
         var scratch = wordScratch ??= new byte[1024];
-        var frameStarts = words.Length > 0 && tokens > 0 ? TokenFramesSpan(tokens) : null;
+        var textOnly = words.Length == 0;
+        var frameStarts = !textOnly && tokens > 0 ? TokenFramesSpan(tokens) : null;
         var utf8Length = 0;
         var wordCount = 0;
         var truncated = false;
@@ -386,16 +502,16 @@ public sealed unsafe partial class Whistle
             while (at > start && (scratch[at - 1] == (byte)' ' || scratch[at - 1] == (byte)'\t' || scratch[at - 1] == (byte)'\n' || scratch[at - 1] == (byte)'\r')) at--;
             if (at == start) { w = to; continue; }
             var length = at - start;
-            if (wordCount >= words.Length) { truncated = true; break; }
-            if (utf8Length + (wordCount > 0 ? 1 : 0) + length > utf8.Length) { truncated = true; break; }
-            if (wordCount > 0) utf8[utf8Length++] = (byte)' ';
+            if (!textOnly && wordCount >= words.Length) { truncated = true; break; }
+            if (utf8Length + (utf8Length > 0 ? 1 : 0) + length > utf8.Length) { truncated = true; break; }
+            if (utf8Length > 0) utf8[utf8Length++] = (byte)' ';
             new Span<byte>(scratch, start, length).CopyTo(utf8.Slice(utf8Length));
             var probability = 0.0;
             for (var i = from; i < to; i++) probability += probs[i];
             probability /= to - from;
             var wordStart = frameStarts != null ? starts[from] * FrameSeconds : 0;
             var wordEnd = frameStarts != null ? starts[to] * FrameSeconds : 0;
-            words[wordCount++] = new WordSlice(utf8Length, length, wordStart + shift, wordEnd + shift, probability);
+            if (!textOnly) words[wordCount++] = new WordSlice(utf8Length, length, wordStart + shift, wordEnd + shift, probability);
             utf8Length += length;
             w = to;
         }
@@ -404,10 +520,22 @@ public sealed unsafe partial class Whistle
 
     int[] TokenFramesSpan(int tokens)
     {
-        var rows = tokens + 1;
         var columns = frames;
-        if (tokens > g.MaxSeq || columns > maxFrames)
-            throw new InvalidOperationException($"alignment exceeds its buffers: tokens={tokens} (max {g.MaxSeq}), frames={columns} (max {maxFrames})");
+        if (tokens < 1 || tokens + 2 > g.MaxSeq || columns < 1 || columns > maxFrames)
+            throw new InvalidOperationException($"alignment exceeds its buffers: tokens={tokens} (max {g.MaxSeq - 2}), frames={columns} (max {maxFrames})");
+        try
+        {
+            return AlignTokens(tokens, columns);
+        }
+        catch (IndexOutOfRangeException error)
+        {
+            throw new InvalidOperationException($"word alignment failed: tokens={tokens}, frames={columns}, maxFrames={maxFrames}, maxSeq={g.MaxSeq}, cost={alignA!.Length}, total={alignB!.Length}, row={alignRow!.Length}, starts={alignStarts!.Length}", error);
+        }
+    }
+
+    int[] AlignTokens(int tokens, int columns)
+    {
+        var rows = tokens + 1;
         var cost = alignA!;
         var total = alignB!;
         var filtered = alignRow!;

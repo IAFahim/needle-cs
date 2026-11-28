@@ -62,6 +62,8 @@ internal sealed class RepairScratch
     public readonly CallSpan[] Spans;
     public int ArenaLength;
     public byte[] PhoneText = Array.Empty<byte>();
+    public readonly RepairText Value = new(1024);
+    public readonly RepairText Whole = new(1024);
 
     public RepairScratch(int maxCalls, int maxArgs, int callBytes)
     {
@@ -132,7 +134,7 @@ internal static class ArgumentRepair
                 outcome |= RepairOutcome.Invalid;
             }
         }
-        var written = Write(plan, s, source, callCount, out var kept, ref outcome);
+        var written = Write(plan, s, source, request, callCount, out var kept, ref outcome);
         if (written < 0) return RepairOutcome.None;
         if (Ungrounded(plan, s, history, request, today, kept)) outcome |= RepairOutcome.Ungrounded;
         if ((outcome & (RepairOutcome.Repaired | RepairOutcome.Negated | RepairOutcome.Invalid | RepairOutcome.Duplicate)) == 0) return outcome;
@@ -405,6 +407,8 @@ internal static class ArgumentRepair
             ref var arg = ref s.Args[a];
             if (arg.Param < 0 || arg.Removed) continue;
             var param = tool.Params[arg.Param];
+            // An inferred value is the game's, not the player's: the request need not state it.
+            if (param.Inferred) continue;
             if (param.Kind is ParamKind.Integer or ParamKind.Number && arg.Kind == ValueKind.Number && param.Options.Length == 0)
             {
                 var stated = Utf8Parser.TryParse(Value(s, json, arg), out double number, out _) && history.HasNumber(number);
@@ -456,7 +460,7 @@ internal static class ArgumentRepair
                         return true;
                     }
         }
-        if (!param.Required && current >= 0 && param.OptionWords[current].Length > 0 && !Stated(s, history, param.OptionWords[current], false))
+        if (!param.Required && !param.Inferred && current >= 0 && param.OptionWords[current].Length > 0 && !Stated(s, history, param.OptionWords[current], false))
         {
             arg.Removed = true;
             return true;
@@ -1001,7 +1005,7 @@ internal static class ArgumentRepair
         return true;
     }
 
-    static int Write(RepairPlan plan, RepairScratch s, ReadOnlySpan<byte> json, int callCount, out int kept, ref RepairOutcome outcome)
+    static int Write(RepairPlan plan, RepairScratch s, ReadOnlySpan<byte> json, RepairText request, int callCount, out int kept, ref RepairOutcome outcome)
     {
         var spans = s.Spans;
         var o = s.Output;
@@ -1034,7 +1038,8 @@ internal static class ArgumentRepair
             if (!Put(o, ref at, "}"u8)) return -1;
             var duplicate = false;
             for (var k = 0; k < kept; k++)
-                if (spans[k].Tool == call.Tool && new ReadOnlySpan<byte>(o, spans[k].ArgumentsStart, spans[k].ArgumentsLength).SequenceEqual(new ReadOnlySpan<byte>(o, argsStart, argsLength)))
+                if (spans[k].Tool == call.Tool && (new ReadOnlySpan<byte>(o, spans[k].ArgumentsStart, spans[k].ArgumentsLength).SequenceEqual(new ReadOnlySpan<byte>(o, argsStart, argsLength)) ||
+                    Fragment(s, request, new ReadOnlySpan<byte>(o, spans[k].ArgumentsStart, spans[k].ArgumentsLength), new ReadOnlySpan<byte>(o, argsStart, argsLength))))
                 {
                     duplicate = true;
                     break;
@@ -1051,6 +1056,63 @@ internal static class ArgumentRepair
         }
         if (!Put(o, ref at, "]"u8)) return -1;
         return at;
+    }
+
+    // A second call to the same tool whose text is only a piece of an earlier call's text ("rye" after
+    // "turkey sandwich on rye"), with every other argument the same, repeats that call: the request names the
+    // piece once, inside the earlier value. Duplicate calls are dropped (Apache-2.0 cactus-compute llms.txt).
+    static bool Fragment(RepairScratch s, RepairText request, ReadOnlySpan<byte> kept, ReadOnlySpan<byte> candidate)
+    {
+        var fragments = 0;
+        var at = 1;
+        var end = candidate.Length - 1;
+        while (at < end)
+        {
+            var keyStart = at;
+            if (!SkipString(candidate, ref at, end + 1)) return false;
+            var key = candidate.Slice(keyStart, at - keyStart);
+            at++;
+            var valueStart = at;
+            if (!SkipValue(candidate, ref at, end, out var kind)) return false;
+            var value = candidate.Slice(valueStart, at - valueStart);
+            if (at < end && candidate[at] == (byte)',') at++;
+            if (!FindValue(kept, key, out var other, out var otherKind)) return false;
+            if (value.SequenceEqual(other)) continue;
+            if (kind != ValueKind.String || otherKind != ValueKind.String || value.Length <= 2) return false;
+            s.Value.Load(value[1..^1]);
+            s.Whole.Load(other[1..^1]);
+            if (s.Value.Length == 0 || s.Value.Length >= s.Whole.Length) return false;
+            var phrase = new ReadOnlySpan<byte>(s.Value.Norm, 0, s.Value.Length);
+            if (s.Whole.FindPhrase(phrase) < 0) return false;
+            var first = request.FindPhrase(phrase);
+            if (first < 0 || request.FindPhrase(phrase, -1, first + 1) >= 0) return false;
+            fragments++;
+        }
+        return fragments > 0;
+    }
+
+    static bool FindValue(ReadOnlySpan<byte> args, ReadOnlySpan<byte> key, out ReadOnlySpan<byte> value, out ValueKind kind)
+    {
+        value = default;
+        kind = default;
+        var at = 1;
+        var end = args.Length - 1;
+        while (at < end)
+        {
+            var keyStart = at;
+            if (!SkipString(args, ref at, end + 1)) return false;
+            var current = args.Slice(keyStart, at - keyStart);
+            at++;
+            var valueStart = at;
+            if (!SkipValue(args, ref at, end, out kind)) return false;
+            if (current.SequenceEqual(key))
+            {
+                value = args.Slice(valueStart, at - valueStart);
+                return true;
+            }
+            if (at < end && args[at] == (byte)',') at++;
+        }
+        return false;
     }
 
     static bool Put(byte[] output, ref int at, ReadOnlySpan<byte> bytes)
@@ -1084,13 +1146,19 @@ internal static class ArgumentRepair
                 if (!SkipValue(output, ref at, end, out var kind)) break;
                 var value = output.Slice(valueStart, at - valueStart);
                 var p = tool.FindParam(key);
-                var param = p >= 0 ? tool.Params[p] : null;
+                var param = p >= 0 && !tool.Params[p].Inferred ? tool.Params[p] : null;
                 var flagged = false;
                 if (kind == ValueKind.Number && param is { Options.Length: 0 } && Utf8Parser.TryParse(value, out double number, out _) &&
-                    !history.HasNumber(number) && !(param.DefaultJson != null && value.SequenceEqual(param.DefaultJson)))
+                    !Stated(number, request, history) && !(param.DefaultJson != null && value.SequenceEqual(param.DefaultJson)))
                     flagged = true;
                 else if (kind == ValueKind.String && param is { Date: true } && anyYear && value.Length >= 6 && RepairText.TryParseDecimal(value.Slice(1, 4), out var year) &&
                          !history.HasNumber(year) && !(relative && today.HasValue && today.Value.Year == (int)year))
+                    flagged = true;
+                else if (kind == ValueKind.String && param is { FreeText: true } && value.Length > 2 &&
+                         !(param.DefaultJson != null && value.SequenceEqual(param.DefaultJson)) &&
+                         (!WordsGrounded(s.Value, value[1..^1], request, history) || EchoesToolName(s.Value, tool)))
+                    flagged = true;
+                else if (kind == ValueKind.String && param is { NameOptions: true } && !NamedOption(param, value, history))
                     flagged = true;
                 if (flagged)
                 {
@@ -1101,6 +1169,77 @@ internal static class ArgumentRepair
             }
         }
         return found;
+    }
+
+    // 4.x grounding: free text must come from the conversation, every word of it ("05 minutes" for
+    // "negative 5 minutes", or a resolved date for "yesterday", is not); semantics from the Apache-2.0
+    // cactus-compute llms.txt ("Arguments contain only values evidenced in the input").
+    static bool WordsGrounded(RepairText scratch, ReadOnlySpan<byte> text, RepairText request, RepairText history)
+    {
+        scratch.Load(text);
+        var clock = text.IndexOf((byte)':') >= 0;
+        for (var w = 0; w < scratch.Words; w++)
+        {
+            var word = scratch.Word(w);
+            var digits = 0;
+            while (digits < word.Length && RepairText.IsDigit(word[digits])) digits++;
+            if (digits > 0 && RepairText.TryParseDecimal(word[..digits], out var stated) && request.HasNumber(stated) && !Stated(stated, request, history))
+                return false;
+            if (history.HasWordOrJoined(word)) continue;
+            if (digits == 0)
+            {
+                // A clock's am/pm restates the hour's half of the day; it adds no value of its own.
+                if (word.SequenceEqual("am"u8) || word.SequenceEqual("pm"u8)) continue;
+                return false;
+            }
+            var suffix = word[digits..];
+            if (!(suffix.IsEmpty || suffix.SequenceEqual("am"u8) || suffix.SequenceEqual("pm"u8) || suffix.SequenceEqual("st"u8) ||
+                  suffix.SequenceEqual("nd"u8) || suffix.SequenceEqual("rd"u8) || suffix.SequenceEqual("th"u8)))
+                return false;
+            if (!NumberGrounded(word[..digits], clock, request, history)) return false;
+        }
+        return true;
+    }
+
+    // A number restated in digits ("7" for "seven", "07:00" or "19:00" for "seven pm") is evidenced; a padded
+    // number outside a clock ("05 minutes" for "negative 5 minutes") is not.
+    static bool NumberGrounded(ReadOnlySpan<byte> digits, bool clock, RepairText request, RepairText history)
+    {
+        if (!RepairText.TryParseDecimal(digits, out var n)) return false;
+        if (clock && digits.SequenceEqual("00"u8)) return true;
+        if (digits.Length > 1 && digits[0] == (byte)'0' && !clock) return false;
+        if (Stated(n, request, history)) return true;
+        if (clock && n > 12 && n < 24 && Stated(n - 12, request, history)) return true;
+        return clock && n == 12 && (history.HasWord("noon"u8) || history.HasWord("midnight"u8));
+    }
+
+    // A number is evidenced by the request or an earlier turn, never by the system text's own wording: the
+    // instructions' "exactly one call" or the date fact's clock do not state a timer's minutes.
+    // "negative 5" states -5: a value that keeps the 5 and drops the sign is not what the request said.
+    static bool Stated(double number, RepairText request, RepairText history) => request.HasSignedNumber(number) || history.HasTurnNumber(number);
+
+    // A value made only of the tool's own name words ("timer" for set_cooking_timer) restates the call, not a
+    // value the user gave: the model filled the slot itself.
+    static bool EchoesToolName(RepairText value, RepairTool tool)
+    {
+        if (value.Words == 0 || tool.NameWords.Length == 0) return false;
+        for (var w = 0; w < value.Words; w++)
+        {
+            var word = value.Word(w);
+            var found = false;
+            foreach (var name in tool.NameWords)
+                if (word.SequenceEqual(name)) { found = true; break; }
+            if (!found) return false;
+        }
+        return true;
+    }
+
+    // A closed set of names ("Maya", "Dr. Patel") is grounded only when the conversation names the chosen one.
+    static bool NamedOption(RepairParam param, ReadOnlySpan<byte> value, RepairText history)
+    {
+        for (var o = 0; o < param.Options.Length; o++)
+            if (value.SequenceEqual(param.Options[o])) return history.FindPhrase(param.OptionWords[o]) >= 0;
+        return true;
     }
 
     static bool IsYear(double value) => value >= 1900 && value <= 2200 && value == Math.Floor(value);

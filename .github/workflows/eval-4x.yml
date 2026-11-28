@@ -1,0 +1,113 @@
+name: Eval 4.x suites
+
+on:
+  push:
+    branches: [claude/engine-4x, claude/engine-4x-eval]
+  workflow_dispatch:
+    inputs:
+      threads:
+        description: thread count for both engines
+        default: "4"
+
+concurrency:
+  group: eval-4x-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  DOTNET_NOLOGO: "1"
+
+jobs:
+  eval:
+    name: 4.x acceptance suites, needle-cs vs upstream 4.x (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Restore cached models
+        uses: actions/cache@v4
+        with:
+          path: ref
+          key: bench-ref-${{ runner.arch }}-${{ hashFiles('tools/ref.lock', 'tools/fetch.sh', 'tools/fetch-engine4.sh') }}
+
+      - name: Download models and the 4.x engine
+        run: |
+          bash tools/fetch.sh
+          if [ "${{ runner.arch }}" = "ARM64" ]; then tag=manylinux2014_aarch64; else tag=manylinux2014_x86_64; fi
+          bash tools/fetch.sh --engine4 "$tag"
+
+      - name: Publish the NativeAOT CLI
+        run: dotnet publish src/Needle.Cli -c Release -o out/aot
+
+      - name: Score both engines on the same suites, date fact and thread count
+        run: |
+          threads="${{ github.event.inputs.threads || '4' }}"
+          date_fact="$(date -u '+%Y-%m-%d %a %H:%M')"
+          echo "date fact: $date_fact, threads: $threads"
+          echo "$date_fact" > date-fact.txt
+          set +e
+          out/aot/needle eval ref/hf/needle3.cact --suite all --threads "$threads" --date "$date_fact" --json needle-cs.json
+          echo "needle-cs exit $?"
+          python3 tools/eval_native.py ref/native4 ref/hf/needle3.cact --suite all --threads "$threads" --date "$date_fact" --json upstream-4x.json
+          echo "upstream exit $?"
+          set -e
+          python3 tools/eval_compare.py needle-cs.json upstream-4x.json --out eval.md
+          { echo "## 4.x acceptance suites (${{ matrix.os }}, run ${{ github.run_id }})"; echo; cat eval.md; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: needle-cs thread invariance (same calls, suppressed calls and tokens at every thread count)
+        run: |
+          date_fact="$(cat date-fact.txt)"
+          for t in 1 2 3 6 8 0; do
+            out/aot/needle eval ref/hf/needle3.cact --suite all --threads "$t" --date "$date_fact" --quiet --json "needle-cs-t$t.json" > /dev/null || true
+          done
+          python3 - needle-cs.json needle-cs-t1.json needle-cs-t2.json needle-cs-t3.json needle-cs-t6.json needle-cs-t8.json needle-cs-t0.json <<'PY' | tee threads.md
+          import json, sys
+          def cases(path):
+              return {(s["suite"], c["query"]): c for s in json.load(open(path))["suites"] for c in s["cases"]}
+          base = cases(sys.argv[1])
+          print("| threads (0 = auto) | cases | calls differ | tokens differ | max confidence delta |")
+          print("|---|---|---|---|---|")
+          bad = 0
+          for path in sys.argv[2:]:
+              other = cases(path)
+              calls = [k for k in base if (base[k]["raw_calls"], base[k]["suppressed_calls"], base[k]["got"]) != (other[k]["raw_calls"], other[k]["suppressed_calls"], other[k]["got"])]
+              tokens = [k for k in base if base[k]["decode_tokens"] != other[k]["decode_tokens"]]
+              delta = max(abs((base[k]["confidence"] or 0) - (other[k]["confidence"] or 0)) for k in base)
+              print(f"| {path.split('-t')[-1].split('.')[0]} vs 4 | {len(base)} | {len(calls)} | {len(tokens)} | {delta:.4f} |")
+              for k in calls[:5]:
+                  print(f"|   {k[0]}: {k[1]} | | {json.dumps(other[k]['got'])} | | |")
+              bad += len(calls)
+          sys.exit(1 if bad else 0)
+          PY
+          { echo "## needle-cs thread invariance (${{ matrix.os }})"; echo; cat threads.md; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Show one raw upstream envelope per suite
+        if: always()
+        run: |
+          python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); [print(s["suite"], json.dumps(s["cases"][0].get("raw_response"))) for s in d["suites"]]' upstream-4x.json || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eval-4x-${{ matrix.os }}
+          path: |
+            eval.md
+            threads.md
+            needle-cs.json
+            upstream-4x.json

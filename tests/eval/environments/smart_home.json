@@ -1,0 +1,372 @@
+{
+ "suite": "smart_home",
+ "source": "cactus-compute 4.2.0 cactus/environments/smart_home.py (Apache-2.0)",
+ "system": "Map each explicit supported home action to exactly one declared call; never duplicate an action. Do not guess missing targets or values. Unsupported, invalid, ambiguous, and negated requests return no call.",
+ "cases": [
+  {
+   "query": "turn on the kitchen lights",
+   "calls": [
+    {
+     "name": "control_lights",
+     "arguments": {
+      "room": "kitchen",
+      "action": "on"
+     }
+    }
+   ],
+   "category": "positive",
+   "critical": false
+  },
+  {
+   "query": "switch off the lights in the bedroom",
+   "calls": [
+    {
+     "name": "control_lights",
+     "arguments": {
+      "room": "bedroom",
+      "action": "off"
+     }
+    }
+   ],
+   "category": "positive",
+   "critical": false
+  },
+  {
+   "query": "dim the living room lights to 35 percent",
+   "calls": [
+    {
+     "name": "control_lights",
+     "arguments": {
+      "room": "living_room",
+      "action": "dim",
+      "brightness_percent": 35
+     }
+    }
+   ],
+   "category": "positive",
+   "critical": false
+  },
+  {
+   "query": "turn on the study lights in warm white",
+   "calls": [
+    {
+     "name": "control_lights",
+     "arguments": {
+      "room": "study",
+      "action": "on",
+      "color": "warm white"
+     }
+    }
+   ],
+   "category": "positive",
+   "critical": false
+  },
+  {
+   "query": "put the bedroom lights on in blue",
+   "calls": [
+    {
+     "name": "control_lights",
+     "arguments": {
+      "room": "bedroom",
+      "action": "on",
+      "color": "blue"
+     }
+    }
+   ],
+   "category": "positive",
+   "critical": false
+  },
+  {
+   "query": "set the thermostat to 22 degrees",
+   "calls": [
+    {
+     "name": "set_thermostat",
+     "arguments": {
+      "temperature": 22
+     }
+    }
+   ],
+   "category": "positive",
+   "critical": false
+  },
+  {
+   "query": "warm the house to 24 degrees",
+   "calls": [
+    {
+     "name": "set_thermostat",
+     "arguments": {
+      "temperature": 24
+     }
+    }
+   ],
+   "category": "positive",
+   "critical": false
+  },
+  {
+   "query": "cool the whole home down to 19 degrees",
+   "calls": [
+    {
+     "name": "set_thermostat",
+     "arguments": {
+      "temperature": 19
+     }
+    }
+   ],
+   "category": "positive",
+   "critical": false
+  },
+  {
+   "query": "turn on the bedroom fan",
+   "calls": [
+    {
+     "name": "control_fan",
+     "arguments": {
+      "room": "bedroom",
+      "action": "on"
+     }
+    }
+   ],
+   "category": "positive",
+   "critical": false
+  },
+  {
+   "query": "switch the study fan off",
+   "calls": [
+    {
+     "name": "control_fan",
+     "arguments": {
+      "room": "study",
+      "action": "off"
+     }
+    }
+   ],
+   "category": "positive",
+   "critical": false
+  },
+  {
+   "query": "turn on the living room fan at high speed",
+   "calls": [
+    {
+     "name": "control_fan",
+     "arguments": {
+      "room": "living_room",
+      "action": "on",
+      "speed": "high"
+     }
+    }
+   ],
+   "category": "positive",
+   "critical": false
+  },
+  {
+   "query": "run the study fan on low",
+   "calls": [
+    {
+     "name": "control_fan",
+     "arguments": {
+      "room": "study",
+      "action": "on",
+      "speed": "low"
+     }
+    }
+   ],
+   "category": "positive",
+   "critical": false
+  },
+  {
+   "query": "open the kitchen blinds",
+   "calls": [
+    {
+     "name": "control_blinds",
+     "arguments": {
+      "room": "kitchen",
+      "action": "open"
+     }
+    }
+   ],
+   "category": "positive",
+   "critical": false
+  },
+  {
+   "query": "close the blinds in the living room",
+   "calls": [
+    {
+     "name": "control_blinds",
+     "arguments": {
+      "room": "living_room",
+      "action": "close"
+     }
+    }
+   ],
+   "category": "positive",
+   "critical": false
+  },
+  {
+   "query": "open up the bedroom blinds",
+   "calls": [
+    {
+     "name": "control_blinds",
+     "arguments": {
+      "room": "bedroom",
+      "action": "open"
+     }
+    }
+   ],
+   "category": "positive",
+   "critical": false
+  },
+  {
+   "query": "start the robot vacuum",
+   "calls": [
+    {
+     "name": "start_robot_vacuum",
+     "arguments": {
+      "action": "start"
+     }
+    }
+   ],
+   "category": "positive",
+   "critical": false
+  },
+  {
+   "query": "start vacuuming the bedroom",
+   "calls": [
+    {
+     "name": "start_robot_vacuum",
+     "arguments": {
+      "action": "start",
+      "room": "bedroom"
+     }
+    }
+   ],
+   "category": "positive",
+   "critical": false
+  },
+  {
+   "query": "stop the robot vacuum",
+   "calls": [
+    {
+     "name": "start_robot_vacuum",
+     "arguments": {
+      "action": "stop"
+     }
+    }
+   ],
+   "category": "positive",
+   "critical": false
+  },
+  {
+   "query": "turn on the lights",
+   "calls": [],
+   "category": "missing",
+   "critical": true
+  },
+  {
+   "query": "set the thermostat to something comfortable",
+   "calls": [],
+   "category": "missing",
+   "critical": true
+  },
+  {
+   "query": "open the blinds",
+   "calls": [],
+   "category": "missing",
+   "critical": true
+  },
+  {
+   "query": "turn the fan on",
+   "calls": [],
+   "category": "missing",
+   "critical": true
+  },
+  {
+   "query": "lock the back door",
+   "calls": [],
+   "category": "irrelevant",
+   "critical": false
+  },
+  {
+   "query": "check whether the robot vacuum is charging",
+   "calls": [],
+   "category": "irrelevant",
+   "critical": false
+  },
+  {
+   "query": "play some jazz in the living room",
+   "calls": [],
+   "category": "irrelevant",
+   "critical": false
+  },
+  {
+   "query": "don't turn on the study lights",
+   "calls": [],
+   "category": "negation",
+   "critical": true
+  },
+  {
+   "query": "do not close the living room blinds",
+   "calls": [],
+   "category": "negation",
+   "critical": true
+  },
+  {
+   "query": "never run the vacuum while I am on a call",
+   "calls": [],
+   "category": "negation",
+   "critical": true
+  },
+  {
+   "query": "dim the bedroom lights to 150 percent",
+   "calls": [],
+   "category": "invalid",
+   "critical": true
+  },
+  {
+   "query": "set the thermostat to 40 degrees",
+   "calls": [],
+   "category": "invalid",
+   "critical": true
+  },
+  {
+   "query": "turn off the bedroom lights and set the thermostat to 18 degrees",
+   "calls": [
+    {
+     "name": "control_lights",
+     "arguments": {
+      "room": "bedroom",
+      "action": "off"
+     }
+    },
+    {
+     "name": "set_thermostat",
+     "arguments": {
+      "temperature": 18
+     }
+    }
+   ],
+   "category": "parallel",
+   "critical": false
+  },
+  {
+   "query": "start the vacuum in the kitchen and open the living room blinds",
+   "calls": [
+    {
+     "name": "start_robot_vacuum",
+     "arguments": {
+      "action": "start",
+      "room": "kitchen"
+     }
+    },
+    {
+     "name": "control_blinds",
+     "arguments": {
+      "room": "living_room",
+      "action": "open"
+     }
+    }
+   ],
+   "category": "parallel",
+   "critical": false
+  }
+ ]
+}

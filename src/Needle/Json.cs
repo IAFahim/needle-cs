@@ -9,6 +9,8 @@ public enum JsonKind { Null, Bool, Number, String, Array, Object }
 
 public sealed class JsonValue
 {
+    const int MaxDepth = 256;
+
     public JsonKind Kind { get; init; }
     public bool Boolean { get; init; }
     public string Text { get; init; } = "";
@@ -33,7 +35,7 @@ public sealed class JsonValue
     public static JsonValue Parse(ReadOnlySpan<char> text)
     {
         var at = 0;
-        var value = ParseValue(text, ref at);
+        var value = ParseValue(text, ref at, 0);
         SkipSpace(text, ref at);
         if (at != text.Length) throw new FormatException($"unexpected trailing JSON at {at}");
         return value;
@@ -101,27 +103,27 @@ public sealed class JsonValue
         while (at < t.Length && char.IsWhiteSpace(t[at])) at++;
     }
 
-    static JsonValue ParseValue(ReadOnlySpan<char> t, ref int at)
+    static JsonValue ParseValue(ReadOnlySpan<char> t, ref int at, int depth)
     {
         SkipSpace(t, ref at);
-        if (at >= t.Length) throw new FormatException("unexpected end of JSON");
-        switch (t[at])
+        if (depth > MaxDepth) throw new FormatException($"JSON nested deeper than {MaxDepth} at {at}");
+        switch (At(t, at))
         {
             case '{':
             {
                 at++;
                 var members = new List<KeyValuePair<string, JsonValue>>();
                 SkipSpace(t, ref at);
-                if (t[at] == '}') { at++; return Object(members); }
+                if (At(t, at) == '}') { at++; return Object(members); }
                 for (;;)
                 {
                     SkipSpace(t, ref at);
                     var key = ParseString(t, ref at);
                     SkipSpace(t, ref at);
                     Expect(t, ref at, ':');
-                    members.Add(new KeyValuePair<string, JsonValue>(key, ParseValue(t, ref at)));
+                    members.Add(new KeyValuePair<string, JsonValue>(key, ParseValue(t, ref at, depth + 1)));
                     SkipSpace(t, ref at);
-                    if (t[at] == ',') { at++; continue; }
+                    if (At(t, at) == ',') { at++; continue; }
                     Expect(t, ref at, '}');
                     return Object(members);
                 }
@@ -131,28 +133,50 @@ public sealed class JsonValue
                 at++;
                 var items = new List<JsonValue>();
                 SkipSpace(t, ref at);
-                if (t[at] == ']') { at++; return Array(items); }
+                if (At(t, at) == ']') { at++; return Array(items); }
                 for (;;)
                 {
-                    items.Add(ParseValue(t, ref at));
+                    items.Add(ParseValue(t, ref at, depth + 1));
                     SkipSpace(t, ref at);
-                    if (t[at] == ',') { at++; continue; }
+                    if (At(t, at) == ',') { at++; continue; }
                     Expect(t, ref at, ']');
                     return Array(items);
                 }
             }
             case '"': return Str(ParseString(t, ref at));
-            case 't': at += 4; return Bool(true);
-            case 'f': at += 5; return Bool(false);
-            case 'n': at += 4; return Null;
+            case 't': Literal(t, ref at, "true"); return Bool(true);
+            case 'f': Literal(t, ref at, "false"); return Bool(false);
+            case 'n': Literal(t, ref at, "null"); return Null;
             default:
             {
                 var start = at;
-                while (at < t.Length && (char.IsDigit(t[at]) || t[at] is '-' or '+' or '.' or 'e' or 'E')) at++;
-                if (start == at) throw new FormatException($"unexpected character '{t[at]}' at {at}");
+                if (At(t, at) == '-') at++;
+                if (At(t, at) == '0') at++;
+                else Digits(t, ref at);
+                if (at < t.Length && t[at] == '.') { at++; Digits(t, ref at); }
+                if (at < t.Length && t[at] is 'e' or 'E')
+                {
+                    at++;
+                    if (At(t, at) is '+' or '-') at++;
+                    Digits(t, ref at);
+                }
                 return Num(t[start..at].ToString());
             }
         }
+    }
+
+    static char At(ReadOnlySpan<char> t, int at) => at < t.Length ? t[at] : throw new FormatException("unexpected end of JSON");
+
+    static void Literal(ReadOnlySpan<char> t, ref int at, string word)
+    {
+        if (!t[at..].StartsWith(word.AsSpan(), StringComparison.Ordinal)) throw new FormatException($"expected '{word}' at {at}");
+        at += word.Length;
+    }
+
+    static void Digits(ReadOnlySpan<char> t, ref int at)
+    {
+        if (At(t, at) is not (>= '0' and <= '9')) throw new FormatException($"unexpected character '{t[at]}' at {at}");
+        while (at < t.Length && t[at] is >= '0' and <= '9') at++;
     }
 
     static void Expect(ReadOnlySpan<char> t, ref int at, char c)
@@ -165,11 +189,11 @@ public sealed class JsonValue
     {
         Expect(t, ref at, '"');
         var b = new StringBuilder();
-        while (t[at] != '"')
+        while (At(t, at) != '"')
         {
             var c = t[at++];
             if (c != '\\') { b.Append(c); continue; }
-            var e = t[at++];
+            var e = At(t, at++);
             switch (e)
             {
                 case 'n': b.Append('\n'); break;
@@ -177,7 +201,11 @@ public sealed class JsonValue
                 case 't': b.Append('\t'); break;
                 case 'b': b.Append('\b'); break;
                 case 'f': b.Append('\f'); break;
-                case 'u': b.Append((char)int.Parse(t.Slice(at, 4), NumberStyles.HexNumber, CultureInfo.InvariantCulture)); at += 4; break;
+                case 'u':
+                    if (at + 4 > t.Length || !ushort.TryParse(t.Slice(at, 4), NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out var code)) throw new FormatException($"bad \\u escape at {at}");
+                    b.Append((char)code);
+                    at += 4;
+                    break;
                 default: b.Append(e); break;
             }
         }

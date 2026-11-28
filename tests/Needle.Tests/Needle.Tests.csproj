@@ -3,6 +3,7 @@
     <TargetFramework>net10.0</TargetFramework>
     <IsPackable>false</IsPackable>
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <DefineConstants>$(DefineConstants);NEEDLE_SIMD</DefineConstants>
     <!-- Generated tool sinks must stay warning-free for hosts that build with warnings as errors. -->
     <WarningsAsErrors>$(WarningsAsErrors);CS0414;CS1522;CS0169;CS0649</WarningsAsErrors>
   </PropertyGroup>
@@ -10,11 +11,17 @@
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
     <PackageReference Include="xunit" Version="2.9.3" />
     <PackageReference Include="xunit.runner.visualstudio" Version="3.0.2" />
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.3.1" />
   </ItemGroup>
   <ItemGroup>
     <Compile Include="..\..\src\Needle.Cli\Bench*.cs" LinkBase="Bench" />
     <Compile Include="..\..\src\Needle.Cli\Eval*.cs" LinkBase="Eval" />
     <EmbeddedResource Include="..\..\tools\game_tools.json" LogicalName="game_tools.json" />
+  </ItemGroup>
+  <!-- The generator and analyzers are compiled in as plain code too, so GeneratorDiagnosticTests can drive them
+       through Roslyn on small sources (the Analyzer reference below only runs them over this project). -->
+  <ItemGroup>
+    <Compile Include="..\..\src\Needle.Generators\*.cs" Exclude="..\..\src\Needle.Generators\IsExternalInit.cs" LinkBase="Generators" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\src\Needle\Needle.csproj" />

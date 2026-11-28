@@ -33,7 +33,9 @@ public sealed class NeedleToolsGenerator : IIncrementalGenerator
         {
             foreach (var diagnostic in built.Diagnostics)
                 context.ReportDiagnostic(Diagnostic.Create(diagnostic.Descriptor, Location.Create(diagnostic.FilePath, diagnostic.Span, diagnostic.LineSpan)));
-            if (built.Model is { } model)
+            // A [Tools] interface that is not partial gets NDG010 from ToolsAnalyzer; emitting the other half would
+            // only add CS0260 on top of it.
+            if (built.Model is { IsPartial: true } model)
                 context.AddSource(model.InterfaceName + ".Tools.g.cs", ModernEmitter.Emit(model));
         });
         var combined = models.Combine(hasToolSet).Combine(useUtf8Literals);
@@ -48,7 +50,7 @@ public sealed class NeedleToolsGenerator : IIncrementalGenerator
             {
                 var qualified = model.GlobalNamespace ? model.CommandsName : model.Namespace + "." + model.CommandsName;
                 if (compilation.GetTypeByMetadataName(qualified) is not null) return;
-                context.AddSource(model.InterfaceName + "Tools.g.cs", Emitter.Emit(model, built.Right, triple.Right));
+                context.AddSource(model.HintName + "Tools.g.cs", Emitter.Emit(model, built.Right && triple.Right, triple.Right));
             }
         });
     }
@@ -67,8 +69,15 @@ internal sealed record ToolArg(
     bool FixedText,
     string? Description,
     bool Optional,
-    string? DefaultLiteral)
+    string? DefaultLiteral,
+    double? Minimum = null,
+    double? Maximum = null,
+    int MaxLength = 0,
+    bool Inferred = false)
 {
+    /// <summary>The longest text the grammar and schema allow, in characters; -1 for no limit.</summary>
+    public int TextLimit => Type != ArgType.Text ? -1 : FixedText ? (MaxLength > 0 ? Math.Min(MaxLength, TextCapacity) : TextCapacity) : MaxLength > 0 ? MaxLength : -1;
+
     public bool PassTextThrough => Type == ArgType.Text && FixedText;
     public string SlotTypeName => Type switch
     {
@@ -90,7 +99,7 @@ internal sealed record ToolArg(
 
 internal sealed record ToolEntry(string Name, string Alias, string Description, ImmutableArray<ToolArg> Args);
 
-internal sealed record ToolSetModel(string InterfaceName, string CommandName, string CommandsName, string Namespace, bool GlobalNamespace, ImmutableArray<ToolEntry> Tools)
+internal sealed record ToolSetModel(string InterfaceName, string InterfaceType, string HintName, string CommandName, string CommandsName, string Namespace, bool GlobalNamespace, ImmutableArray<ToolEntry> Tools, bool IsPartial = true)
 {
     public string Q(string type) => GlobalNamespace ? type : "global::" + Namespace + "." + type;
 }
@@ -114,6 +123,7 @@ internal sealed record BuiltToolSet(ToolSetModel? Model, ImmutableArray<Diagnost
 internal static class ToolModelBuilder
 {
     const string DescriptionAttributeName = "System.ComponentModel.DescriptionAttribute";
+    internal const string ArgAttributeName = "Needle.ArgAttribute";
 
     public static BuiltToolSet Build(INamedTypeSymbol symbol, bool modern = false)
     {
@@ -136,6 +146,11 @@ internal static class ToolModelBuilder
                 diagnostics.Add(Info("NDG007", method.Locations.FirstOrDefault(), $"Tool '{method.Name}' must not be generic."));
                 continue;
             }
+            if (method.Name is "None" or "Kind" or "Presence")
+            {
+                diagnostics.Add(Info("NDG014", method.Locations.FirstOrDefault(), $"Tool name '{method.Name}' is reserved by the generated command types."));
+                continue;
+            }
             var alias = SnakeCase(method.Name);
             if (!seenAliases.Add(alias))
             {
@@ -155,30 +170,119 @@ internal static class ToolModelBuilder
                 args.Add(arg);
             }
             if (!valid) continue;
+            if (args.Select(a => a.Alias).Distinct(StringComparer.Ordinal).Count() != args.Count ||
+                args.Select(a => char.ToUpperInvariant(a.Name[0]) + a.Name.Substring(1)).Distinct(StringComparer.Ordinal).Count() != args.Count)
+            {
+                diagnostics.Add(Info("NDG014", method.Locations.FirstOrDefault(), $"Tool '{method.Name}' has parameters whose names collide after snake_casing or PascalCasing."));
+                continue;
+            }
             if (args.Count > 32)
             {
                 diagnostics.Add(Info("NDG003", method.Locations.FirstOrDefault(), $"Tool '{method.Name}' has more than 32 parameters."));
                 continue;
             }
-            tools.Add(new ToolEntry(method.Name, alias, description, args.ToImmutable()));
+            tools.Add(new ToolEntry(Identifier(method.Name), alias, description, args.ToImmutable()));
         }
         var name = symbol.Name;
-        var stem = name.StartsWith("I", StringComparison.Ordinal) && name.Length > 1 ? name.Substring(1) : name;
+        var stem = name.Length > 1 && name[0] == 'I' && char.IsUpper(name[1]) ? name.Substring(1) : name;
         var commandName = stem.EndsWith("Commands", StringComparison.Ordinal) ? stem.Substring(0, stem.Length - "Commands".Length) + "Command" : stem + "Command";
         var commandsName = commandName.EndsWith("Command", StringComparison.Ordinal) ? commandName.Substring(0, commandName.Length - "Command".Length) + "Commands" : commandName + "Commands";
         var containing = symbol.ContainingNamespace;
         var globalNamespace = containing is null or { IsGlobalNamespace: true };
+        var hint = new StringBuilder();
+        foreach (var c in symbol.ToDisplayString()) hint.Append(char.IsLetterOrDigit(c) || c == '_' ? c : '.');
         var model = new ToolSetModel(
             name,
+            symbol.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat),
+            hint.ToString(),
             commandName,
             commandsName,
             globalNamespace ? "" : containing!.ToDisplayString(),
             globalNamespace,
-            tools.ToImmutable());
+            tools.ToImmutable(),
+            IsPartial(symbol));
         return new BuiltToolSet(model, diagnostics.ToImmutable());
     }
 
+    internal static bool IsPartial(INamedTypeSymbol symbol)
+    {
+        foreach (var reference in symbol.DeclaringSyntaxReferences)
+            if (reference.GetSyntax() is TypeDeclarationSyntax declaration && !declaration.Modifiers.Any(SyntaxKind.PartialKeyword))
+                return false;
+        return true;
+    }
+
     static ToolArg? BuildArg(IParameterSymbol parameter, ImmutableArray<DiagnosticInfo>.Builder diagnostics)
+    {
+        if (BuildType(parameter, diagnostics) is not { } arg) return null;
+        return ApplyLimits(parameter, arg, diagnostics);
+    }
+
+    // [Arg(Min, Max, MaxLength, Inferred)]: checked here so a bad limit is an error at the parameter, never a schema
+    // the model reads one way and the repair step another.
+    static ToolArg? ApplyLimits(IParameterSymbol parameter, ToolArg arg, ImmutableArray<DiagnosticInfo>.Builder diagnostics)
+    {
+        var attribute = parameter.GetAttributes().FirstOrDefault(a => a.AttributeClass?.ToDisplayString() == ArgAttributeName);
+        if (attribute == null) return arg;
+        double? min = null, max = null;
+        var maxLength = 0;
+        var inferred = false;
+        foreach (var named in attribute.NamedArguments)
+        {
+            var value = named.Value.Value;
+            switch (named.Key)
+            {
+                case "Min" when value is double d && !double.IsNaN(d): min = d; break;
+                case "Max" when value is double d && !double.IsNaN(d): max = d; break;
+                case "MaxLength" when value is int i: maxLength = i; break;
+                case "Inferred" when value is bool b: inferred = b; break;
+            }
+        }
+        var location = parameter.Locations.FirstOrDefault();
+        var numeric = arg.Type is ArgType.Int or ArgType.Long or ArgType.Float or ArgType.Double;
+        if ((min.HasValue || max.HasValue) && !numeric)
+        {
+            diagnostics.Add(Info("NDG012", location, $"[Arg] Min and Max apply to numeric parameters; '{parameter.Name}' is {parameter.Type.ToDisplayString()}."));
+            return null;
+        }
+        if (min is { } low && max is { } high && low > high)
+        {
+            diagnostics.Add(Info("NDG012", location, $"[Arg] on '{parameter.Name}' has Min {Number(low)} above Max {Number(high)}."));
+            return null;
+        }
+        if (min is { } m && double.IsInfinity(m) || max is { } x && double.IsInfinity(x))
+        {
+            diagnostics.Add(Info("NDG012", location, $"[Arg] on '{parameter.Name}' needs finite Min and Max; leave a side unset for no limit."));
+            return null;
+        }
+        if (maxLength != 0 && (arg.Type != ArgType.Text || maxLength < 0))
+        {
+            diagnostics.Add(Info("NDG012", location, arg.Type != ArgType.Text
+                ? $"[Arg] MaxLength applies to text parameters; '{parameter.Name}' is {parameter.Type.ToDisplayString()}."
+                : $"[Arg] MaxLength on '{parameter.Name}' must be positive."));
+            return null;
+        }
+        if (arg.FixedText && maxLength > arg.TextCapacity)
+        {
+            diagnostics.Add(Info("NDG011", location,
+                $"Parameter '{parameter.Name}' is {parameter.Type.Name}, which holds {arg.TextCapacity} UTF-8 bytes, but [Arg(MaxLength = {maxLength})] allows {maxLength} characters; " +
+                $"text past byte {arg.TextCapacity} would be cut. Use {LargerText(maxLength)} or lower MaxLength."));
+            return null;
+        }
+        return arg with { Minimum = min, Maximum = max, MaxLength = maxLength, Inferred = inferred };
+    }
+
+    static string LargerText(int bytes)
+    {
+        foreach (var capacity in new[] { 8, 16, 32, 64, 128, 256 })
+            if (capacity >= bytes) return "Utf8Text" + capacity.ToString(CultureInfo.InvariantCulture);
+        return "string";
+    }
+
+    internal static string Number(double value) =>
+        value == Math.Floor(value) && Math.Abs(value) < 1e15 ? ((long)value).ToString(CultureInfo.InvariantCulture) : value.ToString("R", CultureInfo.InvariantCulture);
+
+    static ToolArg? BuildType(IParameterSymbol parameter, ImmutableArray<DiagnosticInfo>.Builder diagnostics)
     {
         if (parameter.RefKind != RefKind.None)
         {
@@ -252,12 +356,21 @@ internal static class ToolModelBuilder
         {
             SpecialType.System_Int32 => value is int i ? i.ToString(CultureInfo.InvariantCulture) : null,
             SpecialType.System_Int64 => value is long l ? l.ToString(CultureInfo.InvariantCulture) + "L" : null,
-            SpecialType.System_Single => value is float f ? f.ToString("R", CultureInfo.InvariantCulture) + "f" : null,
-            SpecialType.System_Double => value is double d ? d.ToString("R", CultureInfo.InvariantCulture) + "d" : null,
+            SpecialType.System_Single => value is float f ? FloatLiteral(f, "float", "f") : null,
+            SpecialType.System_Double => value is double d ? FloatLiteral(d, "double", "d") : null,
             SpecialType.System_Boolean => value is bool b ? (b ? "true" : "false") : null,
             _ => type.TypeKind == TypeKind.Enum && value is not null ? EnumLiteral(type, value) : null,
         };
     }
+
+    static string FloatLiteral(double value, string type, string suffix) =>
+        double.IsNaN(value) ? type + ".NaN" :
+        double.IsPositiveInfinity(value) ? type + ".PositiveInfinity" :
+        double.IsNegativeInfinity(value) ? type + ".NegativeInfinity" :
+        (suffix == "f" ? ((float)value).ToString("R", CultureInfo.InvariantCulture) : value.ToString("R", CultureInfo.InvariantCulture)) + suffix;
+
+    static string Identifier(string name) =>
+        SyntaxFacts.GetKeywordKind(name) != SyntaxKind.None || SyntaxFacts.GetContextualKeywordKind(name) != SyntaxKind.None ? "@" + name : name;
 
     static string EnumLiteral(ITypeSymbol type, object value)
     {
@@ -279,9 +392,12 @@ internal static class ToolModelBuilder
             "NDG006" => "Duplicate tool name",
             "NDG007" => "Generic tool method",
             "NDG009" => "Tool without a description",
+            "NDG011" => "Text limit larger than the fixed-size text",
+            "NDG012" => "Invalid [Arg] limits",
+            "NDG014" => "Reserved or colliding name",
             _ => "Duplicate enum literal",
         },
-        id is "NDG001" or "NDG002" or "NDG003" or "NDG004" or "NDG005" ? "Error" : "Warning",
+        id is "NDG001" or "NDG002" or "NDG003" or "NDG004" or "NDG005" or "NDG011" or "NDG012" or "NDG014" ? "Error" : "Warning",
         message,
         location?.SourceTree?.FilePath ?? "",
         location?.SourceSpan ?? default,

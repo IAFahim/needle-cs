@@ -296,11 +296,14 @@ public sealed class SpanApiTests : IDisposable
         using var session = new NeedleSession(model, SessionCases.DefaultTools(), new NeedleOptions { Threads = 1, AutoDate = false });
         var calls = new byte[4096];
         var reply = default(Reply);
-        for (var attempt = 0; attempt < 5 && reply.Status != ReplyStatus.Cancelled; attempt++)
+        // Fast machines can finish the whole call inside one fixed delay, so each retry cancels sooner.
+        int[] delaysMs = [30, 15, 8, 4, 2, 1, 1, 1, 1, 1];
+        for (var attempt = 0; attempt < delaysMs.Length && reply.Status != ReplyStatus.Cancelled; attempt++)
         {
+            var delay = delaysMs[attempt];
             var canceller = new Thread(() =>
             {
-                Thread.Sleep(30);
+                Thread.Sleep(delay);
                 session.RequestCancel();
             });
             canceller.Start();

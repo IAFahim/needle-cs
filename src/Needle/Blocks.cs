@@ -769,21 +769,24 @@ internal static unsafe class Attention
                 tot += w0 * partials[MaxTileHeads * VDim + Lanes + h];
                 tot += w1 * partials[PartialFloats + MaxTileHeads * VDim + Lanes + h];
 #if NEEDLE_SIMD
-                var inv = Vector256.Create(1f / tot);
-                var w0v = Vector256.Create(w0);
-                var w1v = Vector256.Create(w1);
-                for (var d = 0; d < VDim; d += Lanes)
+                if (Fma.IsSupported)
                 {
-                    var sum = Vector256<float>.Zero;
-                    sum = Fma.MultiplyAdd(w0v, Avx.LoadVector256(partials + h * VDim + d), sum);
-                    sum = Fma.MultiplyAdd(w1v, Avx.LoadVector256(partials + PartialFloats + h * VDim + d), sum);
-                    Avx.Store(output + h * VDim + d, Avx.Multiply(sum, inv));
+                    var invVector = Vector256.Create(1f / tot);
+                    var w0v = Vector256.Create(w0);
+                    var w1v = Vector256.Create(w1);
+                    for (var d = 0; d < VDim; d += Lanes)
+                    {
+                        var sum = Vector256<float>.Zero;
+                        sum = Fma.MultiplyAdd(w0v, Avx.LoadVector256(partials + h * VDim + d), sum);
+                        sum = Fma.MultiplyAdd(w1v, Avx.LoadVector256(partials + PartialFloats + h * VDim + d), sum);
+                        Avx.Store(output + h * VDim + d, Avx.Multiply(sum, invVector));
+                    }
+                    continue;
                 }
-#else
+#endif
                 var inv = 1f / tot;
                 for (var d = 0; d < VDim; d++)
                     output[h * VDim + d] = (w0 * partials[h * VDim + d] + w1 * partials[PartialFloats + h * VDim + d]) * inv;
-#endif
                 continue;
             }
             var peak = float.NegativeInfinity;
@@ -795,15 +798,19 @@ internal static unsafe class Attention
                 total += weights[c] * partials[c * PartialFloats + MaxTileHeads * VDim + Lanes + h];
             }
 #if NEEDLE_SIMD
-            var inverse = Vector256.Create(1f / total);
-            for (var d = 0; d < VDim; d += Lanes)
+            if (Fma.IsSupported)
             {
-                var sum = Vector256<float>.Zero;
-                for (var c = 0; c < count; c++)
-                    sum = Fma.MultiplyAdd(Vector256.Create(weights[c]), Avx.LoadVector256(partials + c * PartialFloats + h * VDim + d), sum);
-                Avx.Store(output + h * VDim + d, Avx.Multiply(sum, inverse));
+                var inverseVector = Vector256.Create(1f / total);
+                for (var d = 0; d < VDim; d += Lanes)
+                {
+                    var sum = Vector256<float>.Zero;
+                    for (var c = 0; c < count; c++)
+                        sum = Fma.MultiplyAdd(Vector256.Create(weights[c]), Avx.LoadVector256(partials + c * PartialFloats + h * VDim + d), sum);
+                    Avx.Store(output + h * VDim + d, Avx.Multiply(sum, inverseVector));
+                }
+                continue;
             }
-#else
+#endif
             var inverse = 1f / total;
             for (var d = 0; d < VDim; d++)
             {
@@ -812,7 +819,6 @@ internal static unsafe class Attention
                     sum += weights[c] * partials[c * PartialFloats + h * VDim + d];
                 output[h * VDim + d] = sum * inverse;
             }
-#endif
         }
     }
     [MethodImpl(MethodImplOptions.NoInlining)]
@@ -829,7 +835,6 @@ internal static unsafe class Attention
 
 internal unsafe struct AttentionBatch
 {
-    const int MaxChunks = 8;
     const int MinChunkPositions = 16;
 
     public sbyte* Queries;
@@ -847,15 +852,38 @@ internal unsafe struct AttentionBatch
     int* arrivals;
     int tileHeads, tilesPerGroup, chunks, planGroups;
 
-    public static void Run(Pool pool, AttentionBatch* batch, int tokens)
+    // A decode row whose context reaches SplitFrom positions is split into a fixed number of position chunks,
+    // merged in chunk order, so the softmax sums in the same order at every thread count. The count is the
+    // split the thread-dependent planner made at four threads (ceil(4 / kv heads)); threads only decide how the
+    // chunks are spread across workers, never the arithmetic.
+    const int SplitFrom = 4 * MinChunkPositions;
+    public const int MaxSplitChunks = 8;
+
+    /// <summary>Position chunks per (row, kv head) for a model with this many kv heads.</summary>
+    public static int SplitChunks(int kvHeads) => Math.Clamp((4 + kvHeads - 1) / kvHeads, 1, MaxSplitChunks);
+
+    /// <summary>Set by causal self-attention callers: every row of a multi-token batch (prefill, speculative
+    /// verify) is split exactly as that row would be when decoded alone.</summary>
+    public bool CausalRows;
+
+    public static void Run(Pool pool, AttentionBatch* batch, int tokens) => Run(pool, batch, tokens, null, null);
+
+    /// <summary>Runs the batch; partials (tokens × kv heads × MaxSplitChunks × PartialFloats floats) and
+    /// arrivals (tokens × kv heads ints) are the caller's preallocated buffers for a split.</summary>
+    public static void Run(Pool pool, AttentionBatch* batch, int tokens, float* partials, int* arrivals)
     {
-        batch->Plan(pool.Threads, tokens, null, null);
+        batch->Plan(pool.Threads, tokens, partials, arrivals);
         if (batch->chunks == 1)
         {
             pool.Run(&Execute, batch, batch->TeamTasks);
             return;
         }
-        RunChunked(pool, batch);
+        if (partials == null) RunChunked(pool, batch);
+        else
+        {
+            for (var i = 0; i < batch->planGroups; i++) arrivals[i] = 0;
+            pool.Run(&ExecuteChunk, batch, batch->TeamTasks);
+        }
     }
 
     public bool UsesChunks => chunks > 1;
@@ -863,22 +891,28 @@ internal unsafe struct AttentionBatch
     public void Plan(int threads, int tokens, float* partials, int* arrivals)
     {
         var group = Heads / KvHeads;
-        Span(0, out _, out var firstCount);
         var splittable = Attention.CanSplitPositions && group > 1 && Probabilities == null;
-        var chunkByPos = splittable && (tokens > 1 || firstCount >= 4 * MinChunkPositions);
+        planGroups = tokens * KvHeads;
+        // Multi-token rows split only for causal callers that hand in buffers (a per-call stack buffer would
+        // grow with the batch); a single row's buffer is small.
+        var rowsSplit = tokens == 1 || CausalRows && partials != null && arrivals != null;
+        var longest = 0;
+        if (splittable && rowsSplit)
+            for (var t = 0; t < tokens; t++)
+            {
+                Span(t, out _, out var count);
+                longest = Math.Max(longest, count);
+            }
+        var chunkByPos = splittable && (tokens > 1 || longest >= SplitFrom);
         if (chunkByPos)
         {
             tilesPerGroup = (group + Attention.MaxTileHeads - 1) / Attention.MaxTileHeads;
             tileHeads = (group + tilesPerGroup - 1) / tilesPerGroup;
-            planGroups = tokens * KvHeads;
-            chunks = tilesPerGroup == 1 ? Math.Clamp((threads + planGroups - 1) / planGroups, 1, MaxChunks) : 1;
-            if (chunks > 1 && tokens == 1)
-                chunks = Math.Min(chunks, Math.Max(1, firstCount / MinChunkPositions));
+            chunks = tilesPerGroup == 1 && rowsSplit && longest >= SplitFrom ? SplitChunks(KvHeads) : 1;
         }
         else
         {
             chunks = 1;
-            planGroups = tokens * KvHeads;
             var desiredTiles = Probabilities == null && tokens == 1 && threads > planGroups
                 ? Math.Clamp((threads + planGroups - 1) / planGroups, 1, group)
                 : 1;
@@ -891,6 +925,9 @@ internal unsafe struct AttentionBatch
         this.partials = partials;
         this.arrivals = arrivals;
     }
+
+    /// <summary>Chunks a row of this many positions is split into: a function of the positions alone.</summary>
+    static int RowChunks(int count, int chunks) => count < SplitFrom ? 1 : Math.Clamp(count / MinChunkPositions, 1, chunks);
 
     public int TeamTasks => planGroups * (chunks == 1 ? tilesPerGroup : chunks);
 
@@ -905,7 +942,8 @@ internal unsafe struct AttentionBatch
     {
         var partials = stackalloc float[batch->planGroups * batch->chunks * Attention.PartialFloats];
         var arrivals = stackalloc int[batch->planGroups];
-        batch->Plan(pool.Threads, batch->planGroups / batch->KvHeads, partials, arrivals);
+        batch->partials = partials;
+        batch->arrivals = arrivals;
         for (var i = 0; i < batch->planGroups; i++) arrivals[i] = 0;
         pool.Run(&ExecuteChunk, batch, batch->TeamTasks);
     }
@@ -936,6 +974,22 @@ internal unsafe struct AttentionBatch
     }
 
     [SkipLocalsInit]
+    static void ExecuteWhole(AttentionBatch* b, int token, int kv, int first, int count)
+    {
+        var group = b->Heads / b->KvHeads;
+        var firstHead = kv * group;
+        var scores = stackalloc float[Attention.ScoreFloats(count)];
+        var work = b->Tile(token, kv, firstHead, group, first, count, scores);
+        work.Output = b->Output + (long)token * b->Heads * b->VDim + firstHead * b->VDim;
+        work.ProbabilityStride = b->Frames;
+        Attention.Run(work);
+#if NEEDLE_SIMD
+        if (b->Gate != null)
+            Ops.ApplyGateAndHeadPeaks(work.Output, b->Gate + ((long)token * b->Heads + firstHead) * b->VDim, group, b->VDim, b->GatePeaks + ((long)token * b->Heads + firstHead) * 16);
+#endif
+    }
+
+    [SkipLocalsInit]
     static void ExecuteChunk(AttentionBatch* b, int task)
     {
         var group = b->Heads / b->KvHeads;
@@ -944,7 +998,13 @@ internal unsafe struct AttentionBatch
         var token = groupIndex / b->KvHeads;
         var kv = groupIndex % b->KvHeads;
         b->Span(token, out var first, out var count);
-        var needed = Math.Clamp(count / MinChunkPositions, 1, b->chunks);
+        var needed = RowChunks(count, b->chunks);
+        if (needed == 1)
+        {
+            // A short row runs whole, exactly as a lone decode row of that length does.
+            if (chunk == 0) ExecuteWhole(b, token, kv, first, count);
+            return;
+        }
         var length = ((count + needed - 1) / needed + 3) & ~3;
         needed = (count + length - 1) / length;
         if (chunk >= needed) return;
@@ -1037,6 +1097,69 @@ internal static unsafe class HadamardMlp
 #else
         false;
 #endif
+
+    public static bool CanSplit(int rows, int cols) =>
+#if NEEDLE_SIMD
+        Blocked(rows, cols) && (void*)Kernels.Active.HadamardMlp == null;
+#else
+        false;
+#endif
+
+    public static int OutputRows(int dim, int rows, int cols) =>
+        Math.Min(rows, ((dim + cols - 1) / cols + TileRows - 1) / TileRows * TileRows);
+
+    public static void KronSlice(float* z, int activeRows, float* left, float* right, int rows, int cols, int rowStart, int rowEnd, float* result, float* tileScratch)
+    {
+        if (rowStart >= rowEnd) return;
+#if NEEDLE_SIMD
+        if (Simd.UseNeon) { Neon.Kron(z, activeRows, left + rowStart, right, rows, cols, rowEnd - rowStart, result + (long)rowStart * cols); return; }
+#endif
+        KronRange(z, activeRows, left, right, rows, cols, rowStart, rowEnd, result, tileScratch);
+    }
+
+    public static int TeamBackFloats(int width) => 3 * ((width + 15) & ~15);
+
+    public static void ApplyTeam(MlpBatch* b, float* residual, float* output, float* scratch, float* back, float* tileScratch, TeamBarrier* barrier, int member, int members)
+    {
+        var w = b->Weights;
+        var dim = b->Dim;
+        var rows = b->Rows;
+        var cols = b->Cols;
+        var width = b->Width;
+        var stride = (width + 15) & ~15;
+        var back1 = back;
+        var back2 = back1 + stride;
+        var back3 = back2 + stride;
+        BeginToken(b, residual, scratch);
+        Layout(scratch, dim, width, out var weights, out _, out var front, out _);
+        var inputRows = (dim + cols - 1) / cols;
+        TeamShard(rows / TileRows, member, members, out var r0, out var r1);
+        KronSlice(front, inputRows, w->W1A, w->W1B, rows, cols, r0, r1, back1, tileScratch);
+        Pool.Barrier(barrier);
+        PermuteModulateActivateRange(b->PermA, back1, w->D2, weights, w->CondU, w->B2, width, front, 0, width);
+        KronSlice(front, rows, w->W2A, w->W2B, rows, cols, r0, r1, back2, tileScratch);
+        Pool.Barrier(barrier);
+        PermuteScaleRange(b->PermB, back2, w->D3, front, 0, width);
+        TeamShard(OutputRows(dim, rows, cols) / TileRows, member, members, out var o0, out var o1);
+        KronSlice(front, rows, w->W3A, w->W3B, rows, cols, o0, o1, back3, tileScratch);
+        var e0 = o0 * cols;
+        var e1 = Math.Min(o1 * cols, dim);
+        if (e0 < e1)
+        {
+            if (output != residual) Buffer.MemoryCopy(residual + e0, output + e0, (e1 - e0) * 4, (e1 - e0) * 4);
+            AccumulateOutput(output + e0, back3 + e0, w->D4 + e0, b->Scale, e1 - e0);
+        }
+        Pool.Barrier(barrier);
+    }
+
+    static void TeamShard(int tiles, int member, int members, out int rowStart, out int rowEnd)
+    {
+        var q = tiles / members;
+        var r = tiles % members;
+        var first = member * q + Math.Min(member, r);
+        rowStart = first * TileRows;
+        rowEnd = rowStart + (q + (member < r ? 1 : 0)) * TileRows;
+    }
 
     public static void Layout(float* scratch, int dim, int width, out float* weights, out float* normalized, out float* front, out float* back)
     {

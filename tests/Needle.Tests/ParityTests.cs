@@ -44,6 +44,75 @@ public sealed class ParityTests : IDisposable
     }
 
     [Fact]
+    public void TokenByTokenDecodeIsBitIdenticalAcrossThreadCounts()
+    {
+        var ids = MemoryMarshal.Cast<byte, int>(File.ReadAllBytes(Path.Combine(Assets.Golden, "case0/ids.bin"))).ToArray();
+        // Past 64 positions decode attention splits positions into partial softmaxes; their count must not
+        // follow the thread count (it did on x64: 3+ threads merged two partials where 1-2 threads merged none).
+        var serial = DecodeLogits(ids, 100, 1, false);
+        foreach (var threads in new[] { 2, 3, 4, 6, 8 })
+            AssertSameBits(serial, DecodeLogits(ids, 100, threads, false), $"threads {threads}");
+        // A 4-thread pool whose adaptive team size changes token by token.
+        AssertSameBits(serial, DecodeLogits(ids, 100, 4, true), "adaptive team");
+    }
+
+    [Fact]
+    public void PrefillAndDecodeAreBitIdenticalAtEveryThreadAndTeamSize()
+    {
+        var ids = MemoryMarshal.Cast<byte, int>(File.ReadAllBytes(Path.Combine(Assets.Golden, "case0/ids.bin"))).ToArray();
+        ids = ids.AsSpan(0, Math.Min(ids.Length, 100)).ToArray();
+        // Pooling (as NeedleSession runs it) prefills layer by layer instead of the fused team.
+        foreach (var pooling in new[] { false, true })
+        {
+            float[][]? full = null;
+            foreach (var (threads, team) in new[] { (4, 0), (4, 1), (4, 2), (4, 3), (1, 0), (2, 0), (3, 0), (6, 0), (8, 0) })
+            {
+                using var engine = new Engine(model, 512, 64, threads) { Pooling = pooling };
+                engine.SharedPool.PinTeamMembers(team);
+                var steps = new System.Collections.Generic.List<float[]>();
+                engine.Feed(ids);
+                steps.Add(engine.Logits.ToArray());
+                var token = new int[1];
+                for (var step = 0; step < 8; step++)
+                {
+                    token[0] = engine.Greedy();
+                    engine.Feed(token);
+                    steps.Add(engine.Logits.ToArray());
+                }
+                if (full == null) { full = steps.ToArray(); continue; }
+                AssertSameBits(full, steps.ToArray(), $"pooling {pooling} threads {threads} team {team}");
+            }
+        }
+    }
+
+    float[][] DecodeLogits(int[] ids, int prompt, int threads, bool varyTeam)
+    {
+        using var engine = new Engine(model, 512, 64, threads);
+        var steps = new System.Collections.Generic.List<float[]>();
+        var token = new int[1];
+        var fed = 0;
+        void Step(int id)
+        {
+            if (varyTeam) engine.SharedPool.PinTeamMembers(1 + fed++ % threads);
+            token[0] = id;
+            engine.Feed(token);
+            steps.Add(engine.Logits.ToArray());
+        }
+        foreach (var id in ids.AsSpan(0, Math.Min(ids.Length, prompt))) Step(id);
+        for (var step = 0; step < 8; step++) Step(engine.Greedy());
+        return steps.ToArray();
+    }
+
+    static void AssertSameBits(float[][] expected, float[][] actual, string label)
+    {
+        Assert.Equal(expected.Length, actual.Length);
+        for (var step = 0; step < expected.Length; step++)
+            for (var i = 0; i < expected[step].Length; i++)
+                Assert.True(BitConverter.SingleToInt32Bits(expected[step][i]) == BitConverter.SingleToInt32Bits(actual[step][i]),
+                    $"{label} step {step} logit {i}: {expected[step][i]} vs {actual[step][i]}");
+    }
+
+    [Fact]
     public void ForwardMatchesReferenceLogits()
     {
         var ids = MemoryMarshal.Cast<byte, int>(File.ReadAllBytes(Path.Combine(Assets.Golden, "case0/ids.bin"))).ToArray();
