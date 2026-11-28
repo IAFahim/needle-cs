@@ -27,6 +27,8 @@ public sealed class NeedleOptions
 
     public bool Stateless { get; init; }
 
+    public bool Repair { get; init; } = true;
+
     internal ThreadPolicy ResolvedThreading => Threading ?? ThreadPolicy.Default.WithThreads(Threads);
 
     internal NeedleOptions WithStateless(bool stateless) => new()
@@ -44,10 +46,18 @@ public sealed class NeedleOptions
         JumpForward = JumpForward,
         PromptLookup = PromptLookup,
         Stateless = stateless,
+        Repair = Repair,
     };
 }
 
 public sealed record FunctionCall(string Name, string ArgumentsJson);
+
+public sealed record CallValidation(bool Repaired, bool Negated, bool Invalid, IReadOnlyList<string> Ungrounded)
+{
+    public static CallValidation Clean { get; } = new(false, false, false, Array.Empty<string>());
+
+    public bool IsClean => !Repaired && !Negated && !Invalid && Ungrounded.Count == 0;
+}
 
 public sealed class CallResult
 {
@@ -55,6 +65,7 @@ public sealed class CallResult
     public string? Error { get; init; }
     public IReadOnlyList<FunctionCall> FunctionCalls { get; init; } = Array.Empty<FunctionCall>();
     public IReadOnlyList<FunctionCall> SuppressedCalls { get; init; } = Array.Empty<FunctionCall>();
+    public CallValidation Validation { get; init; } = CallValidation.Clean;
     public string Reasoning { get; init; } = "";
     public string Response { get; init; } = "";
     public float? Confidence { get; init; }
@@ -76,6 +87,13 @@ public sealed class CallResult
         WriteCalls(b, FunctionCalls);
         b.Append(",\"suppressed_calls\":");
         WriteCalls(b, SuppressedCalls);
+        b.Append(",\"validation\":{\"ungrounded\":[");
+        for (var i = 0; i < Validation.Ungrounded.Count; i++)
+        {
+            if (i > 0) b.Append(',');
+            JsonValue.WriteString(b, Validation.Ungrounded[i]);
+        }
+        b.Append("],\"negation\":").Append(Validation.Negated ? "true" : "false").Append(",\"repaired\":").Append(Validation.Repaired ? "true" : "false").Append('}');
         b.Append(",\"reasoning\":");
         JsonValue.WriteString(b, Reasoning);
         b.Append(",\"response\":");
@@ -153,7 +171,9 @@ public sealed unsafe partial class NeedleSession : IDisposable
     readonly Engine engine;
     readonly Tokenizer tokenizer;
     readonly TokenTrie trie;
-    readonly string system;
+    string system;
+    string systemText;
+    byte[] systemUtf8 = Array.Empty<byte>();
     readonly int maskWords;
     readonly uint* reasoningMask;
     readonly uint* decisionMask;
@@ -195,6 +215,16 @@ public sealed unsafe partial class NeedleSession : IDisposable
     int specPrimedLength;
     int[]? pendingClosing;
     bool pendingClosingCounted;
+    readonly byte[] restored;
+    int restoredLength;
+    readonly RepairPlan? repairPlan;
+    readonly Triggers? triggers;
+    ulong route;
+    readonly RepairScratch? repairScratch;
+    readonly RepairText? repairRequest;
+    readonly RepairText? repairHistory;
+    DateTime? repairToday;
+    RepairOutcome lastRepair;
 
     public NeedleSession(Model model, string toolsJson, NeedleOptions? options = null)
         : this(model, toolsJson, null, default, options)
@@ -215,7 +245,9 @@ public sealed unsafe partial class NeedleSession : IDisposable
         var vocabulary = model.GetVocabulary();
         tokenizer = new Tokenizer(vocabulary, TokenizerInputBytes);
         trie = new TokenTrie(vocabulary.Trie);
-        system = BuildSystem(this.options);
+        systemText = this.options.System ?? "";
+        systemUtf8 = Encoding.UTF8.GetBytes(systemText);
+        system = BuildSystem(systemText, this.options.AutoDate);
         contextCapacity = Math.Min(this.options.Context, model.Geometry.MaxSeq);
         embedderCapacity = Math.Min(EmbedderContext, model.Geometry.MaxSeq);
         maxInputBytes = Math.Max(1, Math.Min(TokenizerInputBytes - InputOverheadBytes, this.options.Context * 16));
@@ -242,6 +274,17 @@ public sealed unsafe partial class NeedleSession : IDisposable
         callText = new byte[Math.Max(1, this.options.MaxCallTokens) * MaxPieceBytes];
         callSpans = new CallSpan[Math.Max(1, this.options.MaxCallTokens)];
         keyScratch = new byte[Math.Max(MinKeyScratchBytes, allTools.Aliases.LongestPropertyAlias + 2)];
+        restored = new byte[callText.Length * 2 + 1024];
+        if (this.options.Repair)
+        {
+            repairPlan = new RepairPlan(allTools, toolsJson);
+            repairScratch = new RepairScratch(callSpans.Length, Math.Max(64, callSpans.Length * 4), restored.Length + repairPlan.LongestValue * 8);
+            repairRequest = new RepairText(maxInputBytes + 16);
+            repairHistory = new RepairText(Math.Max(16384, maxInputBytes * 4));
+            repairToday = ParseToday(system);
+            LoadHistory();
+        }
+        triggers = Triggers.Compile(allTools, toolsJson, maxInputBytes);
         retrieval = allTools.Tools.Count > this.options.RetrievalTopK && model.Confidence != null;
         toolEmbeddings = retrieval ? new float[allTools.Tools.Count * embeddingWidth] : Array.Empty<float>();
         toolScores = retrieval ? new float[allTools.Tools.Count] : Array.Empty<float>();
@@ -272,12 +315,35 @@ public sealed unsafe partial class NeedleSession : IDisposable
 
     internal int LastCallPasses { get; private set; }
 
+    public ReadOnlySpan<byte> Ungrounded => repairScratch == null || (lastRepair & RepairOutcome.Ungrounded) == 0 ? default : new ReadOnlySpan<byte>(repairScratch.Ungrounded, 0, repairScratch.UngroundedLength);
+
+    static DateTime? ParseToday(string system)
+    {
+        var match = IsoStamp.Match(system);
+        return match.Success && DateTime.TryParseExact(match.Value, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var day) ? day : null;
+    }
+
+    void LoadHistory()
+    {
+        if (repairHistory == null) return;
+        repairHistory.Load(systemUtf8);
+        repairRequest!.Clear();
+    }
+
+    void TrackInput(ReadOnlySpan<byte> input, bool toolResult)
+    {
+        route = toolResult || triggers == null || retrieval ? 0 : triggers.Match(input);
+        if (repairHistory == null) return;
+        if (options.Stateless && !toolResult) LoadHistory();
+        if (!toolResult) repairRequest!.Load(input);
+        repairHistory.Append(input);
+    }
+
     public void RequestCancel() => System.Threading.Volatile.Write(ref cancelRequested, 1);
 
-    static string BuildSystem(NeedleOptions o)
+    static string BuildSystem(string text, bool autoDate)
     {
-        var text = o.System ?? "";
-        if (!o.AutoDate || DateKey.IsMatch(text) || IsoStamp.IsMatch(text)) return text;
+        if (!autoDate || DateKey.IsMatch(text) || IsoStamp.IsMatch(text)) return text;
         var fact = DateTime.Now.ToString("'date: 'yyyy-MM-dd ddd HH:mm", CultureInfo.InvariantCulture);
         if (string.IsNullOrWhiteSpace(text)) return fact;
         return text.TrimStart().StartsWith('{') ? text : fact + "; " + text;
@@ -323,8 +389,21 @@ public sealed unsafe partial class NeedleSession : IDisposable
         turnOne = true;
     }
 
+    /// <summary>Replaces the system facts and starts a new conversation. The tools and the model stay as they are.</summary>
+    public void SetSystem(string? text)
+    {
+        systemText = text ?? "";
+        systemUtf8 = Encoding.UTF8.GetBytes(systemText);
+        system = BuildSystem(systemText, options.AutoDate);
+        if (repairScratch != null) repairToday = ParseToday(system);
+        LoadHistory();
+        if (retrieval) activeToolCount = -1;
+        else Prime(active);
+    }
+
     public void Reset()
     {
+        LoadHistory();
         engine.Rewind();
         turnOne = true;
         specHistoryLength = specPrimedLength;
@@ -427,48 +506,380 @@ public sealed unsafe partial class NeedleSession : IDisposable
         where TCommand : struct =>
         RunTyped(utf8Json, true, commands, utf8Reasoning, utf8Response, ref sink);
 
+    enum TurnPhase : byte { Idle, Prefill, Reason, Respond, Calls, Done }
+
+    // Everything a turn carries from one step to the next. Ask runs the steps back to back; a streamed turn runs
+    // them a slice at a time. Both run the same code in the same order, so their output is the same bit for bit.
+    struct TurnCursor
+    {
+        public TurnPhase Phase;
+        public TurnProgress Progress;
+        public int PromptFed;
+        public int Index;
+        public bool FirstPiece;
+        public int Next;
+        public bool CallsReady;
+        public GrammarState Grammar;
+        public double LogProbability;
+        public int Steps;
+        public int Allowed;
+        public bool Full;
+        public Reply Result;
+    }
+
+    TurnCursor turn;
+
     Reply Run(ReadOnlySpan<byte> input, bool toolResult, Span<byte> calls, Span<byte> reasoning, Span<byte> response)
     {
-        var progress = new TurnProgress { Started = Stopwatch.GetTimestamp() };
-        System.Threading.Volatile.Write(ref cancelRequested, 0);
-        if (!toolResult && input.Length == 0) return Failed(FailureReason.EmptyInput, progress);
-        if (input.Length > maxInputBytes) return Failed(FailureReason.InputTooLong, progress);
-        if (retrieval && !toolResult)
-        {
-            var selection = SelectTools(input);
-            if (selection != FailureReason.None) return Failed(selection, progress);
-        }
-        if (!ReplayPendingClosing()) return Failed(FailureReason.ContextExhausted, progress);
-        progress.PromptTokens = EncodePrompt(input, toolResult);
-        if (engine.Length + progress.PromptTokens > contextCapacity) return Failed(FailureReason.ContextExhausted, progress);
-        turnOne = false;
-        engine.Feed(new ReadOnlySpan<int>(promptIds, 0, progress.PromptTokens));
-        RecordSpecHistory(new ReadOnlySpan<int>(promptIds, 0, progress.PromptTokens));
-        progress.PrefillTicks = Stopwatch.GetTimestamp() - progress.Started;
-        return Generate(ref progress, calls, reasoning, response);
+        if (!BeginTurn(input, toolResult, typed: false)) return turn.Result;
+        while (!StepTurn(calls, reasoning, response)) { }
+        return turn.Result;
     }
 
     Reply RunTyped<TSink, TCommand>(ReadOnlySpan<byte> input, bool toolResult, Span<TCommand> commands, Span<byte> reasoning, Span<byte> response, ref TSink sink)
         where TSink : struct, Tools.ICallSink<TCommand>
         where TCommand : struct
     {
-        var progress = new TurnProgress { Started = Stopwatch.GetTimestamp() };
+        if (!BeginTurn(input, toolResult, typed: true)) return turn.Result;
+        while (turn.Phase != TurnPhase.Calls)
+            if (StepTurn(default, reasoning, response)) return turn.Result;
+        var reply = GenerateCallsTyped(ref turn.Progress, commands, ref sink);
+        End(reply);
+        return reply;
+    }
+
+    /// <summary>
+    /// Starts a turn: checks the input, encodes the prompt and queues it for prefill. False when the turn already
+    /// ended (the reply is in <see cref="TurnResult"/>); the model has not run yet either way.
+    /// </summary>
+    bool BeginTurn(ReadOnlySpan<byte> input, bool toolResult, bool typed)
+    {
+        turn = default;
+        turn.Progress.Started = Stopwatch.GetTimestamp();
         System.Threading.Volatile.Write(ref cancelRequested, 0);
-        if (!toolResult && input.Length == 0) return Failed(FailureReason.EmptyInput, progress);
-        if (input.Length > maxInputBytes) return Failed(FailureReason.InputTooLong, progress);
-        if (retrieval) return Failed(FailureReason.ToolContextFailed, progress);
-        if (!ReplayPendingClosing()) return Failed(FailureReason.ContextExhausted, progress);
-        progress.PromptTokens = EncodePrompt(input, toolResult);
-        if (engine.Length + progress.PromptTokens > contextCapacity) return Failed(FailureReason.ContextExhausted, progress);
+        if (!toolResult && input.Length == 0) return !End(Failed(FailureReason.EmptyInput, turn.Progress));
+        if (input.Length > maxInputBytes) return !End(Failed(FailureReason.InputTooLong, turn.Progress));
+        if (retrieval && typed) return !End(Failed(FailureReason.ToolContextFailed, turn.Progress));
+        if (retrieval && !toolResult)
+        {
+            var selection = SelectTools(input);
+            if (selection != FailureReason.None) return !End(Failed(selection, turn.Progress));
+        }
+        if (!ReplayPendingClosing()) return !End(Failed(FailureReason.ContextExhausted, turn.Progress));
+        turn.Progress.PromptTokens = EncodePrompt(input, toolResult);
+        if (engine.Length + turn.Progress.PromptTokens > contextCapacity) return !End(Failed(FailureReason.ContextExhausted, turn.Progress));
         turnOne = false;
-        engine.Feed(new ReadOnlySpan<int>(promptIds, 0, progress.PromptTokens));
-        RecordSpecHistory(new ReadOnlySpan<int>(promptIds, 0, progress.PromptTokens));
-        progress.PrefillTicks = Stopwatch.GetTimestamp() - progress.Started;
-        var interrupted = Reason(ref progress, reasoning, response, out _);
-        if (interrupted.HasValue) return interrupted.Value;
-        if (!TryFeed(ToolCallStart)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
+        TrackInput(input, toolResult);
+        turn.Phase = TurnPhase.Prefill;
+        return true;
+    }
+
+    bool End(Reply reply)
+    {
+        turn.Result = reply;
+        turn.Phase = TurnPhase.Done;
+        return true;
+    }
+
+    /// <summary>
+    /// Runs one step of the current turn: one prefill chunk, one reasoning or response token, one call step (a
+    /// token, or a jump-forward or speculative chunk) or the closing. True when the turn has ended.
+    /// </summary>
+    bool StepTurn(Span<byte> calls, Span<byte> reasoning, Span<byte> response)
+    {
+        switch (turn.Phase)
+        {
+            case TurnPhase.Prefill:
+                PrefillStep();
+                return false;
+            case TurnPhase.Reason:
+                return ReasonStep(reasoning);
+            case TurnPhase.Respond:
+                return RespondStep(response);
+            case TurnPhase.Calls:
+                return CallsStep(calls);
+            default:
+                return true;
+        }
+    }
+
+    // Engine.Feed walks a prompt in chunks of the engine's chunk size, so feeding it one chunk per step runs
+    // exactly the same forward passes as feeding it whole.
+    void PrefillStep()
+    {
+        var total = turn.Progress.PromptTokens;
+        var count = Math.Min(engine.ChunkSize, total - turn.PromptFed);
+        var last = turn.PromptFed + count == total;
+        engine.Feed(new ReadOnlySpan<int>(promptIds, turn.PromptFed, count), computeLogits: last);
+        turn.PromptFed += count;
+        if (!last) return;
+        RecordSpecHistory(new ReadOnlySpan<int>(promptIds, 0, total));
+        turn.Progress.PrefillTicks = Stopwatch.GetTimestamp() - turn.Progress.Started;
+        turn.Phase = TurnPhase.Reason;
+        turn.Index = 0;
+        turn.FirstPiece = true;
+    }
+
+    bool ReasonStep(Span<byte> reasoning)
+    {
+        ref var progress = ref turn.Progress;
+        var budget = options.FrameBudget;
+        if (turn.Index < options.ReasoningBudget)
+        {
+            if (CancelRequested) return End(Abandon(ReplyStatus.Cancelled, FailureReason.None, progress));
+            var next = ArgMax(reasoningMask);
+            if (next < 0) return End(Abandon(ReplyStatus.Failed, FailureReason.GrammarDeadEnd, progress));
+            if (turn.Index == 0) progress.FirstTokenTicks = Stopwatch.GetTimestamp() - progress.Started;
+            if (next != ThinkEnd)
+            {
+                AppendPiece(next, turn.FirstPiece, reasoning, ref progress.ReasoningLength, ref progress.Flags, ReplyFlags.ReasoningTruncated);
+                turn.FirstPiece = false;
+                if (!TryFeed(next)) return End(Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress));
+                RecordSpecHistory(next);
+                progress.DecodeTokens++;
+                if (!budget.IsUnlimited && FrameBudgetHit(progress, budget)) return End(Abandon(ReplyStatus.Failed, FailureReason.FrameBudgetExceeded, progress));
+                turn.Index++;
+                return false;
+            }
+        }
+        if (!thinkEndFolded)
+        {
+            if (!TryFeed(thinkEndForced)) return End(Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress));
+            for (var f = 0; f < thinkEndForced.Length; f++) RecordSpecHistory(thinkEndForced[f]);
+        }
+        var decision = route != 0 ? ToolCallStart : ArgMax(decisionMask);
+        if (decision < 0) return End(Abandon(ReplyStatus.Failed, FailureReason.GrammarDeadEnd, progress));
+        if (decision != ToolCallStart)
+        {
+            turn.Phase = TurnPhase.Respond;
+            turn.Next = decision;
+            turn.Index = 0;
+            return false;
+        }
+        if (!TryFeed(ToolCallStart)) return End(Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress));
         RecordSpecHistory(ToolCallStart);
-        return GenerateCallsTyped(ref progress, commands, ref sink);
+        turn.Phase = TurnPhase.Calls;
+        turn.CallsReady = false;
+        return false;
+    }
+
+    bool RespondStep(Span<byte> response)
+    {
+        ref var progress = ref turn.Progress;
+        var budget = options.FrameBudget;
+        if (turn.Index < options.MaxCallTokens && turn.Next != ImEnd && turn.Next != EndOfText)
+        {
+            if (CancelRequested) return End(Abandon(ReplyStatus.Cancelled, FailureReason.None, progress));
+            AppendPiece(turn.Next, turn.Index == 0, response, ref progress.ResponseLength, ref progress.Flags, ReplyFlags.ResponseTruncated);
+            if (!TryFeed(turn.Next)) return End(Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress));
+            progress.DecodeTokens++;
+            if (!budget.IsUnlimited && FrameBudgetHit(progress, budget)) return End(Abandon(ReplyStatus.Failed, FailureReason.FrameBudgetExceeded, progress));
+            turn.Next = ArgMax(responseMask);
+            if (turn.Next < 0) return End(Abandon(ReplyStatus.Failed, FailureReason.GrammarDeadEnd, progress));
+            turn.Index++;
+            return false;
+        }
+        if (!FinishClosing(responseClosing, countPass: false)) return End(Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress));
+        var confidence = (float)HeadProbability();
+        return End(new Reply(ReplyStatus.Responded, FailureReason.None, progress.Flags, confidence, confidence, float.NaN, 0, 0,
+            progress.ReasoningLength, progress.ResponseLength, progress.PromptTokens, progress.DecodeTokens, progress.PrefillTicks, progress.FirstTokenTicks, Stopwatch.GetTimestamp() - progress.Started));
+    }
+
+    bool CallsStep(Span<byte> calls)
+    {
+        if (!turn.CallsReady)
+        {
+            turn.Grammar = Grammar.Start(grammar.Program, route);
+            turn.LogProbability = 0.0;
+            turn.Steps = 0;
+            callTextLength = 0;
+            LastCallPasses = 0;
+            trie.Allow(grammar.Program, turn.Grammar, mask);
+            turn.Allowed = MaskCount(mask, maskWords);
+            turn.Full = true;
+            turn.CallsReady = true;
+        }
+        if (!Grammar.Complete(turn.Grammar))
+        {
+            var interrupted = CallStep(out var complete);
+            if (interrupted.HasValue) return End(interrupted.Value);
+            if (!complete) return false;
+        }
+        return End(FinishCalls(calls));
+    }
+
+    /// <summary>One pass of the constrained call loop: a token, or a forced or speculative chunk.</summary>
+    Reply? CallStep(out bool complete)
+    {
+        complete = false;
+        ref var progress = ref turn.Progress;
+        var budget = options.FrameBudget;
+        var jump = options.JumpForward;
+        var state = turn.Grammar;
+        var logProbability = turn.LogProbability;
+        var steps = turn.Steps;
+        var allowed = turn.Allowed;
+        var full = turn.Full;
+        var buffer = stackalloc byte[256];
+        var chunkIds = stackalloc int[MaxJumpChunk];
+        var draftAllowed = stackalloc int[MaxDraftTokens];
+        var draftProbs = stackalloc float[MaxDraftTokens];
+        if (CancelRequested) return Abandon(ReplyStatus.Cancelled, FailureReason.None, progress);
+        if (steps >= options.MaxCallTokens) return Abandon(ReplyStatus.Failed, FailureReason.CallTokenBudgetExceeded, progress);
+        if (allowed == 0) return Abandon(ReplyStatus.Failed, FailureReason.GrammarDeadEnd, progress);
+        int pick;
+        float probability;
+        if (jump && allowed == 1)
+        {
+            pick = SoleAllowed(mask, maskWords, sparseRows);
+            probability = 1f;
+        }
+        else if (full) pick = ArgMaxWithProbability(mask, out probability);
+        else pick = ArgMaxSparse(scratchLogits, sparseRows, allowed, out probability);
+        if (pick < 0) return Abandon(ReplyStatus.Failed, FailureReason.GrammarDeadEnd, progress);
+        if (steps == 0 && progress.FirstTokenTicks == 0) progress.FirstTokenTicks = Stopwatch.GetTimestamp() - progress.Started;
+        var length = tokenizer.ConstraintBytes(pick, buffer);
+        if (callTextLength + length > callText.Length) return Abandon(ReplyStatus.Failed, FailureReason.CallTextTooLong, progress);
+        var cursor = &state;
+        for (var b = 0; b < length; b++)
+        {
+            if (!Grammar.Advance(grammar.Program, cursor, buffer[b])) return Abandon(ReplyStatus.Failed, FailureReason.GrammarRejectedToken, progress);
+            callText[callTextLength++] = buffer[b];
+        }
+        logProbability += Math.Log(Math.Max(probability, 1e-9));
+        steps++;
+        progress.DecodeTokens++;
+        if (!budget.IsUnlimited && FrameBudgetHit(progress, budget)) return Abandon(ReplyStatus.Failed, FailureReason.FrameBudgetExceeded, progress);
+        RecordSpecHistory(pick);
+        chunkIds[0] = pick;
+        var chunkCount = 1;
+        var maskFresh = false;
+        if (jump && !Grammar.Complete(state))
+        {
+            while (chunkCount < MaxJumpChunk && !Grammar.Complete(state))
+            {
+                if (CancelRequested) return Abandon(ReplyStatus.Cancelled, FailureReason.None, progress);
+                if (steps >= options.MaxCallTokens) return Abandon(ReplyStatus.Failed, FailureReason.CallTokenBudgetExceeded, progress);
+                trie.Allow(grammar.Program, state, mask);
+                maskFresh = true;
+                allowed = MaskCount(mask, maskWords);
+                if (allowed != 1) break;
+                var forced = SoleAllowed(mask, maskWords, sparseRows);
+                var forcedLength = tokenizer.ConstraintBytes(forced, buffer);
+                if (forcedLength <= 0) break;
+                if (callTextLength + forcedLength > callText.Length) return Abandon(ReplyStatus.Failed, FailureReason.CallTextTooLong, progress);
+                for (var b = 0; b < forcedLength; b++)
+                {
+                    if (!Grammar.Advance(grammar.Program, cursor, buffer[b])) return Abandon(ReplyStatus.Failed, FailureReason.GrammarRejectedToken, progress);
+                    callText[callTextLength++] = buffer[b];
+                }
+                chunkIds[chunkCount++] = forced;
+                steps++;
+                progress.DecodeTokens++;
+                RecordSpecHistory(forced);
+                if (!budget.IsUnlimited && FrameBudgetHit(progress, budget)) return Abandon(ReplyStatus.Failed, FailureReason.FrameBudgetExceeded, progress);
+            }
+        }
+        if (jump && chunkCount > 1 && CancelRequested) return Abandon(ReplyStatus.Cancelled, FailureReason.None, progress);
+        var draftStart = chunkCount;
+        var specFed = false;
+        if (options.PromptLookup && chunkCount == 1 && !Grammar.Complete(state))
+        {
+            var scratchState = state;
+            var drafts = ProposeDrafts(&scratchState, chunkIds, chunkCount, draftAllowed, steps, buffer);
+            if (drafts > 0)
+            {
+                if (CancelRequested) return Abandon(ReplyStatus.Cancelled, FailureReason.None, progress);
+                engine.CheckpointSpec();
+                chunkCount += drafts;
+                if (!FeedCallChunk(new ReadOnlySpan<int>(chunkIds, chunkCount), computeLogits: false)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
+                var accepted = VerifyDrafts(chunkIds, draftStart, drafts, draftAllowed, draftProbs);
+                if (accepted < drafts) engine.RestoreSpec();
+                for (var j = 0; j < accepted; j++)
+                {
+                    var draft = chunkIds[draftStart + j];
+                    var draftLength = tokenizer.ConstraintBytes(draft, buffer);
+                    if (callTextLength + draftLength > callText.Length) return Abandon(ReplyStatus.Failed, FailureReason.CallTextTooLong, progress);
+                    var draftCursor = &state;
+                    for (var b = 0; b < draftLength; b++)
+                    {
+                        if (!Grammar.Advance(grammar.Program, draftCursor, buffer[b])) return Abandon(ReplyStatus.Failed, FailureReason.GrammarRejectedToken, progress);
+                        callText[callTextLength++] = buffer[b];
+                    }
+                    RecordSpecHistory(draft);
+                    logProbability += Math.Log(Math.Max(draftProbs[j], 1e-9));
+                    steps++;
+                    progress.DecodeTokens++;
+                    if (!budget.IsUnlimited && FrameBudgetHit(progress, budget)) return Abandon(ReplyStatus.Failed, FailureReason.FrameBudgetExceeded, progress);
+                }
+                chunkCount = draftStart + accepted;
+                specFed = accepted == drafts;
+                maskFresh = false;
+            }
+        }
+        var chunk = new ReadOnlySpan<int>(chunkIds, chunkCount);
+        if (Grammar.Complete(state))
+        {
+            if (!specFed && !FeedCallChunk(chunk, computeLogits: false)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
+            turn.Grammar = state;
+            turn.LogProbability = logProbability;
+            turn.Steps = steps;
+            complete = true;
+            return null;
+        }
+        if (!maskFresh)
+        {
+            trie.Allow(grammar.Program, state, mask);
+            allowed = MaskCount(mask, maskWords);
+        }
+        if (allowed == 0) return Abandon(ReplyStatus.Failed, FailureReason.GrammarDeadEnd, progress);
+        if (allowed <= SparseHeadThreshold)
+        {
+            ExtractIds(mask, maskWords, sparseRows, SparseHeadThreshold);
+            if (!specFed && !FeedCallChunk(chunk, computeLogits: false)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
+            engine.LogitsForRows(sparseRows, allowed, scratchLogits);
+            full = false;
+        }
+        else
+        {
+            if (specFed) engine.RefreshLastLogits();
+            else if (!FeedCallChunk(chunk, computeLogits: true)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
+            full = true;
+        }
+        turn.Grammar = state;
+        turn.LogProbability = logProbability;
+        turn.Steps = steps;
+        turn.Allowed = allowed;
+        turn.Full = full;
+        return null;
+    }
+
+    Reply FinishCalls(Span<byte> calls)
+    {
+        ref var progress = ref turn.Progress;
+        if (!FinishClosing(callClosing, countPass: true)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
+
+        var head = HeadProbability();
+        var decode = Math.Exp(turn.LogProbability / Math.Max(1, turn.Steps));
+        var confidence = (float)Math.Min(head, decode);
+        if (!CallRestorer.TryRestore(allTools.Aliases, new ReadOnlySpan<byte>(callText, 0, callTextLength), restored, keyScratch, callSpans, out var required, out restoredCallCount))
+            return Failed(FailureReason.MalformedCalls, progress);
+        restoredLength = required;
+        lastRepair = RepairOutcome.None;
+        if (repairPlan != null)
+        {
+            lastRepair = ArgumentRepair.Apply(repairPlan, repairScratch!, repairRequest!, repairHistory!, repairToday, restored, restoredLength, callSpans, ref restoredCallCount, out var repaired);
+            if (repaired <= restored.Length) restoredLength = required = repaired;
+            progress.Flags |= ToFlags(lastRepair);
+        }
+        if (required <= calls.Length) new ReadOnlySpan<byte>(restored, 0, required).CopyTo(calls);
+        // 4.x: a call below the floor is withheld unless a trigger routed it; a grounding gate withholds it either way.
+        var refused = confidence < options.RefuseBelow && route == 0 || (lastRepair & RepairOutcome.Ungrounded) != 0;
+        var declined = restoredCallCount == 0 && required <= calls.Length;
+        var status = required > calls.Length ? ReplyStatus.Failed : declined ? ReplyStatus.Declined : refused ? ReplyStatus.Refused : ReplyStatus.Called;
+        var failure = required > calls.Length ? FailureReason.CallsBufferTooSmall : FailureReason.None;
+        return new Reply(status, failure, progress.Flags, confidence, (float)head, (float)decode, restoredCallCount, required,
+            progress.ReasoningLength, 0, progress.PromptTokens, progress.DecodeTokens, progress.PrefillTicks, progress.FirstTokenTicks, Stopwatch.GetTimestamp() - progress.Started);
     }
 
     bool thinkEndFolded;
@@ -493,195 +904,14 @@ public sealed unsafe partial class NeedleSession : IDisposable
         return total;
     }
 
-    Reply Generate(ref TurnProgress progress, Span<byte> calls, Span<byte> reasoning, Span<byte> response)
+    internal static ReplyFlags ToFlags(RepairOutcome outcome)
     {
-        var budget = options.FrameBudget;
-        var interrupted = Reason(ref progress, reasoning, response, out _);
-        if (interrupted.HasValue) return interrupted.Value;
-        if (!TryFeed(ToolCallStart)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
-        RecordSpecHistory(ToolCallStart);
-        return GenerateCalls(ref progress, calls);
-    }
-
-    Reply? Reason(ref TurnProgress progress, Span<byte> reasoning, Span<byte> response, out int decision)
-    {
-        decision = ToolCallStart;
-        var budget = options.FrameBudget;
-        var firstPiece = true;
-        for (var i = 0; i < options.ReasoningBudget; i++)
-        {
-            if (CancelRequested) return Abandon(ReplyStatus.Cancelled, FailureReason.None, progress);
-            var next = ArgMax(reasoningMask);
-            if (next < 0) return Abandon(ReplyStatus.Failed, FailureReason.GrammarDeadEnd, progress);
-            if (i == 0) progress.FirstTokenTicks = Stopwatch.GetTimestamp() - progress.Started;
-            if (next == ThinkEnd) break;
-            AppendPiece(next, firstPiece, reasoning, ref progress.ReasoningLength, ref progress.Flags, ReplyFlags.ReasoningTruncated);
-            firstPiece = false;
-            if (!TryFeed(next)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
-            RecordSpecHistory(next);
-            progress.DecodeTokens++;
-            if (!budget.IsUnlimited && FrameBudgetHit(progress, budget)) return Abandon(ReplyStatus.Failed, FailureReason.FrameBudgetExceeded, progress);
-        }
-        if (!thinkEndFolded)
-        {
-            if (!TryFeed(thinkEndForced)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
-            for (var f = 0; f < thinkEndForced.Length; f++) RecordSpecHistory(thinkEndForced[f]);
-        }
-        decision = ArgMax(decisionMask);
-        if (decision < 0) return Abandon(ReplyStatus.Failed, FailureReason.GrammarDeadEnd, progress);
-        if (decision != ToolCallStart) return Respond(decision, ref progress, response);
-        return null;
-    }
-
-    Reply GenerateCalls(ref TurnProgress progress, Span<byte> calls)
-    {
-        var budget = options.FrameBudget;
-        var jump = options.JumpForward;
-        var state = Grammar.Start(grammar.Program);
-        var logProbability = 0.0;
-        var steps = 0;
-        var buffer = stackalloc byte[256];
-        var chunkIds = stackalloc int[MaxJumpChunk];
-        var draftAllowed = stackalloc int[MaxDraftTokens];
-        var draftProbs = stackalloc float[MaxDraftTokens];
-        callTextLength = 0;
-        LastCallPasses = 0;
-        trie.Allow(grammar.Program, state, mask);
-        var allowed = MaskCount(mask, maskWords);
-        var full = true;
-        while (!Grammar.Complete(state))
-        {
-            if (CancelRequested) return Abandon(ReplyStatus.Cancelled, FailureReason.None, progress);
-            if (steps >= options.MaxCallTokens) return Abandon(ReplyStatus.Failed, FailureReason.CallTokenBudgetExceeded, progress);
-            if (allowed == 0) return Abandon(ReplyStatus.Failed, FailureReason.GrammarDeadEnd, progress);
-            int pick;
-            float probability;
-            if (jump && allowed == 1)
-            {
-                pick = SoleAllowed(mask, maskWords, sparseRows);
-                probability = 1f;
-            }
-            else if (full) pick = ArgMaxWithProbability(mask, out probability);
-            else pick = ArgMaxSparse(scratchLogits, sparseRows, allowed, out probability);
-            if (pick < 0) return Abandon(ReplyStatus.Failed, FailureReason.GrammarDeadEnd, progress);
-            if (steps == 0 && progress.FirstTokenTicks == 0) progress.FirstTokenTicks = Stopwatch.GetTimestamp() - progress.Started;
-            var length = tokenizer.ConstraintBytes(pick, buffer);
-            if (callTextLength + length > callText.Length) return Abandon(ReplyStatus.Failed, FailureReason.CallTextTooLong, progress);
-            var cursor = &state;
-            for (var b = 0; b < length; b++)
-            {
-                if (!Grammar.Advance(grammar.Program, cursor, buffer[b])) return Abandon(ReplyStatus.Failed, FailureReason.GrammarRejectedToken, progress);
-                callText[callTextLength++] = buffer[b];
-            }
-            logProbability += Math.Log(Math.Max(probability, 1e-9));
-            steps++;
-            progress.DecodeTokens++;
-            if (!budget.IsUnlimited && FrameBudgetHit(progress, budget)) return Abandon(ReplyStatus.Failed, FailureReason.FrameBudgetExceeded, progress);
-            RecordSpecHistory(pick);
-            chunkIds[0] = pick;
-            var chunkCount = 1;
-            var maskFresh = false;
-            if (jump && !Grammar.Complete(state))
-            {
-                while (chunkCount < MaxJumpChunk && !Grammar.Complete(state))
-                {
-                    if (CancelRequested) return Abandon(ReplyStatus.Cancelled, FailureReason.None, progress);
-                    if (steps >= options.MaxCallTokens) return Abandon(ReplyStatus.Failed, FailureReason.CallTokenBudgetExceeded, progress);
-                    trie.Allow(grammar.Program, state, mask);
-                    maskFresh = true;
-                    allowed = MaskCount(mask, maskWords);
-                    if (allowed != 1) break;
-                    var forced = SoleAllowed(mask, maskWords, sparseRows);
-                    var forcedLength = tokenizer.ConstraintBytes(forced, buffer);
-                    if (forcedLength <= 0) break;
-                    if (callTextLength + forcedLength > callText.Length) return Abandon(ReplyStatus.Failed, FailureReason.CallTextTooLong, progress);
-                    for (var b = 0; b < forcedLength; b++)
-                    {
-                        if (!Grammar.Advance(grammar.Program, cursor, buffer[b])) return Abandon(ReplyStatus.Failed, FailureReason.GrammarRejectedToken, progress);
-                        callText[callTextLength++] = buffer[b];
-                    }
-                    chunkIds[chunkCount++] = forced;
-                    steps++;
-                    progress.DecodeTokens++;
-                    RecordSpecHistory(forced);
-                    if (!budget.IsUnlimited && FrameBudgetHit(progress, budget)) return Abandon(ReplyStatus.Failed, FailureReason.FrameBudgetExceeded, progress);
-                }
-            }
-            if (jump && chunkCount > 1 && CancelRequested) return Abandon(ReplyStatus.Cancelled, FailureReason.None, progress);
-            var draftStart = chunkCount;
-            var specFed = false;
-            if (options.PromptLookup && chunkCount == 1 && !Grammar.Complete(state))
-            {
-                var scratchState = state;
-                var drafts = ProposeDrafts(&scratchState, chunkIds, chunkCount, draftAllowed, steps, buffer);
-                if (drafts > 0)
-                {
-                    if (CancelRequested) return Abandon(ReplyStatus.Cancelled, FailureReason.None, progress);
-                    engine.CheckpointSpec();
-                    chunkCount += drafts;
-                    if (!FeedCallChunk(new ReadOnlySpan<int>(chunkIds, chunkCount), computeLogits: false)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
-                    var accepted = VerifyDrafts(chunkIds, draftStart, drafts, draftAllowed, draftProbs);
-                    if (accepted < drafts) engine.RestoreSpec();
-                    for (var j = 0; j < accepted; j++)
-                    {
-                        var draft = chunkIds[draftStart + j];
-                        var draftLength = tokenizer.ConstraintBytes(draft, buffer);
-                        if (callTextLength + draftLength > callText.Length) return Abandon(ReplyStatus.Failed, FailureReason.CallTextTooLong, progress);
-                        var draftCursor = &state;
-                        for (var b = 0; b < draftLength; b++)
-                        {
-                            if (!Grammar.Advance(grammar.Program, draftCursor, buffer[b])) return Abandon(ReplyStatus.Failed, FailureReason.GrammarRejectedToken, progress);
-                            callText[callTextLength++] = buffer[b];
-                        }
-                        RecordSpecHistory(draft);
-                        logProbability += Math.Log(Math.Max(draftProbs[j], 1e-9));
-                        steps++;
-                        progress.DecodeTokens++;
-                        if (!budget.IsUnlimited && FrameBudgetHit(progress, budget)) return Abandon(ReplyStatus.Failed, FailureReason.FrameBudgetExceeded, progress);
-                    }
-                    chunkCount = draftStart + accepted;
-                    specFed = accepted == drafts;
-                    maskFresh = false;
-                }
-            }
-            var chunk = new ReadOnlySpan<int>(chunkIds, chunkCount);
-            if (Grammar.Complete(state))
-            {
-                if (!specFed && !FeedCallChunk(chunk, computeLogits: false)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
-                break;
-            }
-            if (!maskFresh)
-            {
-                trie.Allow(grammar.Program, state, mask);
-                allowed = MaskCount(mask, maskWords);
-            }
-            if (allowed == 0) return Abandon(ReplyStatus.Failed, FailureReason.GrammarDeadEnd, progress);
-            if (allowed <= SparseHeadThreshold)
-            {
-                ExtractIds(mask, maskWords, sparseRows, SparseHeadThreshold);
-                if (!specFed && !FeedCallChunk(chunk, computeLogits: false)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
-                engine.LogitsForRows(sparseRows, allowed, scratchLogits);
-                full = false;
-            }
-            else
-            {
-                if (specFed) engine.RefreshLastLogits();
-                else if (!FeedCallChunk(chunk, computeLogits: true)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
-                full = true;
-            }
-        }
-        if (!FinishClosing(callClosing, countPass: true)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
-
-        var head = HeadProbability();
-        var decode = Math.Exp(logProbability / Math.Max(1, steps));
-        var confidence = (float)Math.Min(head, decode);
-        if (!CallRestorer.TryRestore(allTools.Aliases, new ReadOnlySpan<byte>(callText, 0, callTextLength), calls, keyScratch, callSpans, out var required, out restoredCallCount))
-            return Failed(FailureReason.MalformedCalls, progress);
-        var refused = confidence < options.RefuseBelow;
-        var status = required > calls.Length ? ReplyStatus.Failed : refused ? ReplyStatus.Refused : ReplyStatus.Called;
-        var failure = required > calls.Length ? FailureReason.CallsBufferTooSmall : FailureReason.None;
-        return new Reply(status, failure, progress.Flags, confidence, (float)head, (float)decode, restoredCallCount, required,
-            progress.ReasoningLength, 0, progress.PromptTokens, progress.DecodeTokens, progress.PrefillTicks, progress.FirstTokenTicks, Stopwatch.GetTimestamp() - progress.Started);
+        var flags = ReplyFlags.None;
+        if ((outcome & (RepairOutcome.Repaired | RepairOutcome.Duplicate)) != 0) flags |= ReplyFlags.Repaired;
+        if ((outcome & RepairOutcome.Negated) != 0) flags |= ReplyFlags.Negated;
+        if ((outcome & RepairOutcome.Invalid) != 0) flags |= ReplyFlags.Invalid;
+        if ((outcome & RepairOutcome.Ungrounded) != 0) flags |= ReplyFlags.Ungrounded;
+        return flags;
     }
 
     Reply GenerateCallsTyped<TSink, TCommand>(ref TurnProgress progress, Span<TCommand> commands, ref TSink sink)
@@ -690,8 +920,13 @@ public sealed unsafe partial class NeedleSession : IDisposable
     {
         var startCount = sink.CallCount;
         sink.TryTakeCall(out _);
+        // The neutral per-call form: with repair on, the constrained bytes are kept as on the JSON path, and a
+        // copy of the sink from before the turn lets a repaired call list be replayed into it.
+        var record = repairPlan != null;
+        var before = record ? sink : default;
+        callTextLength = 0;
         var jump = options.JumpForward;
-        var state = Grammar.Start(grammar.Program);
+        var state = Grammar.Start(grammar.Program, route);
         var logProbability = 0.0;
         var steps = 0;
         var buffer = stackalloc byte[256];
@@ -720,10 +955,12 @@ public sealed unsafe partial class NeedleSession : IDisposable
             if (pick < 0) return Abandon(ReplyStatus.Failed, FailureReason.GrammarDeadEnd, progress);
             if (steps == 0 && progress.FirstTokenTicks == 0) progress.FirstTokenTicks = Stopwatch.GetTimestamp() - progress.Started;
             var length = tokenizer.ConstraintBytes(pick, buffer);
+            if (record && callTextLength + length > callText.Length) return Abandon(ReplyStatus.Failed, FailureReason.CallTextTooLong, progress);
             var cursor = &state;
             for (var b = 0; b < length; b++)
             {
                 if (!Grammar.Advance(grammar.Program, cursor, buffer[b], ref sink)) return Abandon(ReplyStatus.Failed, FailureReason.GrammarRejectedToken, progress);
+                if (record) callText[callTextLength++] = buffer[b];
                 if (sink.TryTakeCall(out var call) && stored < commands.Length) commands[stored++] = call;
             }
             logProbability += Math.Log(Math.Max(probability, 1e-9));
@@ -746,9 +983,11 @@ public sealed unsafe partial class NeedleSession : IDisposable
                     var forced = SoleAllowed(mask, maskWords, sparseRows);
                     var forcedLength = tokenizer.ConstraintBytes(forced, buffer);
                     if (forcedLength <= 0) break;
+                    if (record && callTextLength + forcedLength > callText.Length) return Abandon(ReplyStatus.Failed, FailureReason.CallTextTooLong, progress);
                     for (var b = 0; b < forcedLength; b++)
                     {
                         if (!Grammar.Advance(grammar.Program, cursor, buffer[b], ref sink)) return Abandon(ReplyStatus.Failed, FailureReason.GrammarRejectedToken, progress);
+                        if (record) callText[callTextLength++] = buffer[b];
                         if (sink.TryTakeCall(out var forcedCall) && stored < commands.Length) commands[stored++] = forcedCall;
                     }
                     chunkIds[chunkCount++] = forced;
@@ -776,10 +1015,12 @@ public sealed unsafe partial class NeedleSession : IDisposable
                     {
                         var draft = chunkIds[draftStart + j];
                         var draftLength = tokenizer.ConstraintBytes(draft, buffer);
+                        if (record && callTextLength + draftLength > callText.Length) return Abandon(ReplyStatus.Failed, FailureReason.CallTextTooLong, progress);
                         var draftCursor = &state;
                         for (var b = 0; b < draftLength; b++)
                         {
                             if (!Grammar.Advance(grammar.Program, draftCursor, buffer[b], ref sink)) return Abandon(ReplyStatus.Failed, FailureReason.GrammarRejectedToken, progress);
+                            if (record) callText[callTextLength++] = buffer[b];
                             if (sink.TryTakeCall(out var draftCall) && stored < commands.Length) commands[stored++] = draftCall;
                         }
                         RecordSpecHistory(draft);
@@ -823,35 +1064,23 @@ public sealed unsafe partial class NeedleSession : IDisposable
         var head = HeadProbability();
         var decode = Math.Exp(logProbability / Math.Max(1, steps));
         var confidence = (float)Math.Min(head, decode);
+        lastRepair = RepairOutcome.None;
+        if (record)
+        {
+            lastRepair = CallReplay.Repair(grammar.Program, allTools.Aliases, repairPlan!, repairScratch!, repairRequest!, repairHistory!, repairToday,
+                new ReadOnlySpan<byte>(callText, 0, callTextLength), restored, keyScratch, callSpans, in before, ref sink, commands, ref stored,
+                out restoredCallCount, out restoredLength, out var repairFailure);
+            progress.Flags |= ToFlags(lastRepair);
+            if (repairFailure != FailureReason.None) return Failed(repairFailure, progress);
+        }
         var total = sink.CallCount - startCount;
         restoredCallCount = total;
         if (total > stored)
             return new Reply(ReplyStatus.Failed, FailureReason.CallsBufferTooSmall, progress.Flags, confidence, (float)head, (float)decode, total, 0,
                 progress.ReasoningLength, 0, progress.PromptTokens, progress.DecodeTokens, progress.PrefillTicks, progress.FirstTokenTicks, Stopwatch.GetTimestamp() - progress.Started);
-        var refused = confidence < options.RefuseBelow;
-        var status = refused ? ReplyStatus.Refused : ReplyStatus.Called;
+        var status = CallReplay.Status(stored, confidence, options.RefuseBelow, route, lastRepair);
         return new Reply(status, FailureReason.None, progress.Flags, confidence, (float)head, (float)decode, stored, 0,
             progress.ReasoningLength, 0, progress.PromptTokens, progress.DecodeTokens, progress.PrefillTicks, progress.FirstTokenTicks, Stopwatch.GetTimestamp() - progress.Started);
-    }
-
-    Reply Respond(int first, ref TurnProgress progress, Span<byte> response)
-    {
-        var next = first;
-        var budget = options.FrameBudget;
-        for (var i = 0; i < options.MaxCallTokens && next != ImEnd && next != EndOfText; i++)
-        {
-            if (CancelRequested) return Abandon(ReplyStatus.Cancelled, FailureReason.None, progress);
-            AppendPiece(next, i == 0, response, ref progress.ResponseLength, ref progress.Flags, ReplyFlags.ResponseTruncated);
-            if (!TryFeed(next)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
-            progress.DecodeTokens++;
-            if (!budget.IsUnlimited && FrameBudgetHit(progress, budget)) return Abandon(ReplyStatus.Failed, FailureReason.FrameBudgetExceeded, progress);
-            next = ArgMax(responseMask);
-            if (next < 0) return Abandon(ReplyStatus.Failed, FailureReason.GrammarDeadEnd, progress);
-        }
-        if (!FinishClosing(responseClosing, countPass: false)) return Abandon(ReplyStatus.Failed, FailureReason.ContextExhausted, progress);
-        var confidence = (float)HeadProbability();
-        return new Reply(ReplyStatus.Responded, FailureReason.None, progress.Flags, confidence, confidence, float.NaN, 0, 0,
-            progress.ReasoningLength, progress.ResponseLength, progress.PromptTokens, progress.DecodeTokens, progress.PrefillTicks, progress.FirstTokenTicks, Stopwatch.GetTimestamp() - progress.Started);
     }
 
     bool CancelRequested => System.Threading.Volatile.Read(ref cancelRequested) != 0;

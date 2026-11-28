@@ -78,6 +78,11 @@ public sealed unsafe class BatchedSession : IDisposable
         public int RestoredCallCount;
         public CallResult Result;
         public bool Finished;
+        public RepairPlan? Plan;
+        public RepairScratch? RepairScratch;
+        public RepairText? Request;
+        public RepairText? History;
+        public RepairOutcome Outcome;
     }
 
     readonly Model model;
@@ -100,6 +105,8 @@ public sealed unsafe class BatchedSession : IDisposable
     readonly int contextCapacity;
     readonly int embeddingWidth;
     readonly Lane[] lanes;
+    readonly byte[] historySeed;
+    readonly DateTime? today;
     int laneCount;
     int disposed;
     internal long TurnGate;
@@ -114,6 +121,9 @@ public sealed unsafe class BatchedSession : IDisposable
         tokenizer = new Tokenizer(vocabulary, TokenizerInputBytes);
         trie = new TokenTrie(vocabulary.Trie);
         system = BuildSystem(this.options);
+        historySeed = Encoding.UTF8.GetBytes(this.options.System ?? "");
+        var stamp = IsoStamp.Match(system);
+        today = stamp.Success && DateTime.TryParseExact(stamp.Value, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var day) ? day : null;
         maskWords = trie.Words;
         vocabSize = model.VocabSize;
         reasoningMask = CopySharedMask(vocabulary);
@@ -167,6 +177,13 @@ public sealed unsafe class BatchedSession : IDisposable
             lane.Calls = new byte[callBytes + CallsHeadroomBytes];
             lane.CallSpans = new CallSpan[Math.Max(1, options.MaxCallTokens)];
             lane.KeyScratch = new byte[Math.Max(64, tools.Aliases.LongestPropertyAlias + 2)];
+            if (options.Repair)
+            {
+                lane.Plan = new RepairPlan(tools, toolsJson);
+                lane.RepairScratch = new RepairScratch(lane.CallSpans.Length, Math.Max(64, lane.CallSpans.Length * 4), lane.Calls.Length + lane.Plan.LongestValue * 8);
+                lane.Request = new RepairText(maxInputBytes + 16);
+                lane.History = new RepairText(Math.Max(16384, maxInputBytes * 4));
+            }
             lane.Reasoning = new byte[Math.Max(0, options.MaxReasoningTokens) * MaxPieceBytes];
             lane.Response = new byte[Math.Max(0, options.MaxCallTokens) * MaxPieceBytes];
             Prime(ref lane);
@@ -283,6 +300,7 @@ public sealed unsafe class BatchedSession : IDisposable
         lane.ResponseLength = 0;
         lane.CallTextLength = 0;
         lane.Flags = ReplyFlags.None;
+        lane.Outcome = RepairOutcome.None;
         lane.PendingCount = 0;
         lane.First = true;
         lane.Finished = false;
@@ -295,6 +313,16 @@ public sealed unsafe class BatchedSession : IDisposable
         if (engine.SlotLength(lane.Slot) + count > engine.Capacity) { FailLane(ref lane, ReplyStatus.Failed, FailureReason.ContextExhausted); return; }
         lane.TurnOne = false;
         lane.PromptTokens = count;
+        // A lane rewinds to its primed tools every turn, so repair sees what a stateless session sees.
+        if (lane.History != null)
+        {
+            if (!toolResult)
+            {
+                lane.History.Load(historySeed);
+                lane.Request!.Load(input);
+            }
+            lane.History.Append(input);
+        }
         engine.FeedSlot(lane.Slot, new ReadOnlySpan<int>(promptIds, 0, count), true);
         Buffer.MemoryCopy(engine.BatchLogitsRow(0), lane.Logits, (nuint)vocabSize * 4, (nuint)vocabSize * 4);
         lane.PrefillTicks = Stopwatch.GetTimestamp() - started;
@@ -464,13 +492,17 @@ public sealed unsafe class BatchedSession : IDisposable
             FailLane(ref lane, ReplyStatus.Failed, FailureReason.MalformedCalls);
             return;
         }
+        if (required <= calls.Length) Repair(ref lane, calls, ref required, ref restored);
         lane.RestoredCallCount = restored;
         lane.ElapsedTicks = Stopwatch.GetTimestamp() - lane.Started;
-        var refused = confidence < options.RefuseBelow;
+        // Same rule as NeedleSession: below the floor, or any argument the grounding gate flagged, withholds the calls.
+        var refused = confidence < options.RefuseBelow || (lane.Outcome & RepairOutcome.Ungrounded) != 0;
         if (required > calls.Length)
         {
             var exact = new byte[required];
             CallRestorer.TryRestore(lane.Tools.Aliases, new ReadOnlySpan<byte>(lane.CallText, 0, lane.CallTextLength), exact, lane.KeyScratch, lane.CallSpans, out _, out _);
+            Repair(ref lane, exact, ref required, ref restored);
+            lane.RestoredCallCount = restored;
             lane.Result = ToCallResult(ref lane, ReplyStatus.Failed, FailureReason.CallsBufferTooSmall, float.NaN, float.NaN, float.NaN, restored, required, exact);
         }
         else
@@ -479,6 +511,14 @@ public sealed unsafe class BatchedSession : IDisposable
             lane.Result = ToCallResult(ref lane, status, FailureReason.None, confidence, (float)head, (float)decode, restored, required, calls);
         }
         lane.Finished = true;
+    }
+
+    void Repair(ref Lane lane, byte[] calls, ref int required, ref int callCount)
+    {
+        if (lane.Plan == null) return;
+        lane.Outcome = ArgumentRepair.Apply(lane.Plan, lane.RepairScratch!, lane.Request!, lane.History!, today, calls, required, lane.CallSpans, ref callCount, out var repaired);
+        if (repaired <= calls.Length) required = repaired;
+        lane.Flags |= NeedleSession.ToFlags(lane.Outcome);
     }
 
     void FinishRespond(ref Lane lane)
@@ -697,6 +737,7 @@ public sealed unsafe class BatchedSession : IDisposable
         var refused = status == ReplyStatus.Refused;
         return new CallResult
         {
+            Validation = Validation(ref lane),
             FunctionCalls = refused ? Array.Empty<FunctionCall>() : resultCalls,
             SuppressedCalls = refused ? resultCalls : Array.Empty<FunctionCall>(),
             Reasoning = reasoning,
@@ -710,6 +751,25 @@ public sealed unsafe class BatchedSession : IDisposable
             DecodeTps = timing.DecodeTps,
             TotalMs = timing.TotalMs,
         };
+    }
+
+    static CallValidation Validation(ref Lane lane)
+    {
+        if ((lane.Flags & (ReplyFlags.Repaired | ReplyFlags.Negated | ReplyFlags.Invalid | ReplyFlags.Ungrounded)) == 0) return CallValidation.Clean;
+        var ungrounded = Array.Empty<string>();
+        if ((lane.Outcome & RepairOutcome.Ungrounded) != 0 && lane.RepairScratch is { UngroundedLength: > 0 } scratch)
+        {
+            var list = new System.Collections.Generic.List<string>();
+            var start = 0;
+            for (var i = 0; i < scratch.UngroundedLength; i++)
+                if (scratch.Ungrounded[i] == (byte)'\n')
+                {
+                    list.Add(Encoding.UTF8.GetString(scratch.Ungrounded, start, i - start));
+                    start = i + 1;
+                }
+            ungrounded = list.ToArray();
+        }
+        return new CallValidation((lane.Flags & ReplyFlags.Repaired) != 0, (lane.Flags & ReplyFlags.Negated) != 0, (lane.Flags & ReplyFlags.Invalid) != 0, ungrounded);
     }
 
     static string Describe(FailureReason reason) => reason switch

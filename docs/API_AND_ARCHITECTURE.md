@@ -391,6 +391,29 @@ namespace Needle.Tools
 }
 ```
 
+**Limits on parameters** (`namespace Needle`, for `[Tools]` and `[NeedleTools]` interfaces alike):
+
+```csharp
+[AttributeUsage(AttributeTargets.Parameter)]
+public sealed class ArgAttribute : Attribute
+{
+    public double Min { get; set; }       // schema "minimum"; NaN (default) = no lower limit
+    public double Max { get; set; }       // schema "maximum"; NaN (default) = no upper limit
+    public int MaxLength { get; set; }    // schema "maxLength" in characters; at most a Utf8TextN's N
+    public bool Inferred { get; set; }    // the game fills it in: no grounding gate, no dropping of unstated values
+}
+
+[Tools] public partial interface ISquad
+{
+    [Description("Set the music volume.")] void SetVolume([Arg(Min = 0, Max = 100)] int level);
+    [Description("Walk to a map position.")] void MoveTo([Arg(Inferred = true)] float x, [Arg(Inferred = true)] float y);
+}
+```
+
+A call with a number outside `[Min, Max]` is withheld (never clamped) and the reply carries `ReplyFlags.Invalid`; `Answer.Why` is `AnswerWhy.OutOfRange` when no call is left. Inferred fields are listed in a tool-level `"inferred"` array beside `"triggers"`, which the prompt leaves out; hand-written JSON tools can use it too.
+
+**Diagnostics**: NDG001 unsupported parameter type, NDG002 `[Tools]` on a non-interface or generic type, NDG003 more than 32 parameters, NDG004 `ref`/`out`/`in`, NDG005 non-constant default, NDG006 duplicate tool name, NDG007 generic method (warning), NDG008 duplicate enum literal (warning), NDG009 no description (warning), NDG010 `[Tools]` interface not `partial`, NDG011 `MaxLength` past a `Utf8TextN` capacity, NDG012 bad `[Arg]` limits, NDG014 a tool name the generated types reserve, or parameters that collide after snake_casing, NDG013 `NeedleAgent.Ask`/`Continue` inside a `MonoBehaviour`'s `Update`, `LateUpdate` or `FixedUpdate` (warning; use `TryPost` and `TryTake`).
+
 **Supported parameter types in `[NeedleTools]` interfaces**: `float`, `double`, `int`, `long`, `bool`, `enum` (mapped to JSON lowercase snake-case string enums), and `Utf8Text8` / `16` / `32` / `64` / `128` / `256` (mapped to `"type":"string","maxLength":N`). Optional C# default values mark parameters non-required.
 
 **Generated types** for `public partial interface IFooCommands` (or `ISquadCommands`):

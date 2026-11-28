@@ -22,6 +22,8 @@ namespace Needle.Samples
         public string ModelFile = "needle3.cact";
         [Tooltip("Needle worker threads. 0 = automatic: half the logical cores, capped at 4 (4 threads where the box has headroom, 2 on a 4-core laptop). Set 1-4 to force a count.")]
         public int Threads = 0;
+        [Tooltip("Calls below this confidence are refused. Games use 0.3; the engine default is upstream 4.x's 0.1.")]
+        [Range(0f, 1f)] public float MinConfidence = 0.3f;
         NeedleHost host;
         NeedleChannel channel;
         Entity singleton;
@@ -33,7 +35,7 @@ namespace Needle.Samples
             if (!File.Exists(path)) { Debug.LogError($"Needle model missing: {path}"); enabled = false; return; }
             host = new NeedleHost();
             var tools = System.Text.Encoding.UTF8.GetString(NpcCommands.Schema.ToArray());
-            channel = host.StartTyped<NpcSink, NpcCommand>(new HostOptions { ModelPath = path, ToolsJson = tools, Session = new NeedleOptions { Threading = ThreadPolicy.Game.WithThreads(ResolveThreads()) } });
+            channel = host.StartTyped<NpcSink, NpcCommand>(new HostOptions { ModelPath = path, ToolsJson = tools, Session = new NeedleOptions { Threading = ThreadPolicy.Game.WithThreads(ResolveThreads()), RefuseBelow = MinConfidence } });
             var manager = World.DefaultGameObjectInjectionWorld.EntityManager;
             singleton = manager.CreateSingleton(new NeedleChannelHandle { Channel = channel, Identity = channel.Identity });
             npc = manager.CreateEntity(typeof(NeedlePending), typeof(NpcCommandElement));

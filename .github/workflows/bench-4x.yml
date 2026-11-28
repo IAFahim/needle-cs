@@ -1,0 +1,113 @@
+name: Bench 4.x
+
+on:
+  push:
+    branches: [claude/engine-4x, claude/engine-4x-eval]
+  workflow_dispatch:
+    inputs:
+      rounds:
+        description: interleaved rounds per engine
+        default: "5"
+
+concurrency:
+  group: bench-4x-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  DOTNET_NOLOGO: "1"
+
+jobs:
+  bench:
+    name: needle-cs vs upstream 3.3.3 vs upstream 4.x (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Restore cached models
+        uses: actions/cache@v4
+        with:
+          path: ref
+          key: bench-ref-${{ runner.arch }}-${{ hashFiles('tools/ref.lock', 'tools/fetch.sh', 'tools/fetch-engine4.sh') }}
+
+      - name: Download models, the 3.3.3 wheel and the 4.x engine
+        run: |
+          bash tools/fetch.sh
+          if [ "${{ runner.arch }}" = "ARM64" ]; then tag=manylinux2014_aarch64; else tag=manylinux2014_x86_64; fi
+          bash tools/fetch.sh --engine4 "$tag"
+
+      - name: Machine
+        run: |
+          lscpu | head -25
+          nproc
+
+      - name: Publish the NativeAOT CLI
+        run: dotnet publish src/Needle.Cli -c Release -o out/aot
+
+      - name: Smoke test all three engines
+        run: |
+          out/aot/needle cpu
+          out/aot/needle bench-e2e ref/hf/needle3.cact tools/tools.json --sets golden --threads 1 --reps 1 --profile || true
+          out/aot/needle call ref/hf/needle3.cact tools/tools.json "set a timer for 12 minutes and play some Miles Davis"
+          python3 tools/native_bench.py ref/native4 ref/hf/needle3.cact tools/tools.json --sets golden --reps 1 --threads 4
+          if [ "${{ runner.arch }}" = "X64" ]; then python3 tools/native_bench.py ref/hf/wheel ref/hf/needle3.cact tools/tools.json --sets golden --reps 1; fi
+
+      - name: Upstream 4.x thread scaling, set_threads before load vs after load
+        run: |
+          python3 tools/bench_engines.py --rounds 2 --json threads.json \
+            --title "Upstream 4.x: set_threads before load (one process per count, as the package does) vs after load (one process)" \
+            --engine "4.x before load" "python3 tools/native_bench.py ref/native4 ref/hf/needle3.cact tools/tools.json --json --reps 3 --threads 1 2 4 0" \
+            --engine "4.x after load" "python3 tools/native_bench.py ref/native4 ref/hf/needle3.cact tools/tools.json --json --reps 3 --threads 1 2 4 0 --threads-after-load" \
+            | tee threads.md
+
+      - name: Engine parity benchmark
+        run: |
+          rounds="${{ github.event.inputs.rounds || '5' }}"
+          # Same schema bytes, empty system text, no date fact, the same prompts; set_threads before load.
+          engines=(--engine "upstream-4.x" "python3 tools/native_bench.py ref/native4 ref/hf/needle3.cact tools/tools.json --json --reps 3 --threads 1 2 4 0 --probe-tokens")
+          if [ "${{ runner.arch }}" = "X64" ]; then
+            engines+=(--engine "upstream-3.3.3" "python3 tools/native_bench.py ref/hf/wheel ref/hf/needle3.cact tools/tools.json --json --reps 3")
+          fi
+          engines+=(--engine "needle-cs" "out/aot/needle bench-e2e ref/hf/needle3.cact tools/tools.json --threads 1,2,4,0 --reps 3 --json")
+          python3 tools/bench_engines.py --rounds "$rounds" --json bench.json --title "Engine parity (same schema bytes, empty system, no date fact)" "${engines[@]}" | tee bench.md
+
+      - name: Product default vs product default
+        run: |
+          rounds="${{ github.event.inputs.rounds || '5' }}"
+          # upstream: what cactus.Needle does by default (automatic thread count, date fact as the system text);
+          # needle-cs: NeedleOptions defaults (library default: 1 thread) and the same with threads 0 (automatic).
+          python3 tools/bench_engines.py --rounds "$rounds" --json product.json --single-row "product default" \
+            --title "Product default vs product default (upstream: threads 0 + auto_date; needle-cs: NeedleOptions defaults at 1 thread and at threads 0)" \
+            --engine "upstream-4.x" "python3 tools/native_bench.py ref/native4 ref/hf/needle3.cact tools/tools.json --json --reps 3 --threads 0 --system auto-date --probe-tokens" \
+            --engine "needle-cs 1 thread" "out/aot/needle bench-e2e ref/hf/needle3.cact tools/tools.json --threads 1 --reps 3 --json --product" \
+            --engine "needle-cs auto" "out/aot/needle bench-e2e ref/hf/needle3.cact tools/tools.json --threads 0 --reps 3 --json --product" \
+            | tee product.md
+          { echo "# ${{ matrix.os }}"; echo; cat threads.md; echo; cat bench.md; echo; cat product.md; } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-${{ matrix.os }}
+          path: |
+            bench.md
+            bench.json
+            threads.md
+            threads.json
+            product.md
+            product.json

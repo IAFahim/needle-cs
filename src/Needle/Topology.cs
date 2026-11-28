@@ -44,6 +44,15 @@ internal static class Topology
         };
     }
 
+    /// <summary>Physical performance cores this process may run on (one per core, SMT siblings not counted); 0 when unknown.</summary>
+    internal static int PhysicalPerformanceCores()
+    {
+        var count = 0;
+        foreach (var core in Allowed(Cores(), onlyPerformance: true))
+            if (core.SmtRank == 0) count++;
+        return count;
+    }
+
     static CoreInfo[] Cores()
     {
         discovered ??= Discover();

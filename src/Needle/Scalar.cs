@@ -31,7 +31,7 @@ internal static class Simd
     public static bool UseAvx
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        get => Avx2.IsSupported && Fma.IsSupported && Sse41.IsSupported && Tiers.Active is CpuTier.Avx2 or CpuTier.AvxVnni or CpuTier.AvxVnniInt8 or CpuTier.Avx512Bw;
+        get => Avx2.IsSupported && Fma.IsSupported && Sse41.IsSupported && Tiers.Active is CpuTier.Avx2 or CpuTier.AvxVnni or CpuTier.AvxVnniInt8 or CpuTier.Avx512Bw or CpuTier.Avx512Vnni;
     }
 
     public static bool UseNeon

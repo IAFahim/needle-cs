@@ -216,7 +216,12 @@ public sealed unsafe class UpstreamBughuntTests
     public void AutoDatePrefixesTheFactExactlyWhenUpstreamWould(Type session, string system, bool prefixed)
     {
         var build = session.GetMethod("BuildSystem", BindingFlags.Static | BindingFlags.NonPublic)!;
-        var text = (string)build.Invoke(null, new object[] { new NeedleOptions { AutoDate = true, System = system } })!;
+        // NeedleSession builds from the system text and the flag (the 4.x branch re-primes with new facts);
+        // BatchedSession still takes the options.
+        var args = build.GetParameters().Length == 2
+            ? new object[] { system, true }
+            : new object[] { new NeedleOptions { AutoDate = true, System = system } };
+        var text = (string)build.Invoke(null, args)!;
         Assert.Equal(prefixed, text.StartsWith("date: ", StringComparison.Ordinal) && text.EndsWith("; " + system, StringComparison.Ordinal));
         if (!prefixed) Assert.Equal(system, text);
     }

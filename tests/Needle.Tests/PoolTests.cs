@@ -266,7 +266,7 @@ public sealed unsafe class PoolTests
         Assert.Equal(0, default(ThreadPolicy).Workers);
         Assert.Equal(3, ThreadPolicy.Default.WithThreads(4).Workers);
         Assert.Equal(4, ThreadPolicy.Default.WithThreads(4).WithCaller(CallerRole.Waits).Workers);
-        Assert.Equal(1, ThreadPolicy.Default.WithThreads(-5).Threads);
+        Assert.Equal(ThreadPolicy.AutoThreads, ThreadPolicy.Default.WithThreads(-5).Threads);
         Assert.Equal(0, ThreadPolicy.Default.WithSpinMicroseconds(-1).SpinMicroseconds);
         Assert.Equal(ThreadPolicy.DefaultSpinMicroseconds, ThreadPolicy.Default.SpinMicroseconds);
         Assert.Equal(CorePlacement.Any, new ThreadPolicy(2, 50, WorkerPriority.Normal, CorePlacement.Explicit, CallerRole.Participates, 0).Placement);
@@ -410,5 +410,128 @@ public sealed unsafe class TeamBarrierTests
         var barrier = stackalloc TeamBarrier[1];
         pool.RunTeam(&RecordMember, &ran, barrier, pool.Members);
         Assert.Equal(Environment.CurrentManagedThreadId, ran);
+    }
+    [Fact]
+    public void AdaptiveTeamRunsOnlyTheRequestedMembers()
+    {
+        using var pool = new Pool(4);
+        var counts = stackalloc int[pool.Members];
+        var seen = stackalloc int[pool.Members * Phases];
+        var barrier = stackalloc TeamBarrier[1];
+        foreach (var size in new[] { 1, 2, 3, 4, 2, 4, 1 })
+        {
+            for (var i = 0; i < pool.Members; i++) counts[i] = 0;
+            var context = new TeamContext { Seen = counts, Barrier = barrier, Members = size };
+            pool.RunAdaptiveTeam(&CountMember, &context, barrier, size);
+            for (var i = 0; i < pool.Members; i++) Assert.True(counts[i] == (i < size ? 1 : 0), $"size {size} member {i} ran {counts[i]} times");
+            for (var i = 0; i < pool.Members * Phases; i++) seen[i] = 0;
+            context = new TeamContext { Seen = seen, Barrier = barrier, Members = size };
+            pool.RunAdaptiveTeam(&WriteSlots, &context, barrier, size);
+            for (var i = 0; i < pool.Members * Phases; i++)
+                Assert.True(seen[i] == (i / Phases < size ? i % Phases + 1 : 0), $"size {size} slot {i}");
+        }
+    }
+
+    [Fact]
+    public void PinnedTeamSizeIsReportedAndClampedToMembers()
+    {
+        using var pool = new Pool(4);
+        Assert.Equal(4, pool.TeamMembers);
+        pool.PinTeamMembers(2);
+        Assert.Equal(2, pool.TeamMembers);
+        pool.PinTeamMembers(9);
+        Assert.Equal(4, pool.TeamMembers);
+        pool.PinTeamMembers(0);
+        Assert.Equal(4, pool.TeamMembers);
+        pool.Pause();
+        Assert.Equal(1, pool.TeamMembers);
+        pool.Resume();
+    }
+
+    [Fact]
+    public void TaskRunsUseOnlyTheSettledTeam()
+    {
+        using var pool = new Pool(ThreadPolicy.Default.WithThreads(4));
+        var threads = stackalloc int[64];
+        var caller = Environment.CurrentManagedThreadId;
+        foreach (var (pinned, most) in new[] { (1, 1), (2, 2), (0, 4) })
+        {
+            pool.PinTeamMembers(pinned);
+            for (var round = 0; round < 20; round++)
+            {
+                pool.Run(&RecordThread, threads, 64);
+                var distinct = 0;
+                for (var i = 0; i < 64; i++)
+                {
+                    Assert.NotEqual(0, threads[i]);
+                    var seen = false;
+                    for (var j = 0; j < i; j++) seen |= threads[j] == threads[i];
+                    if (!seen) distinct++;
+                }
+                Assert.True(distinct <= most, $"pinned {pinned}: {distinct} threads ran tasks");
+                if (pinned == 1) Assert.Equal(caller, threads[0]);
+            }
+        }
+        pool.PinTeamMembers(0);
+    }
+
+    static void RecordThread(void* context, int task)
+    {
+        Thread.SpinWait(200);
+        ((int*)context)[task] = Environment.CurrentManagedThreadId;
+    }
+
+    [Fact]
+    public void IdleAndThreadCpuTimesAreReportedWhereTheOsSaysThem()
+    {
+        if (!OperatingSystem.IsLinux() && !OperatingSystem.IsWindows()) return;
+        Assert.True(OsThreads.TrySystemIdleSeconds(out var first));
+        Thread.Sleep(200);
+        Assert.True(OsThreads.TrySystemIdleSeconds(out var second));
+        Assert.True(second >= first, $"{first} then {second}");
+        Assert.True(OsThreads.TryCurrentThreadCpu(out var before));
+        var until = System.Diagnostics.Stopwatch.GetTimestamp() + System.Diagnostics.Stopwatch.Frequency / 10;
+        while (System.Diagnostics.Stopwatch.GetTimestamp() < until) Thread.SpinWait(64);
+        Assert.True(OsThreads.TryCurrentThreadCpu(out var after));
+        Assert.True(after - before >= 200_000, $"spinning 100 ms used {(after - before) / 10_000.0} ms of CPU");
+    }
+
+    [Fact]
+    public void AdaptiveTeamFollowsTheCheapestSize()
+    {
+        using var pool = new Pool(ThreadPolicy.Default.WithThreads(4));
+        var barrier = stackalloc TeamBarrier[1];
+        var context = new StallContext { Barrier = barrier, Stall = 1 };
+        // Work that halves with each doubling of the team, plus a stall whenever workers take part:
+        // one member wins (4 ms against 7 ms and 6 ms).
+        for (var run = 0; run < 400 && pool.TeamMembers != 1; run++)
+        {
+            context.Members = pool.TeamMembers;
+            pool.RunAdaptiveTeam(&SplitWork, &context, barrier, context.Members);
+        }
+        Assert.Equal(1, pool.TeamMembers);
+        // Without the stall the full team wins again (1 ms against 2 ms and 4 ms).
+        context.Stall = 0;
+        for (var run = 0; run < 600 && pool.TeamMembers != 4; run++)
+        {
+            context.Members = pool.TeamMembers;
+            pool.RunAdaptiveTeam(&SplitWork, &context, barrier, context.Members);
+        }
+        Assert.Equal(4, pool.TeamMembers);
+    }
+
+    struct StallContext
+    {
+        public TeamBarrier* Barrier;
+        public int Members;
+        public int Stall;
+    }
+
+    static void SplitWork(void* context, int member)
+    {
+        var state = (StallContext*)context;
+        Thread.Sleep(4 / state->Members);
+        if (state->Stall != 0 && state->Members > 1 && member == state->Members - 1) Thread.Sleep(5);
+        Pool.Barrier(state->Barrier);
     }
 }

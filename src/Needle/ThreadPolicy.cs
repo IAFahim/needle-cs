@@ -41,12 +41,25 @@ public readonly struct ThreadPolicy
 
     public ThreadPolicy(int threads, int spinMicroseconds, WorkerPriority priority, CorePlacement placement, CallerRole caller, ulong explicitCpus)
     {
-        threadCount = Math.Max(1, threads);
+        threadCount = threads <= 0 ? AutoThreads : threads;
         SpinMicroseconds = Math.Max(0, spinMicroseconds);
         Priority = priority;
         Placement = placement == CorePlacement.Explicit && explicitCpus == 0 ? CorePlacement.Any : placement;
         Caller = caller;
         ExplicitCpus = explicitCpus;
+    }
+
+    /// <summary>The thread count used for 0 ("automatic", as upstream's set_threads(0)): one per physical core, at most 4.</summary>
+    public static int AutoThreads { get; } = DetectAutoThreads();
+
+    static int DetectAutoThreads()
+    {
+        // Two logical CPUs per core share that core's matrix units, so a second thread per core only adds barrier cost.
+        var cores = 0;
+        try { cores = Topology.PhysicalPerformanceCores(); }
+        catch (Exception) { }
+        if (cores <= 0) cores = Environment.ProcessorCount;
+        return Math.Clamp(cores, 1, 4);
     }
 
     public static ThreadPolicy Default => new(1, DefaultSpinMicroseconds, WorkerPriority.Normal, CorePlacement.PerformanceCores, CallerRole.Participates, 0);

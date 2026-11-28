@@ -23,6 +23,13 @@ jobs:
     name: Model and golden fixtures
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    # The goldens are float32 numpy, and both numpy's own loops and OpenBLAS pick kernels by CPU, so
+    # the same script gave Whistle references that differ by runner (macOS arm64 'test' encoder cosine
+    # 0.999497 against one cache, above 0.9995 against two others, same code). One x86 code path for
+    # every runner makes the fixtures a function of the scripts alone.
+    env:
+      OPENBLAS_CORETYPE: Haswell
+      NPY_DISABLE_CPU_FEATURES: X86_V4 AVX512_ICL AVX512_SPR
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -32,7 +39,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ref
-          key: ref-v2-${{ hashFiles('tools/fetch.sh', 'tools/ref.lock', 'tools/golden.py', 'tools/golden_confidence.py', 'tools/golden_whistle.py') }}
+          key: ref-v3-${{ hashFiles('tools/fetch.sh', 'tools/ref.lock', 'tools/golden.py', 'tools/golden_confidence.py', 'tools/golden_whistle.py') }}
 
       - name: Set up Python
         if: steps.ref-cache.outputs.cache-hit != 'true'
@@ -42,7 +49,7 @@ jobs:
 
       - name: Install Python dependencies
         if: steps.ref-cache.outputs.cache-hit != 'true'
-        run: pip install numpy sentencepiece soxr
+        run: pip install numpy==2.5.5 sentencepiece==0.2.3 soxr==1.1.0
 
       - name: Download models, tokenizer and audio clips
         if: steps.ref-cache.outputs.cache-hit != 'true'
@@ -118,11 +125,14 @@ jobs:
     #    The hang watchdog now covers macos-arm64 for the same reason
     #    (BSD top lacks the per-thread flags, so only the dotnet-stack
     #    dumps apply there).
-    #  - linux-x64-noavx512 (DOTNET_EnableAVX512F=0 experiment, AVX2
+    #  - linux-x64-noavx512 (DOTNET_EnableAVX512=0 on .NET 10, EnableAVX512F=0 before; AVX2
     #    fallback path) promoted after 5 consecutive green runs; history:
     #    41366006614 failed GenerationMatchesReferenceGreedyDecode +
     #    LongContextStaysCloseToNative, the same flake family as the
     #    required legs, not tier-specific.
+    # macos-arm64 moved from macos-14 to macos-15 on 2026-11-27: GitHub now
+    # rejects the macos-14 image ('macos-14-arm64-us-default' is not
+    # supported), so all three macos legs were cancelled before starting.
     # No macos-x64 leg: the last stable Intel image (macos-13) retired Dec
     # 2025; Intel-only coverage stays on windows/linux x64. No
     # windows-arm64 leg yet (image GA Aug 2026): unobserved with no owner,
@@ -263,11 +273,12 @@ jobs:
       - name: Select shard filter
         run: |
           case "${{ matrix.shard }}" in
-            unit) echo 'FILTER=FullyQualifiedName~AttentionBatchTests|FullyQualifiedName~AttentionTileTests|FullyQualifiedName~Avx512OpsTests|FullyQualifiedName~BackendTests|FullyQualifiedName~CallRestorerTests|FullyQualifiedName~Needle.Tests.Conformance.|FullyQualifiedName~EvalDatasetTests|FullyQualifiedName~ForcedTierTests|FullyQualifiedName~FormatTests|FullyQualifiedName~FusedKernelTests|FullyQualifiedName~GrammarTests|FullyQualifiedName~HadamardMlpTests|FullyQualifiedName~Int8DotTierTests|FullyQualifiedName~KernelTests|FullyQualifiedName~MatMulTests|FullyQualifiedName~NeonTests|FullyQualifiedName~PoolTests|FullyQualifiedName~RopeScheduleTests|FullyQualifiedName~SimdCanaryTests|FullyQualifiedName~TeamBarrierTests|FullyQualifiedName~TelemetryTests|FullyQualifiedName~TierSelectionTests|FullyQualifiedName~ToolGenTests' >> $GITHUB_ENV ;;
-            core) echo 'FILTER=FullyQualifiedName~Needle.Tests.Bughunt.|FullyQualifiedName~ChannelTests|FullyQualifiedName~ChunkParityTests|FullyQualifiedName~EvalTests|FullyQualifiedName~HugePagesTests|FullyQualifiedName~JumpForwardTests|FullyQualifiedName~LoadingTests|FullyQualifiedName~MaskedDecodingTests|FullyQualifiedName~NativeParityTests|FullyQualifiedName~ParityTests|FullyQualifiedName~PrefixSnapshotTests|FullyQualifiedName~RewindTests|FullyQualifiedName~ServiceTests|FullyQualifiedName~SessionStartupTests|FullyQualifiedName~SessionTests|FullyQualifiedName~SpanApiTests|FullyQualifiedName~SpeculativeTests|FullyQualifiedName~ToolGenSessionTests|FullyQualifiedName~TypedHostTests|FullyQualifiedName~TypedSinkTests' >> $GITHUB_ENV ;;
-            heavy) echo 'FILTER=FullyQualifiedName~BatchedDecodeTests|FullyQualifiedName~BatchedHostTests|FullyQualifiedName~BenchHarnessTests|FullyQualifiedName~SpeechTests|FullyQualifiedName~VoiceTests|FullyQualifiedName~WhistleStageTests|FullyQualifiedName~ZeroAllocationTests' >> $GITHUB_ENV ;;
+            unit) echo 'FILTER=FullyQualifiedName~AttentionBatchTests|FullyQualifiedName~AttentionTileTests|FullyQualifiedName~Avx512OpsTests|FullyQualifiedName~BackendTests|FullyQualifiedName~CallRestorerTests|FullyQualifiedName~Needle.Tests.Conformance.|FullyQualifiedName~EvalDatasetTests|FullyQualifiedName~ForcedTierTests|FullyQualifiedName~FormatTests|FullyQualifiedName~FusedKernelTests|FullyQualifiedName~GrammarTests|FullyQualifiedName~HadamardMlpTests|FullyQualifiedName~Int8DotTierTests|FullyQualifiedName~KernelTests|FullyQualifiedName~MatMulTests|FullyQualifiedName~NeonTests|FullyQualifiedName~PoolTests|FullyQualifiedName~RopeScheduleTests|FullyQualifiedName~SimdCanaryTests|FullyQualifiedName~TeamBarrierTests|FullyQualifiedName~TelemetryTests|FullyQualifiedName~TierSelectionTests|FullyQualifiedName~ToolGenTests|FullyQualifiedName~TierDispatchTests|FullyQualifiedName~EvexVnniKernelTests|FullyQualifiedName~CallScannerTests|FullyQualifiedName~VoiceActivityTests|FullyQualifiedName~ArgAttributeTests|FullyQualifiedName~ArgumentRepairTests|FullyQualifiedName~GeneratorDiagnosticTests|FullyQualifiedName~GroundingGateTests|FullyQualifiedName~ToolsInterfaceTests|FullyQualifiedName~TriggerTests|FullyQualifiedName~TypedRepairTests' >> $GITHUB_ENV ;;
+            core) echo 'FILTER=FullyQualifiedName~Needle.Tests.Bughunt.|FullyQualifiedName~ChannelTests|FullyQualifiedName~ChunkParityTests|FullyQualifiedName~EvalTests|FullyQualifiedName~HugePagesTests|FullyQualifiedName~JumpForwardTests|FullyQualifiedName~LoadingTests|FullyQualifiedName~MaskedDecodingTests|FullyQualifiedName~NativeParityTests|FullyQualifiedName~ParityTests|FullyQualifiedName~PrefixSnapshotTests|FullyQualifiedName~RewindTests|FullyQualifiedName~ServiceTests|FullyQualifiedName~SessionStartupTests|FullyQualifiedName~SessionTests|FullyQualifiedName~SpanApiTests|FullyQualifiedName~SpeculativeTests|FullyQualifiedName~ToolGenSessionTests|FullyQualifiedName~TypedHostTests|FullyQualifiedName~TypedSinkTests|FullyQualifiedName~TurnStreamTests|FullyQualifiedName~AgentApiTests|FullyQualifiedName~AgentPostTests' >> $GITHUB_ENV ;;
+            heavy) echo 'FILTER=FullyQualifiedName~BatchedDecodeTests|FullyQualifiedName~BatchedHostTests|FullyQualifiedName~BenchHarnessTests|FullyQualifiedName~SpeechTests|FullyQualifiedName~VoiceTests|FullyQualifiedName~WhistleStageTests|FullyQualifiedName~ZeroAllocationTests|FullyQualifiedName~VoiceStreamTests|FullyQualifiedName~ListenTests|FullyQualifiedName~AgentModelTests' >> $GITHUB_ENV ;;
           esac
-          if [ "${{ matrix.noavx512 }}" = "true" ]; then echo 'DOTNET_EnableAVX512F=0' >> $GITHUB_ENV; fi
+          # .NET 10 renamed the knob to EnableAVX512 and ignores EnableAVX512F; set both.
+          if [ "${{ matrix.noavx512 }}" = "true" ]; then echo 'DOTNET_EnableAVX512F=0' >> $GITHUB_ENV; echo 'DOTNET_EnableAVX512=0' >> $GITHUB_ENV; fi
 
       - name: Log the kernel tier this runner selects
         run: dotnet run -c Release --project src/Needle.Cli -- cpu

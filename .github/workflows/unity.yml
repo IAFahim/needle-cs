@@ -47,6 +47,10 @@ on:
         description: Build and bench the IL2CPP and CoreCLR players
         type: boolean
         default: true
+      windows:
+        description: Run the Windows checks on the self-hosted Windows runner instead of the Unity job
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -72,7 +76,7 @@ jobs:
     needs: package-check
     # A self-hosted runner on a public repository would run a fork's code on the owner's PC, so
     # pull requests from forks stop at package-check.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && !inputs.windows
     runs-on: [self-hosted, Linux, X64, unity]
     timeout-minutes: 240
     # One Unity job at a time on the PC, and never cancelled halfway, so the benches are not timed
@@ -182,3 +186,31 @@ jobs:
             out/unity/*.json
           if-no-files-found: warn
           retention-days: 30
+
+  windows:
+    name: Windows checks (self-hosted)
+    # Only on request: a manual run with windows ticked. Reads the machine, builds, and runs the
+    # model-free tests and the CPU tier report; it installs nothing.
+    if: github.event_name == 'workflow_dispatch' && inputs.windows
+    runs-on: [self-hosted, Windows]
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show the machine, the Unity editors and the tools on PATH
+        continue-on-error: true
+        run: |
+          Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, NumberOfLogicalProcessors | Format-List
+          [System.Environment]::OSVersion.VersionString
+          foreach ($root in @("$env:ProgramFiles\Unity\Hub\Editor", "$env:ProgramFiles\Unity")) { if (Test-Path $root) { "Unity under ${root}:"; Get-ChildItem $root -Name } }
+          foreach ($tool in @('dotnet', 'git', 'bash', 'python', 'python3', 'py')) { $c = Get-Command $tool -ErrorAction SilentlyContinue; if ($c) { "${tool}: $($c.Source)" } else { "${tool}: not found" } }
+          if (Get-Command dotnet -ErrorAction SilentlyContinue) { dotnet --list-sdks }
+
+      - name: Kernel tier this machine selects
+        run: dotnet run -c Release --project src/Needle.Cli -- cpu
+
+      - name: Model-free tests (argument limits, generator diagnostics, repair, scanner, voice activity, pool)
+        run: dotnet test tests/Needle.Tests -c Release --filter "FullyQualifiedName~ArgAttributeTests|FullyQualifiedName~GeneratorDiagnosticTests|FullyQualifiedName~ArgumentRepairTests|FullyQualifiedName~TypedRepairTests|FullyQualifiedName~GroundingGateTests|FullyQualifiedName~CallScannerTests|FullyQualifiedName~VoiceActivityTests|FullyQualifiedName~PoolTests|FullyQualifiedName~TeamBarrierTests|FullyQualifiedName~KernelTests|FullyQualifiedName~Needle.Tests.Conformance." -- xUnit.ParallelizeTestCollections=false

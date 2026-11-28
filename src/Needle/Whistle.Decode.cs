@@ -59,6 +59,7 @@ public sealed unsafe partial class Whistle
         string? detected = language;
         while (offset < pcm.Length)
         {
+            if (offset > 0 && CancelPending()) break;
             var length = Math.Min(window, pcm.Length - offset);
             var pass = Decode(pcm.Slice(offset, length), detected, keywords, true);
             first ??= pass;
@@ -182,6 +183,7 @@ public sealed unsafe partial class Whistle
         var hasKeywords = keywords != null && keywords.Count > 0;
         for (var step = 0; step < g.MaxSeq - 3 && !beam; step++)
         {
+            if (CancelPending()) break;
             logits = decoder.Logits;
             int best;
             float prob;
@@ -413,6 +415,7 @@ public sealed unsafe partial class Whistle
         var hasKeywords = spanKeywordStrings.Length > 0;
         for (var step = 0; step < g.MaxSeq - 4; step++)
         {
+            if (CancelPending()) break;
             var n = 0;
             for (var i = 0; i < liveCount; i++)
             {

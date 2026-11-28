@@ -16,8 +16,10 @@ internal static class CpuInfo
         Console.WriteLine($"active tier : {Tiers.Active}");
         Console.WriteLine($"vector512   : {Vector512.IsHardwareAccelerated} (Avx512F {Avx512F.IsSupported}, Avx512BW {Avx512BW.IsSupported}, Avx512Vbmi {Avx512Vbmi.IsSupported})");
         Console.WriteLine($"x86 int8 dot: Avx2 {Avx2.IsSupported}, Fma {Fma.IsSupported}, AvxVnni {AvxVnni.IsSupported}, AvxVnniInt8 {AvxVnniInt8.IsSupported}");
+        Console.WriteLine($"evex vnni   : cpu {EvexVnni.CpuHasAvx512Vnni}, kernels {(EvexVnni.Ready ? "mapped and self-tested" : "off")}");
         Console.WriteLine($"arm         : AdvSimd {AdvSimd.IsSupported}, Dp {Dp.IsSupported}");
-        foreach (var name in new[] { "NEEDLE_TIER", "NEEDLE_SCALAR", "NEEDLE_NOVNNI", "NEEDLE_NOAVX512", "NEEDLE_NODP", "DOTNET_EnableAVX512F", "DOTNET_EnableAVX2", "DOTNET_PROCESSOR_COUNT" })
+        Console.WriteLine($"features    : {Tiers.Detected}");
+        foreach (var name in new[] { "NEEDLE_TIER", "NEEDLE_SCALAR", "NEEDLE_NOVNNI", "NEEDLE_NOAVX512", "NEEDLE_NOEVEX", "NEEDLE_NODP", "DOTNET_EnableAVX512F", "DOTNET_EnableAVX512", "DOTNET_EnableAVX2", "DOTNET_PROCESSOR_COUNT" })
             if (Environment.GetEnvironmentVariable(name) is { } value) Console.WriteLine($"env         : {name}={value}");
         return 0;
     }

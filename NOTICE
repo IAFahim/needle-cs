@@ -51,5 +51,13 @@ See CONTRIBUTING.md.
    license that applies to that repository before using them anywhere
    other than local testing.
 
+6. 4.x acceptance suites and their scoring rule
+
+   cactus-compute 4.2.0 (Python package, Apache License, Version 2.0):
+   cactus/environments/*.py, _harness.py and cactus/agent/grounding.py.
+   tests/eval/environments holds the six suites as data, and
+   src/Needle.Cli/EvalSuites.cs and tools/eval_rule.py follow its scoring
+   rule. See tests/eval/environments/NOTICE.
+
 Names such as Needle, Whistle and Cactus belong to their respective owners.
 This project is not affiliated with or endorsed by Cactus Compute, Inc.
