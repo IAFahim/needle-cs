@@ -51,6 +51,13 @@ on:
         description: Run the Windows checks on the self-hosted Windows runner instead of the Unity job
         type: boolean
         default: false
+      profile:
+        description: Run the Unity gap profile (tools/unity-gap.sh) instead of the Unity job
+        type: boolean
+        default: false
+      rounds:
+        description: Interleaved rounds for the gap profile
+        default: "3"
 
 permissions:
   contents: read
@@ -76,7 +83,7 @@ jobs:
     needs: package-check
     # A self-hosted runner on a public repository would run a fork's code on the owner's PC, so
     # pull requests from forks stop at package-check.
-    if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && !inputs.windows
+    if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && !inputs.windows && !inputs.profile
     runs-on: [self-hosted, Linux, X64, unity]
     timeout-minutes: 240
     # One Unity job at a time on the PC, and never cancelled halfway, so the benches are not timed
@@ -184,6 +191,93 @@ jobs:
             out/unity/*.xml
             out/unity/*.log
             out/unity/*.json
+          if-no-files-found: warn
+          retention-days: 30
+
+  build-cli:
+    name: Build the needle-cs CLI for the gap profile
+    if: github.event_name == 'workflow_dispatch' && inputs.profile
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      # Built here so nothing is installed on the self-hosted PC. The JIT build is self-contained
+      # and picks its SIMD at run time, like CoreCLR in Unity; the NativeAOT build targets x86-64-v4.
+      - name: Publish a self-contained JIT CLI
+        run: dotnet publish src/Needle.Cli -c Release -r linux-x64 --self-contained -p:PublishAot=false -o out/cli/jit
+      - name: Publish a NativeAOT CLI
+        continue-on-error: true
+        run: dotnet publish src/Needle.Cli -c Release -r linux-x64 -p:IlcInstructionSet=x86-64-v4 -o out/cli/aot
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gap-cli
+          path: out/cli
+          retention-days: 3
+
+  profile:
+    name: Unity gap profile (self-hosted)
+    needs: build-cli
+    if: github.event_name == 'workflow_dispatch' && inputs.profile
+    runs-on: [self-hosted, Linux, X64, unity]
+    timeout-minutes: 240
+    concurrency:
+      group: unity-self-hosted
+      cancel-in-progress: false
+    env:
+      NEEDLE_REQUIRE_MODEL: "1"
+      NEEDLE_THREADS: "4"
+      NEEDLE_REPS: "3"
+      NEEDLE_WARMUPS: "1"
+      NEEDLE_GAP_ROUNDS: ${{ inputs.rounds || '3' }}
+      UNITY_SERIAL: ${{ secrets.UNITY_SERIAL }}
+      UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+      UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: gap-cli
+          path: out/cli
+      - name: Fetch the model and the native library into the cache (skips verified files)
+        run: |
+          echo "NEEDLE_REF_CACHE=${NEEDLE_REF_CACHE:-$HOME/needle-ref}" >> "$GITHUB_ENV"
+          chmod +x out/cli/jit/needle out/cli/aot/needle 2>/dev/null || true
+          cache="${NEEDLE_REF_CACHE:-$HOME/needle-ref}"
+          mkdir -p "$cache"
+          ln -sfn "$cache" ref
+          NEEDLE_REF_DIR="$cache" bash tools/fetch.sh
+      - name: Machine, CPU topology and the kernel tier each build picks
+        if: ${{ !cancelled() }}
+        run: tools/unity-gap.sh machine
+      - name: Threads the native library runs on its own
+        if: ${{ !cancelled() }}
+        run: tools/unity-gap.sh native-threads
+      - name: Engine ceiling, native vs plain .NET needle-cs (interleaved)
+        if: ${{ !cancelled() }}
+        run: tools/unity-gap.sh engines
+      - name: Per-stage profile of plain .NET needle-cs
+        if: ${{ !cancelled() }}
+        run: tools/unity-gap.sh stages
+      - name: Unity players, native vs CoreCLR vs CoreCLR with Burst kernels vs IL2CPP (interleaved)
+        if: ${{ !cancelled() }}
+        run: tools/unity-gap.sh players
+      - name: perf samples, if perf works on this machine
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: tools/unity-gap.sh perf
+      - name: Upload the gap reports
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: unity-gap-${{ github.run_id }}
+          path: |
+            out/gap/*.json
+            out/gap/*.md
+            out/gap/*.log
+            out/unity/*.log
           if-no-files-found: warn
           retention-days: 30
 
